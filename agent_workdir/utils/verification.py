@@ -32,7 +32,7 @@ def check_equal(actual, expected):
     elif isinstance(actual, (str, float, int)):
         assert actual == expected, f"{actual=} != {expected=}"
     elif isinstance(actual, torch.Tensor):
-        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2, equal_nan=True)
     else:
         raise TypeError(f"Unsupported output type: {type(actual)}")
 

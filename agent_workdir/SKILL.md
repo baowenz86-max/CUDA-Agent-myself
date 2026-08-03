@@ -166,7 +166,7 @@ class ModelNew(nn.Module):
 ### Step 2: Compile and Test
 ```bash
 # Compile with architecture-specific optimizations
-TORCH_CUDA_ARCH_LIST=9.0 bash utils/compile.sh
+TORCH_CUDA_ARCH_LIST=8.9 bash utils/compile.sh
 
 # Test in sandbox 
 sudo python3 -m utils.verification

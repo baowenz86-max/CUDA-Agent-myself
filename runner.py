@@ -1,0 +1,402 @@
+import subprocess
+import os
+#保存当前工作目录
+import shutil
+from pathlib import Path
+from datetime import datetime
+#数据
+import argparse
+from datasets import load_dataset
+DATASET_NAME = "BytedTsinghua-SIA/CUDA-Agent-Ops-6K"
+
+WORKDIR = "./agent_workdir"
+MAX_RETRY = 5
+
+ENV = os.environ.copy()
+
+ENV["CC"] = "gcc-13"
+ENV["CXX"] = "g++-13"
+ENV["CUDAHOSTCXX"] = "/usr/bin/g++-13"
+
+def parse_args():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--task-id",
+        type=int,
+        default=0,
+        help="dataset task id"
+    )
+
+    return parser.parse_args()
+
+
+def load_task(task_id):
+
+    print(
+        f"Loading dataset task {task_id}"
+    )
+
+    dataset = load_dataset(
+        DATASET_NAME
+    )
+
+
+    sample = dataset["train"][task_id]
+
+
+    print("operators:")
+    print(sample["ops"])
+
+
+    return sample
+
+
+def prepare_model(sample):
+
+    model_path = os.path.join(
+        WORKDIR,
+        "model.py"
+    )
+
+
+    with open(
+        model_path,
+        "w"
+    ) as f:
+
+        f.write(
+            sample["code"]
+        )
+
+
+    print(
+        "[OK] model.py generated"
+    )
+
+
+def run(cmd):
+
+    print("\n==========")
+    print(cmd)
+    print("==========")
+
+
+    result = subprocess.run(
+        cmd,
+        cwd=WORKDIR,
+        env=ENV,
+        shell=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
+    )
+
+
+    print(result.stdout)
+
+
+    return (
+        result.returncode == 0,
+        result.stdout
+    )
+
+
+def send_feedback(error_log):
+
+    prompt = f"""
+当前任务：
+
+model.py:
+{open(
+    os.path.join(WORKDIR,"model.py")
+).read()}
+
+错误：
+
+{error_log}
+
+请修改CUDA实现。
+
+你正在优化 CUDA kernel。
+
+刚刚生成的代码运行失败。
+
+错误日志如下：
+
+----------------
+{error_log}
+----------------
+
+
+请：
+
+1. 分析错误原因
+2. 修改 model_new.py 或 kernels/
+3. 不修改 utils/
+4. 不修改 binding.cpp
+5. 修改后重新运行：
+
+bash utils/compile.sh
+
+直到编译成功。
+"""
+
+
+    subprocess.run(
+        [
+            "codex",
+            "exec",
+            prompt
+        ],
+        cwd=WORKDIR,
+        env=ENV,
+        text=True
+    )
+
+def generate_cuda():
+
+    prompt = """
+你现在是CUDA kernel优化agent。
+
+请执行：
+
+1. 阅读 SKILL.md
+2. 阅读 model.py
+3. 生成 CUDA 优化版本
+
+要求：
+
+- 修改 model_new.py
+- 在 kernels/ 中生成CUDA kernel
+
+禁止：
+
+- 修改 utils
+- 修改 binding.cpp
+- 修改 binding_registry.h
+
+完成后：
+
+运行:
+bash utils/compile.sh
+
+如果失败继续修复。
+"""
+
+
+    result = subprocess.run(
+        [
+            "codex",
+            "exec",
+            prompt
+        ],
+        cwd=WORKDIR,
+        env=ENV,
+        text=True
+    )
+
+
+    return result.returncode == 0
+
+
+def compile_with_feedback(max_retry=3):
+
+    for i in range(max_retry):
+
+        success, log = run(
+            "bash utils/compile.sh"
+        )
+
+        if success:
+            print("Compile success")
+            return True
+
+
+        print(log)
+
+        send_feedback(log)
+
+
+    return False
+
+
+def verify_with_feedback(max_retry=3):
+
+    for i in range(max_retry):
+
+        success, log = run(
+            "python3 -m utils.verification"
+        )
+
+
+        if success:
+
+            print("Verification success")
+            return True
+
+
+        print("Verification failed")
+
+        send_feedback(
+            f"""
+Verification failed:
+
+{log}
+
+请检查CUDA kernel计算逻辑。
+重点检查：
+
+1. tensor shape
+2. index
+3. dtype
+4. reduction
+
+重新修改。
+"""
+        )
+
+
+def profile():
+
+    return run(
+        "python3 -m utils.profiling"
+    )
+
+
+def save_result(task_id=0, logs=None):
+    """
+    保存一次成功生成的CUDA程序
+    """
+
+    save_dir = Path(
+        f"./results/task_{task_id:04d}"
+    )
+
+    save_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    # 保存 model.py
+    files = [
+        "model.py",
+        "model_new.py",
+    ]
+
+    for file in files:
+
+        src = Path(WORKDIR) / file
+
+        if src.exists():
+
+            shutil.copy(
+                src,
+                save_dir / file
+            )
+
+
+    # 保存 kernels
+    kernel_src = Path(WORKDIR) / "kernels"
+
+    kernel_dst = save_dir / "kernels"
+
+
+    if kernel_src.exists():
+
+        shutil.copytree(
+            kernel_src,
+            kernel_dst,
+            dirs_exist_ok=True
+        )
+
+
+    # 保存日志
+    if logs:
+
+        for name, content in logs.items():
+
+            with open(
+                save_dir / name,
+                "w"
+            ) as f:
+
+                f.write(content)
+
+
+
+    # 保存时间信息
+
+    with open(
+        save_dir / "meta.txt",
+        "w"
+    ) as f:
+
+        f.write(
+            f"""
+task_id: {task_id}
+time: {datetime.now()}
+
+status: success
+"""
+        )
+
+
+    print(
+        f"[SAVE] result saved to {save_dir}"
+    )
+
+
+def main():
+
+    args = parse_args()
+
+
+    print(
+        "Start CUDA Agent"
+    )
+
+
+    # 1.读取任务
+    sample = load_task(
+        args.task_id
+    )
+
+
+    # 2.生成model.py
+    prepare_model(
+        sample
+    )
+
+
+    # 3.CUDA Agent流程
+
+    print("Start CUDA Agent")
+
+    for retry in range(MAX_RETRY):
+
+        generate_cuda()
+
+        if compile_with_feedback():
+            if verify_with_feedback():
+
+                success, profile_log = run(
+                    "python3 -m utils.profiling"
+                )
+
+
+                save_result(
+                    task_id=args.task_id,
+                    logs={
+                        "profile.log": profile_log
+                    }
+                )
+
+                return
+    print("Task failed")
+
+
+if __name__=="__main__":
+    main()
