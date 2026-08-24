@@ -1,12 +1,13 @@
 import torch
+import torch.nn as nn
 import cuda_extension
 
 
-class ModelNew(torch.nn.Module):
-    def __init__(self, in_channels, num_groups, num_features):
-        super().__init__()
-        self.num_groups = num_groups
-        self.num_features = num_features
+class ModelNew(nn.Module):
 
-    def forward(self, x):
-        return cuda_extension.ceil_transpose_group_norm(x, self.num_groups)
+    def __init__(self, alpha: float) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, a, b):
+        return cuda_extension.axpby_forward(a, b, self.alpha, 0)

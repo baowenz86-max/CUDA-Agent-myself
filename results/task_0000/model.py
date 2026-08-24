@@ -25,16 +25,7 @@ width = 15
 
 
 def get_inputs():
-
-    x = torch.empty(
-        batch_size,
-        channels,
-        depth,
-        height,
-        width
-    ).uniform_(0.1, 5.0)
-
-    return [x]
+    return [torch.randn(batch_size, channels, depth, height, width)]
 
 
 def get_init_inputs():

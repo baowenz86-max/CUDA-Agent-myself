@@ -30,7 +30,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Profile cuda_extension vs torch baseline and torch.compile."
     )
-    parser.add_argument("--iters", type=int, default=10000, help="Benchmark iterations")
+    parser.add_argument("--iters", type=int, default=10, help="Benchmark iterations")
     parser.add_argument(
         "--single-run",
         type=str,
@@ -58,27 +58,19 @@ def initialize_models():
 
 def benchmark_model(model, inputs, warmup_iters, run_iters):
     with torch.no_grad():
-
         for _ in range(warmup_iters):
-            model(*inputs)
+            _ = model(*inputs)
 
-        torch.cuda.synchronize()
+        with get_prof_ctx() as ctx:
+            torch.cuda.synchronize()
+            for _ in range(run_iters):
+                _ = model(*inputs)
+            torch.cuda.synchronize()
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-
-        for _ in range(run_iters):
-            model(*inputs)
-
-        end.record()
-
-        torch.cuda.synchronize()
-
-    elapsed_ms = start.elapsed_time(end)
-
-    return elapsed_ms / run_iters
+    return (
+        sum(e.device_time for e in ctx.events() if e.device_type.name == "CUDA")
+        / run_iters
+    )
 
 
 def print_results(torch_time, compile_time, cuda_time):

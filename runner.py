@@ -1,12 +1,18 @@
 import subprocess
 import os
+import sys
 #保存当前工作目录
 import shutil
 from pathlib import Path
 from datetime import datetime
 #数据
 import argparse
-from datasets import load_dataset
+
+try:
+    from datasets import load_dataset
+except ImportError:  # pragma: no cover - optional dependency for local environments
+    load_dataset = None
+
 DATASET_NAME = "BytedTsinghua-SIA/CUDA-Agent-Ops-6K"
 
 WORKDIR = "./agent_workdir"
@@ -37,6 +43,11 @@ def load_task(task_id):
     print(
         f"Loading dataset task {task_id}"
     )
+
+    if load_dataset is None:
+        raise RuntimeError(
+            "datasets package is not installed; cannot load the dataset."
+        )
 
     dataset = load_dataset(
         DATASET_NAME
@@ -265,6 +276,37 @@ def profile():
     )
 
 
+def generate_kernel_artifacts():
+    """
+    调用工具脚本生成 .ptx 和 .sass，并保存在 agent_workdir/kernels 中。
+    """
+
+    repo_root = Path(__file__).resolve().parent
+
+    for script_name in [
+        "tools/cu_to_ptx.py",
+        "tools/cu_to_sass.py",
+    ]:
+
+        script_path = repo_root / script_name
+
+        print(f"\n[RUN] {script_name}")
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            cwd=repo_root,
+            env=ENV,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+
+        print(result.stdout)
+
+        if result.returncode != 0:
+            print(f"[WARN] {script_name} failed")
+
+
 def save_result(task_id=0, logs=None):
     """
     保存一次成功生成的CUDA程序
@@ -386,6 +428,7 @@ def main():
                     "python3 -m utils.profiling"
                 )
 
+                generate_kernel_artifacts()
 
                 save_result(
                     task_id=args.task_id,
