@@ -61,16 +61,20 @@ def benchmark_model(model, inputs, warmup_iters, run_iters):
         for _ in range(warmup_iters):
             _ = model(*inputs)
 
-        with get_prof_ctx() as ctx:
-            torch.cuda.synchronize()
-            for _ in range(run_iters):
-                _ = model(*inputs)
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
-    return (
-        sum(e.device_time for e in ctx.events() if e.device_type.name == "CUDA")
-        / run_iters
-    )
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        for _ in range(run_iters):
+            _ = model(*inputs)
+        end.record()
+
+        torch.cuda.synchronize()
+
+    # elapsed_time 返回毫秒，乘 1000 转为微秒
+    return start.elapsed_time(end) * 1000.0 / run_iters
 
 
 def print_results(torch_time, compile_time, cuda_time):

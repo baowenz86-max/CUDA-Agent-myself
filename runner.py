@@ -20,9 +20,21 @@ MAX_RETRY = 5
 
 ENV = os.environ.copy()
 
-ENV["CC"] = "gcc-13"
-ENV["CXX"] = "g++-13"
-ENV["CUDAHOSTCXX"] = "/usr/bin/g++-13"
+# 固定 CUDA 12.6 和 GCC/G++ 13，确保 runner 启动的所有子进程
+# （编译、验证、profiling 和产物生成）使用同一套工具链。
+CUDA_HOME = "/usr/local/cuda-12.6"
+HOST_CC = "/usr/bin/gcc-13"
+HOST_CXX = "/usr/bin/g++-13"
+
+ENV["CUDA_HOME"] = CUDA_HOME
+ENV["CUDACXX"] = f"{CUDA_HOME}/bin/nvcc"
+ENV["CC"] = HOST_CC
+ENV["CXX"] = HOST_CXX
+ENV["CUDAHOSTCXX"] = HOST_CXX
+ENV["PATH"] = f"{CUDA_HOME}/bin{os.pathsep}{ENV.get('PATH', '')}"
+ENV["LD_LIBRARY_PATH"] = (
+    f"{CUDA_HOME}/lib64{os.pathsep}{ENV.get('LD_LIBRARY_PATH', '')}"
+)
 
 def parse_args():
 

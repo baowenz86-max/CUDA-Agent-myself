@@ -36,7 +36,7 @@ python runner.py --task-id 2#验证agent工作流程正常
 
 但是反编译出来的性能挺差的
 
-悲，突然发现编译相关文件里文件名忘记从decompilde_** 改回 **了，前面做的都错了
+悲，突然发现编译相关文件里文件名忘记从decompiled_** 改回 **了
 
 好奇怪，刚才虽然错了，但是也就是文件重命名而已，还是可以正常运行的，现在不能运行了
 重新下载了源文件，仍然报错
@@ -49,7 +49,7 @@ CUDA_HOME=/usr/local/cuda-12.6 \
 PATH=/usr/local/cuda-12.6/bin:$PATH \
 TORCH_CUDA_ARCH_LIST=8.9 \
 ```
-现在运行runner.py，kernels里面根本没有文件，没更新
+现在运行runner.py，kernels里面根本没有文件，codex没更新
  原因已经定位，不是 save_result() 没复制，而是运行过程中根本没有生成 kernel。
 
   主要有三个问题：
@@ -77,3 +77,12 @@ TORCH_CUDA_ARCH_LIST=8.9 \
 
   总结：直接原因是 Codex 这次改成了“在 binding.cpp 实现算子”，没有写入 kernels/；runner 又缺少生
   成结果和目录内容校验，把这个异常流程当成了成功。目前我只做了诊断，没有修改你的文件。
+
+怎么时好时坏，更新了一下codex又可以写入了，改了cuda和g++版本号（总是忘记改），verification通过。
+绷不住了，python3 -m utils.profiling
+Torch Baseline: 0.000us, Torch Compile: 0.000us, CUDA Extension: 0.000us。
+>问题：`torch.profiler` 未正确采集 CUDA 事件，导致三项耗时均显示为 `0.000us`。
+>修复：使用 `torch.cuda.Event` 在 GPU 时间线上记录起止时间，并通过 `torch.cuda.synchronize()` 等待异步任务完成。修改了profiling.py中的benchmark_model函数。
+>原理：CUDA Event 直接测量 GPU 执行时间，不依赖 Profiler 的事件采集，因此更加稳定。`elapsed_time()` 返回毫秒，乘以 1000 后换算为微秒。
+
+运行了python runner.py --task-id 2，编写.cu,cpp、compile、verification、profiling都成功了，但是cu_to_ptx(sass)等因为和前面的所需g++, cuda版本不一样，失败了。修改了runner.py, cu_to_ptx.py, cu_to_sass.py，加入了配置cuda和g++的代码，成功。

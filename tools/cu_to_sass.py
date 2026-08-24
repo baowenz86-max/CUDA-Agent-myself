@@ -8,8 +8,12 @@ from pathlib import Path
 ARCH = "sm_89"
 
 
-NVCC = "nvcc"
-CUOBJDUMP = "cuobjdump"
+# 固定编译工具版本，避免受 PATH 和系统默认版本影响
+CUDA_HOME = Path("/usr/local/cuda-13.3")
+NVCC = str(CUDA_HOME / "bin" / "nvcc")
+CUOBJDUMP = str(CUDA_HOME / "bin" / "cuobjdump")
+HOST_CC = "/usr/bin/gcc-15"
+HOST_CXX = "/usr/bin/g++-15"
 
 
 KERNEL_DIR = Path("agent_workdir/kernels")
@@ -17,10 +21,9 @@ KERNEL_DIR = Path("agent_workdir/kernels")
 
 ENV = os.environ.copy()
 
-# CUDA需要gcc13
-ENV["CC"] = "gcc-13"
-ENV["CXX"] = "g++-13"
-ENV["CUDAHOSTCXX"] = "/usr/bin/g++-13"
+ENV["CC"] = HOST_CC
+ENV["CXX"] = HOST_CXX
+ENV["CUDAHOSTCXX"] = HOST_CXX
 
 
 def run_cmd(cmd):
@@ -52,9 +55,11 @@ def compile_to_cubin(cu_file):
 
 
     cmd = [
-        "nvcc",
+        NVCC,
         "--expt-relaxed-constexpr",
-        "-arch=sm_89",
+        f"-arch={ARCH}",
+        "-ccbin",
+        HOST_CXX,
         "-cubin",
         str(cu_file),
         "-o",

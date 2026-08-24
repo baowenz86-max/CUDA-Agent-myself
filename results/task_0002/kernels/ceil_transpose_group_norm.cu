@@ -1,97 +1,102 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-// One block owns one (batch, group) row.  The input is read coalesced in
-// width-sized runs despite the virtual transpose, and no intermediate tensor
-// is materialized.  GroupNorm has no affine parameters in the source model.
-template <int BLOCK>
-__global__ __launch_bounds__(BLOCK, 2) void fused_group_norm_kernel(
-    const float* __restrict__ input,
-    float* __restrict__ output,
-    int channels,
-    int transposed_channels,
-    int width,
-    int groups,
-    int elements_per_group) {
-    const int group_id = blockIdx.x;
-    const int n = group_id / groups;
-    const int group = group_id - n * groups;
-
-    double sum = 0.0;
-    double square_sum = 0.0;
-    const int channels_per_group = transposed_channels / groups;
-    const int first_h = group * channels_per_group;
-
-    for (int i = threadIdx.x; i < elements_per_group; i += BLOCK) {
-        const int w = i % width;
-        const int channel = (i / width) % channels;
-        const int h = first_h + i / (channels * width);
-        const int64_t input_idx =
-            ((int64_t(n) * channels + channel) * transposed_channels + h)
-            * width + w;
-        const float value = ceilf(input[input_idx]);
-        sum += double(value);
-        square_sum += double(value) * double(value);
-    }
-
-    __shared__ double sums[BLOCK / 32];
-    __shared__ double squares[BLOCK / 32];
-    const unsigned mask = 0xffffffffu;
+__device__ __forceinline__ float warp_sum(float value) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(mask, sum, offset);
-        square_sum += __shfl_down_sync(mask, square_sum, offset);
+        value += __shfl_down_sync(0xffffffff, value, offset);
     }
+    return value;
+}
+
+template <int THREADS>
+__global__ __launch_bounds__(THREADS, 2)
+void ceil_transpose_group_norm_kernel(
+    const float* __restrict__ input, float* __restrict__ output,
+    int channels, int height, int width, int group_height,
+    int vectors_per_group) {
+    const int group = blockIdx.x;
+    const int batch = blockIdx.y;
+    const int h_begin = group * group_height;
+    const int input_batch_stride = channels * height * width;
+    const int output_batch_stride = height * channels * width;
+
+    float sum = 0.0f;
+    float square_sum = 0.0f;
+    for (int vector_index = threadIdx.x; vector_index < vectors_per_group;
+         vector_index += THREADS) {
+        const int scalar_index = vector_index * 4;
+        const int h_local = scalar_index / (channels * width);
+        const int remainder = scalar_index - h_local * channels * width;
+        const int channel = remainder / width;
+        const int w = remainder - channel * width;
+        const float4 values = *reinterpret_cast<const float4*>(
+            input + batch * input_batch_stride + channel * height * width
+            + (h_begin + h_local) * width + w);
+        const float x0 = ceilf(values.x);
+        const float x1 = ceilf(values.y);
+        const float x2 = ceilf(values.z);
+        const float x3 = ceilf(values.w);
+        sum += (x0 + x1) + (x2 + x3);
+        square_sum += (x0 * x0 + x1 * x1) + (x2 * x2 + x3 * x3);
+    }
+
+    sum = warp_sum(sum);
+    square_sum = warp_sum(square_sum);
+    __shared__ float warp_sums[THREADS / 32];
+    __shared__ float warp_squares[THREADS / 32];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     if (lane == 0) {
-        sums[warp] = sum;
-        squares[warp] = square_sum;
+        warp_sums[warp] = sum;
+        warp_squares[warp] = square_sum;
     }
     __syncthreads();
-
     if (warp == 0) {
-        sum = lane < BLOCK / 32 ? sums[lane] : 0.0;
-        square_sum = lane < BLOCK / 32 ? squares[lane] : 0.0;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(mask, sum, offset);
-            square_sum += __shfl_down_sync(mask, square_sum, offset);
-        }
+        sum = lane < THREADS / 32 ? warp_sums[lane] : 0.0f;
+        square_sum = lane < THREADS / 32 ? warp_squares[lane] : 0.0f;
+        sum = warp_sum(sum);
+        square_sum = warp_sum(square_sum);
         if (lane == 0) {
-            const double inv_count = 1.0 / double(elements_per_group);
-            const double mean = sum * inv_count;
-            const double variance = fmax(square_sum * inv_count - mean * mean, 0.0);
-            sums[0] = mean;
-            squares[0] = rsqrt(variance + 1.0e-5);
+            const float count = float(vectors_per_group * 4);
+            const float mean = sum / count;
+            const float variance = fmaxf(square_sum / count - mean * mean, 0.0f);
+            warp_sums[0] = mean;
+            warp_squares[0] = rsqrtf(variance + 1.0e-5f);
         }
     }
     __syncthreads();
+    const float mean = warp_sums[0];
+    const float inverse_std = warp_squares[0];
 
-    const float mean = float(sums[0]);
-    const float inv_std = float(squares[0]);
-    const int64_t output_base =
-        (int64_t(n) * transposed_channels + first_h) * channels * width;
-    for (int i = threadIdx.x; i < elements_per_group; i += BLOCK) {
-        const int w = i % width;
-        const int channel = (i / width) % channels;
-        const int h = first_h + i / (channels * width);
-        const int64_t input_idx =
-            ((int64_t(n) * channels + channel) * transposed_channels + h)
-            * width + w;
-        const float value = ceilf(input[input_idx]);
-        output[output_base + i] = (value - mean) * inv_std;
+    for (int vector_index = threadIdx.x; vector_index < vectors_per_group;
+         vector_index += THREADS) {
+        const int scalar_index = vector_index * 4;
+        const int h_local = scalar_index / (channels * width);
+        const int remainder = scalar_index - h_local * channels * width;
+        const int channel = remainder / width;
+        const int w = remainder - channel * width;
+        const float4 values = *reinterpret_cast<const float4*>(
+            input + batch * input_batch_stride + channel * height * width
+            + (h_begin + h_local) * width + w);
+        float4 result;
+        result.x = (ceilf(values.x) - mean) * inverse_std;
+        result.y = (ceilf(values.y) - mean) * inverse_std;
+        result.z = (ceilf(values.z) - mean) * inverse_std;
+        result.w = (ceilf(values.w) - mean) * inverse_std;
+        *reinterpret_cast<float4*>(
+            output + batch * output_batch_stride
+            + (h_begin + h_local) * channels * width + channel * width + w) = result;
     }
 }
 
 extern "C" void ceil_transpose_group_norm_launcher(
-    const float* input, float* output, int batch, int channels,
-    int height, int width, int groups, cudaStream_t stream) {
-    constexpr int block = 256;
-    const int group_size = height / groups;
-    const int elements_per_group = group_size * channels * width;
-    const int grid = batch * groups;
-    fused_group_norm_kernel<block><<<grid, block, 0, stream>>>(
-        input, output, channels, height, width, groups,
-        elements_per_group);
+    const float* input, float* output, int batch, int channels, int height,
+    int width, int groups, cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int group_height = height / groups;
+    const int vectors_per_group = group_height * channels * width / 4;
+    const dim3 grid(groups, batch);
+    ceil_transpose_group_norm_kernel<threads><<<grid, threads, 0, stream>>>(
+        input, output, channels, height, width, group_height, vectors_per_group);
 }

@@ -1,32 +1,31 @@
 import torch
-from torch import digamma, max
-from torch.nn import BatchNorm3d, Parameter
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class Model(torch.nn.Module):
-    def __init__(self):
+class Model(nn.Module):
+    def __init__(self, in_channels, num_groups, num_features):
         super().__init__()
-        self.batch_norm = BatchNorm3d(10)
-        self.parameter = Parameter(torch.randn(10))
+        self.num_groups = num_groups
+        self.num_features = num_features
 
     def forward(self, x):
-        x = self.batch_norm(x)
-        x = digamma(x)
-        x = max(x)
-        x = x + self.parameter
+        x = torch.ceil(x)
+        x = torch.transpose(x, 1, 2)
+        x = F.group_norm(x, self.num_groups)
         return x
 
 
 batch_size = 512
-channels = 10
-depth = 15
-height = 15
-width = 15
+in_channels = 32
+num_groups = 4
+num_features = in_channels
+height, width = 128, 128  # Increased from 32x32 to 128x128 to increase computation
 
 
 def get_inputs():
-    return [torch.randn(batch_size, channels, depth, height, width)]
+    return [torch.randn(batch_size, in_channels, height, width)]
 
 
 def get_init_inputs():
-    return []
+    return [in_channels, num_groups, num_features]

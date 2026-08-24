@@ -8,16 +8,19 @@ from pathlib import Path
 ARCH = "sm_89"
 
 
-# CUDA路径
-NVCC = "nvcc"
+# 固定编译工具版本，避免受 PATH 和系统默认版本影响
+CUDA_HOME = Path("/usr/local/cuda-13.3")
+NVCC = str(CUDA_HOME / "bin" / "nvcc")
+HOST_CC = "/usr/bin/gcc-15"
+HOST_CXX = "/usr/bin/g++-15"
 
 
 KERNEL_DIR = Path("agent_workdir/kernels")
 ENV = os.environ.copy()
 
-ENV["CC"] = "gcc-13"
-ENV["CXX"] = "g++-13"
-ENV["CUDAHOSTCXX"] = "/usr/bin/g++-13"
+ENV["CC"] = HOST_CC
+ENV["CXX"] = HOST_CXX
+ENV["CUDAHOSTCXX"] = HOST_CXX
 
 def compile_to_ptx(cu_file):
 
@@ -28,7 +31,7 @@ def compile_to_ptx(cu_file):
         NVCC,
         f"-arch={ARCH}",
         "-ccbin",
-        "/usr/bin/g++-13",
+        HOST_CXX,
         "-ptx",
         str(cu_file),
         "-o",
