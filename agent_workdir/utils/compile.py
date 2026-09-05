@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
 """Simplified compile script: force-compile root and kernels CUDA/C++ sources."""
 
+import os
 import shutil
 import sys
 from pathlib import Path
+
+# 必须在导入 torch CUDA extension 之前固定工具链，
+# 否则 PyTorch 可能会缓存 PATH 中的其他 CUDA 版本。
+CUDA_HOME = "/usr/local/cuda-12.6"
+HOST_CC = "/usr/bin/gcc-13"
+HOST_CXX = "/usr/bin/g++-13"
+
+os.environ["CUDA_HOME"] = CUDA_HOME
+os.environ["CUDACXX"] = f"{CUDA_HOME}/bin/nvcc"
+os.environ["CC"] = HOST_CC
+os.environ["CXX"] = HOST_CXX
+os.environ["CUDAHOSTCXX"] = HOST_CXX
+os.environ["PATH"] = f"{CUDA_HOME}/bin{os.pathsep}{os.environ.get('PATH', '')}"
+os.environ["LD_LIBRARY_PATH"] = (
+    f"{CUDA_HOME}/lib64{os.pathsep}{os.environ.get('LD_LIBRARY_PATH', '')}"
+)
 
 import torch.utils.cpp_extension as cpp_ext
 
@@ -46,7 +63,11 @@ def compile_kernels() -> int:
             verbose=False,
             with_cuda=True,
             extra_cflags=['-O3', '-std=c++17'],
-            extra_cuda_cflags=['-O3', '--use_fast_math'],
+            extra_cuda_cflags=[
+                '-O3',
+                '--use_fast_math',
+                f'-ccbin={HOST_CXX}',
+            ],
         )
     except Exception as exc:
         print('Compilation failed.')

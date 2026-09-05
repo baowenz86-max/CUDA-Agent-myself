@@ -1,57 +1,74 @@
 #include <cuda_runtime.h>
-#include <math_constants.h>
+#include <math.h>
 
-__global__ void fused_activation_kernel(
-    float* __restrict__ output,
-    const float* __restrict__ input,
-    long long n,
-    float negative_slope,
-    float exponent,
-    float upper_bound) {
-    const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long long stride = (long long)blockDim.x * gridDim.x;
+namespace {
 
-    // The benchmark exponent is exactly two.  Retain a general fallback so
-    // the constructor arguments still determine the operation.
-    if (exponent == 2.0f) {
-        for (long long i = tid; i < n; i += stride) {
-            float v = input[i];
-            v = v >= 0.0f ? v : v * negative_slope;
-            v *= v;
-            // For v >= 0, with t=exp(-v):
-            // tanh(softplus(v)) = (1 + 2t) / (1 + 2t + 2t^2).
-            // This removes log and tanh while remaining algebraically exact.
-            const float t = expf(-v);
-            const float numerator = fmaf(2.0f, t, 1.0f);
-            const float denominator = fmaf(2.0f * t, t, numerator);
-            v *= numerator / denominator;
-            output[i] = v > upper_bound ? upper_bound : v;
-        }
+__device__ __forceinline__ float mish_nonnegative(float x) {
+    // tanh(softplus(x)) = 1 - 2 / ((1 + exp(x))^2 + 1).
+    // For x >= 10 the correction is below float precision at this scale.
+    if (x >= 10.0f) return x;
+    const float e = __expf(x);
+    return x * (1.0f - 2.0f / fmaf(e, e + 2.0f, 2.0f));
+}
+
+__global__ void fused_square_kernel(float* __restrict__ output,
+                                    const float* __restrict__ input,
+                                    size_t n,
+                                    float negative_slope,
+                                    float abs_max) {
+    const size_t i = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        const float4 v = *reinterpret_cast<const float4*>(input + i);
+        float4 r;
+        float a = v.x < 0.0f ? v.x * negative_slope : v.x;
+        float b = v.y < 0.0f ? v.y * negative_slope : v.y;
+        float c = v.z < 0.0f ? v.z * negative_slope : v.z;
+        float d = v.w < 0.0f ? v.w * negative_slope : v.w;
+        r.x = fminf(mish_nonnegative(a * a), abs_max);
+        r.y = fminf(mish_nonnegative(b * b), abs_max);
+        r.z = fminf(mish_nonnegative(c * c), abs_max);
+        r.w = fminf(mish_nonnegative(d * d), abs_max);
+        *reinterpret_cast<float4*>(output + i) = r;
     } else {
-        for (long long i = tid; i < n; i += stride) {
-            float v = input[i];
-            v = v >= 0.0f ? v : v * negative_slope;
-            v = fabsf(powf(v, exponent));
-            const float softplus = fmaxf(v, 0.0f) + log1pf(expf(-fabsf(v)));
-            v = v * tanhf(softplus);
-            output[i] = fminf(fmaxf(v, 0.0f), upper_bound);
+        for (size_t j = i; j < n; ++j) {
+            float a = input[j];
+            a = a < 0.0f ? a * negative_slope : a;
+            output[j] = fminf(mish_nonnegative(a * a), abs_max);
         }
     }
 }
 
-extern "C" void fused_activation_launcher(
-    float* output,
-    const float* input,
-    long long n,
-    float negative_slope,
-    float exponent,
-    float upper_bound,
-    cudaStream_t stream) {
+__global__ void fused_general_kernel(float* __restrict__ output,
+                                     const float* __restrict__ input,
+                                     size_t n,
+                                     float negative_slope,
+                                     float exponent,
+                                     float abs_max) {
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += static_cast<size_t>(blockDim.x) * gridDim.x) {
+        float x = input[i];
+        x = x < 0.0f ? x * negative_slope : x;
+        x = fabsf(powf(x, exponent));
+        output[i] = fminf(mish_nonnegative(x), abs_max);
+    }
+}
+
+}  // namespace
+
+extern "C" void fused_activation_launcher(float* output, const float* input,
+                                            size_t n, float negative_slope,
+                                            float exponent, float abs_max,
+                                            cudaStream_t stream) {
     constexpr int threads = 256;
-    // A persistent grid avoids excessive launch geometry while supplying
-    // ample independent work for this large, transcendental-heavy tensor.
-    int blocks = (int)((n + threads - 1) / threads);
-    if (blocks > 4096) blocks = 4096;
-    fused_activation_kernel<<<blocks, threads, 0, stream>>>(
-        output, input, n, negative_slope, exponent, upper_bound);
+    if (exponent == 2.0f) {
+        const size_t vectors = (n + 3) / 4;
+        const int blocks = static_cast<int>((vectors + threads - 1) / threads);
+        fused_square_kernel<<<blocks, threads, 0, stream>>>(
+            output, input, n, negative_slope, abs_max);
+    } else {
+        int blocks = static_cast<int>((n + threads - 1) / threads);
+        if (blocks > 65535) blocks = 65535;
+        fused_general_kernel<<<blocks, threads, 0, stream>>>(
+            output, input, n, negative_slope, exponent, abs_max);
+    }
 }

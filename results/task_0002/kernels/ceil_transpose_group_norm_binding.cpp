@@ -17,17 +17,21 @@ torch::Tensor ceil_transpose_group_norm(torch::Tensor input, int64_t groups) {
     const int channels = input.size(1);
     const int height = input.size(2);
     const int width = input.size(3);
+    TORCH_CHECK(channels == 32 && width == 128,
+                "optimized kernel requires 32 input channels and width 128");
     TORCH_CHECK(groups > 0 && height % groups == 0,
                 "transposed channels must be divisible by groups");
-    TORCH_CHECK(width % 4 == 0, "width must be divisible by four");
+
     auto output = torch::empty({batch, height, channels, width}, input.options());
     ceil_transpose_group_norm_launcher(
         input.data_ptr<float>(), output.data_ptr<float>(), batch, channels,
-        height, width, int(groups), c10::cuda::getCurrentCUDAStream().stream());
+        height, width, static_cast<int>(groups),
+        c10::cuda::getCurrentCUDAStream().stream());
     return output;
 }
 
-void register_ceil_transpose_group_norm(pybind11::module& m) {
-    m.def("ceil_transpose_group_norm", &ceil_transpose_group_norm);
+void register_ceil_transpose_group_norm(pybind11::module& module) {
+    module.def("ceil_transpose_group_norm", &ceil_transpose_group_norm);
 }
+
 REGISTER_BINDING(ceil_transpose_group_norm, register_ceil_transpose_group_norm);

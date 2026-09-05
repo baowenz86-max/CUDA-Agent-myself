@@ -3,10 +3,17 @@ import cuda_extension
 
 
 class ModelNew(torch.nn.Module):
-    def __init__(self, in_channels, num_groups, num_features):
+    def __init__(self):
         super().__init__()
-        self.num_groups = num_groups
-        self.num_features = num_features
+        self.batch_norm = torch.nn.BatchNorm3d(10)
+        self.parameter = torch.nn.Parameter(torch.randn(10))
 
     def forward(self, x):
-        return cuda_extension.ceil_transpose_group_norm(x, self.num_groups)
+        return cuda_extension.fused_bn_digamma_max(
+            x,
+            self.batch_norm.weight,
+            self.batch_norm.bias,
+            self.batch_norm.running_mean,
+            self.batch_norm.running_var,
+            self.parameter,
+        )

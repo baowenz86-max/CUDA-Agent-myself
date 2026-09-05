@@ -86,3 +86,52 @@ Torch Baseline: 0.000us, Torch Compile: 0.000us, CUDA Extension: 0.000us。
 >原理：CUDA Event 直接测量 GPU 执行时间，不依赖 Profiler 的事件采集，因此更加稳定。`elapsed_time()` 返回毫秒，乘以 1000 后换算为微秒。
 
 运行了python runner.py --task-id 2，编写.cu,cpp、compile、verification、profiling都成功了，但是cu_to_ptx(sass)等因为和前面的所需g++, cuda版本不一样，失败了。修改了runner.py, cu_to_ptx.py, cu_to_sass.py，加入了配置cuda和g++的代码，成功。
+又在compile里面加入了cuda和g++配置
+agent部分debug暂时完成。
+示例
+>(agent_workdir) stella@LAPTOP-0LE65POH:~/learn/URP/CUDA-Agent/agent_workdir$ python -m utils.verification
+>[PASS] check 1/5
+>[PASS] check 2/5
+>[PASS] check 3/5
+>[PASS] check 4/5
+>[PASS] check 5/5
+>[PASS] verify success
+>(agent_workdir) stella@LAPTOP-0LE65POH:~/learn/URP/CUDA-Agent/agent_workdir$ python -m utils.profiling
+>Torch Baseline: 33035.873us, Torch Compile: 13192.186us, CUDA Extension: 13747.200us
+
+反编译部分
+用AI根据sass反编译了一个.cu和对应的.cpp文件，又修改了.cu中的一个函数错误，使得目前版本的.cu文件可以通过verification
+>(agent_workdir) stella@LAPTOP-0LE65POH:~/learn/URP/CUDA-Agent/agent_workdir$ bash utils/compile.sh
+>Compiling 3 files: binding.cpp, kernels/ceil_transpose_group_norm.cu, kernels/ceil_transpose_group_norm_binding.cpp
+>/home/stella/learn/URP/CUDA-Agent/agent_workdir/.venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2059: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+>If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+>  warnings.warn(
+>Compile success: cuda_extension.so
+>[TIME] Compilation took 16.40s
+>(agent_workdir) stella@LAPTOP-0LE65POH:~/learn/URP/CUDA-Agent/agent_workdir$ python3 -m utils.verification
+>[PASS] check 1/5
+>[PASS] check 2/5
+>[PASS] check 3/5
+>[PASS] check 4/5
+>[PASS] check 5/5
+>[PASS] verify success
+>(agent_workdir) stella@LAPTOP-0LE65POH:~/learn/URP/CUDA-Agent/agent_workdir$ sudo python3 -m utils.profiling
+>[sudo: authenticate] Password: 
+
+>(agent_workdir) stella@LAPTOP-0LE65POH:~/learn/URP/CUDA-Agent/agent_workdir$ python -m utils.profiling
+>Torch Baseline: 33015.604us, Torch Compile: 13244.211us, CUDA Extension: 14190.387us
+
+| 等级 | 状态 | 依据 |
+|---|---|---|
+| 1. 可编译 | 通过 | 反编译 `.cu + .cpp` 编译成功 |
+| 2. 可加载 | 通过 | Python 能导入并运行扩展 |
+| 3. 可执行 | 通过 | CUDA kernel 正常完成，没有报错 |
+| 4. 功能正确 | 通过 | `verification.py` 通过 |
+| 5. 鲁棒正确 | 尚未充分证明 | 当前只有 5 次随机测试，形状和 dtype 固定 |
+| 6. 性能接近 | 通过 | 14.063 ms，与 `torch.compile` 的 13.514 ms 接近 |
+| 7. 源码还原 | 无法证明 | 需要与原始实现的算法、线程布局和内存访问结构比较 |
+
+用ai写了一个robustness_test.py，成功运行。
+
+
+并发

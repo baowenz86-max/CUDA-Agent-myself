@@ -7,9 +7,10 @@ from pathlib import Path
 from datetime import datetime
 #数据
 import argparse
+from llm_agent import run_agent
 
 try:
-    from datasets import load_dataset
+    from datasets import Dataset, load_dataset
 except ImportError:  # pragma: no cover - optional dependency for local environments
     load_dataset = None
 
@@ -22,7 +23,7 @@ ENV = os.environ.copy()
 
 # 固定 CUDA 12.6 和 GCC/G++ 13，确保 runner 启动的所有子进程
 # （编译、验证、profiling 和产物生成）使用同一套工具链。
-CUDA_HOME = "/usr/local/cuda-12.6"
+CUDA_HOME = "/public/app/cuda/12.6"
 HOST_CC = "/usr/bin/gcc-13"
 HOST_CXX = "/usr/bin/g++-13"
 
@@ -51,27 +52,28 @@ def parse_args():
 
 
 def load_task(task_id):
+    print(f"Loading dataset task {task_id}")
 
-    print(
-        f"Loading dataset task {task_id}"
+    arrow_file = Path(
+        "datasets/BytedTsinghua-SIA___cuda-agent-ops-6_k/"
+        "default/0.0.0/44a734c78c947bfcba5189cbfd13f57a6d29a698/"
+        "cuda-agent-ops-6_k-train.arrow"
     )
 
-    if load_dataset is None:
-        raise RuntimeError(
-            "datasets package is not installed; cannot load the dataset."
-        )
+    if arrow_file.exists():
+        print(f"Using local Arrow dataset: {arrow_file}")
+        dataset = Dataset.from_file(str(arrow_file))
+        sample = dataset[task_id]
+    else:
+        if load_dataset is None:
+            raise RuntimeError("datasets package is not installed.")
 
-    dataset = load_dataset(
-        DATASET_NAME
-    )
-
-
-    sample = dataset["train"][task_id]
-
+        print("Local Arrow dataset not found; trying Hugging Face Hub.")
+        remote_dataset = load_dataset(DATASET_NAME)
+        sample = remote_dataset["train"][task_id]
 
     print("operators:")
     print(sample["ops"])
-
 
     return sample
 
@@ -97,6 +99,24 @@ def prepare_model(sample):
     print(
         "[OK] model.py generated"
     )
+
+
+def reset_generated_workspace():
+    """开始新任务前，清理上一任务生成的 CUDA 源码和编译产物。"""
+    kernel_dir = Path(WORKDIR) / "kernels"
+    generated_suffixes = {".cu", ".cpp", ".ptx", ".cubin", ".sass"}
+
+    if kernel_dir.exists():
+        for path in kernel_dir.iterdir():
+            if path.is_file() and path.suffix in generated_suffixes:
+                path.unlink()
+                print(f"[CLEAN] removed: {path}")
+
+    for filename in ("model_new.py", "cuda_extension.so"):
+        path = Path(WORKDIR) / filename
+        if path.exists():
+            path.unlink()
+            print(f"[CLEAN] removed: {path}")
 
 
 def run(cmd):
@@ -167,16 +187,7 @@ bash utils/compile.sh
 """
 
 
-    subprocess.run(
-        [
-            "codex",
-            "exec",
-            prompt
-        ],
-        cwd=WORKDIR,
-        env=ENV,
-        text=True
-    )
+    return run_agent(prompt, WORKDIR)
 
 def generate_cuda():
 
@@ -209,19 +220,7 @@ bash utils/compile.sh
 """
 
 
-    result = subprocess.run(
-        [
-            "codex",
-            "exec",
-            prompt
-        ],
-        cwd=WORKDIR,
-        env=ENV,
-        text=True
-    )
-
-
-    return result.returncode == 0
+    return run_agent(prompt, WORKDIR)
 
 
 def compile_with_feedback(max_retry=3):
@@ -423,7 +422,9 @@ def main():
     )
 
 
-    # 2.生成model.py
+    # 2. 清理上一任务的生成文件，并写入当前任务的 model.py
+    reset_generated_workspace()
+
     prepare_model(
         sample
     )
