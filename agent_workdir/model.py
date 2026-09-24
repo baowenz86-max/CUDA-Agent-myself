@@ -3,7 +3,6 @@ from torch import digamma, max
 from torch.nn import BatchNorm3d, Parameter
 
 
-<<<<<<< HEAD
 class Model(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -15,18 +14,6 @@ class Model(torch.nn.Module):
         x = digamma(x)
         x = max(x)
         x = x + self.parameter
-=======
-class Model(nn.Module):
-    def __init__(self, in_channels, num_groups, num_features):
-        super().__init__()
-        self.num_groups = num_groups
-        self.num_features = num_features
-
-    def forward(self, x):
-        x = torch.ceil(x)
-        x = torch.transpose(x, 1, 2)
-        x = F.group_norm(x, self.num_groups)
->>>>>>> b8d3180 (Update implementation with new approach)
         return x
 
 
