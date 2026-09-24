@@ -166,7 +166,11 @@ class ModelNew(nn.Module):
 ### Step 2: Compile and Test
 ```bash
 # Compile with architecture-specific optimizations
+<<<<<<< HEAD
 TORCH_CUDA_ARCH_LIST=8.9 bash utils/compile.sh
+=======
+TORCH_CUDA_ARCH_LIST=8.0 bash utils/compile.sh
+>>>>>>> b8d3180 (Update implementation with new approach)
 
 # Test in sandbox 
 sudo python3 -m utils.verification
@@ -289,7 +293,11 @@ sudo python3 -m utils.profiling
 
 ### Compilation
 ```bash
+<<<<<<< HEAD
 TORCH_CUDA_ARCH_LIST=9.0 bash utils/compile.sh
+=======
+TORCH_CUDA_ARCH_LIST=8.0 bash utils/compile.sh
+>>>>>>> b8d3180 (Update implementation with new approach)
 ```
 
 

@@ -151,4 +151,7 @@ docs/                Workflow and design documentation
 agent_workdir/       Runtime workspace consumed by the workflow
 main.py              Backward-compatible command-line entry point
 ```
+<<<<<<< HEAD
 >>>>>>> 441d92a (Add redesigned CUDA agent project)
+=======
+>>>>>>> b8d3180 (Update implementation with new approach)
