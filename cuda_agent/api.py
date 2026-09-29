@@ -195,6 +195,12 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
         LOGGER.info("学校 API 调用成功，耗时 %.2fs", time.monotonic() - started_at)
         return True
 
+    except TimeoutError:
+        LOGGER.error(
+            "学校 API 请求超时（等待 %d 秒仍未收到响应）。",
+            config.timeout_seconds,
+        )
+
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         LOGGER.error("学校 API HTTP 错误：%s\n%s", exc.code, body)

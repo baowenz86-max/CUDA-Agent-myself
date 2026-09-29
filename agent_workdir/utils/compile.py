@@ -8,9 +8,9 @@ from pathlib import Path
 
 # 必须在导入 torch CUDA extension 之前固定工具链，
 # 否则 PyTorch 可能会缓存 PATH 中的其他 CUDA 版本。
-CUDA_HOME = "/usr/local/cuda-12.6"
-HOST_CC = "/usr/bin/gcc-13"
-HOST_CXX = "/usr/bin/g++-13"
+CUDA_HOME = "/public/app/cuda/12.6"
+HOST_CC = "/usr/bin/gcc"
+HOST_CXX = "/usr/bin/g++"
 
 os.environ["CUDA_HOME"] = CUDA_HOME
 os.environ["CUDACXX"] = f"{CUDA_HOME}/bin/nvcc"
@@ -62,7 +62,7 @@ def compile_kernels() -> int:
             build_directory=str(build_dir),
             verbose=False,
             with_cuda=True,
-            extra_cflags=['-O3', '-std=c++17'],
+            extra_cflags=['-O3', '-std=c++20'],
             extra_cuda_cflags=[
                 '-O3',
                 '--use_fast_math',
