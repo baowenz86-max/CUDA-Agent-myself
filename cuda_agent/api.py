@@ -5,6 +5,7 @@ import logging
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -13,6 +14,76 @@ from cuda_agent.config import SchoolAPIConfig
 
 ALLOWED_SUFFIXES = {".cu", ".cpp"}
 LOGGER = logging.getLogger(__name__)
+
+
+def _content_as_text(content: Any) -> str:
+    """Normalize common Chat Completions content representations to text."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, Mapping):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part.strip()).strip()
+    return ""
+
+
+def _response_content(response_data: Any) -> str:
+    """Extract the assistant's final text or explain why the response is empty."""
+    if not isinstance(response_data, Mapping):
+        raise ValueError(
+            f"API 响应顶层应为 JSON 对象，实际类型为 {type(response_data).__name__}。"
+        )
+
+    choices = response_data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError(
+            "API 响应没有 choices；顶层字段为 "
+            f"{sorted(str(key) for key in response_data.keys())}。"
+        )
+
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        raise ValueError("API 响应的 choices[0] 不是 JSON 对象。")
+    message = choice.get("message")
+    if not isinstance(message, Mapping):
+        raise ValueError(
+            "API 响应没有 assistant message；choice 字段为 "
+            f"{sorted(str(key) for key in choice.keys())}。"
+        )
+
+    content = _content_as_text(message.get("content"))
+    if content:
+        return content
+
+    usage = response_data.get("usage")
+    token_usage = "unknown"
+    if isinstance(usage, Mapping):
+        token_usage = (
+            f"prompt={usage.get('prompt_tokens', 'unknown')}, "
+            f"completion={usage.get('completion_tokens', 'unknown')}, "
+            f"total={usage.get('total_tokens', 'unknown')}"
+        )
+    refusal = message.get("refusal")
+    refusal_status = (
+        "present" if isinstance(refusal, str) and refusal.strip() else "none"
+    )
+    reasoning_status = (
+        "present" if _content_as_text(message.get("reasoning_content")) else "none"
+    )
+    raise ValueError(
+        "API 返回了空的 assistant 最终内容；"
+        f"finish_reason={choice.get('finish_reason', 'unknown')}, "
+        f"usage=({token_usage}), refusal={refusal_status}, "
+        f"reasoning_content={reasoning_status}, "
+        f"message_fields={sorted(str(key) for key in message.keys())}。"
+        "请检查模型/网关是否返回了空答复，或 completion token 是否被推理内容耗尽。"
+    )
 
 
 def _read_file(path: Path) -> str:
@@ -163,6 +234,7 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
         "model": config.model,
         "temperature": 0.1,
         "max_tokens": config.max_tokens,
+        "stream": False,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -186,9 +258,7 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
         with urlopen(request, timeout=config.timeout_seconds) as response:
             response_data = json.loads(response.read().decode("utf-8"))
 
-        content = response_data["choices"][0]["message"]["content"]
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("API 返回内容为空。")
+        content = _response_content(response_data)
 
         LOGGER.debug("API response (%d chars):\n%s", len(content), content)
         _apply_files(_extract_json(content), workdir_path)
@@ -206,7 +276,7 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
         LOGGER.error("学校 API HTTP 错误：%s\n%s", exc.code, body)
     except URLError as exc:
         LOGGER.error("无法连接学校 API：%s", exc.reason)
-    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        LOGGER.exception("学校 API 回复或文件变更格式错误：%s", exc)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        LOGGER.error("学校 API 回复或文件变更格式错误：%s", exc)
 
     return False
