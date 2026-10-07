@@ -82,7 +82,9 @@ def _response_content(response_data: Any) -> str:
         f"usage=({token_usage}), refusal={refusal_status}, "
         f"reasoning_content={reasoning_status}, "
         f"message_fields={sorted(str(key) for key in message.keys())}。"
-        "请检查模型/网关是否返回了空答复，或 completion token 是否被推理内容耗尽。"
+        "finish_reason=length 表示达到输出 token 上限。对于 DeepSeek，设置 "
+        "CUDA_AGENT_THINKING_MODE=disabled 可避免推理内容耗尽输出预算；"
+        "同时可将 CUDA_AGENT_MAX_TOKENS 提高到 32768 或更大。"
     )
 
 
@@ -240,6 +242,12 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
             {"role": "user", "content": user_prompt},
         ],
     }
+    # DeepSeek 默认开启 thinking；在纯文件生成任务中，推理 token 会挤占
+    # JSON/代码的输出预算。允许通过环境变量显式开启，但默认关闭。
+    if "deepseek" in config.model.lower():
+        payload["thinking"] = {"type": config.thinking_mode}
+        if config.thinking_mode == "enabled":
+            payload["reasoning_effort"] = "low"
 
     request = Request(
         url=config.chat_completions_url,
@@ -252,7 +260,13 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
     )
 
     started_at = time.monotonic()
-    LOGGER.info("调用学校 API：model=%s endpoint=%s", config.model, request.full_url)
+    LOGGER.info(
+        "调用学校 API：model=%s endpoint=%s max_tokens=%d thinking=%s",
+        config.model,
+        request.full_url,
+        config.max_tokens,
+        config.thinking_mode if "deepseek" in config.model.lower() else "provider-default",
+    )
     LOGGER.debug("API user prompt (%d chars):\n%s", len(user_prompt), user_prompt)
     try:
         with urlopen(request, timeout=config.timeout_seconds) as response:

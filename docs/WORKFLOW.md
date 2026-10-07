@@ -61,7 +61,9 @@ logs/task_0000/20260924_120000_000000/
 
 - 学校 API：`CUDA_AGENT_API_KEY`、`CUDA_AGENT_BASE_URL`、
   `CUDA_AGENT_MODEL`；超时与输出上限可通过 `CUDA_AGENT_API_TIMEOUT` 和
-  `CUDA_AGENT_MAX_TOKENS` 调整。
+  `CUDA_AGENT_MAX_TOKENS` 调整。DeepSeek 的推理模式可通过
+  `CUDA_AGENT_THINKING_MODE=enabled|disabled` 控制；文件生成默认关闭推理，避免
+  推理内容耗尽 token 上限而没有最终 JSON。
 - CUDA 工具链：`CUDA_HOME`、`CC`、`CXX`、`CUDA_ARCH`。
 - 模型只能更新 `model_new.py` 和 `kernels/*.cu|*.cpp`，路径在写入前统一校验。
 - API 请求失败、格式错误、编译失败、验证失败和 profiling 失败均有明确状态。

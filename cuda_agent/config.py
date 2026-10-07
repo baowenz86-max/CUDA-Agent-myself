@@ -12,7 +12,8 @@ class SchoolAPIConfig:
     base_url: str
     model: str
     timeout_seconds: int = 300
-    max_tokens: int = 16384
+    max_tokens: int = 32768
+    thinking_mode: str = "disabled"
 
     @property
     def chat_completions_url(self) -> str:
@@ -33,7 +34,10 @@ class SchoolAPIConfig:
             base_url=values["CUDA_AGENT_BASE_URL"],
             model=values["CUDA_AGENT_MODEL"],
             timeout_seconds=_positive_int("CUDA_AGENT_API_TIMEOUT", 300),
-            max_tokens=_positive_int("CUDA_AGENT_MAX_TOKENS", 16384),
+            max_tokens=_positive_int("CUDA_AGENT_MAX_TOKENS", 32768),
+            thinking_mode=_choice(
+                "CUDA_AGENT_THINKING_MODE", "disabled", {"enabled", "disabled"}
+            ),
         )
 
 
@@ -45,4 +49,12 @@ def _positive_int(name: str, default: int) -> int:
         raise ValueError(f"{name} 必须是正整数，当前值：{raw_value!r}") from exc
     if value < 1:
         raise ValueError(f"{name} 必须是正整数，当前值：{raw_value!r}")
+    return value
+
+
+def _choice(name: str, default: str, choices: set[str]) -> str:
+    value = os.environ.get(name, default).strip().lower()
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ValueError(f"{name} 必须是 {allowed} 之一，当前值：{value!r}")
     return value
