@@ -6,25 +6,27 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cuda_agent.api import _apply_files, _extract_json
-from cuda_agent.config import SchoolAPIConfig
+from cuda_agent.config import OpenAIAPIConfig
 from cuda_agent.report import WorkflowReport
 
 
 class ConfigTests(unittest.TestCase):
-    def test_school_api_config(self) -> None:
+    def test_openai_api_config(self) -> None:
         env = {
-            "CUDA_AGENT_API_KEY": "secret",
-            "CUDA_AGENT_BASE_URL": "https://school.example/v1/",
-            "CUDA_AGENT_MODEL": "school-model",
+            "OPENAI_API_KEY": "secret",
+            "OPENAI_BASE_URL": "https://api.openai.com/v1/",
+            "CUDA_AGENT_MODEL": "gpt-5.6",
             "CUDA_AGENT_API_TIMEOUT": "12",
         }
         with patch.dict(os.environ, env, clear=True):
-            config = SchoolAPIConfig.from_env()
+            config = OpenAIAPIConfig.from_env()
         self.assertEqual(
             config.chat_completions_url,
-            "https://school.example/v1/chat/completions",
+            "https://api.openai.com/v1/chat/completions",
         )
         self.assertEqual(config.timeout_seconds, 12)
+        self.assertEqual(config.model, "gpt-5.6")
+        self.assertEqual(config.reasoning_effort, "medium")
 
 
 class APIResponseTests(unittest.TestCase):

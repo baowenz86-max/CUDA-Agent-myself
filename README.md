@@ -111,13 +111,16 @@ python3 -m utils.profiling
 
 ## 4. Running the Agent
 
-Configure the OpenAI-compatible endpoint, then run a dataset task from the
-repository root:
+Configure an OpenAI API key, then run a dataset task from the repository root.
+The default endpoint and model are OpenAI's `https://api.openai.com/v1` and
+`gpt-5.6`:
 
 ```bash
-export CUDA_AGENT_API_KEY=...
-export CUDA_AGENT_BASE_URL=https://example.com/v1
-export CUDA_AGENT_MODEL=your-model
+export OPENAI_API_KEY=...
+export OPENAI_BASE_URL=https://api.openai.com/v1
+export CUDA_AGENT_MODEL=gpt-5.6
+export CUDA_AGENT_REASONING_EFFORT=medium
+export CUDA_AGENT_MAX_TOKENS=32768
 python main.py --task-id 0
 ```
 

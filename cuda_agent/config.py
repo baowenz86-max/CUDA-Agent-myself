@@ -1,4 +1,4 @@
-"""Configuration for the school-provided model API."""
+"""Configuration for the OpenAI API used by CUDA-Agent."""
 
 from __future__ import annotations
 
@@ -7,36 +7,35 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class SchoolAPIConfig:
+class OpenAIAPIConfig:
     api_key: str
     base_url: str
     model: str
     timeout_seconds: int = 300
-    max_tokens: int = 32768
-    thinking_mode: str = "disabled"
+    max_completion_tokens: int = 32768
+    reasoning_effort: str = "medium"
 
     @property
     def chat_completions_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/chat/completions"
 
     @classmethod
-    def from_env(cls) -> "SchoolAPIConfig":
-        values = {
-            "CUDA_AGENT_API_KEY": os.environ.get("CUDA_AGENT_API_KEY", "").strip(),
-            "CUDA_AGENT_BASE_URL": os.environ.get("CUDA_AGENT_BASE_URL", "").strip(),
-            "CUDA_AGENT_MODEL": os.environ.get("CUDA_AGENT_MODEL", "").strip(),
-        }
-        missing = [name for name, value in values.items() if not value]
-        if missing:
-            raise ValueError(f"缺少学校 API 环境变量：{', '.join(missing)}")
+    def from_env(cls) -> "OpenAIAPIConfig":
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("缺少 OpenAI API 密钥环境变量：OPENAI_API_KEY")
         return cls(
-            api_key=values["CUDA_AGENT_API_KEY"],
-            base_url=values["CUDA_AGENT_BASE_URL"],
-            model=values["CUDA_AGENT_MODEL"],
+            api_key=api_key,
+            base_url=os.environ.get(
+                "OPENAI_BASE_URL", "https://api.openai.com/v1"
+            ).strip().rstrip("/"),
+            model=os.environ.get("CUDA_AGENT_MODEL", "gpt-5.6").strip(),
             timeout_seconds=_positive_int("CUDA_AGENT_API_TIMEOUT", 300),
-            max_tokens=_positive_int("CUDA_AGENT_MAX_TOKENS", 32768),
-            thinking_mode=_choice(
-                "CUDA_AGENT_THINKING_MODE", "disabled", {"enabled", "disabled"}
+            max_completion_tokens=_positive_int("CUDA_AGENT_MAX_TOKENS", 32768),
+            reasoning_effort=_choice(
+                "CUDA_AGENT_REASONING_EFFORT",
+                "medium",
+                {"none", "low", "medium", "high", "xhigh", "max"},
             ),
         )
 

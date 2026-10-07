@@ -9,7 +9,7 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from cuda_agent.config import SchoolAPIConfig
+from cuda_agent.config import OpenAIAPIConfig
 
 
 ALLOWED_SUFFIXES = {".cu", ".cpp"}
@@ -82,9 +82,9 @@ def _response_content(response_data: Any) -> str:
         f"usage=({token_usage}), refusal={refusal_status}, "
         f"reasoning_content={reasoning_status}, "
         f"message_fields={sorted(str(key) for key in message.keys())}。"
-        "finish_reason=length 表示达到输出 token 上限。对于 DeepSeek，设置 "
-        "CUDA_AGENT_THINKING_MODE=disabled 可避免推理内容耗尽输出预算；"
-        "同时可将 CUDA_AGENT_MAX_TOKENS 提高到 32768 或更大。"
+        "finish_reason=length 表示达到输出 token 上限或上下文限制。推理 token "
+        "也计入 GPT-5.6 的 max_completion_tokens；可提高 CUDA_AGENT_MAX_TOKENS，"
+        "或降低 CUDA_AGENT_REASONING_EFFORT。"
     )
 
 
@@ -198,9 +198,9 @@ def _apply_files(data: dict, workdir: Path) -> None:
 def run_agent(instruction: str, workdir: str) -> bool:
     """请求远程模型，并将其返回的受限文件变更写入 agent_workdir。"""
     try:
-        config = SchoolAPIConfig.from_env()
+        config = OpenAIAPIConfig.from_env()
     except ValueError as exc:
-        LOGGER.error("学校 API 配置错误：%s", exc)
+        LOGGER.error("OpenAI API 配置错误：%s", exc)
         return False
 
     workdir_path = Path(workdir)
@@ -234,20 +234,15 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
 
     payload = {
         "model": config.model,
-        "temperature": 0.1,
-        "max_tokens": config.max_tokens,
+        "max_completion_tokens": config.max_completion_tokens,
+        "reasoning_effort": config.reasoning_effort,
         "stream": False,
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     }
-    # DeepSeek 默认开启 thinking；在纯文件生成任务中，推理 token 会挤占
-    # JSON/代码的输出预算。允许通过环境变量显式开启，但默认关闭。
-    if "deepseek" in config.model.lower():
-        payload["thinking"] = {"type": config.thinking_mode}
-        if config.thinking_mode == "enabled":
-            payload["reasoning_effort"] = "low"
 
     request = Request(
         url=config.chat_completions_url,
@@ -261,11 +256,11 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
 
     started_at = time.monotonic()
     LOGGER.info(
-        "调用学校 API：model=%s endpoint=%s max_tokens=%d thinking=%s",
+        "调用 OpenAI API：model=%s endpoint=%s max_completion_tokens=%d reasoning_effort=%s",
         config.model,
         request.full_url,
-        config.max_tokens,
-        config.thinking_mode if "deepseek" in config.model.lower() else "provider-default",
+        config.max_completion_tokens,
+        config.reasoning_effort,
     )
     LOGGER.debug("API user prompt (%d chars):\n%s", len(user_prompt), user_prompt)
     try:
@@ -276,21 +271,21 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
 
         LOGGER.debug("API response (%d chars):\n%s", len(content), content)
         _apply_files(_extract_json(content), workdir_path)
-        LOGGER.info("学校 API 调用成功，耗时 %.2fs", time.monotonic() - started_at)
+        LOGGER.info("OpenAI API 调用成功，耗时 %.2fs", time.monotonic() - started_at)
         return True
 
     except TimeoutError:
         LOGGER.error(
-            "学校 API 请求超时（等待 %d 秒仍未收到响应）。",
+            "OpenAI API 请求超时（等待 %d 秒仍未收到响应）。",
             config.timeout_seconds,
         )
 
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        LOGGER.error("学校 API HTTP 错误：%s\n%s", exc.code, body)
+        LOGGER.error("OpenAI API HTTP 错误：%s\n%s", exc.code, body)
     except URLError as exc:
-        LOGGER.error("无法连接学校 API：%s", exc.reason)
+        LOGGER.error("无法连接 OpenAI API：%s", exc.reason)
     except (KeyError, IndexError, TypeError, ValueError) as exc:
-        LOGGER.error("学校 API 回复或文件变更格式错误：%s", exc)
+        LOGGER.error("OpenAI API 回复或文件变更格式错误：%s", exc)
 
     return False
