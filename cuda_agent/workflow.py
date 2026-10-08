@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from cuda_agent.api import run_agent
 from cuda_agent.log_setup import configure_logging
@@ -147,8 +147,9 @@ def run_stage_with_repairs(
     command: Sequence[str],
     config: WorkflowConfig,
     env: Mapping[str, str],
+    before_retry: Callable[[], tuple[bool, str]] | None = None,
 ) -> tuple[bool, str]:
-    """Run a stage and request a model repair between failed attempts."""
+    """Run a stage, optionally preparing dependent stages after each repair."""
     last_log = ""
     for attempt in range(1, config.repair_attempts + 1):
         LOGGER.info("%s 尝试 %d/%d", name, attempt, config.repair_attempts)
@@ -161,6 +162,16 @@ def run_stage_with_repairs(
         ):
             LOGGER.error("%s 的 API 修复请求失败", name)
             break
+        if attempt < config.repair_attempts and before_retry is not None:
+            prepared, preparation_log = before_retry()
+            if not prepared:
+                LOGGER.error("%s 修复后的前置步骤失败", name)
+                if preparation_log.strip():
+                    last_log += (
+                        "\n\n修复后、重试该阶段前的准备步骤失败：\n"
+                        f"{preparation_log}"
+                    )
+                break
     return False, last_log
 
 
@@ -228,8 +239,30 @@ def execute_workflow(
         if not compiled:
             continue
         started = time.monotonic()
+
+        def recompile_after_verification_repair() -> tuple[bool, str]:
+            nonlocal compile_log
+            compile_started = time.monotonic()
+            recompiled, recompile_log = run_stage_with_repairs(
+                "compile", COMPILE_COMMAND, config, env
+            )
+            compile_log += (
+                "\n\n=== compile after verification repair ===\n"
+                f"{recompile_log}"
+            )
+            report.add_stage(
+                "compile after verification repair",
+                recompiled,
+                time.monotonic() - compile_started,
+            )
+            return recompiled, recompile_log
+
         verified, verify_log = run_stage_with_repairs(
-            "verification", VERIFY_COMMAND, config, env
+            "verification",
+            VERIFY_COMMAND,
+            config,
+            env,
+            before_retry=recompile_after_verification_repair,
         )
         report.add_stage("verification", verified, time.monotonic() - started)
         if not verified:
