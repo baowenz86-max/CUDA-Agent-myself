@@ -227,7 +227,7 @@ def execute_workflow(
         generated = generate_cuda(config.workdir)
         report.add_stage(
             f"generation #{attempt}", generated, time.monotonic() - started,
-            "school API",
+            "DeepSeek API",
         )
         if not generated:
             continue

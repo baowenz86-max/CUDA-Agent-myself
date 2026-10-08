@@ -1,4 +1,4 @@
-"""通过 OpenAI 兼容 Chat Completions API 调用远程 CUDA 代码生成模型。"""
+"""通过 DeepSeek Chat Completions API 调用远程 CUDA 代码生成模型。"""
 
 import json
 import logging
@@ -9,7 +9,7 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from cuda_agent.config import OpenAIAPIConfig
+from cuda_agent.config import DeepSeekAPIConfig
 
 
 ALLOWED_SUFFIXES = {".cu", ".cpp"}
@@ -82,9 +82,9 @@ def _response_content(response_data: Any) -> str:
         f"usage=({token_usage}), refusal={refusal_status}, "
         f"reasoning_content={reasoning_status}, "
         f"message_fields={sorted(str(key) for key in message.keys())}。"
-        "finish_reason=length 表示达到输出 token 上限或上下文限制。推理 token "
-        "也计入 GPT-5.6 的 max_completion_tokens；可提高 CUDA_AGENT_MAX_TOKENS，"
-        "或降低 CUDA_AGENT_REASONING_EFFORT。"
+        "finish_reason=length 表示达到输出 token 上限或上下文限制。DeepSeek 的 "
+        "reasoning_content 也占用 max_tokens；可提高 CUDA_AGENT_MAX_TOKENS，"
+        "降低 CUDA_AGENT_REASONING_EFFORT，或将 CUDA_AGENT_THINKING_MODE 设为 disabled。"
     )
 
 
@@ -198,9 +198,9 @@ def _apply_files(data: dict, workdir: Path) -> None:
 def run_agent(instruction: str, workdir: str) -> bool:
     """请求远程模型，并将其返回的受限文件变更写入 agent_workdir。"""
     try:
-        config = OpenAIAPIConfig.from_env()
+        config = DeepSeekAPIConfig.from_env()
     except ValueError as exc:
-        LOGGER.error("OpenAI API 配置错误：%s", exc)
+        LOGGER.error("DeepSeek API 配置错误：%s", exc)
         return False
 
     workdir_path = Path(workdir)
@@ -234,8 +234,8 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
 
     payload = {
         "model": config.model,
-        "max_completion_tokens": config.max_completion_tokens,
-        "reasoning_effort": config.reasoning_effort,
+        "max_tokens": config.max_tokens,
+        "thinking": {"type": config.thinking_mode},
         "stream": False,
         "response_format": {"type": "json_object"},
         "messages": [
@@ -243,6 +243,8 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
             {"role": "user", "content": user_prompt},
         ],
     }
+    if config.thinking_mode == "enabled":
+        payload["reasoning_effort"] = config.reasoning_effort
 
     request = Request(
         url=config.chat_completions_url,
@@ -256,11 +258,12 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
 
     started_at = time.monotonic()
     LOGGER.info(
-        "调用 OpenAI API：model=%s endpoint=%s max_completion_tokens=%d reasoning_effort=%s",
+        "调用 DeepSeek API：model=%s endpoint=%s max_tokens=%d thinking=%s reasoning_effort=%s",
         config.model,
         request.full_url,
-        config.max_completion_tokens,
-        config.reasoning_effort,
+        config.max_tokens,
+        config.thinking_mode,
+        config.reasoning_effort if config.thinking_mode == "enabled" else "n/a",
     )
     LOGGER.debug("API user prompt (%d chars):\n%s", len(user_prompt), user_prompt)
     try:
@@ -271,21 +274,21 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
 
         LOGGER.debug("API response (%d chars):\n%s", len(content), content)
         _apply_files(_extract_json(content), workdir_path)
-        LOGGER.info("OpenAI API 调用成功，耗时 %.2fs", time.monotonic() - started_at)
+        LOGGER.info("DeepSeek API 调用成功，耗时 %.2fs", time.monotonic() - started_at)
         return True
 
     except TimeoutError:
         LOGGER.error(
-            "OpenAI API 请求超时（等待 %d 秒仍未收到响应）。",
+            "DeepSeek API 请求超时（等待 %d 秒仍未收到响应）。",
             config.timeout_seconds,
         )
 
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        LOGGER.error("OpenAI API HTTP 错误：%s\n%s", exc.code, body)
+        LOGGER.error("DeepSeek API HTTP 错误：%s\n%s", exc.code, body)
     except URLError as exc:
-        LOGGER.error("无法连接 OpenAI API：%s", exc.reason)
+        LOGGER.error("无法连接 DeepSeek API：%s", exc.reason)
     except (KeyError, IndexError, TypeError, ValueError) as exc:
-        LOGGER.error("OpenAI API 回复或文件变更格式错误：%s", exc)
+        LOGGER.error("DeepSeek API 回复或文件变更格式错误：%s", exc)
 
     return False

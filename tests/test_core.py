@@ -6,27 +6,28 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cuda_agent.api import _apply_files, _extract_json
-from cuda_agent.config import OpenAIAPIConfig
+from cuda_agent.config import DeepSeekAPIConfig
 from cuda_agent.report import WorkflowReport
 
 
 class ConfigTests(unittest.TestCase):
-    def test_openai_api_config(self) -> None:
+    def test_deepseek_api_config(self) -> None:
         env = {
-            "OPENAI_API_KEY": "secret",
-            "OPENAI_BASE_URL": "https://api.openai.com/v1/",
-            "CUDA_AGENT_MODEL": "gpt-5.6",
+            "DEEPSEEK_API_KEY": "secret",
+            "DEEPSEEK_BASE_URL": "https://api.deepseek.com/",
+            "CUDA_AGENT_MODEL": "deepseek-v4-pro",
             "CUDA_AGENT_API_TIMEOUT": "12",
         }
         with patch.dict(os.environ, env, clear=True):
-            config = OpenAIAPIConfig.from_env()
+            config = DeepSeekAPIConfig.from_env()
         self.assertEqual(
             config.chat_completions_url,
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.deepseek.com/chat/completions",
         )
         self.assertEqual(config.timeout_seconds, 12)
-        self.assertEqual(config.model, "gpt-5.6")
-        self.assertEqual(config.reasoning_effort, "medium")
+        self.assertEqual(config.model, "deepseek-v4-pro")
+        self.assertEqual(config.thinking_mode, "enabled")
+        self.assertEqual(config.reasoning_effort, "low")
 
 
 class APIResponseTests(unittest.TestCase):
@@ -56,7 +57,7 @@ class ReportTests(unittest.TestCase):
             log_path = Path(directory) / "workflow.log"
             log_path.touch()
             report = WorkflowReport(3, log_path)
-            report.add_stage("generation", False, 0.5, "school API")
+            report.add_stage("generation", False, 0.5, "DeepSeek API")
             report_path = report.write(False, "request failed")
             content = report_path.read_text(encoding="utf-8")
             self.assertIn("FAILED", content)
