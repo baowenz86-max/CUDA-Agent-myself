@@ -125,6 +125,17 @@ export CUDA_AGENT_REASONING_EFFORT=low
 python main.py --task-id 0
 ```
 
+默认的生成重试次数为 3 次。连续处理一段任务时，可指定包含首尾的任务范围；
+例如依次处理 task 0 到 task 10：
+
+```bash
+python main.py --task-start 0 --task-end 10
+```
+
+每个任务仍会写入各自的日志、报告和成功结果；单个任务失败不会中断后续任务，
+但批次中有失败任务时命令会以非零状态退出。可用
+`--generation-attempts` 覆盖默认生成重试次数。
+
 After `uv sync`, the same workflow is available as an installed command:
 
 ```bash

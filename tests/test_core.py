@@ -2,12 +2,14 @@ import json
 import os
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
 from cuda_agent.api import _apply_files, _extract_json
 from cuda_agent.config import DeepSeekAPIConfig
 from cuda_agent.report import WorkflowReport
+from cuda_agent.workflow import task_ids_from_args
 
 
 class ConfigTests(unittest.TestCase):
@@ -62,6 +64,21 @@ class ReportTests(unittest.TestCase):
             content = report_path.read_text(encoding="utf-8")
             self.assertIn("FAILED", content)
             self.assertIn("request failed", content)
+
+
+class TaskSelectionTests(unittest.TestCase):
+    def test_range_is_inclusive(self) -> None:
+        args = Namespace(task_id=None, task_start=0, task_end=10)
+        self.assertEqual(list(task_ids_from_args(args)), list(range(11)))
+
+    def test_default_task_is_zero(self) -> None:
+        args = Namespace(task_id=None, task_start=None, task_end=None)
+        self.assertEqual(list(task_ids_from_args(args)), [0])
+
+    def test_task_id_and_range_are_mutually_exclusive(self) -> None:
+        args = Namespace(task_id=0, task_start=0, task_end=10)
+        with self.assertRaises(ValueError):
+            task_ids_from_args(args)
 
 
 if __name__ == "__main__":

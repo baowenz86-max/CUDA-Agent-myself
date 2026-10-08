@@ -37,13 +37,14 @@ COMPILE_COMMAND = ("bash", "utils/compile.sh")
 VERIFY_COMMAND = (sys.executable, "-m", "utils.verification")
 PROFILE_COMMAND = (sys.executable, "-m", "utils.profiling")
 DEFAULT_LOG_DIR = REPO_ROOT / "logs"
+DEFAULT_GENERATION_ATTEMPTS = 3
 LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class WorkflowConfig:
     workdir: Path = DEFAULT_WORKDIR
-    generation_attempts: int = 5
+    generation_attempts: int = DEFAULT_GENERATION_ATTEMPTS
     repair_attempts: int = 3
 
 
@@ -51,13 +52,46 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate, compile, verify, and profile a CUDA kernel."
     )
-    parser.add_argument("--task-id", type=int, default=0, help="Dataset row index")
+    parser.add_argument("--task-id", type=int, help="Dataset row index")
+    parser.add_argument(
+        "--task-start",
+        type=int,
+        help="First dataset row index to process (inclusive)",
+    )
+    parser.add_argument(
+        "--task-end",
+        type=int,
+        help="Last dataset row index to process (inclusive)",
+    )
     parser.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
-    parser.add_argument("--generation-attempts", type=int, default=5)
+    parser.add_argument(
+        "--generation-attempts", type=int, default=DEFAULT_GENERATION_ATTEMPTS
+    )
     parser.add_argument("--repair-attempts", type=int, default=3)
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--verbose", action="store_true", help="Show debug logs in console")
     return parser.parse_args()
+
+
+def task_ids_from_args(args: argparse.Namespace) -> range:
+    """Return the requested task IDs, preserving the legacy task 0 default."""
+    has_range_start = args.task_start is not None
+    has_range_end = args.task_end is not None
+    if has_range_start != has_range_end:
+        raise ValueError("--task-start 和 --task-end 必须同时提供")
+    if has_range_start:
+        if args.task_id is not None:
+            raise ValueError("--task-id 不能与 --task-start/--task-end 一起使用")
+        if args.task_start < 0 or args.task_end < 0:
+            raise ValueError("Task IDs must be non-negative")
+        if args.task_start > args.task_end:
+            raise ValueError("--task-start 不能大于 --task-end")
+        return range(args.task_start, args.task_end + 1)
+
+    task_id = 0 if args.task_id is None else args.task_id
+    if task_id < 0:
+        raise ValueError("Task IDs must be non-negative")
+    return range(task_id, task_id + 1)
 
 
 def load_task(task_id: int) -> Mapping[str, object]:
@@ -286,21 +320,16 @@ def execute_workflow(
     return False
 
 
-def main() -> int:
-    args = parse_args()
-    config = WorkflowConfig(
-        args.workdir.resolve(), args.generation_attempts, args.repair_attempts
-    )
-    if config.generation_attempts < 1 or config.repair_attempts < 1:
-        raise ValueError("Attempt counts must be at least 1")
-    log_path = configure_logging(args.log_dir.resolve(), args.task_id, args.verbose)
-    report = WorkflowReport(args.task_id, log_path)
+def run_task(task_id: int, config: WorkflowConfig, args: argparse.Namespace) -> bool:
+    """Run one task and always write its report before returning."""
+    log_path = configure_logging(args.log_dir.resolve(), task_id, args.verbose)
+    report = WorkflowReport(task_id, log_path)
     LOGGER.info("启动 CUDA Agent；详细日志：%s", log_path)
 
     success = False
     error = ""
     try:
-        success = execute_workflow(args.task_id, config, report)
+        success = execute_workflow(task_id, config, report)
         if not success:
             error = "All generation attempts were exhausted. See workflow.log."
     except Exception as exc:  # preserve a report for unexpected failures
@@ -311,10 +340,36 @@ def main() -> int:
         LOGGER.info("工作流报告：%s", report_path)
 
     if success:
-        LOGGER.info("任务成功")
-        return 0
-    LOGGER.error("任务失败：%s", error)
-    return 1
+        LOGGER.info("任务 %d 成功", task_id)
+    else:
+        LOGGER.error("任务 %d 失败：%s", task_id, error)
+    return success
+
+
+def main() -> int:
+    args = parse_args()
+    task_ids = task_ids_from_args(args)
+    config = WorkflowConfig(
+        args.workdir.resolve(), args.generation_attempts, args.repair_attempts
+    )
+    if config.generation_attempts < 1 or config.repair_attempts < 1:
+        raise ValueError("Attempt counts must be at least 1")
+
+    successful_task_ids: list[int] = []
+    failed_task_ids: list[int] = []
+    for task_id in task_ids:
+        if run_task(task_id, config, args):
+            successful_task_ids.append(task_id)
+        else:
+            failed_task_ids.append(task_id)
+
+    LOGGER.info(
+        "任务批次完成：成功 %d，失败 %d", len(successful_task_ids), len(failed_task_ids)
+    )
+    if failed_task_ids:
+        LOGGER.error("失败任务：%s", ", ".join(map(str, failed_task_ids)))
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
