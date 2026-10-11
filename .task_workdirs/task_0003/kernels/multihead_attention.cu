@@ -147,10 +147,10 @@ __global__ void multihead_attention_kernel(
 // Kernel: Apply output projection (matrix multiply by out_proj_weight and add bias) on the attention output.
 // The input and output may point to the same memory (in-place projection).
 __global__ void output_projection_kernel2(
-    const float* __restrict__ input,
+    const float* input,
     const float* __restrict__ weight,
     const float* __restrict__ bias,
-    float* __restrict__ output,
+    float* output,
     int B, int T, int E,
     int input_batch_stride, int input_time_stride, int input_elem_stride,
     int output_batch_stride, int output_time_stride, int output_elem_stride,
