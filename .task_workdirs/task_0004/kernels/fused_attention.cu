@@ -1,33 +1,108 @@
 #include <cuda_runtime.h>
-#include <math.h>
+#include <cstdint>
+#include <cmath>
+#include "attention_launchers.h"
 
-__global__ void fused_attention_kernel(const float* x,const float* y,const float* iw,const float* ib,const float* ow,const float* ob,float* out,int B,int S,int R,int E,int H,float scale){
-  int b=blockIdx.y,sq=blockIdx.x,e=threadIdx.x,Sr=S*R,D=E/H;
-  if(b>=B||sq>=Sr||e>=E)return;
-  extern __shared__ float sm[]; float* q=sm; float* p=sm+E; int srcq=sq/R;
-  float qv=ib[e]; for(int j=0;j<E;++j) qv+=x[(b*S+srcq)*E+j]*iw[e*E+j]; q[e]=qv; __syncthreads();
-  if(e==0){
-    float mx=-CUDART_INF_F;
-    for(int h=0;h<H;++h) for(int sk=0;sk<Sr;++sk){ int src=sk/R; float score=0;
-      for(int d=0;d<D;++d){ int k=h*D+d; float kv=ib[E+k];
-        for(int j=0;j<E;++j) kv+=y[(b*S+src)*E+j]*iw[(E+k)*E+j]; score+=q[k]*kv; }
-      p[h*Sr+sk]=score*rsqrtf((float)D);
+__global__ void pack_kernel(const float* projection, const float* bias, float* packed,
+                            int batch, int sequence, int embed, int heads, bool batch_first) {
+    int depth = embed / heads;
+    int64_t count = static_cast<int64_t>(batch) * sequence * embed;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        int channel = index % depth;
+        int token = (index / depth) % sequence;
+        int head = (index / (static_cast<int64_t>(depth) * sequence)) % heads;
+        int sample = index / (static_cast<int64_t>(sequence) * embed);
+        int64_t row = batch_first ? static_cast<int64_t>(sample) * sequence + token
+                                 : static_cast<int64_t>(token) * batch + sample;
+        int feature = head * depth + channel;
+        packed[index] = projection[row * embed + feature] + bias[feature];
     }
-    for(int h=0;h<H;++h){ float mx=-CUDART_INF_F,den=0; for(int sk=0;sk<Sr;++sk)mx=fmaxf(mx,p[h*Sr+sk]);
-      for(int sk=0;sk<Sr;++sk){p[h*Sr+sk]=expf(p[h*Sr+sk]-mx);den+=p[h*Sr+sk];}
-      for(int sk=0;sk<Sr;++sk)p[h*Sr+sk]/=den;
-    }
-  }
-  __syncthreads();
-  float result=ob[e];
-  for(int k=0;k<E;++k){ int kh=k/D,kd=k%D; float c=0;
-    for(int sk=0;sk<Sr;++sk){int src=sk/R,vd=kh*D+kd;float vv=ib[2*E+vd];
-      for(int j=0;j<E;++j)vv+=y[(b*S+src)*E+j]*iw[(2*E+vd)*E+j]; c+=p[kh*Sr+sk]*vv;}
-    result+=ow[e*E+k]*c;
-  }
-  out[(b*Sr+sq)*E+e]=tanhf(result*scale);
 }
-extern "C" void fused_attention_forward_launcher(const float* x,const float* y,const float* iw,const float* ib,const float* ow,const float* ob,float* out,int B,int S,int R,int E,int H,float scale,cudaStream_t stream){
-  dim3 grid(S*R,B),block(E); size_t shared=(size_t)(E+H*S*R)*sizeof(float);
-  fused_attention_kernel<<<grid,block,shared,stream>>>(x,y,iw,ib,ow,ob,out,B,S,R,E,H,scale);
+
+__global__ void softmax_kernel(float* scores, int64_t rows, int keys) {
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    for (int64_t row = static_cast<int64_t>(blockIdx.x) * 8 + warp;
+         row < rows; row += static_cast<int64_t>(gridDim.x) * 8) {
+        float* values = scores + row * keys;
+        float maximum = -CUDART_INF_F;
+        for (int64_t column = lane; column < keys; column += 32)
+            maximum = fmaxf(maximum, values[column]);
+        for (int offset = 16; offset > 0; offset /= 2)
+            maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, offset));
+        maximum = __shfl_sync(0xffffffff, maximum, 0);
+        float total = 0.0f;
+        for (int64_t column = lane; column < keys; column += 32) {
+            float probability = expf(values[column] - maximum);
+            values[column] = probability;
+            total += probability;
+        }
+        for (int offset = 16; offset > 0; offset /= 2)
+            total += __shfl_down_sync(0xffffffff, total, offset);
+        float inverse = 1.0f / __shfl_sync(0xffffffff, total, 0);
+        for (int64_t column = lane; column < keys; column += 32)
+            values[column] *= inverse;
+    }
+}
+
+__global__ void merge_kernel(const float* context, float* merged, int batch,
+                             int sequence, int embed, int heads, bool batch_first) {
+    int depth = embed / heads;
+    int64_t count = static_cast<int64_t>(batch) * sequence * embed;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        int feature = index % embed;
+        int64_t row = index / embed;
+        int sample = batch_first ? row / sequence : row % batch;
+        int token = batch_first ? row % sequence : row / batch;
+        int64_t source = ((static_cast<int64_t>(sample) * heads + feature / depth) * sequence + token) * depth + feature % depth;
+        merged[index] = context[source];
+    }
+}
+
+__global__ void epilogue_kernel(const float* projected, const float* bias, float* output,
+                                int batch, int sequence, int embed, int repeats,
+                                float scale, bool batch_first) {
+    int64_t count = static_cast<int64_t>(batch) * sequence * embed * repeats;
+    int64_t repeated_axis = static_cast<int64_t>(batch_first ? sequence : batch) * repeats;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        int feature = index % embed;
+        int64_t row = index / embed;
+        int64_t outer = row / repeated_axis;
+        int64_t inner = (row % repeated_axis) / repeats;
+        int64_t source_row = outer * (batch_first ? sequence : batch) + inner;
+        output[index] = tanf((projected[source_row * embed + feature] + bias[feature]) * scale);
+    }
+}
+
+static int blocks_for(int64_t count) {
+    int64_t blocks = (count + 255) / 256;
+    return static_cast<int>(blocks > 65535 ? 65535 : blocks);
+}
+
+void attention_pack(const float* projection, const float* bias, float* packed,
+                    int batch, int sequence, int embed, int heads, bool batch_first, cudaStream_t stream) {
+    pack_kernel<<<blocks_for(static_cast<int64_t>(batch) * sequence * embed), 256, 0, stream>>>(
+        projection, bias, packed, batch, sequence, embed, heads, batch_first);
+}
+
+void attention_softmax(float* scores, int64_t rows, int keys, cudaStream_t stream) {
+    int64_t needed = (rows + 7) / 8;
+    int blocks = static_cast<int>(needed > 65535 ? 65535 : needed);
+    softmax_kernel<<<blocks, 256, 0, stream>>>(scores, rows, keys);
+}
+
+void attention_merge(const float* context, float* merged, int batch, int sequence,
+                     int embed, int heads, bool batch_first, cudaStream_t stream) {
+    merge_kernel<<<blocks_for(static_cast<int64_t>(batch) * sequence * embed), 256, 0, stream>>>(
+        context, merged, batch, sequence, embed, heads, batch_first);
+}
+
+void attention_epilogue(const float* projected, const float* bias, float* output,
+                        int batch, int sequence, int embed, int repeats,
+                        float scale, bool batch_first, cudaStream_t stream) {
+    epilogue_kernel<<<blocks_for(static_cast<int64_t>(batch) * sequence * embed * repeats), 256, 0, stream>>>(
+        projected, bias, output, batch, sequence, embed, repeats, scale, batch_first);
 }
