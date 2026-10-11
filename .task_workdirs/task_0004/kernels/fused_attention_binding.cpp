@@ -62,6 +62,9 @@ torch::Tensor fused_attention_forward(
     TORCH_CHECK(in_proj_bias.numel() == 3 * embed_dim, "in_proj_bias must have 3E elements");
     TORCH_CHECK(out_proj_weight.size(0) == embed_dim && out_proj_weight.size(1) == embed_dim, "out_proj_weight shape must be [E, E]");
     TORCH_CHECK(out_proj_bias.numel() == embed_dim, "out_proj_bias must have E elements");
+    TORCH_CHECK(num_heads > 0, "num_heads must be positive");
+    TORCH_CHECK(repeat_interleave_times > 0, "repeat_interleave_times must be positive");
+    TORCH_CHECK(embed_dim <= 1024, "embed_dim must be <= 1024 for the fused kernel");
     TORCH_CHECK(embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads");
 
     // Compute output size: S_rep = S_orig * repeat_interleave_times

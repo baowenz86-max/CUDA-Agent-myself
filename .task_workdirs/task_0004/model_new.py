@@ -11,9 +11,8 @@ class ModelNew(nn.Module):
         self.scaling_factor = scaling_factor
 
     def forward(self, x, y):
-        # Custom fused op: repeat interleave + multihead attention + tanh scaling
-        # Inputs: x, y, attention weights/bias from nn.MultiheadAttention
-        # To be implemented in CUDA extension
+        # The extension fuses repeat_interleave, attention, output projection,
+        # and the scaled tanh epilogue.
         attn_output = cuda_extension.fused_attention_forward(
             x, y, self.multihead_attn.in_proj_weight, self.multihead_attn.in_proj_bias,
             self.multihead_attn.out_proj.weight, self.multihead_attn.out_proj.bias,
