@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from cuda_agent.api import run_agent
-from cuda_agent.log_setup import configure_logging
+from cuda_agent.log_setup import CURRENT_TASK_ID, configure_logging
 from cuda_agent.report import WorkflowReport
 from cuda_agent.tools.toolchain import build_environment
 
@@ -429,12 +429,13 @@ def run_task(
     gpu_pool: GPUPool,
 ) -> bool:
     """Run one task and always write its report before returning."""
+    task_token = CURRENT_TASK_ID.set(task_id)
     # configure_logging changes process-wide handlers, so at least make the
     # setup itself atomic while task workers start.
     with _LOGGING_SETUP_LOCK:
         log_path = configure_logging(DEFAULT_LOG_DIR, task_id, False)
     report = WorkflowReport(task_id, log_path)
-    LOGGER.info("启动 CUDA Agent；详细日志：%s", log_path)
+    LOGGER.info("启动 CUDA Agent；工作目录：%s；详细日志：%s", config.workdir, log_path)
 
     success = False
     error = ""
@@ -448,6 +449,7 @@ def run_task(
     finally:
         report_path = report.write(success, error)
         LOGGER.info("工作流报告：%s", report_path)
+        CURRENT_TASK_ID.reset(task_token)
 
     if success:
         LOGGER.info("任务 %d 成功", task_id)
