@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse #解析命令行参数
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 import logging #记录日志
+import os
 import shutil #复制、删除目录
 import subprocess #执行编译、验证等外部命令
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -39,6 +43,7 @@ PROFILE_COMMAND = (sys.executable, "-m", "utils.profiling")
 DEFAULT_LOG_DIR = REPO_ROOT / "logs"
 DEFAULT_GENERATION_ATTEMPTS = 3
 LOGGER = logging.getLogger(__name__)
+_LOGGING_SETUP_LOCK = threading.Lock()
 
 
 # Generation is intentionally split into three calls.  Each call has one
@@ -84,6 +89,49 @@ class WorkflowConfig:
     workdir: Path = DEFAULT_WORKDIR
     generation_attempts: int = DEFAULT_GENERATION_ATTEMPTS
     repair_attempts: int = 3
+
+
+class GPUPool:
+    """A small GPU semaphore; CUDA commands receive one visible GPU at a time."""
+
+    def __init__(self, gpu_ids: Sequence[str]) -> None:
+        if not gpu_ids:
+            raise ValueError("至少需要一张 GPU")
+        self._semaphore = threading.Semaphore(len(gpu_ids))
+        self._available = list(gpu_ids)
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        self._semaphore.acquire()
+        with self._lock:
+            gpu_id = self._available.pop()
+        return _GPULease(self, gpu_id)
+
+    def release(self, gpu_id: str) -> None:
+        with self._lock:
+            self._available.append(gpu_id)
+        self._semaphore.release()
+
+
+class _GPULease:
+    def __init__(self, pool: GPUPool, gpu_id: str) -> None:
+        self.pool, self.gpu_id = pool, gpu_id
+
+    def __enter__(self) -> str:
+        return self.gpu_id
+
+    def __exit__(self, *_: object) -> None:
+        self.pool.release(self.gpu_id)
+
+
+def gpu_ids_from_environment() -> list[str]:
+    configured = os.environ.get("CUDA_AGENT_GPUS", "").strip()
+    if configured:
+        return [item.strip() for item in configured.split(",") if item.strip()]
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible and visible != "-1":
+        return [item.strip() for item in visible.split(",") if item.strip()]
+    return ["0"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,14 +220,20 @@ def reset_generated_workspace(workdir: Path) -> None:
 
 
 def run_command(
-    command: Sequence[str], workdir: Path, env: Mapping[str, str]
+    command: Sequence[str], workdir: Path, env: Mapping[str, str],
+    gpu_pool: GPUPool | None = None,
 ) -> tuple[bool, str]:
     """Run one command without a shell and capture its combined output."""
     LOGGER.info("执行命令：%s", " ".join(command))
-    result = subprocess.run(
-        list(command), cwd=workdir, env=dict(env), text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
-    )
+    lease = gpu_pool.acquire() if gpu_pool is not None else nullcontext(None)
+    with lease as gpu_id:
+        command_env = dict(env)
+        if gpu_id is not None:
+            command_env["CUDA_VISIBLE_DEVICES"] = gpu_id
+        result = subprocess.run(
+            list(command), cwd=workdir, env=command_env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
     if result.stdout.strip():
         LOGGER.info("命令输出：\n%s", result.stdout.rstrip())
     LOGGER.info("命令结束：exit_code=%d", result.returncode)
@@ -222,12 +276,13 @@ def run_stage_with_repairs(
     config: WorkflowConfig,
     env: Mapping[str, str],
     before_retry: Callable[[], tuple[bool, str]] | None = None,
+    gpu_pool: GPUPool | None = None,
 ) -> tuple[bool, str]:
     """Run a stage, optionally preparing dependent stages after each repair."""
     last_log = ""
     for attempt in range(1, config.repair_attempts + 1):
         LOGGER.info("%s 尝试 %d/%d", name, attempt, config.repair_attempts)
-        success, last_log = run_command(command, config.workdir, env)
+        success, last_log = run_command(command, config.workdir, env, gpu_pool)
         if success:
             LOGGER.info("%s 成功", name)
             return True, last_log
@@ -249,14 +304,19 @@ def run_stage_with_repairs(
     return False, last_log
 
 
-def generate_kernel_artifacts(env: Mapping[str, str]) -> None:
+def generate_kernel_artifacts(
+    env: Mapping[str, str], workdir: Path, gpu_pool: GPUPool | None = None
+) -> None:
     """Generate optional PTX and SASS artifacts after a successful run."""
+    artifact_env = dict(env)
+    artifact_env["CUDA_AGENT_WORKDIR"] = str(workdir)
+    artifact_env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + artifact_env.get("PYTHONPATH", "")
     for module_name in (
         "cuda_agent.tools.cu_to_ptx",
         "cuda_agent.tools.cu_to_sass",
     ):
         success, _ = run_command(
-            (sys.executable, "-m", module_name), REPO_ROOT, env
+            (sys.executable, "-m", module_name), workdir, artifact_env, gpu_pool
         )
         if not success:
             LOGGER.warning("%s 失败；继续保存其他结果", module_name)
@@ -287,7 +347,8 @@ def save_result(task_id: int, workdir: Path, logs: Mapping[str, str]) -> Path:
 
 
 def execute_workflow(
-    task_id: int, config: WorkflowConfig, report: WorkflowReport
+    task_id: int, config: WorkflowConfig, report: WorkflowReport,
+    gpu_pool: GPUPool,
 ) -> bool:
     env = build_environment()
     sample = load_task(task_id)
@@ -307,7 +368,7 @@ def execute_workflow(
             continue
         started = time.monotonic()
         compiled, compile_log = run_stage_with_repairs(
-            "compile", COMPILE_COMMAND, config, env
+            "compile", COMPILE_COMMAND, config, env, gpu_pool=gpu_pool
         )
         report.add_stage("compile", compiled, time.monotonic() - started)
         if not compiled:
@@ -318,7 +379,7 @@ def execute_workflow(
             nonlocal compile_log
             compile_started = time.monotonic()
             recompiled, recompile_log = run_stage_with_repairs(
-                "compile", COMPILE_COMMAND, config, env
+                "compile", COMPILE_COMMAND, config, env, gpu_pool=gpu_pool
             )
             compile_log += (
                 "\n\n=== compile after verification repair ===\n"
@@ -337,19 +398,22 @@ def execute_workflow(
             config,
             env,
             before_retry=recompile_after_verification_repair,
+            gpu_pool=gpu_pool,
         )
         report.add_stage("verification", verified, time.monotonic() - started)
         if not verified:
             continue
         started = time.monotonic()
-        profiled, profile_log = run_command(PROFILE_COMMAND, config.workdir, env)
+        profiled, profile_log = run_command(
+            PROFILE_COMMAND, config.workdir, env, gpu_pool
+        )
         report.add_stage("profiling", profiled, time.monotonic() - started)
         if not profiled:
             LOGGER.error("profiling 失败；本轮不会标记为成功")
             continue
 
         started = time.monotonic()
-        generate_kernel_artifacts(env)
+        generate_kernel_artifacts(env, config.workdir, gpu_pool)
         report.add_stage("artifacts", True, time.monotonic() - started, "best effort")
         save_result(task_id, config.workdir, {
             "compile.log": compile_log,
@@ -360,16 +424,22 @@ def execute_workflow(
     return False
 
 
-def run_task(task_id: int, config: WorkflowConfig, args: argparse.Namespace) -> bool:
+def run_task(
+    task_id: int, config: WorkflowConfig, args: argparse.Namespace,
+    gpu_pool: GPUPool,
+) -> bool:
     """Run one task and always write its report before returning."""
-    log_path = configure_logging(DEFAULT_LOG_DIR, task_id, False)
+    # configure_logging changes process-wide handlers, so at least make the
+    # setup itself atomic while task workers start.
+    with _LOGGING_SETUP_LOCK:
+        log_path = configure_logging(DEFAULT_LOG_DIR, task_id, False)
     report = WorkflowReport(task_id, log_path)
     LOGGER.info("启动 CUDA Agent；详细日志：%s", log_path)
 
     success = False
     error = ""
     try:
-        success = execute_workflow(task_id, config, report)
+        success = execute_workflow(task_id, config, report, gpu_pool)
         if not success:
             error = "All generation attempts were exhausted. See workflow.log."
     except Exception as exc:  # preserve a report for unexpected failures
@@ -393,13 +463,35 @@ def main() -> int:
     if config.generation_attempts < 1 or config.repair_attempts < 1:
         raise ValueError("Attempt counts must be at least 1")
 
+    task_id_list = list(task_ids)
+    gpu_pool = GPUPool(gpu_ids_from_environment())
+    generation_workers = min(
+        len(task_id_list),
+        max(1, int(os.environ.get("CUDA_AGENT_GENERATION_WORKERS", len(task_id_list)))),
+    )
+
+    def worker(task_id: int) -> bool:
+        task_workdir = REPO_ROOT / ".task_workdirs" / f"task_{task_id:04d}"
+        if task_workdir.exists():
+            shutil.rmtree(task_workdir)
+        shutil.copytree(config.workdir, task_workdir)
+        task_config = WorkflowConfig(
+            task_workdir, config.generation_attempts, config.repair_attempts
+        )
+        return run_task(task_id, task_config, args, gpu_pool)
+
     successful_task_ids: list[int] = []
     failed_task_ids: list[int] = []
-    for task_id in task_ids:
-        if run_task(task_id, config, args):
-            successful_task_ids.append(task_id)
-        else:
-            failed_task_ids.append(task_id)
+    with ThreadPoolExecutor(max_workers=generation_workers) as executor:
+        futures = {executor.submit(worker, task_id): task_id for task_id in task_id_list}
+        for future in as_completed(futures):
+            task_id = futures[future]
+            try:
+                success = future.result()
+            except Exception:
+                LOGGER.exception("任务 %d 工作线程异常", task_id)
+                success = False
+            (successful_task_ids if success else failed_task_ids).append(task_id)
 
     LOGGER.info(
         "任务批次完成：成功 %d，失败 %d", len(successful_task_ids), len(failed_task_ids)

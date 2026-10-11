@@ -64,7 +64,7 @@ class WorkflowReport:
 ## Reproduction
 
 ```bash
-python main.py --task-id {self.task_id}
+python main.py --task-start {self.task_id} --task-end {self.task_id}
 ```
 """
         report_path = self.log_path.parent / "workflow_report.md"

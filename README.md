@@ -122,7 +122,7 @@ export CUDA_AGENT_MODEL=deepseek-v4-pro
 export CUDA_AGENT_MAX_TOKENS=32768
 export CUDA_AGENT_THINKING_MODE=enabled
 export CUDA_AGENT_REASONING_EFFORT=low
-python main.py --task-id 0
+python main.py --task-start 0 --task-end 0
 ```
 
 默认的生成重试次数为 3 次。连续处理一段任务时，可指定包含首尾的任务范围；
@@ -139,7 +139,7 @@ python main.py --task-start 0 --task-end 10
 After `uv sync`, the same workflow is available as an installed command:
 
 ```bash
-uv run cuda-agent --task-id 0
+uv run cuda-agent --task-start 0 --task-end 0
 uv run cuda-agent-download
 ```
 

@@ -1,12 +1,13 @@
 """Compile generated CUDA sources and disassemble them to SASS."""
 
 import subprocess
+import os
 from pathlib import Path
 
 from cuda_agent.tools.toolchain import build_environment, cuda_arch, cuda_home, host_cxx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-KERNEL_DIR = REPO_ROOT / "agent_workdir" / "kernels"
+KERNEL_DIR = Path(os.environ.get("CUDA_AGENT_WORKDIR", REPO_ROOT / "agent_workdir")) / "kernels"
 
 
 def run_command(command: list[str]) -> tuple[bool, str]:
