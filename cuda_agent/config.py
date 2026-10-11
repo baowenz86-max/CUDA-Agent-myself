@@ -12,7 +12,7 @@ class DeepSeekAPIConfig:
     base_url: str
     model: str
     timeout_seconds: int = 300
-    max_tokens: int = 32768
+    max_tokens: int = 50000
     thinking_mode: str = "enabled"
     reasoning_effort: str = "low"
 
@@ -32,7 +32,7 @@ class DeepSeekAPIConfig:
             ).strip().rstrip("/"),
             model=os.environ.get("CUDA_AGENT_MODEL", "deepseek-v4-pro").strip(),
             timeout_seconds=_positive_int("CUDA_AGENT_API_TIMEOUT", 300),
-            max_tokens=_positive_int("CUDA_AGENT_MAX_TOKENS", 32768),
+            max_tokens=_positive_int("CUDA_AGENT_MAX_TOKENS", 50000),
             thinking_mode=_choice(
                 "CUDA_AGENT_THINKING_MODE", "enabled", {"enabled", "disabled"}
             ),

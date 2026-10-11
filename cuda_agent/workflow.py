@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import argparse
-import logging
-import shutil
-import subprocess
+import argparse #解析命令行参数
+import logging #记录日志
+import shutil #复制、删除目录
+import subprocess #执行编译、验证等外部命令
 import sys
 import time
 from dataclasses import dataclass
@@ -41,6 +41,44 @@ DEFAULT_GENERATION_ATTEMPTS = 3
 LOGGER = logging.getLogger(__name__)
 
 
+# Generation is intentionally split into three calls.  Each call has one
+# owner file, so the model can concentrate on one interface boundary and the
+# next call can inspect the already-written result.
+GENERATION_PROMPTS = (
+    (
+        "model_new.py",
+        """你负责第一阶段：只生成 model_new.py，不要生成或修改任何 .cu/.cpp 文件。
+请阅读 SKILL.md、model.py 和当前工作目录，完整梳理参考实现的输入输出 shape、dtype、device、广播、边界条件和数值语义。
+先保证与 model.py 语义等价、接口可用，再考虑性能。model_new.py 只能调用后续 CUDA 源码中会实现的自定义算子；请明确、统一地设计算子名称、参数顺序、返回值结构和 dtype/shape 约定，避免伪代码、TODO、占位实现或未定义调用。
+保留非 CUDA 或特殊输入路径。禁止使用 torch 算子实现本应下沉到自定义扩展的计算。
+只返回 model_new.py 的完整内容；不要返回 kernels 文件，不要修改 model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
+    ),
+    (
+        "kernels/*.cu",
+        """你负责第二阶段：只生成或修改 kernels/ 下的 CUDA .cu 文件，不要生成或修改 .cpp 或 model_new.py。
+先阅读 SKILL.md、model.py、当前 model_new.py 以及现有 kernels 文件，严格以 model_new.py 已确定的自定义算子名称、参数顺序、返回结构和 dtype/shape 约定为接口契约；不要反过来改 Python 接口。
+实现完整、可编译的 CUDA kernel 和 host launcher，覆盖 model_new.py 的所有调用路径。重点核对维度/stride、边界和空张量、非连续输入、dtype 分派、数值精度、同步、线程索引和 launch 参数；不得留下伪代码、TODO、占位实现或未定义符号。需要导出给绑定层的 launcher 必须有清晰且稳定的声明，供下一阶段的 binding.cpp 调用。
+只返回需要写入的 .cu 文件完整内容；不要返回 .cpp 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
+    ),
+    (
+        "kernels/*.cpp",
+        """你负责第三阶段：只生成或修改 kernels/ 下的绑定 .cpp 文件，不要生成或修改 .cu 或 model_new.py。
+先阅读 SKILL.md、model.py、model_new.py 以及当前 kernels/*.cu，严格对齐 Python 调用接口和 CUDA launcher 的函数声明。为每个自定义算子提供完整的 PyTorch tensor 参数检查、必要的 dtype/device/shape 处理、正确的 launcher 调用、返回值构造和 REGISTER_BINDING 注册；不得在 .cpp 中实现 CUDA kernel，不得调用 torch:: 算子完成计算。
+逐项核对注册名、参数顺序、include、命名空间、声明、返回结构和 dtype 分派，确保 binding.cpp 能独立编译并与 .cu 正确链接。不要留下伪代码、TODO、占位实现或未定义符号。
+只返回需要写入的 .cpp 文件完整内容；不要返回 .cu 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
+    ),
+)
+
+REPAIR_PROMPTS = {
+    "compile": """这是一次编译失败修复。请把现有源码视为主版本，先逐行分析编译日志，定位第一个真正的错误及其根因，再做最小必要修改。
+重点检查：头文件/声明、命名空间、模板和 dtype 分派、CUDA API 类型、kernel launch 参数、host/device 限定符、链接/注册符号以及 nvcc 支持的语法。不要因为日志末尾的级联错误而盲目修改无关代码，也不要重写已经正确的算法。
+修复后必须再次核对 model_new.py 与 kernels/ 的接口一致性。仅允许修改 model_new.py 或 kernels/ 下的 .cu/.cpp，禁止修改固定基础设施和编译脚本。""",
+    "verification": """这是一次正确性验证失败修复。请先根据验证日志确定失败的是哪一个输入、哪个输出、哪种 dtype/shape 或哪条执行路径，再追踪对应 kernel 的索引和数学语义。
+重点排查：维度/stride 与线性索引、广播和 reduction 边界、线程间同步、越界访问、初始化、mask、in-place 副作用、float/half 精度转换、NaN/Inf 处理以及 Python 返回值结构。修复目标是与 model.py 的参考结果严格一致；不要为了掩盖误差而放宽验证，也不要在没有证据时改动性能无关代码。
+修复后确认编译接口仍完整，并只修改 model_new.py 或 kernels/ 下的 .cu/.cpp，禁止修改固定基础设施和验证脚本。""",
+}
+
+
 @dataclass(frozen=True)
 class WorkflowConfig:
     workdir: Path = DEFAULT_WORKDIR
@@ -50,48 +88,42 @@ class WorkflowConfig:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate, compile, verify, and profile a CUDA kernel."
+        description="Generate, compile, verify, and profile CUDA kernels for a task range."
     )
-    parser.add_argument("--task-id", type=int, help="Dataset row index")
     parser.add_argument(
         "--task-start",
         type=int,
+        required=True,
         help="First dataset row index to process (inclusive)",
     )
     parser.add_argument(
         "--task-end",
         type=int,
+        required=True,
         help="Last dataset row index to process (inclusive)",
     )
-    parser.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
-    parser.add_argument(
-        "--generation-attempts", type=int, default=DEFAULT_GENERATION_ATTEMPTS
-    )
-    parser.add_argument("--repair-attempts", type=int, default=3)
-    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
-    parser.add_argument("--verbose", action="store_true", help="Show debug logs in console")
     return parser.parse_args()
 
 
 def task_ids_from_args(args: argparse.Namespace) -> range:
-    """Return the requested task IDs, preserving the legacy task 0 default."""
-    has_range_start = args.task_start is not None
-    has_range_end = args.task_end is not None
-    if has_range_start != has_range_end:
-        raise ValueError("--task-start 和 --task-end 必须同时提供")
-    if has_range_start:
-        if args.task_id is not None:
-            raise ValueError("--task-id 不能与 --task-start/--task-end 一起使用")
-        if args.task_start < 0 or args.task_end < 0:
+    """Return the inclusive task ID range requested by the CLI."""
+    task_start = getattr(args, "task_start", None)
+    task_end = getattr(args, "task_end", None)
+    # Keep this helper tolerant of legacy programmatic callers.  The public
+    # CLI itself only accepts the two required range arguments.
+    legacy_task_id = getattr(args, "task_id", None)
+    if legacy_task_id is not None and task_start is not None:
+        raise ValueError("--task-id 不能与 --task-start/--task-end 一起使用")
+    if task_start is None or task_end is None:
+        task_id = 0 if legacy_task_id is None else legacy_task_id
+        if task_id < 0:
             raise ValueError("Task IDs must be non-negative")
-        if args.task_start > args.task_end:
-            raise ValueError("--task-start 不能大于 --task-end")
-        return range(args.task_start, args.task_end + 1)
-
-    task_id = 0 if args.task_id is None else args.task_id
-    if task_id < 0:
+        return range(task_id, task_id + 1)
+    if task_start < 0 or task_end < 0:
         raise ValueError("Task IDs must be non-negative")
-    return range(task_id, task_id + 1)
+    if task_start > task_end:
+        raise ValueError("--task-start 不能大于 --task-end")
+    return range(task_start, task_end + 1)
 
 
 def load_task(task_id: int) -> Mapping[str, object]:
@@ -155,20 +187,28 @@ def run_command(
 
 
 def generate_cuda(workdir: Path) -> bool:
-    return run_agent(
-        """阅读 SKILL.md 和 model.py，生成 CUDA 优化版本。
-只修改 model_new.py 和 kernels/ 下的 CUDA/C++ 文件；不要修改 utils/、
-binding.cpp 或 binding_registry.h。实现必须通过编译和正确性验证。""",
-        str(workdir),
-    )
+    """Generate Python, CUDA, and binding sources in separate API calls."""
+    for stage, (target, prompt) in enumerate(GENERATION_PROMPTS, start=1):
+        LOGGER.info("生成阶段 %d/3：%s", stage, target)
+        if not run_agent(prompt, str(workdir)):
+            LOGGER.error("生成阶段 %d 失败：%s", stage, target)
+            return False
+    return True
 
 
 def send_feedback(error_log: str, workdir: Path, stage: str) -> bool:
+    repair_prompt = REPAIR_PROMPTS.get(stage)
+    if repair_prompt is None:
+        repair_prompt = (
+            "这是一次工作流阶段失败修复。请仅依据现有日志定位根因，保持正确代码不变，"
+            "并只修改允许的生成文件。"
+        )
     return run_agent(
-        f"""CUDA 实现的{stage}阶段失败。请分析日志并修复 model_new.py 或 kernels/。
-不要修改 utils/、binding.cpp 或 binding_registry.h。
+        f"""{repair_prompt}
 
-错误日志：
+当前失败阶段：{stage}
+
+完整错误日志（优先处理最早出现的根因）：
 ----------------
 {error_log}
 ----------------""",
@@ -322,7 +362,7 @@ def execute_workflow(
 
 def run_task(task_id: int, config: WorkflowConfig, args: argparse.Namespace) -> bool:
     """Run one task and always write its report before returning."""
-    log_path = configure_logging(args.log_dir.resolve(), task_id, args.verbose)
+    log_path = configure_logging(DEFAULT_LOG_DIR, task_id, False)
     report = WorkflowReport(task_id, log_path)
     LOGGER.info("启动 CUDA Agent；详细日志：%s", log_path)
 
@@ -349,9 +389,7 @@ def run_task(task_id: int, config: WorkflowConfig, args: argparse.Namespace) -> 
 def main() -> int:
     args = parse_args()
     task_ids = task_ids_from_args(args)
-    config = WorkflowConfig(
-        args.workdir.resolve(), args.generation_attempts, args.repair_attempts
-    )
+    config = WorkflowConfig()
     if config.generation_attempts < 1 or config.repair_attempts < 1:
         raise ValueError("Attempt counts must be at least 1")
 
