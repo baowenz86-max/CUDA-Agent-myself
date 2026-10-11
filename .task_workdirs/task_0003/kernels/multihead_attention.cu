@@ -156,21 +156,28 @@ __global__ void output_projection_kernel2(
     int output_batch_stride, int output_time_stride, int output_elem_stride,
     bool use_bias
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = B * T * E;
-    // Use grid-stride loop to handle arbitrary size
-    for (int i = idx; i < total; i += blockDim.x * gridDim.x) {
-        int batch = i / (T * E);
-        int remainder = i % (T * E);
-        int time = remainder / E;
-        int col = remainder % E;
+    // The attention result and final result share the same allocation.  A
+    // conventional elementwise in-place GEMM is incorrect: one output column
+    // can overwrite an input column still needed by another column.  Cache a
+    // complete row before any thread writes to the output.
+    extern __shared__ float row[];
+    int row_id = blockIdx.x;
+    int total_rows = B * T;
+    if (row_id >= total_rows) return;
+    int batch = row_id / T;
+    int time = row_id - batch * T;
+    const float* in_ptr = input + batch * input_batch_stride + time * input_time_stride;
+    float* out_ptr = output + batch * output_batch_stride + time * output_time_stride;
 
-        const float* in_ptr = input + batch * input_batch_stride + time * input_time_stride;
-        float* out_ptr = output + batch * output_batch_stride + time * output_time_stride;
+    for (int e = threadIdx.x; e < E; e += blockDim.x)
+        row[e] = in_ptr[e * input_elem_stride];
+    __syncthreads();
+
+    for (int col = threadIdx.x; col < E; col += blockDim.x) {
         float sum = 0.0f;
-        for (int e = 0; e < E; ++e) {
-            sum += in_ptr[e * input_elem_stride] * weight[col * E + e];
-        }
+        const float* w = weight + col * E;
+        for (int e = 0; e < E; ++e)
+            sum += row[e] * w[e];
         if (use_bias) sum += bias[col];
         out_ptr[col * output_elem_stride] = sum;
     }
@@ -232,10 +239,9 @@ extern "C" void multihead_attention_forward_launcher(
 
     // Launch output projection kernel: simple elementwise linear transformation.
     // It operates in-place on output.
-    int total_elems = B * T * E;
-    int threads = 256;
-    int blocks = (total_elems + threads - 1) / threads;
-    output_projection_kernel2<<<blocks, threads, 0, stream>>>(
+    int threads = (E < 256) ? E : 256;
+    int blocks = B * T;
+    output_projection_kernel2<<<blocks, threads, static_cast<size_t>(E) * sizeof(float), stream>>>(
         output, out_proj_weight, out_proj_bias, output,
         B, T, E,
         batch_stride_out, time_stride_out, elem_stride_out,
