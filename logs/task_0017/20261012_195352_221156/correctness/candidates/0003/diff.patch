@@ -1,0 +1,418 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,128 +1,111 @@
+ #include <cuda_runtime.h>
+-#include <cmath>
++#include <math.h>
+ 
+-// ConvTranspose1d kernel (float32 only, as used by this task)
+-// Input: (batch, in_channels, in_len)
+-// Weight: (in_channels, out_channels, kernel_size)
+-// Bias: (out_channels)
+-// Output: (batch, out_channels, out_len)
+-// out_len = (in_len - 1) * stride - 2 * padding + kernel_size + output_padding
++// Helper for erf approximation using CUDA erff (should match torch.erf within tolerance)
++__device__ float erf_approx(float x) {
++    return erff(x);
++}
++
++// ConvTranspose1d kernel: standard transposed convolution.
++// input: [N, C_in, L_in], weight: [C_in, C_out, K], bias: [C_out]
++// output: [N, C_out, L_out]
++// L_out = (L_in - 1) * stride - 2 * padding + K + output_padding
++// Each output element is sum over ic, kw of input[n, ic, iw] * weight[ic, oc, kw] where
++// iw = (ow + padding - kw) / stride if divisible and 0 <= iw < L_in, with ow in [0, L_out-1].
+ __global__ void conv_transpose1d_kernel(
+     const float* __restrict__ input,
+     const float* __restrict__ weight,
+     const float* __restrict__ bias,
+     float* __restrict__ output,
+-    int batch,
+-    int in_channels,
+-    int out_channels,
+-    int in_len,
+-    int out_len,
+-    int kernel_size,
+-    int stride,
+-    int padding,
+-    int output_padding
+-) {
++    int N, int C_in, int C_out, int L_in, int L_out,
++    int K, int stride, int padding, int output_padding)
++{
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = batch * out_channels * out_len;
++    int total = N * C_out * L_out;
+     if (idx >= total) return;
+ 
+-    int ow = idx % out_len;
+-    int oc = (idx / out_len) % out_channels;
+-    int n = idx / (out_len * out_channels);
++    int ow = idx % L_out;
++    int oc = (idx / L_out) % C_out;
++    int n = idx / (L_out * C_out);
+ 
+-    float acc = bias[oc];
+-
+-    // For each input position that can contribute to this output position:
+-    // ow = iw * stride - padding + k, for k in [0, kernel_size-1]
+-    // So iw = (ow + padding - k) / stride, must be integer and in [0, in_len-1]
+-    for (int k = 0; k < kernel_size; ++k) {
+-        int numerator = ow + padding - k;
+-        if (numerator % stride != 0) continue;
+-        int iw = numerator / stride;
+-        if (iw < 0 || iw >= in_len) continue;
+-
+-        for (int ic = 0; ic < in_channels; ++ic) {
+-            // Weight index: (ic, oc, k)
+-            float w = weight[(ic * out_channels + oc) * kernel_size + k];
+-            float x = input[(n * in_channels + ic) * in_len + iw];
+-            acc += x * w;
++    float sum = bias[oc];
++    for (int ic = 0; ic < C_in; ++ic) {
++        for (int kw = 0; kw < K; ++kw) {
++            int t = ow + padding - kw;
++            if (t % stride != 0) continue;
++            int iw = t / stride;
++            if (iw >= 0 && iw < L_in) {
++                sum += input[((n * C_in + ic) * L_in) + iw] * weight[((ic * C_out + oc) * K) + kw];
++            }
+         }
+     }
+-
+-    output[idx] = acc;
++    output[idx] = sum;
+ }
+ 
+-// Min scalar kernel: output = min(input, scalar)
++// Min with scalar: output = min(input, val)
+ __global__ void min_scalar_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+-    float scalar,
+-    int total
+-) {
++    int size,
++    float val)
++{
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= total) return;
+-    float v = input[idx];
+-    output[idx] = v < scalar ? v : scalar;
++    if (idx < size) {
++        float x = input[idx];
++        output[idx] = fminf(x, val);
++    }
+ }
+ 
+-// Erf kernel: output = erf(input)
++// Erf: output = erf(input)
+ __global__ void erf_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+-    int total
+-) {
++    int size)
++{
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= total) return;
+-    output[idx] = erff(input[idx]);
++    if (idx < size) {
++        output[idx] = erff(input[idx]);
++    }
+ }
+ 
+-// Launchers (extern "C" for binding)
+-
+-extern "C" void conv_transpose1d_forward_launcher(
++// Launchers
++extern "C" void conv_transpose1d_custom_launcher(
+     const float* input,
+     const float* weight,
+     const float* bias,
+     float* output,
+-    int batch,
+-    int in_channels,
+-    int out_channels,
+-    int in_len,
+-    int out_len,
+-    int kernel_size,
+-    int stride,
+-    int padding,
+-    int output_padding,
+-    cudaStream_t stream
+-) {
+-    int total = batch * out_channels * out_len;
++    int N, int C_in, int C_out, int L_in, int L_out,
++    int K, int stride, int padding, int output_padding,
++    cudaStream_t stream)
++{
++    int total = N * C_out * L_out;
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+     conv_transpose1d_kernel<<<blocks, threads, 0, stream>>>(
+         input, weight, bias, output,
+-        batch, in_channels, out_channels, in_len, out_len,
+-        kernel_size, stride, padding, output_padding
+-    );
++        N, C_in, C_out, L_in, L_out,
++        K, stride, padding, output_padding);
+ }
+ 
+-extern "C" void min_scalar_forward_launcher(
++extern "C" void min_scalar_custom_launcher(
+     const float* input,
+     float* output,
+-    int total,
+-    float scalar,
+-    cudaStream_t stream
+-) {
++    int size,
++    float val,
++    cudaStream_t stream)
++{
+     int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    min_scalar_kernel<<<blocks, threads, 0, stream>>>(input, output, scalar, total);
++    int blocks = (size + threads - 1) / threads;
++    min_scalar_kernel<<<blocks, threads, 0, stream>>>(input, output, size, val);
+ }
+ 
+-extern "C" void erf_forward_launcher(
++extern "C" void erf_custom_launcher(
+     const float* input,
+     float* output,
+-    int total,
+-    cudaStream_t stream
+-) {
++    int size,
++    cudaStream_t stream)
++{
+     int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    erf_kernel<<<blocks, threads, 0, stream>>>(input, output, total);
++    int blocks = (size + threads - 1) / threads;
++    erf_kernel<<<blocks, threads, 0, stream>>>(input, output, size);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,141 @@
++// PyTorch binding for custom ConvTranspose1d, min, erf kernels
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void conv_transpose1d_custom_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int C_out, int L_in, int L_out,
++    int K, int stride, int padding, int output_padding,
++    cudaStream_t stream);
++
++extern "C" void min_scalar_custom_launcher(
++    const float* input,
++    float* output,
++    int size,
++    float val,
++    cudaStream_t stream);
++
++extern "C" void erf_custom_launcher(
++    const float* input,
++    float* output,
++    int size,
++    cudaStream_t stream);
++
++// Wrapper for conv_transpose1d
++static torch::Tensor conv_transpose1d_custom(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    int64_t stride,
++    int64_t padding,
++    int64_t output_padding) {
++    // Input checks
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 3, "input must have shape [N, C_in, L_in]");
++    TORCH_CHECK(weight.dim() == 3, "weight must have shape [C_in, C_out, K]");
++    TORCH_CHECK(bias.dim() == 1, "bias must have shape [C_out]");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++    TORCH_CHECK(output_padding >= 0, "output_padding must be non-negative");
++
++    // Ensure contiguous tensors (needed for raw pointer access)
++    input = input.contiguous();
++    weight = weight.contiguous();
++    bias = bias.contiguous();
++
++    // Dimensions
++    int N = input.size(0);
++    int C_in = input.size(1);
++    int L_in = input.size(2);
++    int C_out = weight.size(1);
++    int K = weight.size(2);
++    TORCH_CHECK(weight.size(0) == C_in, "weight C_in dimension mismatch");
++    TORCH_CHECK(bias.size(0) == C_out, "bias size mismatch");
++
++    // Output length formula: (L_in - 1) * stride - 2 * padding + K + output_padding
++    int64_t L_out = (L_in - 1) * stride - 2 * padding + K + output_padding;
++    TORCH_CHECK(L_out > 0, "computed output length must be positive");
++
++    // Allocate output: [N, C_out, L_out]
++    auto output = torch::empty({N, C_out, L_out}, input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    conv_transpose1d_custom_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C_in, C_out, L_in, static_cast<int>(L_out),
++        K, static_cast<int>(stride), static_cast<int>(padding), static_cast<int>(output_padding),
++        stream);
++
++    return output;
++}
++
++// Wrapper for min with scalar
++static torch::Tensor min_scalar_custom(torch::Tensor input, double val) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    input = input.contiguous();
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    min_scalar_custom_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input.numel(),
++        static_cast<float>(val),
++        stream);
++    return output;
++}
++
++// Wrapper for erf
++static torch::Tensor erf_custom(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    input = input.contiguous();
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    erf_custom_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input.numel(),
++        stream);
++    return output;
++}
++
++// Registration function
++static void register_custom_ops(pybind11::module& m) {
++    m.def("conv_transpose1d_custom", &conv_transpose1d_custom,
++          "Custom ConvTranspose1d (CUDA)",
++          pybind11::arg("input"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"),
++          pybind11::arg("stride") = 1,
++          pybind11::arg("padding") = 0,
++          pybind11::arg("output_padding") = 0);
++    m.def("min_scalar_custom", &min_scalar_custom,
++          "Custom min with scalar (CUDA)",
++          pybind11::arg("input"),
++          pybind11::arg("val"));
++    m.def("erf_custom", &erf_custom,
++          "Custom erf (CUDA)",
++          pybind11::arg("input"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -6,55 +6,43 @@
+ class ModelNew(nn.Module):
+     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+         super().__init__()
+-        # 参考模型的 conv_transpose 模块虽然定义了 bias，但 forward 使用额外的 self.bias，
+-        # 因此这里仅初始化 conv_transpose.weight，并保留 self.bias 以匹配 state_dict。
+-        self.conv_transpose_weight = nn.Parameter(torch.empty(in_channels, out_channels, kernel_size))
+-        # 与参考模型一致的额外 bias
+-        self.bias = nn.Parameter(torch.empty(bias_shape))
+-        # 存储标量参数供 forward 使用
++        # Preserve state_dict keys exactly
++        self.conv_transpose = nn.ConvTranspose1d(
++            in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding
++        )
++        self.bias = nn.Parameter(torch.randn(bias_shape))
++        # Store convolution attributes for custom op call
+         self.stride = stride
+         self.padding = padding
+         self.output_padding = output_padding
+ 
+-        # 模拟参考模型中的 nn.ConvTranspose1d，其自身也有一个未使用的 bias 参数，
+-        # 为保证 state_dict 键完全一致，需要添加 conv_transpose.bias。
+-        # 参考模型 state_dict 包含 conv_transpose.bias，因此这里保留一个 parameter。
+-        self.conv_transpose_bias = nn.Parameter(torch.empty(out_channels))
+-
+-        # 初始化参数（与参考模型相同分布，但实际训练/测试会 load state_dict 覆盖）
+-        nn.init.kaiming_uniform_(self.conv_transpose_weight, a=5**0.5)
+-        nn.init.zeros_(self.bias)
+-        nn.init.zeros_(self.conv_transpose_bias)
+-
+     def forward(self, x):
+-        # 第一步：转置卷积，使用自定义算子，传入权重、额外 bias 和标量参数
+-        x = cuda_extension.conv_transpose1d_forward(
++        # Custom conv transpose1d: input, weight, bias, stride, padding, output_padding
++        x = cuda_extension.conv_transpose1d_custom(
+             x,
+-            self.conv_transpose_weight,
++            self.conv_transpose.weight,
+             self.bias,
+             self.stride,
+             self.padding,
+             self.output_padding
+         )
+-        # 第二步：torch.min(x, 1.0)
+-        x = cuda_extension.min_scalar_forward(x, 1.0)
+-        # 第三步：torch.erf(x)
+-        x = cuda_extension.erf_forward(x)
++        x = cuda_extension.min_scalar_custom(x, 1.0)
++        x = cuda_extension.erf_custom(x)
+         return x
+ 
+     def debug_forward(self, x):
+-        # 与 forward 完全相同的计算，每步 yield (id, value)
+-        x = cuda_extension.conv_transpose1d_forward(
++        # Same computational path, but yield intermediate tensors with checkpoint ids
++        x = cuda_extension.conv_transpose1d_custom(
+             x,
+-            self.conv_transpose_weight,
++            self.conv_transpose.weight,
+             self.bias,
+             self.stride,
+             self.padding,
+             self.output_padding
+         )
+-        yield "step_001", x
+-        x = cuda_extension.min_scalar_forward(x, 1.0)
+-        yield "step_002", x
+-        x = cuda_extension.erf_forward(x)
+-        yield "step_003", x
+-        yield "step_004", x
++        yield 'step_001', x
++        x = cuda_extension.min_scalar_custom(x, 1.0)
++        yield 'step_002', x
++        x = cuda_extension.erf_custom(x)
++        yield 'step_003', x
++        yield 'step_004', x

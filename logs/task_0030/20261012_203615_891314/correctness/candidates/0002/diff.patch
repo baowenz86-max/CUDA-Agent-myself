@@ -1,0 +1,128 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -4,8 +4,6 @@
+ #include <cstdint>
+ 
+ // =========================== POLAR ===========================
+-// Computes complex64 output from float32 magnitudes and angles.
+-// Each thread computes one element: real = mag * cos(angle), imag = mag * sin(angle).
+ __global__ void polar_kernel(const float* __restrict__ mag,
+                              const float* __restrict__ angle,
+                              float2* __restrict__ out,
+@@ -32,33 +30,7 @@
+     polar_kernel<<<blocks, threads, 0, stream>>>(mag, angle, out, total);
+ }
+ 
+-// =========================== ONE_HOT ===========================
+-// Generates identity matrix of shape num_classes x num_classes as float32.
+-// Output is a float32 tensor with 1 on diagonal, 0 elsewhere.
+-__global__ void one_hot_kernel(float* out, int num_classes) {
+-    int row = blockIdx.y * blockDim.y + threadIdx.y;
+-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (row < num_classes && col < num_classes) {
+-        out[row * num_classes + col] = (row == col) ? 1.0f : 0.0f;
+-    }
+-}
+-
+-extern "C" void one_hot_launcher(float* out,
+-                                int num_classes,
+-                                cudaStream_t stream) {
+-    if (num_classes <= 0) return;
+-    dim3 block(16, 16);
+-    dim3 grid((num_classes + block.x - 1) / block.x,
+-              (num_classes + block.y - 1) / block.y);
+-    one_hot_kernel<<<grid, block, 0, stream>>>(out, num_classes);
+-}
+-
+ // =========================== SDPA ===========================
+-// Scaled dot-product attention: softmax(Q*K^T / sqrt(d)) * V
+-// Inputs: Q, K, V of shape [B, H, L, D], float32.
+-// Output: O of same shape, float32.
+-// This implementation uses one thread per output element, with a loop over sequence length.
+-// It is optimized for the given dimensions (L=128, D=16) but works generally.
+ __global__ void sdpa_kernel(const float* __restrict__ q,
+                             const float* __restrict__ k,
+                             const float* __restrict__ v,
+@@ -68,7 +40,6 @@
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx >= total) return;
+ 
+-    // Decode indices
+     int d = idx % D;
+     int l = (idx / D) % L;
+     int h = (idx / (D * L)) % H;
+@@ -76,14 +47,7 @@
+ 
+     float inv_scale = 1.0f / sqrtf((float)D);
+ 
+-    // Compute softmax denominator and numerator parts for this (b,h,l)
+     float max_score = -1e30f;
+-    float scores[128]; // L up to 128, but we'll assume L <= 128 for stack; use dynamic for large L
+-    // For general L, we should use dynamic allocation, but for known L=128 we can use fixed array.
+-    // To be safe, we use a loop with two passes and no large array: first compute max, then denominator, then output.
+-
+-    // First pass: compute max score for stability
+-    float local_max = -1e30f;
+     for (int j = 0; j < L; ++j) {
+         const float* q_row = q + ((b * H + h) * L + l) * D;
+         const float* k_row = k + ((b * H + h) * L + j) * D;
+@@ -92,10 +56,9 @@
+             dot += q_row[dd] * k_row[dd];
+         }
+         dot *= inv_scale;
+-        if (dot > local_max) local_max = dot;
++        if (dot > max_score) max_score = dot;
+     }
+ 
+-    // Second pass: compute denominator (sum of exp(score - max))
+     float denom = 0.0f;
+     for (int j = 0; j < L; ++j) {
+         const float* q_row = q + ((b * H + h) * L + l) * D;
+@@ -104,11 +67,10 @@
+         for (int dd = 0; dd < D; ++dd) {
+             dot += q_row[dd] * k_row[dd];
+         }
+-        dot = (dot * inv_scale) - local_max;
++        dot = (dot * inv_scale) - max_score;
+         denom += expf(dot);
+     }
+ 
+-    // Third pass: compute weighted sum of V
+     float sum = 0.0f;
+     for (int j = 0; j < L; ++j) {
+         const float* q_row = q + ((b * H + h) * L + l) * D;
+@@ -118,7 +80,7 @@
+         for (int dd = 0; dd < D; ++dd) {
+             dot += q_row[dd] * k_row[dd];
+         }
+-        dot = (dot * inv_scale) - local_max;
++        dot = (dot * inv_scale) - max_score;
+         float weight = expf(dot) / denom;
+         sum += weight * v_row[d];
+     }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -7,7 +7,6 @@
+ // Declare launchers from custom_ops.cu
+ extern "C" {
+ void polar_launcher(const float* mag, const float* angle, float2* out, int64_t total, cudaStream_t stream);
+-void one_hot_launcher(float* out, int num_classes, cudaStream_t stream);
+ void sdpa_launcher(const float* q, const float* k, const float* v, float* out, int B, int H, int L, int D, cudaStream_t stream);
+ }
+ 
+@@ -38,8 +37,13 @@
+ torch::Tensor one_hot_forward(int64_t num_classes) {
+     TORCH_CHECK(num_classes > 0, "num_classes must be positive");
+     auto output = torch::empty({num_classes, num_classes}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+-    // Launcher expects float* and stream; for CPU we pass 0 (no CUDA stream needed)
+-    one_hot_launcher(output.data_ptr<float>(), static_cast<int>(num_classes), 0);
++    float* data = output.data_ptr<float>();
++    // Fill identity matrix on CPU (no CUDA kernel)
++    for (int64_t i = 0; i < num_classes; ++i) {
++        for (int64_t j = 0; j < num_classes; ++j) {
++            data[i * num_classes + j] = (i == j) ? 1.0f : 0.0f;
++        }
++    }
+     return output;
+ }
+ 

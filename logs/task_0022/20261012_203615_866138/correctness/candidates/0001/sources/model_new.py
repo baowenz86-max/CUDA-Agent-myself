@@ -1,0 +1,35 @@
+import torch
+import torch.nn as nn
+
+try:
+    import cuda_extension
+except ImportError:
+    cuda_extension = None
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, scale_factor, mode, align_corners):
+        super().__init__()
+        self.input_size = input_size
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.align_corners = align_corners
+
+    def forward(self, x):
+        if cuda_extension is None:
+            raise RuntimeError("cuda_extension is not available; compile kernels first")
+        x = cuda_extension.norm2_channel(x)
+        x = cuda_extension.upsample_bilinear2d(x, self.scale_factor, self.align_corners)
+        is_complex = torch.is_complex(x)
+        return x, is_complex
+
+    def debug_forward(self, x):
+        if cuda_extension is None:
+            raise RuntimeError("cuda_extension is not available; compile kernels first")
+        x = cuda_extension.norm2_channel(x)
+        yield "step_001", x
+        x = cuda_extension.upsample_bilinear2d(x, self.scale_factor, self.align_corners)
+        yield "step_002", x
+        is_complex = torch.is_complex(x)
+        yield "step_003", is_complex
+        yield "step_004", (x, is_complex)

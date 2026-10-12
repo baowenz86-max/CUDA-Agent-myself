@@ -1,0 +1,294 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,142 @@
++// custom_ops.cu
++#include <cuda_runtime.h>
++
++// Kernel: compute L2 norm over channel dimension (dim=1) with keepdim=True.
++// Input: [N, C, H, W] float32
++// Output: [N, 1, H, W] float32
++// Each thread handles one spatial location (n, h, w) and reduces over channels.
++__global__ void norm2_channel_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int in_stride_n, int in_stride_c, int in_stride_h, int in_stride_w,
++    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w)
++{
++    int total = N * H * W;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        int n = i / (H * W);
++        int rem = i % (H * W);
++        int h = rem / W;
++        int w = rem % W;
++        float sum_sq = 0.0f;
++        const float* in_base = input + n * in_stride_n + h * in_stride_h + w * in_stride_w;
++        for (int c = 0; c < C; ++c) {
++            float val = in_base[c * in_stride_c];
++            sum_sq += val * val;
++        }
++        float norm = sqrtf(sum_sq);
++        output[n * out_stride_n + h * out_stride_h + w * out_stride_w] = norm;
++    }
++}
++
++// Launcher for norm2_channel.
++extern "C" void norm2_channel_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int in_stride_n, int in_stride_c, int in_stride_h, int in_stride_w,
++    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w,
++    cudaStream_t stream)
++{
++    int total = N * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    // Cap blocks to avoid excessive grid dimension; grid-stride loop handles remainder.
++    if (blocks > 65535) blocks = 65535;
++    norm2_channel_kernel<<<blocks, threads, 0, stream>>>(
++        input, output,
++        N, C, H, W,
++        in_stride_n, in_stride_c, in_stride_h, in_stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w);
++}
++
++// Kernel: bilinear upsampling (2D) for float32.
++// Input: [N, C, Hin, Win] float32
++// Output: [N, C, Hout, Wout] float32
++// Supports align_corners true/false.
++// Each thread computes one output element.
++__global__ void upsample_bilinear2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int Hin, int Win,
++    int Hout, int Wout,
++    int in_stride_n, int in_stride_c, int in_stride_h, int in_stride_w,
++    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w,
++    bool align_corners)
++{
++    int total = N * C * Hout * Wout;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        int w_out = i % Wout;
++        int tmp = i / Wout;
++        int h_out = tmp % Hout;
++        tmp /= Hout;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        float h_in, w_in;
++        if (align_corners) {
++            // PyTorch formula when align_corners=True
++            h_in = (Hout > 1) ? (float)h_out * (Hin - 1) / (Hout - 1) : 0.0f;
++            w_in = (Wout > 1) ? (float)w_out * (Win - 1) / (Wout - 1) : 0.0f;
++        } else {
++            // PyTorch formula when align_corners=False
++            h_in = ((float)h_out + 0.5f) * (Hin / (float)Hout) - 0.5f;
++            w_in = ((float)w_out + 0.5f) * (Win / (float)Wout) - 0.5f;
++            h_in = maxf(0.0f, h_in);
++            w_in = maxf(0.0f, w_in);
++        }
++
++        int h0 = (int)h_in;
++        int w0 = (int)w_in;
++        int h1 = h0 + 1;
++        int w1 = w0 + 1;
++
++        // Clamp indices to valid range for edge cases (align_corners=False may produce -0.5 or slightly out)
++        h0 = max(0, min(h0, Hin - 1));
++        h1 = max(0, min(h1, Hin - 1));
++        w0 = max(0, min(w0, Win - 1));
++        w1 = max(0, min(w1, Win - 1));
++
++        float h_lambda = h_in - (float)h0;
++        float w_lambda = w_in - (float)w0;
++
++        const float* in_n_c = input + n * in_stride_n + c * in_stride_c;
++        float v00 = in_n_c[h0 * in_stride_h + w0 * in_stride_w];
++        float v01 = in_n_c[h0 * in_stride_h + w1 * in_stride_w];
++        float v10 = in_n_c[h1 * in_stride_h + w0 * in_stride_w];
++        float v11 = in_n_c[h1 * in_stride_h + w1 * in_stride_w];
++
++        float top = v00 * (1.0f - w_lambda) + v01 * w_lambda;
++        float bottom = v10 * (1.0f - w_lambda) + v11 * w_lambda;
++        float result = top * (1.0f - h_lambda) + bottom * h_lambda;
++
++        output[n * out_stride_n + c * out_stride_c + h_out * out_stride_h + w_out * out_stride_w] = result;
++    }
++}
++
++// Launcher for bilinear upsampling.
++extern "C" void upsample_bilinear2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int Hin, int Win,
++    int Hout, int Wout,
++    int in_stride_n, int in_stride_c, int in_stride_h, int in_stride_w,
++    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w,
++    bool align_corners,
++    cudaStream_t stream)
++{
++    int total = N * C * Hout * Wout;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    upsample_bilinear2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output,
++        N, C, Hin, Win, Hout, Wout,
++        in_stride_n, in_stride_c, in_stride_h, in_stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w,
++        align_corners);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,108 @@
++// custom_ops_binding.cpp: PyTorch bindings for custom_ops.cu launchers
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void norm2_channel_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int in_stride_n, int in_stride_c, int in_stride_h, int in_stride_w,
++    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w,
++    cudaStream_t stream);
++
++extern "C" void upsample_bilinear2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int Hin, int Win,
++    int Hout, int Wout,
++    int in_stride_n, int in_stride_c, int in_stride_h, int in_stride_w,
++    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w,
++    bool align_corners,
++    cudaStream_t stream);
++
++// norm2_channel: L2 norm over channel dimension with keepdim=True.
++// Input: [N, C, H, W] float32
++// Output: [N, 1, H, W] float32
++static torch::Tensor norm2_channel(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "norm2_channel: input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "norm2_channel: input must be 4D (N, C, H, W)");
++    TORCH_CHECK(input.size(1) > 0, "norm2_channel: channel dimension must be positive");
++    TORCH_CHECK(input.is_contiguous(), "norm2_channel: input must be contiguous");
++    TORCH_CHECK(input.scalar_type() == at::kFloat || input.scalar_type() == at::kDouble ||
++                input.scalar_type() == at::kHalf || input.scalar_type() == at::kBFloat16,
++                "norm2_channel: input dtype must be floating point");
++    if (input.scalar_type() == at::kComplexFloat || input.scalar_type() == at::kComplexDouble) {
++        TORCH_CHECK(false, "norm2_channel: complex input not supported");
++    }
++    // Convert to float32 for kernel execution if needed.
++    torch::Tensor x = input;
++    if (input.scalar_type() != at::kFloat) {
++        x = input.to(torch::kFloat32);
++    }
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++    auto output = torch::empty({N, 1, H, W}, x.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    norm2_channel_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        (int)N, (int)C, (int)H, (int)W,
++        (int)x.stride(0), (int)x.stride(1), (int)x.stride(2), (int)x.stride(3),
++        (int)output.stride(0), (int)output.stride(1), (int)output.stride(2), (int)output.stride(3),
++        stream);
++    return output;
++}
++
++// upsample_bilinear2d: bilinear upsampling 2D.
++// Input: [N, C, Hin, Win] float32
++// Output: [N, C, Hout, Wout] float32
++static torch::Tensor upsample_bilinear2d(
++    torch::Tensor input,
++    double scale_factor,
++    bool align_corners) {
++    TORCH_CHECK(input.is_cuda(), "upsample_bilinear2d: input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "upsample_bilinear2d: input must be 4D (N, C, Hin, Win)");
++    TORCH_CHECK(input.is_contiguous(), "upsample_bilinear2d: input must be contiguous");
++    TORCH_CHECK(input.scalar_type() == at::kFloat || input.scalar_type() == at::kDouble ||
++                input.scalar_type() == at::kHalf || input.scalar_type() == at::kBFloat16,
++                "upsample_bilinear2d: input dtype must be floating point");
++    TORCH_CHECK(scale_factor > 0, "upsample_bilinear2d: scale_factor must be positive");
++    torch::Tensor x = input;
++    if (input.scalar_type() != at::kFloat) {
++        x = input.to(torch::kFloat32);
++    }
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t Hin = x.size(2);
++    int64_t Win = x.size(3);
++    int64_t Hout = static_cast<int64_t>(std::floor(Hin * scale_factor));
++    int64_t Wout = static_cast<int64_t>(std::floor(Win * scale_factor));
++    TORCH_CHECK(Hout > 0 && Wout > 0, "upsample_bilinear2d: output size must be positive");
++    auto output = torch::empty({N, C, Hout, Wout}, x.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    upsample_bilinear2d_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        (int)N, (int)C, (int)Hin, (int)Win,
++        (int)Hout, (int)Wout,
++        (int)x.stride(0), (int)x.stride(1), (int)x.stride(2), (int)x.stride(3),
++        (int)output.stride(0), (int)output.stride(1), (int)output.stride(2), (int)output.stride(3),
++        align_corners,
++        stream);
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("norm2_channel", &norm2_channel, "L2 norm over channel dimension (dim=1) keepdim=True",
++          py::arg("input"));
++    m.def("upsample_bilinear2d", &upsample_bilinear2d, "Bilinear 2D upsampling",
++          py::arg("input"), py::arg("scale_factor"), py::arg("align_corners"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,35 @@
++import torch
++import torch.nn as nn
++
++try:
++    import cuda_extension
++except ImportError:
++    cuda_extension = None
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, scale_factor, mode, align_corners):
++        super().__init__()
++        self.input_size = input_size
++        self.scale_factor = scale_factor
++        self.mode = mode
++        self.align_corners = align_corners
++
++    def forward(self, x):
++        if cuda_extension is None:
++            raise RuntimeError("cuda_extension is not available; compile kernels first")
++        x = cuda_extension.norm2_channel(x)
++        x = cuda_extension.upsample_bilinear2d(x, self.scale_factor, self.align_corners)
++        is_complex = torch.is_complex(x)
++        return x, is_complex
++
++    def debug_forward(self, x):
++        if cuda_extension is None:
++            raise RuntimeError("cuda_extension is not available; compile kernels first")
++        x = cuda_extension.norm2_channel(x)
++        yield "step_001", x
++        x = cuda_extension.upsample_bilinear2d(x, self.scale_factor, self.align_corners)
++        yield "step_002", x
++        is_complex = torch.is_complex(x)
++        yield "step_003", is_complex
++        yield "step_004", (x, is_complex)

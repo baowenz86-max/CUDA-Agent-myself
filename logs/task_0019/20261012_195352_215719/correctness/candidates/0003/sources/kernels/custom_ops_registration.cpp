@@ -1,0 +1,25 @@
+// Torch operator registration for custom CUDA kernels
+#include <torch/library.h>
+#include "../binding_registry.h"
+
+// Declare the C++ wrapper functions from custom_ops_binding.cpp
+torch::Tensor conv_transpose_forward(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    std::vector<int64_t> stride,
+    std::vector<int64_t> padding,
+    std::vector<int64_t> output_padding);
+
+torch::Tensor clamp_forward(torch::Tensor input, double min_val, double max_val);
+torch::Tensor leaky_relu_forward(torch::Tensor input, double negative_slope);
+torch::Tensor triu_forward(torch::Tensor input, int64_t diagonal);
+torch::Tensor add_forward(torch::Tensor input, torch::Tensor bias);
+
+TORCH_LIBRARY(cuda_extension, m) {
+    m.def("conv_transpose_forward", &conv_transpose_forward);
+    m.def("clamp_forward", &clamp_forward);
+    m.def("leaky_relu_forward", &leaky_relu_forward);
+    m.def("triu_forward", &triu_forward);
+    m.def("add_forward", &add_forward);
+}

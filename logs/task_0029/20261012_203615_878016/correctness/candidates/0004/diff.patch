@@ -1,0 +1,196 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,32 +1,38 @@
+ #include <cuda_runtime.h>
++#include <cstdint>
+ 
+-__global__ void fused_unbind_max_kernel(
++// Fused kernel: for each (b,h,w), compute max over C and store value and index.
++// Input: [B, C, H, W] float32 contiguous.
++// Output values: [B, H, W] float32 contiguous (flatten as B*H*W).
++// Output indices: [B, H, W] int64 contiguous.
++__global__ void unbind_max_dim1_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ values,
+     int64_t* __restrict__ indices,
+-    int B, int C, int H, int W)
+-{
+-    int w = blockIdx.y;
+-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-
+-    for (int pos = tid; pos < B * H; pos += stride) {
+-        int b = pos / H;
+-        int h = pos - b * H;
+-
+-        float max_val = -3.402823466e+38f;
++    int B, int C, int H, int W
++) {
++    // Total number of output elements: B*H*W.
++    long long total = (long long)B * H * W;
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (; idx < total; idx += stride) {
++        int w = idx % W;
++        long long tmp = idx / W;
++        int h = tmp % H;
++        int b = tmp / H;
++        // Input index for (b, 0, h, w)
++        long long base = ((long long)b * C * H * W) + (long long)h * W + w;
++        float max_val = input[base];
+         int64_t max_idx = 0;
+-        for (int c = 0; c < C; ++c) {
+-            float val = input[((long long)(b * C + c) * H + h) * W + w];
+-            if (c == 0 || val > max_val) {
++        for (int c = 1; c < C; ++c) {
++            float val = input[base + (long long)c * H * W];
++            if (val > max_val) {
+                 max_val = val;
+-                max_idx = (int64_t)c;
++                max_idx = c;
+             }
+         }
+-
+-        long long out_idx = ((long long)(b * H) + h) * W + w;
+-        values[out_idx] = max_val;
+-        indices[out_idx] = max_idx;
++        values[idx] = max_val;
++        indices[idx] = max_idx;
+     }
+ }
+ 
+@@ -34,14 +40,18 @@
+     const float* input,
+     float* values,
+     int64_t* indices,
+-    int B, int C, int H, int W,
+-    cudaStream_t stream)
+-{
+-    dim3 block(256);
+-    int threads_per_output = 256;
+-    int grid_x = (B * H + threads_per_output - 1) / threads_per_output;
+-    dim3 grid(grid_x, W);
+-
+-    fused_unbind_max_kernel<<<grid, block, 0, stream>>>(
++    int B,
++    int C,
++    int H,
++    int W,
++    cudaStream_t stream
++) {
++    long long total = (long long)B * H * W;
++    const int threads = 256;
++    // Choose grid size to cover total with grid-stride loop.
++    long long blocks_ll = (total + threads - 1) / threads;
++    int blocks = (int)min(blocks_ll, (long long)65535); // gridDim.x max is 65535 on all supported archs
++    if (blocks < 1) blocks = 1;
++    unbind_max_dim1_kernel<<<blocks, threads, 0, stream>>>(
+         input, values, indices, B, C, H, W);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,60 +0,0 @@
+-#include <torch/types.h>
+-#include <torch/csrc/utils/pybind.h>
+-#include <cuda_runtime.h>
+-#include <c10/cuda/CUDAStream.h>
+-#include "../binding_registry.h"
+-
+-extern "C" void custom_unbind_max_launcher(
+-    const float* input,
+-    float* values,
+-    int64_t* indices,
+-    int B, int C, int H, int W,
+-    cudaStream_t stream);
+-
+-std::vector<std::pair<torch::Tensor, torch::Tensor>> custom_unbind_max(torch::Tensor x) {
+-    TORCH_CHECK(x.is_cuda(), "custom_unbind_max: input must be a CUDA tensor");
+-    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_unbind_max: input must be float32");
+-    TORCH_CHECK(x.dim() == 4, "custom_unbind_max: input must be 4D (B, C, H, W)");
+-    TORCH_CHECK(x.is_contiguous(), "custom_unbind_max: input must be contiguous");
+-
+-    int64_t B = x.size(0);
+-    int64_t C = x.size(1);
+-    int64_t H = x.size(2);
+-    int64_t W = x.size(3);
+-
+-    auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
+-    auto options_long  = torch::TensorOptions().dtype(torch::kInt64).device(x.device());
+-    auto values = torch::empty({B, H, W}, options_float);
+-    auto indices = torch::empty({B, H, W}, options_long);
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-
+-    custom_unbind_max_launcher(
+-        x.data_ptr<float>(),
+-        values.data_ptr<float>(),
+-        indices.data_ptr<int64_t>(),
+-        static_cast<int>(B),
+-        static_cast<int>(C),
+-        static_cast<int>(H),
+-        static_cast<int>(W),
+-        stream
+-    );
+-
+-    std::vector<std::pair<torch::Tensor, torch::Tensor>> result;
+-    result.reserve(static_cast<size_t>(W));
+-    for (int64_t w = 0; w < W; ++w) {
+-        torch::Tensor val_w = values.index({torch::indexing::Slice(), torch::indexing::Slice(), w}).contiguous();
+-        torch::Tensor idx_w = indices.index({torch::indexing::Slice(), torch::indexing::Slice(), w}).contiguous();
+-        result.emplace_back(val_w, idx_w);
+-    }
+-
+-    return result;
+-}
+-
+-void register_custom_unbind_max(pybind11::module& m) {
+-    m.def("custom_unbind_max", &custom_unbind_max,
+-          "Perform unbind along last dimension and max over channel dimension",
+-          py::arg("x"));
+-}
+-
+-REGISTER_BINDING(custom_unbind_max, register_custom_unbind_max);
+--- before/model_new.py
++++ after/model_new.py
+@@ -1,6 +1,5 @@
+ import torch
+ import torch.nn as nn
+-import cuda_extension
+ 
+ 
+ class ModelNew(nn.Module):
+@@ -9,17 +8,22 @@
+         self.input_size = input_size
+ 
+     def forward(self, x):
+-        return cuda_extension.custom_unbind_max(x)
++        x_detached = cuda_extension.custom_detach(x)  # custom detach to avoid torch.detach
++        unbind_tuple = cuda_extension.custom_unbind(x_detached, -1)
++        max_results = []
++        for xi in unbind_tuple:
++            values, indices = cuda_extension.custom_max_dim(xi, 1)
++            max_results.append(torch.return_types.max((values, indices)))
++        return max_results
+ 
+     def debug_forward(self, x):
+-        # step_001: torch.detach(x) -> tensor (identity; detach is a no-op for correctness)
+-        x_detached = x
+-        yield "step_001", x_detached
+-
+-        # step_003: final result [torch.max(xi, dim=1) for xi in torch.unbind(x, dim=-1)]
+-        max_list = cuda_extension.custom_unbind_max(x)
+-        yield "step_003", max_list
+-
+-        # step_004: return x
+-        yield "step_004", max_list
+-        return
++        x_detached = cuda_extension.custom_detach(x)
++        yield ('step_001', x_detached)
++        unbind_tuple = cuda_extension.custom_unbind(x_detached, -1)
++        yield ('step_002', unbind_tuple)
++        max_results = []
++        for xi in unbind_tuple:
++            values, indices = cuda_extension.custom_max_dim(xi, 1)
++            max_results.append(torch.return_types.max((values, indices)))
++        yield ('step_003', max_results)
++        yield ('step_004', max_results)

@@ -1,0 +1,561 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,153 +1,141 @@
++// custom_ops.cu : all CUDA kernels and launchers for model_new.py
++// No torch/ATen/c10/pybind dependencies; only raw pointers, scalars, cudaStream_t.
+ #include <cuda_runtime.h>
+ #include <math.h>
+ 
+-// All kernels are float32 only as per contract.
++// -------------------------- Kernel definitions --------------------------
+ 
+-// -----------------------------------------------------------------------------
+-// Conv1d forward: output[b, oc, ol] = bias[oc] + sum_{ic, k} input[b, ic, ol+k] * weight[oc, ic, k]
+-// input is [B, C_in, L_in], weight [C_out, C_in, K], output [B, C_out, L_out]
+-// Assume contiguous tensors, stride: input: (C_in*L_in, L_in, 1), weight: (C_in*K, K, 1), output: (C_out*L_out, L_out, 1)
+-// No padding, stride=1, dilation=1, L_out = L_in - K + 1.
+-// B, C_in, C_out, L_in, L_out are ints passed from binding.
++// Conv1d: in_channels=3, out_channels=64, kernel_size=3, stride=1, no padding, dilation=1.
++// Input: [B, C_in, L_in], weight: [C_out, C_in, K], bias: [C_out] (may be null)
++// Output: [B, C_out, L_out] where L_out = L_in - K + 1 = L_in - 2.
++// Each thread computes one output element (b, co, l).
+ __global__ void conv1d_kernel(
+     const float* __restrict__ input,
+     const float* __restrict__ weight,
+     const float* __restrict__ bias,
+     float* __restrict__ output,
+-    int B, int C_in, int C_out, int L_in, int L_out, int K) {
++    int B, int C_in, int L_in, int C_out, int K, int L_out
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int total = B * C_out * L_out;
+-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int idx = index; idx < total; idx += stride) {
+-        int ol = idx % L_out;
+-        int tmp = idx / L_out;
+-        int oc = tmp % C_out;
+-        int b = tmp / C_out;
+-        float acc = bias[oc];
+-        for (int ic = 0; ic < C_in; ++ic) {
+-            const float* in_ptr = input + b * C_in * L_in + ic * L_in + ol;
+-            const float* w_ptr = weight + oc * C_in * K + ic * K;
+-            #pragma unroll
+-            for (int k = 0; k < K; ++k) {
+-                acc += in_ptr[k] * w_ptr[k];
+-            }
++    if (idx >= total) return;
++    
++    int l = idx % L_out;
++    int co = (idx / L_out) % C_out;
++    int b = idx / (L_out * C_out);
++    
++    float acc = (bias != nullptr) ? bias[co] : 0.0f;
++    for (int ci = 0; ci < C_in; ++ci) {
++        for (int k = 0; k < K; ++k) {
++            acc += input[b * C_in * L_in + ci * L_in + (l + k)] *
++                   weight[co * C_in * K + ci * K + k];
+         }
+-        output[idx] = acc;
+     }
++    output[idx] = acc;
+ }
++
++// Batch matmul A @ A^T: input [B, C, L], output [B, C, C]
++// Each thread computes one output element (b, i, j).
++// Use shared memory tile of A rows to improve performance: each block handles a tile of C length? Since C=64 and L=8190, we can use a 1D grid with each thread computing multiple output elements.
++// Simple kernel: each thread computes one output element with a loop over L.
++__global__ void batch_matmul_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int B, int C, int L
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = B * C * C;
++    if (idx >= total) return;
++    
++    int j = idx % C;
++    int i = (idx / C) % C;
++    int b = idx / (C * C);
++    
++    const float* A_i = input + b * C * L + i * L;
++    const float* A_j = input + b * C * L + j * L; // A^T columns are A rows, but multiplication sum over L
++    float sum = 0.0f;
++    for (int k = 0; k < L; ++k) {
++        sum += A_i[k] * A_j[k];
++    }
++    output[idx] = sum;
++}
++
++// Softplus: y = log(1 + exp(x)), with linear for x > 20 to avoid overflow.
++__global__ void softplus_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int n
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= n) return;
++    float x = input[idx];
++    output[idx] = (x > 20.0f) ? x : log1p(expf(x));
++}
++
++// Add bias: bias shape [C] (or [C,1] but contiguous), broadcast over last dimension of input [B, C, N]
++__global__ void add_bias_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int B, int C, int N
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = B * C * N;
++    if (idx >= total) return;
++    int n = idx % N;
++    int c = (idx / N) % C;
++    output[idx] = input[idx] + bias[c];
++}
++
++// -------------------------- Host launchers (extern "C") --------------------------
+ 
+ extern "C" void conv1d_launcher(
+     const float* input,
+     const float* weight,
+     const float* bias,
+     float* output,
+-    int B, int C_in, int C_out, int L_in, int L_out, int K,
+-    cudaStream_t stream) {
++    int B, int C_in, int L_in, int C_out, int K, int L_out,
++    cudaStream_t stream
++) {
+     int total = B * C_out * L_out;
+-    int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    // Limit blocks to avoid excessive grid size if total huge; but total ~67M, blocks ~262k ok.
+-    conv1d_kernel<<<blocks, threads, 0, stream>>>(input, weight, bias, output, B, C_in, C_out, L_in, L_out, K);
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Batch Matmul: output[b, i, j] = sum_k A[b, i, k] * A[b, j, k]
+-// A is [B, N, K], output [B, N, N]
+-// Because A^T is used, we multiply rows of A with rows of A (dot product over K).
+-__global__ void batch_matmul_kernel(
+-    const float* __restrict__ A,
+-    float* __restrict__ output,
+-    int B, int N, int K) {
+-    int total = B * N * N;
+-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int idx = index; idx < total; idx += stride) {
+-        int j = idx % N;
+-        int tmp = idx / N;
+-        int i = tmp % N;
+-        int b = tmp / N;
+-        const float* row_i = A + b * N * K + i * K;
+-        const float* row_j = A + b * N * K + j * K;
+-        float acc = 0.0f;
+-        for (int k = 0; k < K; ++k) {
+-            acc += row_i[k] * row_j[k];
+-        }
+-        output[idx] = acc;
+-    }
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    conv1d_kernel<<<grid, block, 0, stream>>>(input, weight, bias, output,
++                                               B, C_in, L_in, C_out, K, L_out);
+ }
+ 
+ extern "C" void batch_matmul_launcher(
+-    const float* A,
++    const float* input,
+     float* output,
+-    int B, int N, int K,
+-    cudaStream_t stream) {
+-    int total = B * N * N;
+-    int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    batch_matmul_kernel<<<blocks, threads, 0, stream>>>(A, output, B, N, K);
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Softplus: output = log(1 + exp(x)), with linear fallback for x > threshold
+-// PyTorch default: beta=1, threshold=20
+-__global__ void softplus_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    int total,
+-    float threshold) {
+-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int idx = index; idx < total; idx += stride) {
+-        float x = input[idx];
+-        float y;
+-        if (x > threshold) {
+-            y = x;
+-        } else {
+-            y = log1pf(expf(x));
+-        }
+-        output[idx] = y;
+-    }
++    int B, int C, int L,
++    cudaStream_t stream
++) {
++    int total = B * C * C;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    batch_matmul_kernel<<<grid, block, 0, stream>>>(input, output, B, C, L);
+ }
+ 
+ extern "C" void softplus_launcher(
+     const float* input,
+     float* output,
+-    int total,
+-    float threshold,
+-    cudaStream_t stream) {
+-    int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    softplus_kernel<<<blocks, threads, 0, stream>>>(input, output, total, threshold);
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Add bias: output[b, c, n] = input[b, c, n] + bias[c]
+-// bias shape [C_out, 1] but we treat as array of length C_out; broadcast over last dim.
+-__global__ void add_bias_kernel(
+-    const float* __restrict__ input,
+-    const float* __restrict__ bias,
+-    float* __restrict__ output,
+-    int B, int C_out, int N) {
+-    int total = B * C_out * N;
+-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int idx = index; idx < total; idx += stride) {
+-        int n = idx % N;
+-        int tmp = idx / N;
+-        int c = tmp % C_out;
+-        // b = tmp / C_out not used except for indexing input, but input has same layout with leading B dim.
+-        output[idx] = input[idx] + bias[c];
+-    }
++    int n,
++    cudaStream_t stream
++) {
++    int block = 256;
++    int grid = (n + block - 1) / block;
++    softplus_kernel<<<grid, block, 0, stream>>>(input, output, n);
+ }
+ 
+ extern "C" void add_bias_launcher(
+     const float* input,
+     const float* bias,
+     float* output,
+-    int B, int C_out, int N,
+-    cudaStream_t stream) {
+-    int total = B * C_out * N;
+-    int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    add_bias_kernel<<<blocks, threads, 0, stream>>>(input, bias, output, B, C_out, N);
++    int B, int C, int N,
++    cudaStream_t stream
++) {
++    int total = B * C * N;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    add_bias_kernel<<<grid, block, 0, stream>>>(input, bias, output, B, C, N);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,7 +1,8 @@
++// custom_ops_binding.cpp : PyTorch bindings for custom_ops.cu
++// All Tensor checks, allocations, and pybind registrations.
+ #include <torch/types.h>
+-#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
+ #include <cuda_runtime.h>
+-#include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+@@ -10,158 +11,142 @@
+     const float* weight,
+     const float* bias,
+     float* output,
+-    int B, int C_in, int C_out, int L_in, int L_out, int K,
+-    cudaStream_t stream);
++    int B, int C_in, int L_in, int C_out, int K, int L_out,
++    cudaStream_t stream
++);
+ 
+ extern "C" void batch_matmul_launcher(
+-    const float* A,
++    const float* input,
+     float* output,
+-    int B, int N, int K,
+-    cudaStream_t stream);
++    int B, int C, int L,
++    cudaStream_t stream
++);
+ 
+ extern "C" void softplus_launcher(
+     const float* input,
+     float* output,
+-    int total,
+-    float threshold,
+-    cudaStream_t stream);
++    int n,
++    cudaStream_t stream
++);
+ 
+ extern "C" void add_bias_launcher(
+     const float* input,
+     const float* bias,
+     float* output,
+-    int B, int C_out, int N,
+-    cudaStream_t stream);
++    int B, int C, int N,
++    cudaStream_t stream
++);
+ 
+-// Conv1d wrapper
+-at::Tensor conv1d_forward(
+-    const at::Tensor& input,
+-    const at::Tensor& weight,
+-    const at::Tensor& bias) {
+-    // Validate input
+-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+-    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+-    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+-    TORCH_CHECK(input.dtype() == at::kFloat, "input must be float32");
+-    TORCH_CHECK(weight.dtype() == at::kFloat, "weight must be float32");
+-    TORCH_CHECK(bias.dtype() == at::kFloat, "bias must be float32");
++// Helper to check CUDA float32 contiguous
++static void check_cuda_float32_contiguous(const torch::Tensor& t, const char* name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
+ 
+-    // Conv1d expects 3D input [B, C_in, L]
+-    TORCH_CHECK(input.dim() == 3, "input must be 3D [B, C_in, L]");
++// conv1d_forward: input [B, C_in, L_in], weight [C_out, C_in, K], bias [C_out] optional
++// outputs [B, C_out, L_out]
++torch::Tensor conv1d_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
++    check_cuda_float32_contiguous(input, "input");
++    check_cuda_float32_contiguous(weight, "weight");
++    if (bias.defined()) {
++        check_cuda_float32_contiguous(bias, "bias");
++    }
++
++    TORCH_CHECK(input.dim() == 3, "input must be 3D [B, C_in, L_in]");
+     TORCH_CHECK(weight.dim() == 3, "weight must be 3D [C_out, C_in, K]");
+-    TORCH_CHECK(bias.dim() == 1, "bias must be 1D [C_out]");
+ 
+     int B = input.size(0);
+     int C_in = input.size(1);
+     int L_in = input.size(2);
+     int C_out = weight.size(0);
+     int K = weight.size(2);
++    TORCH_CHECK(weight.size(1) == C_in, "weight input channels must match");
++    TORCH_CHECK(weight.size(2) == K, "kernel size mismatch");
++    TORCH_CHECK(K == 3, "only kernel size 3 supported"); // hardcoded for model
++    int L_out = L_in - K + 1;
++    TORCH_CHECK(L_out > 0, "input length too small for kernel");
++    if (bias.defined()) {
++        TORCH_CHECK(bias.dim() == 1 && bias.size(0) == C_out, "bias must be 1D [C_out]");
++    }
+ 
+-    TORCH_CHECK(weight.size(1) == C_in, "weight C_in dimension mismatch");
+-    TORCH_CHECK(bias.size(0) == C_out, "bias length must match C_out");
+-
+-    int L_out = L_in - K + 1;
+-
+-    // Ensure contiguous
+-    auto input_c = input.contiguous();
+-    auto weight_c = weight.contiguous();
+-    auto bias_c = bias.contiguous();
+-
+-    // Allocate output
+-    auto output = at::empty({B, C_out, L_out}, input.options());
+-
++    auto output = torch::empty({B, C_out, L_out}, input.options());
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     conv1d_launcher(
+-        input_c.data_ptr<float>(),
+-        weight_c.data_ptr<float>(),
+-        bias_c.data_ptr<float>(),
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.defined() ? bias.data_ptr<float>() : nullptr,
+         output.data_ptr<float>(),
+-        B, C_in, C_out, L_in, L_out, K,
+-        stream);
+-
++        B, C_in, L_in, C_out, K, L_out,
++        stream
++    );
+     return output;
+ }
+ 
+-// Batch Matmul wrapper: A is [B, N, K], output is [B, N, N]
+-at::Tensor batch_matmul_forward(const at::Tensor& A) {
+-    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+-    TORCH_CHECK(A.dtype() == at::kFloat, "A must be float32");
+-    TORCH_CHECK(A.dim() == 3, "A must be 3D [B, N, K]");
+-
+-    int B = A.size(0);
+-    int N = A.size(1);
+-    int K = A.size(2);
+-
+-    auto A_c = A.contiguous();
+-    auto output = at::empty({B, N, N}, A.options());
+-
++// batch_matmul_forward: input [B, C, L] -> output [B, C, C] = A @ A^T
++torch::Tensor batch_matmul_forward(torch::Tensor input) {
++    check_cuda_float32_contiguous(input, "input");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D [B, C, L]");
++    int B = input.size(0);
++    int C = input.size(1);
++    int L = input.size(2);
++    auto output = torch::empty({B, C, C}, input.options());
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     batch_matmul_launcher(
+-        A_c.data_ptr<float>(),
++        input.data_ptr<float>(),
+         output.data_ptr<float>(),
+-        B, N, K,
+-        stream);
+-
++        B, C, L,
++        stream
++    );
+     return output;
+ }
+ 
+-// Softplus wrapper (elementwise)
+-at::Tensor softplus_forward(const at::Tensor& input, double threshold = 20.0) {
+-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+-    TORCH_CHECK(input.dtype() == at::kFloat, "input must be float32");
+-
+-    auto input_c = input.contiguous();
+-    auto output = at::empty_like(input_c);
+-
++// softplus_forward: elementwise softplus
++torch::Tensor softplus_forward(torch::Tensor input) {
++    check_cuda_float32_contiguous(input, "input");
++    auto output = torch::empty_like(input);
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     softplus_launcher(
+-        input_c.data_ptr<float>(),
++        input.data_ptr<float>(),
+         output.data_ptr<float>(),
+-        input_c.numel(),
+-        static_cast<float>(threshold),
+-        stream);
+-
++        input.numel(),
++        stream
++    );
+     return output;
+ }
+ 
+-// Add bias wrapper: input [B, C, N], bias [C]
+-at::Tensor add_bias_forward(const at::Tensor& input, const at::Tensor& bias) {
+-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+-    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+-    TORCH_CHECK(input.dtype() == at::kFloat, "input must be float32");
+-    TORCH_CHECK(bias.dtype() == at::kFloat, "bias must be float32");
++// add_bias_forward: input [B, C, N], bias [C] or [C,1] -> output [B, C, N]
++torch::Tensor add_bias_forward(torch::Tensor input, torch::Tensor bias) {
++    check_cuda_float32_contiguous(input, "input");
++    check_cuda_float32_contiguous(bias, "bias");
+     TORCH_CHECK(input.dim() == 3, "input must be 3D [B, C, N]");
+-    TORCH_CHECK(bias.dim() == 1, "bias must be 1D [C]");
+-
++    TORCH_CHECK(bias.dim() == 1 || (bias.dim() == 2 && bias.size(1) == 1), "bias must be 1D [C] or 2D [C,1]");
+     int B = input.size(0);
+     int C = input.size(1);
+     int N = input.size(2);
+-
+-    TORCH_CHECK(bias.size(0) == C, "bias length must match C");
+-
+-    auto input_c = input.contiguous();
+-    auto bias_c = bias.contiguous();
+-    auto output = at::empty_like(input_c);
+-
++    TORCH_CHECK(bias.numel() == C, "bias numel must match C dimension");
++    auto output = torch::empty_like(input);
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     add_bias_launcher(
+-        input_c.data_ptr<float>(),
+-        bias_c.data_ptr<float>(),
++        input.data_ptr<float>(),
++        bias.data_ptr<float>(),
+         output.data_ptr<float>(),
+         B, C, N,
+-        stream);
+-
++        stream
++    );
+     return output;
+ }
+ 
+-// Registration function
++// Register all functions
+ void register_custom_ops(pybind11::module& m) {
+-    m.def("conv1d_forward", &conv1d_forward, "Conv1d forward");
+-    m.def("batch_matmul_forward", &batch_matmul_forward, "Batch matmul forward");
++    m.def("conv1d_forward", &conv1d_forward, "Conv1d forward (custom CUDA)",
++          pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias"));
++    m.def("batch_matmul_forward", &batch_matmul_forward, "Batch matmul A @ A^T",
++          pybind11::arg("input"));
+     m.def("softplus_forward", &softplus_forward, "Softplus forward",
+-          pybind11::arg("input"), pybind11::arg("threshold") = 20.0);
+-    m.def("add_bias_forward", &add_bias_forward, "Add bias forward");
++          pybind11::arg("input"));
++    m.def("add_bias_forward", &add_bias_forward, "Add bias broadcast",
++          pybind11::arg("input"), pybind11::arg("bias"));
+ }
+ 
+-// Auto-register
+ REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -6,23 +6,35 @@
+ class ModelNew(nn.Module):
+     def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+         super().__init__()
++        # Use nn.Conv1d to preserve state_dict keys 'conv1d.weight' and 'conv1d.bias'
+         self.conv1d = nn.Conv1d(in_channels, out_channels, kernel_size)
++        # Additional bias parameter for final addition, state_dict key 'bias'
+         self.bias = nn.Parameter(torch.randn(bias_shape))
+ 
+     def forward(self, x):
++        # Step 1: conv1d
+         x = cuda_extension.conv1d_forward(x, self.conv1d.weight, self.conv1d.bias)
+-        x = cuda_extension.batch_matmul_forward(x, x.transpose(1, 2))
++        # Step 2: batch matmul with transpose (A @ A^T)
++        x = cuda_extension.batch_matmul_forward(x)
++        # Step 3: softplus
+         x = cuda_extension.softplus_forward(x)
++        # Step 4: add bias (shape [out_channels, 1])
+         x = cuda_extension.add_bias_forward(x, self.bias)
+         return x
+ 
+     def debug_forward(self, x):
++        # Must yield checkpoints in same order as reference trace
++        # step_001: after conv1d
+         x = cuda_extension.conv1d_forward(x, self.conv1d.weight, self.conv1d.bias)
+-        yield "step_001", x
+-        x = cuda_extension.batch_matmul_forward(x, x.transpose(1, 2))
+-        yield "step_002", x
++        yield 'step_001', x
++        # step_002: after batch matmul
++        x = cuda_extension.batch_matmul_forward(x)
++        yield 'step_002', x
++        # step_003: after softplus
+         x = cuda_extension.softplus_forward(x)
+-        yield "step_003", x
++        yield 'step_003', x
++        # step_004: after bias add
+         x = cuda_extension.add_bias_forward(x, self.bias)
+-        yield "step_004", x
+-        yield "step_005", x
++        yield 'step_004', x
++        # step_005: final return
++        yield 'step_005', x

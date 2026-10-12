@@ -1,0 +1,250 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,89 @@
++#include <cuda_runtime.h>
++
++// Tanh forward: output = tanh(input)
++__global__ void tanh_forward_kernel(const float* __restrict__ input,
++                                    float* __restrict__ output,
++                                    int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = tanhf(input[i]);
++    }
++}
++
++// LeakyReLU forward: output = input > 0 ? input : negative_slope * input
++__global__ void leaky_relu_forward_kernel(const float* __restrict__ input,
++                                           float* __restrict__ output,
++                                           float negative_slope,
++                                           int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float v = input[i];
++        output[i] = (v > 0.0f) ? v : (negative_slope * v);
++    }
++}
++
++// BatchNorm3d inference: output = (input - running_mean[c]) / sqrt(running_var[c] + eps) * weight[c] + bias[c]
++// Input is 5D: N, C, D, H, W
++__global__ void batch_norm3d_inference_kernel(const float* __restrict__ input,
++                                               float* __restrict__ output,
++                                               const float* __restrict__ weight,
++                                               const float* __restrict__ bias,
++                                               const float* __restrict__ running_mean,
++                                               const float* __restrict__ running_var,
++                                               float eps,
++                                               int64_t N,
++                                               int64_t C,
++                                               int64_t spatial_size) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    int64_t total = N * C * spatial_size;
++    for (int64_t i = idx; i < total; i += stride) {
++        int64_t c = (i / spatial_size) % C;
++        float inv_std = rsqrtf(running_var[c] + eps);
++        output[i] = (input[i] - running_mean[c]) * inv_std * weight[c] + bias[c];
++    }
++}
++
++// Launcher functions (extern "C" to avoid name mangling)
++extern "C" void tanh_forward_launcher(const float* input,
++                                      float* output,
++                                      int64_t numel,
++                                      cudaStream_t stream) {
++    const int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    // Cap blocks to avoid excessive grid size; grid-stride loop handles the rest
++    if (blocks > 65535) blocks = 65535;
++    tanh_forward_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++extern "C" void leaky_relu_forward_launcher(const float* input,
++                                            float* output,
++                                            float negative_slope,
++                                            int64_t numel,
++                                            cudaStream_t stream) {
++    const int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    leaky_relu_forward_kernel<<<blocks, threads, 0, stream>>>(input, output, negative_slope, numel);
++}
++
++extern "C" void batch_norm3d_inference_launcher(const float* input,
++                                                float* output,
++                                                const float* weight,
++                                                const float* bias,
++                                                const float* running_mean,
++                                                const float* running_var,
++                                                float eps,
++                                                int64_t N,
++                                                int64_t C,
++                                                int64_t spatial_size,
++                                                cudaStream_t stream) {
++    const int threads = 256;
++    int64_t total = N * C * spatial_size;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    batch_norm3d_inference_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, weight, bias, running_mean, running_var, eps, N, C, spatial_size);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,113 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void tanh_forward_launcher(const float* input,
++                                      float* output,
++                                      int64_t numel,
++                                      cudaStream_t stream);
++
++extern "C" void leaky_relu_forward_launcher(const float* input,
++                                            float* output,
++                                            float negative_slope,
++                                            int64_t numel,
++                                            cudaStream_t stream);
++
++extern "C" void batch_norm3d_inference_launcher(const float* input,
++                                                float* output,
++                                                const float* weight,
++                                                const float* bias,
++                                                const float* running_mean,
++                                                const float* running_var,
++                                                float eps,
++                                                int64_t N,
++                                                int64_t C,
++                                                int64_t spatial_size,
++                                                cudaStream_t stream);
++
++// Helper to check common tensor requirements
++void check_cuda_float32_contiguous(const torch::Tensor& t, const char* name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++
++// tanh_forward
++at::Tensor tanh_forward(const at::Tensor& input) {
++    check_cuda_float32_contiguous(input, "input");
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    tanh_forward_launcher(input.data_ptr<float>(),
++                          output.data_ptr<float>(),
++                          input.numel(),
++                          stream);
++    return output;
++}
++
++// leaky_relu_forward
++at::Tensor leaky_relu_forward(const at::Tensor& input, double negative_slope) {
++    check_cuda_float32_contiguous(input, "input");
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    leaky_relu_forward_launcher(input.data_ptr<float>(),
++                                output.data_ptr<float>(),
++                                static_cast<float>(negative_slope),
++                                input.numel(),
++                                stream);
++    return output;
++}
++
++// batch_norm3d_inference_forward
++at::Tensor batch_norm3d_inference_forward(const at::Tensor& input,
++                                          const at::Tensor& weight,
++                                          const at::Tensor& bias,
++                                          const at::Tensor& running_mean,
++                                          const at::Tensor& running_var,
++                                          double eps) {
++    check_cuda_float32_contiguous(input, "input");
++    check_cuda_float32_contiguous(weight, "weight");
++    check_cuda_float32_contiguous(bias, "bias");
++    check_cuda_float32_contiguous(running_mean, "running_mean");
++    check_cuda_float32_contiguous(running_var, "running_var");
++    TORCH_CHECK(input.dim() == 5, "input must be 5D (N, C, D, H, W)");
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t D = input.size(2);
++    int64_t H = input.size(3);
++    int64_t W = input.size(4);
++    int64_t spatial_size = D * H * W;
++    TORCH_CHECK(weight.numel() == C, "weight size mismatch");
++    TORCH_CHECK(bias.numel() == C, "bias size mismatch");
++    TORCH_CHECK(running_mean.numel() == C, "running_mean size mismatch");
++    TORCH_CHECK(running_var.numel() == C, "running_var size mismatch");
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    batch_norm3d_inference_launcher(input.data_ptr<float>(),
++                                    output.data_ptr<float>(),
++                                    weight.data_ptr<float>(),
++                                    bias.data_ptr<float>(),
++                                    running_mean.data_ptr<float>(),
++                                    running_var.data_ptr<float>(),
++                                    static_cast<float>(eps),
++                                    N,
++                                    C,
++                                    spatial_size,
++                                    stream);
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("tanh_forward", &tanh_forward, "Tanh forward");
++    m.def("leaky_relu_forward", &leaky_relu_forward, "LeakyReLU forward",
++          pybind11::arg("input"), pybind11::arg("negative_slope"));
++    m.def("batch_norm3d_inference_forward", &batch_norm3d_inference_forward,
++          "BatchNorm3d inference forward",
++          pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias"),
++          pybind11::arg("running_mean"), pybind11::arg("running_var"), pybind11::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,39 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, leaky_relu_negative_slope, batch_norm_num_features):
++        super().__init__()
++        self.leaky_relu_negative_slope = leaky_relu_negative_slope
++        self.batch_norm = nn.BatchNorm3d(num_features=batch_norm_num_features)
++
++    def forward(self, x):
++        x = cuda_extension.tanh_forward(x)
++        x = cuda_extension.leaky_relu_forward(x, self.leaky_relu_negative_slope)
++        x = cuda_extension.batch_norm3d_inference_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.batch_norm.eps,
++        )
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.tanh_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.leaky_relu_forward(x, self.leaky_relu_negative_slope)
++        yield 'step_002', x
++        x = cuda_extension.batch_norm3d_inference_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.batch_norm.eps,
++        )
++        yield 'step_003', x
++        yield 'step_004', x

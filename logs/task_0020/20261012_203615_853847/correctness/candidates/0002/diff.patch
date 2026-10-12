@@ -1,0 +1,525 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,12 +1,8 @@
+ #include <cuda_runtime.h>
+ 
+-// ConvTranspose1d kernel
+-// Input: (batch, in_channels, length_in)
+-// Weight: (in_channels, out_channels, kernel_size)
+-// Bias: (out_channels)
+-// Output: (batch, out_channels, length_out)
+-// length_out = (length_in - 1) * stride - 2 * padding + kernel_size + output_padding
+-// All tensors assumed contiguous.
++// ConvTranspose1d forward kernel
++// Computes output[b][oc][j] = bias[oc] + sum_{ic, k} input[b][ic][i] * weight[ic][oc][k]
++// where i = (j + padding - k) / stride if divisible and 0 <= i < input_length.
+ __global__ void conv_transpose1d_kernel(
+     const float* __restrict__ input,
+     const float* __restrict__ weight,
+@@ -15,42 +11,87 @@
+     int batch_size,
+     int in_channels,
+     int out_channels,
+-    int length_in,
+-    int length_out,
++    int input_length,
++    int output_length,
+     int kernel_size,
+     int stride,
+-    int padding,
+-    int output_padding)
+-{
+-    int total = batch_size * out_channels * length_out;
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int padding
++) {
++    int total = batch_size * out_channels * output_length;
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+     int stride_total = blockDim.x * gridDim.x;
+-    for (int i = idx; i < total; i += stride_total) {
+-        int l_out = i % length_out;
+-        int tmp = i / length_out;
+-        int oc = tmp % out_channels;
+-        int b = tmp / out_channels;
+ 
+-        float sum = 0.0f;
++    for (int idx = tid; idx < total; idx += stride_total) {
++        int b = idx / (out_channels * output_length);
++        int rem = idx % (out_channels * output_length);
++        int oc = rem / output_length;
++        int j = rem % output_length;
++
++        float sum = bias[oc];
+         for (int ic = 0; ic < in_channels; ++ic) {
+-            const float* input_ptr = input + (b * in_channels + ic) * length_in;
+-            const float* weight_ptr = weight + (ic * out_channels + oc) * kernel_size;
+             for (int k = 0; k < kernel_size; ++k) {
+-                int pos = l_out + padding - k;
+-                if (pos >= 0 && pos % stride == 0) {
+-                    int l_in = pos / stride;
+-                    if (l_in < length_in) {
+-                        sum += input_ptr[l_in] * weight_ptr[k];
+-                    }
++                int i = (j + padding - k);
++                if (i < 0 || i % stride != 0) continue;
++                i /= stride;
++                if (i >= 0 && i < input_length) {
++                    sum += input[(b * in_channels + ic) * input_length + i] *
++                           weight[(ic * out_channels + oc) * kernel_size + k];
+                 }
+             }
+         }
+-        output[i] = sum + bias[oc];
++        output[idx] = sum;
+     }
+ }
+ 
+-// Sign kernel: elementwise sign, for float32
+-extern "C" void conv_transpose1d_forward(
++// Sign kernel: out[i] = (in[i] > 0) ? 1 : ((in[i] < 0) ? -1 : 0)
++__global__ void sign_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int total
++) {
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int idx = tid; idx < total; idx += stride) {
++        float val = input[idx];
++        if (val > 0.0f) {
++            output[idx] = 1.0f;
++        } else if (val < 0.0f) {
++            output[idx] = -1.0f;
++        } else {
++            output[idx] = 0.0f;
++        }
++    }
++}
++
++// Embedding kernel: output[b][j][d] = weight[index[b][j]][d]
++__global__ void embedding_kernel(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int batch_size,
++    int seq_len,
++    int embedding_dim,
++    int num_embeddings
++) {
++    int total = batch_size * seq_len * embedding_dim;
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int idx = tid; idx < total; idx += stride) {
++        int d = idx % embedding_dim;
++        int j = (idx / embedding_dim) % seq_len;
++        int b = idx / (embedding_dim * seq_len);
++        int index = (int)indices[b * seq_len + j];
++        // Assuming indices are within [0, num_embeddings), no bounds check needed if trusted.
++        output[idx] = weight[index * embedding_dim + d];
++    }
++}
++
++// Launcher for ConvTranspose1d
++// Parameters: input, weight, bias are float32 tensors on CUDA.
++// output is preallocated with shape [batch_size, out_channels, output_length].
++void conv_transpose1d_launcher(
+     const float* input,
+     const float* weight,
+     const float* bias,
+@@ -58,77 +99,101 @@
+     int batch_size,
+     int in_channels,
+     int out_channels,
+-    int length_in,
+-    int length_out,
++    int input_length,
++    int output_length,
+     int kernel_size,
+     int stride,
+     int padding,
+-    int output_padding,
+-    cudaStream_t stream)
+-{
+-    int total = batch_size * out_channels * length_out;
++    cudaStream_t stream
++) {
++    int total = batch_size * out_channels * output_length;
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+-    if (blocks > 65535) blocks = 65535; // grid cap, kernel uses grid-stride loop
++    // Limit blocks to avoid excessive grid size; grid-stride loop handles rest.
++    if (blocks > 65535) blocks = 65535;
+     conv_transpose1d_kernel<<<blocks, threads, 0, stream>>>(
+         input, weight, bias, output,
+-        batch_size, in_channels, out_channels, length_in, length_out,
+-        kernel_size, stride, padding, output_padding);
++        batch_size, in_channels, out_channels, input_length, output_length,
++        kernel_size, stride, padding
++    );
+ }
+ 
+-__global__ void sign_kernel(const float* __restrict__ input, float* __restrict__ output, int n)
+-{
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int i = idx; i < n; i += stride) {
+-        float v = input[i];
+-        output[i] = (v > 0.0f) - (v < 0.0f);
+-    }
++// Launcher for Sign
++void sign_launcher(
++    const float* input,
++    float* output,
++    int total,
++    cudaStream_t stream
++) {
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    sign_kernel<<<blocks, threads, 0, stream>>>(input, output, total);
+ }
+ 
+-extern "C" void sign_forward(const float* input, float* output, int n, cudaStream_t stream)
+-{
+-    int threads = 256;
+-    int blocks = (n + threads - 1) / threads;
+-    if (blocks > 65535) blocks = 65535;
+-    sign_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
+-}
+-
+-// Embedding kernel: gather rows from weight
+-__global__ void embedding_kernel(
+-    const int64_t* __restrict__ indices,
+-    const float* __restrict__ weight,
+-    float* __restrict__ output,
+-    int num_indices,
+-    int embedding_dim)
+-{
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int i = idx; i < num_indices; i += stride) {
+-        int64_t index = indices[i];
+-        // Assume indices are valid (< num_embeddings); binding can check but we don't have num_embeddings here.
+-        // We'll rely on weight rows count provided.
+-        // Use float4 for vectorized copy if possible
+-        const float* src = weight + index * embedding_dim;
+-        float* dst = output + i * embedding_dim;
+-        // copy embedding_dim floats
+-        for (int j = 0; j < embedding_dim; ++j) {
+-            dst[j] = src[j];
+-        }
+-    }
+-}
+-
+-extern "C" void embedding_forward(
++// Launcher for Embedding
++void embedding_launcher(
+     const int64_t* indices,
+     const float* weight,
+     float* output,
+-    int num_indices,
++    int batch_size,
++    int seq_len,
+     int embedding_dim,
+-    cudaStream_t stream)
+-{
++    int num_embeddings,
++    cudaStream_t stream
++) {
++    int total = batch_size * seq_len * embedding_dim;
+     int threads = 256;
+-    int blocks = (num_indices + threads - 1) / threads;
++    int blocks = (total + threads - 1) / threads;
+     if (blocks > 65535) blocks = 65535;
+     embedding_kernel<<<blocks, threads, 0, stream>>>(
+-        indices, weight, output, num_indices, embedding_dim);
++        indices, weight, output,
++        batch_size, seq_len, embedding_dim, num_embeddings
++    );
+ }
++
++// C-interface launchers with extern "C" to avoid mangling issues.
++extern "C" {
++    void conv_transpose1d_forward(
++        const float* input,
++        const float* weight,
++        const float* bias,
++        float* output,
++        int batch_size,
++        int in_channels,
++        int out_channels,
++        int input_length,
++        int output_length,
++        int kernel_size,
++        int stride,
++        int padding,
++        cudaStream_t stream
++    ) {
++        conv_transpose1d_launcher(input, weight, bias, output,
++                                  batch_size, in_channels, out_channels,
++                                  input_length, output_length, kernel_size, stride, padding, stream);
++    }
++
++    void sign_forward(
++        const float* input,
++        float* output,
++        int total,
++        cudaStream_t stream
++    ) {
++        sign_launcher(input, output, total, stream);
++    }
++
++    void embedding_forward(
++        const int64_t* indices,
++        const float* weight,
++        float* output,
++        int batch_size,
++        int seq_len,
++        int embedding_dim,
++        int num_embeddings,
++        cudaStream_t stream
++    ) {
++        embedding_launcher(indices, weight, output,
++                           batch_size, seq_len, embedding_dim, num_embeddings, stream);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,160 +0,0 @@
+-#include <torch/types.h>
+-#include <torch/csrc/utils/pybind.h>
+-#include <cuda_runtime.h>
+-#include <c10/cuda/CUDAStream.h>
+-#include "../binding_registry.h"
+-
+-// Declare launchers from custom_ops.cu
+-extern "C" void conv_transpose1d_forward(
+-    const float* input,
+-    const float* weight,
+-    const float* bias,
+-    float* output,
+-    int batch_size,
+-    int in_channels,
+-    int out_channels,
+-    int length_in,
+-    int length_out,
+-    int kernel_size,
+-    int stride,
+-    int padding,
+-    int output_padding,
+-    cudaStream_t stream
+-);
+-
+-extern "C" void sign_forward(
+-    const float* input,
+-    float* output,
+-    int n,
+-    cudaStream_t stream
+-);
+-
+-extern "C" void embedding_forward(
+-    const int64_t* indices,
+-    const float* weight,
+-    float* output,
+-    int num_indices,
+-    int embedding_dim,
+-    cudaStream_t stream
+-);
+-
+-// ConvTranspose1d binding
+-at::Tensor conv_transpose1d(
+-    at::Tensor input,
+-    at::Tensor weight,
+-    at::Tensor bias,
+-    int64_t kernel_size,
+-    int64_t stride,
+-    int64_t padding,
+-    int64_t output_padding
+-) {
+-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+-    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+-    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+-    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+-    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+-    TORCH_CHECK(input.dim() == 3, "input must be 3D (batch, channels, length)");
+-    TORCH_CHECK(weight.dim() == 3, "weight must be 3D (in_channels, out_channels, kernel_size)");
+-    TORCH_CHECK(bias.dim() == 1, "bias must be 1D (out_channels)");
+-    TORCH_CHECK(input.dtype() == at::kFloat, "input must be float32");
+-    TORCH_CHECK(weight.dtype() == at::kFloat, "weight must be float32");
+-    TORCH_CHECK(bias.dtype() == at::kFloat, "bias must be float32");
+-
+-    int64_t batch_size = input.size(0);
+-    int64_t in_channels = input.size(1);
+-    int64_t length_in = input.size(2);
+-    int64_t out_channels = weight.size(1);
+-    int64_t k = weight.size(2);
+-
+-    TORCH_CHECK(kernel_size == k, "kernel_size mismatch");
+-    TORCH_CHECK(weight.size(0) == in_channels, "in_channels mismatch");
+-    TORCH_CHECK(bias.size(0) == out_channels, "out_channels mismatch");
+-
+-    int64_t length_out = (length_in - 1) * stride - 2 * padding + kernel_size + output_padding;
+-    TORCH_CHECK(length_out > 0, "computed output length must be positive");
+-
+-    auto output = at::empty({batch_size, out_channels, length_out}, input.options());
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-
+-    conv_transpose1d_forward(
+-        input.data_ptr<float>(),
+-        weight.data_ptr<float>(),
+-        bias.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        static_cast<int>(batch_size),
+-        static_cast<int>(in_channels),
+-        static_cast<int>(out_channels),
+-        static_cast<int>(length_in),
+-        static_cast<int>(length_out),
+-        static_cast<int>(kernel_size),
+-        static_cast<int>(stride),
+-        static_cast<int>(padding),
+-        static_cast<int>(output_padding),
+-        stream
+-    );
+-
+-    return output;
+-}
+-
+-// Sign binding
+-at::Tensor sign(at::Tensor input) {
+-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+-    TORCH_CHECK(input.dtype() == at::kFloat, "input must be float32");
+-
+-    auto output = at::empty_like(input);
+-    int numel = static_cast<int>(input.numel());
+-    TORCH_CHECK(numel <= INT_MAX, "input too large for int indexing");
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    sign_forward(
+-        input.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        numel,
+-        stream
+-    );
+-
+-    return output;
+-}
+-
+-// Embedding binding
+-at::Tensor embedding(at::Tensor indices, at::Tensor weight) {
+-    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
+-    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+-    TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
+-    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+-    TORCH_CHECK(weight.dim() == 2, "weight must be 2D (num_embeddings, embedding_dim)");
+-    TORCH_CHECK(indices.dtype() == at::kLong, "indices must be int64");
+-    TORCH_CHECK(weight.dtype() == at::kFloat, "weight must be float32");
+-
+-    int64_t num_indices = indices.numel();
+-    int64_t embedding_dim = weight.size(1);
+-
+-    auto output = at::empty({num_indices, embedding_dim}, weight.options());
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    embedding_forward(
+-        indices.data_ptr<int64_t>(),
+-        weight.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        static_cast<int>(num_indices),
+-        static_cast<int>(embedding_dim),
+-        stream
+-    );
+-
+-    return output;
+-}
+-
+-// Register all functions
+-void register_custom_ops(pybind11::module& m) {
+-    m.def("conv_transpose1d_forward", &conv_transpose1d,
+-          "ConvTranspose1d forward",
+-          py::arg("input"), py::arg("weight"), py::arg("bias"),
+-          py::arg("kernel_size"), py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
+-    m.def("sign_forward", &sign, "Sign forward", py::arg("input"));
+-    m.def("embedding_forward", &embedding, "Embedding forward", py::arg("indices"), py::arg("weight"));
+-}
+-
+-REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -8,60 +8,36 @@
+         self, in_channels, out_channels, kernel_size, stride, padding, output_padding, num_embeddings, embedding_dim
+     ):
+         super().__init__()
+-        # 保持与原始 nn.ConvTranspose1d 和 nn.Embedding 相同的参数结构
+         self.conv_transpose1d = nn.ConvTranspose1d(
+             in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding
+         )
+         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+-        # 缓存标量参数供自定义算子使用
+-        self.in_channels = in_channels
+-        self.out_channels = out_channels
+-        self.kernel_size = kernel_size
+-        self.stride = stride
+-        self.padding = padding
+-        self.output_padding = output_padding
+-        self.num_embeddings = num_embeddings
+-        self.embedding_dim = embedding_dim
+ 
+     def forward(self, x, indices):
+-        # 步骤1: ConvTranspose1d
+         x = cuda_extension.conv_transpose1d_forward(
+             x,
+             self.conv_transpose1d.weight,
+             self.conv_transpose1d.bias,
+-            self.kernel_size,
+-            self.stride,
+-            self.padding,
+-            self.output_padding,
++            self.conv_transpose1d.stride[0],
++            self.conv_transpose1d.padding[0],
++            self.conv_transpose1d.output_padding[0],
+         )
+-        # 步骤2: sign
+         x = cuda_extension.sign_forward(x)
+-        # 步骤3: embedding
+-        embedded = cuda_extension.embedding_forward(
+-            indices,
+-            self.embedding.weight,
+-        )
++        embedded = cuda_extension.embedding_forward(indices, self.embedding.weight)
+         return x, embedded
+ 
+     def debug_forward(self, x, indices):
+-        # 按 checkpoints 顺序 yield (id, value)
+         x = cuda_extension.conv_transpose1d_forward(
+             x,
+             self.conv_transpose1d.weight,
+             self.conv_transpose1d.bias,
+-            self.kernel_size,
+-            self.stride,
+-            self.padding,
+-            self.output_padding,
++            self.conv_transpose1d.stride[0],
++            self.conv_transpose1d.padding[0],
++            self.conv_transpose1d.output_padding[0],
+         )
+-        yield "step_001", x
++        yield 'step_001', x
+         x = cuda_extension.sign_forward(x)
+-        yield "step_002", x
+-        embedded = cuda_extension.embedding_forward(
+-            indices,
+-            self.embedding.weight,
+-        )
+-        yield "step_003", embedded
+-        result = (x, embedded)
+-        yield "step_004", result
+-        return  # debug_forward 是一个 generator，不需要显式返回 result
++        yield 'step_002', x
++        embedded = cuda_extension.embedding_forward(indices, self.embedding.weight)
++        yield 'step_003', embedded
++        yield 'step_004', (x, embedded)

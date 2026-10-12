@@ -1,130 +1,159 @@
+// CUDA kernels for reflection_pad2d, ge_scalar, remainder_scalar
 #include <cuda_runtime.h>
-#include <torch/types.h>
-#include <c10/cuda/CUDAStream.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include "../binding_registry.h"
 
-namespace py = pybind11;
+// Helper to reflect index in [0, dim-1]
+__device__ __forceinline__ int reflect_index(int idx, int dim) {
+    if (idx < 0) return -idx;
+    if (idx >= dim) return 2 * dim - idx - 2;
+    return idx;
+}
 
-// Fused kernel: reflection padding, ge(0), remainder(2)
-// Input: float tensor (N, C, H, W)
-// Output: int64 tensor (N, C, H+pad_top+pad_bottom, W+pad_left+pad_right)
-__global__ void fused_pad_ge_remainder_kernel(
+// Kernel for reflection padding 2D with arbitrary padding sizes and strides
+__global__ void reflection_pad2d_kernel(
     const float* __restrict__ input,
-    int64_t* __restrict__ output,
+    float* __restrict__ output,
     int N, int C, int H, int W,
     int pad_left, int pad_right, int pad_top, int pad_bottom,
-    int out_H, int out_W,
-    long total_elements)
-{
-    long idx = blockIdx.x * blockDim.x + threadIdx.x;
-    long stride = (long)blockDim.x * gridDim.x;
+    int in_stride_n, int in_stride_c, int in_stride_h, int in_stride_w,
+    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w,
+    int out_height, int out_width) {
 
-    for (long i = idx; i < total_elements; i += stride) {
-        int ow = i % out_W;
-        long tmp = i / out_W;
-        int oh = tmp % out_H;
-        tmp /= out_H;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * out_height * out_width;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int i = idx; i < total; i += stride) {
+        // Decode output index
+        int w = i % out_width;
+        int tmp = i / out_width;
+        int h = tmp % out_height;
+        tmp /= out_height;
         int c = tmp % C;
         int n = tmp / C;
 
-        // Reflection padding index calculation for width
-        int iw;
-        if (ow < pad_left) {
-            iw = pad_left - ow;
-        } else if (ow >= pad_left + W) {
-            iw = 2 * W + pad_left - ow - 2;
-        } else {
-            iw = ow - pad_left;
-        }
+        // Compute corresponding input coordinates with reflection
+        int in_h = h - pad_top;
+        int in_w = w - pad_left;
+        in_h = reflect_index(in_h, H);
+        in_w = reflect_index(in_w, W);
 
-        // Reflection padding index calculation for height
-        int ih;
-        if (oh < pad_top) {
-            ih = pad_top - oh;
-        } else if (oh >= pad_top + H) {
-            ih = 2 * H + pad_top - oh - 2;
-        } else {
-            ih = oh - pad_top;
-        }
+        // Read input value using strides
+        const float* in_ptr = input + n * in_stride_n + c * in_stride_c + in_h * in_stride_h + in_w * in_stride_w;
+        float val = *in_ptr;
 
-        float val = input[((long)n * C + c) * H * W + (long)ih * W + iw];
-
-        // greater-than-equal zero: returns 1.0f if true, 0.0f if false
-        float ge_result = (val >= 0.0f) ? 1.0f : 0.0f;
-
-        // remainder with 2: result is ge_result - floor(ge_result/2)*2
-        // Since ge_result is 0 or 1, floor division by 2 gives 0, remainder is ge_result
-        // So remainder = ge_result
-        int64_t rem_result = (int64_t)(ge_result);
-
-        output[i] = rem_result;
+        // Write output
+        float* out_ptr = output + n * out_stride_n + c * out_stride_c + h * out_stride_h + w * out_stride_w;
+        *out_ptr = val;
     }
 }
 
-// Host launcher for the fused operation
-torch::Tensor custom_ops_forward(
-    torch::Tensor input,
-    int64_t pad_left,
-    int64_t pad_right,
-    int64_t pad_top,
-    int64_t pad_bottom)
-{
-    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
-    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
-    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N,C,H,W)");
+// Kernel for ge_scalar: input >= scalar, output bool (as unsigned char)
+__global__ void ge_scalar_kernel(
+    const float* __restrict__ input,
+    unsigned char* __restrict__ output,
+    float scalar,
+    int total_elements,
+    int in_stride_n, int in_stride_c, int in_stride_h, int in_stride_w,
+    int H, int W, int C) {
 
-    // Make input contiguous if not already
-    if (!input.is_contiguous()) {
-        input = input.contiguous();
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int i = idx; i < total_elements; i += stride) {
+        // Decode index assuming contiguous output? But input may be non-contiguous.
+        // However, ge_scalar is applied on the padded tensor which is contiguous from our launcher.
+        // For generality, we handle non-contiguous by using strides.
+        // We assume output is contiguous with same shape. We need shape info: but total_elements suffices for flat index.
+        int w = i % W;
+        int tmp = i / W;
+        int h = tmp % H;
+        tmp /= H;
+        int c = tmp % C;
+        int n = tmp / C;
+
+        // Here we need shapes and strides. We'll pass them.
+        const float* in_ptr = input + n * in_stride_n + c * in_stride_c + h * in_stride_h + w * in_stride_w;
+        float val = *in_ptr;
+        unsigned char result = (val >= scalar) ? 1 : 0;
+        output[i] = result;
     }
+}
 
-    int N = input.size(0);
-    int C = input.size(1);
-    int H = input.size(2);
-    int W = input.size(3);
+// Kernel for remainder_scalar: input (bool or int) % scalar, output int64.
+// We operate on bool input (as unsigned char) and output int64 (long long).
+__global__ void remainder_scalar_kernel(
+    const unsigned char* __restrict__ input,
+    long long* __restrict__ output,
+    double scalar,
+    int total_elements) {
 
-    int out_H = H + pad_top + pad_bottom;
-    int out_W = W + pad_left + pad_right;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
 
-    auto output = torch::empty({N, C, out_H, out_W}, input.options().dtype(torch::kInt64));
-
-    long total_elements = (long)N * C * out_H * out_W;
-    if (total_elements == 0) {
-        return output;
+    for (int i = idx; i < total_elements; i += stride) {
+        // input is bool (0 or 1), scalar is 2.0 -> result 0 or 1 (as int64)
+        unsigned char val = input[i];
+        // Use Python-like modulo: result = val - floor(val/scalar)*scalar
+        // For val in {0,1}, scalar=2, result is 0 or 1.
+        double dval = (double)val;
+        double rem = dval - floor(dval / scalar) * scalar;
+        output[i] = (long long)rem;
     }
+}
 
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+// Launchers (extern "C")
 
-    int block_size = 256;
-    int grid_size = (total_elements + block_size - 1) / block_size;
-    // Cap grid size to 65535 and use grid-stride loop if needed
-    if (grid_size > 65535) {
-        grid_size = 65535;
-    }
+extern "C" void reflection_pad2d_forward(
+    const float* input,
+    float* output,
+    int N, int C, int H, int W,
+    int pad_left, int pad_right, int pad_top, int pad_bottom,
+    long long in_stride_n, long long in_stride_c, long long in_stride_h, long long in_stride_w,
+    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
+    int out_height, int out_width,
+    cudaStream_t stream) {
 
-    fused_pad_ge_remainder_kernel<<<grid_size, block_size, 0, stream>>>(
-        input.data_ptr<float>(),
-        output.data_ptr<int64_t>(),
-        N, C, H, W,
+    int total = N * C * out_height * out_width;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    // Cap blocks to avoid excessive grid launch; use at most 65535 blocks for older GPUs
+    if (blocks > 65535) blocks = 65535;
+    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
+        input, output, N, C, H, W,
         pad_left, pad_right, pad_top, pad_bottom,
-        out_H, out_W,
-        total_elements
-    );
-
-    return output;
+        (int)in_stride_n, (int)in_stride_c, (int)in_stride_h, (int)in_stride_w,
+        (int)out_stride_n, (int)out_stride_c, (int)out_stride_h, (int)out_stride_w,
+        out_height, out_width);
 }
 
-// Binding registration
-void register_custom_ops(py::module& m) {
-    m.def("custom_ops_forward", &custom_ops_forward,
-          "Fused reflection pad + ge + remainder",
-          py::arg("input"),
-          py::arg("pad_left"),
-          py::arg("pad_right"),
-          py::arg("pad_top"),
-          py::arg("pad_bottom"));
+extern "C" void ge_scalar_forward(
+    const float* input,
+    unsigned char* output,
+    float scalar,
+    int total_elements,
+    long long in_stride_n, long long in_stride_c, long long in_stride_h, long long in_stride_w,
+    int H, int W, int C,
+    cudaStream_t stream) {
+
+    int threads = 256;
+    int blocks = (total_elements + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    ge_scalar_kernel<<<blocks, threads, 0, stream>>>(
+        input, output, scalar, total_elements,
+        (int)in_stride_n, (int)in_stride_c, (int)in_stride_h, (int)in_stride_w,
+        H, W, C);
 }
 
-REGISTER_BINDING(custom_ops, register_custom_ops);
+extern "C" void remainder_scalar_forward(
+    const unsigned char* input,
+    long long* output,
+    double scalar,
+    int total_elements,
+    cudaStream_t stream) {
+
+    int threads = 256;
+    int blocks = (total_elements + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    remainder_scalar_kernel<<<blocks, threads, 0, stream>>>(
+        input, output, scalar, total_elements);
+}

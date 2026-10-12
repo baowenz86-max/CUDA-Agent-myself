@@ -1,0 +1,318 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,144 @@
++#include <cuda_runtime.h>
++#include <float.h>
++
++// -----------------------------------------------------------------------------
++// Kernel 1: AddMM forward
++// Computes C = bias + A * B^T
++// A is [M, K], B is [N, K] (i.e., weight.t() from [K, N])
++// Output C is [M, N]
++// bias is [N]
++// All tensors are float32, contiguous.
++// -----------------------------------------------------------------------------
++__global__ void addmm_kernel(const float* __restrict__ A,
++                             const float* __restrict__ B,
++                             const float* __restrict__ bias,
++                             float* __restrict__ C,
++                             int M, int N, int K) {
++    int total = M * N;
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int idx = tid; idx < total; idx += stride) {
++        int row = idx / N;
++        int col = idx % N;
++        float sum = bias[col];
++        for (int k = 0; k < K; ++k) {
++            sum += A[row * K + k] * B[col * K + k];
++        }
++        C[idx] = sum;
++    }
++}
++
++// Launcher for addmm
++// Inputs: bias [N], A [M,K], B [N,K]; Output: C [M,N]
++// All pointers are raw device pointers to float32 data.
++// M, N, K are integers; stream is the CUDA stream.
++extern "C" void addmm_forward_launcher(const float* bias,
++                                       const float* A,
++                                       const float* B,
++                                       float* C,
++                                       int M, int N, int K,
++                                       cudaStream_t stream) {
++    if (M <= 0 || N <= 0 || K <= 0) return;
++    int total = M * N;
++    const int threads = 256;
++    // Choose grid size based on occupancy, cap at max grid (2^31-1) but use grid-stride loop.
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535; // sensible cap, grid-stride loop handles rest
++    addmm_kernel<<<blocks, threads, 0, stream>>>(A, B, bias, C, M, N, K);
++}
++
++// -----------------------------------------------------------------------------
++// Kernel 2: Unsqueeze forward (adds a dimension at specified position, but here only dim=0 is used)
++// Input shape: [M, N], output shape: [1, M, N]. Data is copied.
++// The kernel treats the tensor as flat contiguous memory, so effectively a copy.
++// We provide a generic unsqueeze kernel that handles any dim, but the launcher is
++// specialized for dim=0 for the current use case (since model_new.py always uses dim=0).
++// For safety, implement a simple memcpy-like copy.
++// -----------------------------------------------------------------------------
++__global__ void unsqueeze_copy_kernel(const float* __restrict__ input,
++                                      float* __restrict__ output,
++                                      int total_elements) {
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = tid; i < total_elements; i += stride) {
++        output[i] = input[i];
++    }
++}
++
++// Launcher for unsqueeze
++// We ignore the dim parameter because it doesn't affect the underlying data layout
++// for a contiguous tensor when adding a leading dimension (dim=0).
++// If dim is not 0, the binding layer must handle it, but for our contract dim=0 always.
++extern "C" void unsqueeze_forward_launcher(const float* input,
++                                           float* output,
++                                           int total_elements,
++                                           int dim,
++                                           cudaStream_t stream) {
++    if (total_elements <= 0) return;
++    const int threads = 256;
++    int blocks = (total_elements + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    unsqueeze_copy_kernel<<<blocks, threads, 0, stream>>>(input, output, total_elements);
++}
++
++// -----------------------------------------------------------------------------
++// Kernel 3: Linear interpolation for 3D input [1, M, N] with scale_factor=2
++// Output shape [1, M, 2*N]
++// Align_corners=False: out_x = (in_x + 0.5) * scale - 0.5; clamp to [0, N-1]
++// Here scale = output_width / input_width = 2.0 (since scale_factor=2 and input is [1,M,N])
++// Actually we compute scale_factor as output_size / input_size, where output_size
++// is always 2*N (since scale_factor=2). We assume only scale_factor=2 is used.
++// In general, we can compute using scale_factor parameter given to launcher, but
++// model_new.py passes self.scale_factor which is 2.0. We'll implement for arbitrary
++// positive scale_factor by computing output width as (int)(input_width * scale_factor).
++// However, to be safe, we'll implement using the computed output width.
++// The kernel handles each output element: for each (b=0, m, out_x), find source coordinate.
++// -----------------------------------------------------------------------------
++__global__ void interpolate_linear_kernel(const float* __restrict__ input,
++                                          float* __restrict__ output,
++                                          int input_height,   // M
++                                          int input_width,    // N
++                                          int output_width,   // out_N
++                                          float scale) {
++    int total = input_height * output_width; // batch=1
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int idx = tid; idx < total; idx += stride) {
++        int m = idx / output_width;
++        int out_x = idx % output_width;
++        // Compute source coordinate for align_corners=False
++        float src_x_f = (static_cast<float>(out_x) + 0.5f) * scale - 0.5f;
++        // Clamp to [0, input_width-1]
++        src_x_f = fmaxf(0.0f, fminf(src_x_f, static_cast<float>(input_width - 1)));
++        int x0 = static_cast<int>(floorf(src_x_f));
++        int x1 = min(x0 + 1, input_width - 1);
++        float dx = src_x_f - static_cast<float>(x0);
++        // Linear interpolation along width
++        const float* row_ptr = input + m * input_width;
++        float val = row_ptr[x0] * (1.0f - dx) + row_ptr[x1] * dx;
++        output[idx] = val;
++    }
++}
++
++// Launcher for interpolate_linear
++// Input shape: batch=1, channels=M, length=N (we call height and width generically)
++// Output width = (int)(N * scale_factor). For our case scale_factor=2, so output_width=2*N.
++// We assume contiguous float32 tensor.
++// Note: The binding layer must compute output_width and pass it.
++extern "C" void interpolate_linear_forward_launcher(const float* input,
++                                                    float* output,
++                                                    int input_height,
++                                                    int input_width,
++                                                    int output_width,
++                                                    float scale_factor,
++                                                    cudaStream_t stream) {
++    if (input_height <= 0 || input_width <= 0 || output_width <= 0) return;
++    int total = input_height * output_width;
++    const int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    // scale = (float)input_width / (float)output_width (align_corners=False)
++    float scale = static_cast<float>(input_width) / static_cast<float>(output_width);
++    interpolate_linear_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, input_height, input_width, output_width, scale);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,112 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declarations from custom_ops.cu
++extern "C" void addmm_forward_launcher(const float* bias,
++                                       const float* A,
++                                       const float* B,
++                                       float* C,
++                                       int M, int N, int K,
++                                       cudaStream_t stream);
++
++extern "C" void unsqueeze_forward_launcher(const float* input,
++                                           float* output,
++                                           int total_elements,
++                                           int dim,
++                                           cudaStream_t stream);
++
++extern "C" void interpolate_linear_forward_launcher(const float* input,
++                                                    float* output,
++                                                    int input_height,
++                                                    int input_width,
++                                                    int output_width,
++                                                    float scale_factor,
++                                                    cudaStream_t stream);
++
++// ---------------- addmm_forward ----------------
++torch::Tensor addmm_forward(torch::Tensor bias, torch::Tensor mat1, torch::Tensor mat2) {
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(mat1.is_cuda(), "mat1 must be a CUDA tensor");
++    TORCH_CHECK(mat2.is_cuda(), "mat2 must be a CUDA tensor");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++    TORCH_CHECK(mat1.is_contiguous(), "mat1 must be contiguous");
++    TORCH_CHECK(mat2.is_contiguous(), "mat2 must be contiguous");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(mat1.dtype() == torch::kFloat32, "mat1 must be float32");
++    TORCH_CHECK(mat2.dtype() == torch::kFloat32, "mat2 must be float32");
++    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
++    TORCH_CHECK(mat1.dim() == 2, "mat1 must be 2D");
++    TORCH_CHECK(mat2.dim() == 2, "mat2 must be 2D");
++    int N = bias.size(0);
++    int M = mat1.size(0);
++    int K = mat1.size(1);
++    TORCH_CHECK(mat2.size(0) == N && mat2.size(1) == K,
++                "mat2 must have shape [N, K] = [hidden_size, input_size]");
++    auto C = torch::empty({M, N}, mat1.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    addmm_forward_launcher(bias.data_ptr<float>(),
++                           mat1.data_ptr<float>(),
++                           mat2.data_ptr<float>(),
++                           C.data_ptr<float>(),
++                           M, N, K,
++                           stream);
++    return C;
++}
++
++// ---------------- unsqueeze_forward ----------------
++torch::Tensor unsqueeze_forward(torch::Tensor input, int64_t dim) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(dim == 0, "only dim=0 is supported");
++    auto output = torch::empty_like(input);
++    int total_elements = input.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    unsqueeze_forward_launcher(input.data_ptr<float>(),
++                               output.data_ptr<float>(),
++                               total_elements,
++                               static_cast<int>(dim),
++                               stream);
++    // Unsqueeze to shape [1, *input.sizes()]
++    std::vector<int64_t> out_shape;
++    out_shape.push_back(1);
++    for (auto s : input.sizes()) out_shape.push_back(s);
++    return output.view(out_shape);
++}
++
++// ---------------- interpolate_linear_forward ----------------
++torch::Tensor interpolate_linear_forward(torch::Tensor input, double scale_factor) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D [1, M, N]");
++    TORCH_CHECK(input.size(0) == 1, "batch dimension must be 1 for this task");
++    int64_t M = input.size(1);
++    int64_t N = input.size(2);
++    int64_t out_N = static_cast<int64_t>(N * scale_factor);
++    TORCH_CHECK(out_N > 0, "output width must be positive");
++    auto output = torch::empty({1, M, out_N}, input.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    interpolate_linear_forward_launcher(input.data_ptr<float>(),
++                                        output.data_ptr<float>(),
++                                        static_cast<int>(M),
++                                        static_cast<int>(N),
++                                        static_cast<int>(out_N),
++                                        static_cast<float>(scale_factor),
++                                        stream);
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("addmm_forward", &addmm_forward, "AddMM forward",
++          py::arg("bias"), py::arg("mat1"), py::arg("mat2"));
++    m.def("unsqueeze_forward", &unsqueeze_forward, "Unsqueeze forward",
++          py::arg("input"), py::arg("dim"));
++    m.def("interpolate_linear_forward", &interpolate_linear_forward, "Linear interpolation forward",
++          py::arg("input"), py::arg("scale_factor"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -15,32 +15,35 @@
+ 
+     def forward(self, x):
+         # Step 1: x = torch.addmm(self.bias, x, self.weight.t())
+-        # = bias + x @ weight.t()
+-        # custom op: addmm_custom(bias, x, weight) -> [batch_size, hidden_size]
+-        x = cuda_extension.addmm_custom(self.bias, x, self.weight)
++        # Custom op: addmm_forward(input, mat1, mat2) -> output
++        #   input: bias [hidden_size]
++        #   mat1: x [batch_size, input_size]
++        #   mat2: weight.t() [input_size, hidden_size]
++        # 这里约定 addmm_forward 接收三个张量，返回 [batch_size, hidden_size]
++        x = cuda_extension.addmm_forward(self.bias, x, self.weight.t())
+ 
+-        # Step 2: x = torch.unsqueeze(x, 0)  # Adding a batch dimension
+-        # custom op: unsqueeze_custom(x, dim=0) -> [1, batch_size, hidden_size]
+-        x = cuda_extension.unsqueeze_custom(x, 0)
++        # Step 2: x = torch.unsqueeze(x, 0)
++        # Custom op: unsqueeze_forward(input, dim) -> output
++        x = cuda_extension.unsqueeze_forward(x, 0)
+ 
+-        # Step 3: x = F.interpolate(x, scale_factor=self.scale_factor, mode="linear", align_corners=False)
+-        # custom op: interpolate_linear_custom(x, scale_factor, align_corners=False) -> [1, batch_size, output_size]
+-        x = cuda_extension.interpolate_linear_custom(x, self.scale_factor, False)
++        # Step 3: x = F.interpolate(x, scale_factor=self.scale_factor, mode='linear', align_corners=False)
++        # Custom op: interpolate_linear_forward(input, scale_factor) -> output
++        x = cuda_extension.interpolate_linear_forward(x, self.scale_factor)
++
+         return x
+ 
+     def debug_forward(self, x):
+-        # Same calculations as forward, but yield intermediate checkpoints.
+         # Step 1
+-        x1 = cuda_extension.addmm_custom(self.bias, x, self.weight)
+-        yield ("step_001", x1)
++        x = cuda_extension.addmm_forward(self.bias, x, self.weight.t())
++        yield 'step_001', x
+ 
+         # Step 2
+-        x2 = cuda_extension.unsqueeze_custom(x1, 0)
+-        yield ("step_002", x2)
++        x = cuda_extension.unsqueeze_forward(x, 0)
++        yield 'step_002', x
+ 
+         # Step 3
+-        x3 = cuda_extension.interpolate_linear_custom(x2, self.scale_factor, False)
+-        yield ("step_003", x3)
++        x = cuda_extension.interpolate_linear_forward(x, self.scale_factor)
++        yield 'step_003', x
+ 
+-        # Final return
+-        yield ("step_004", x3)
++        # Final return checkpoint
++        yield 'step_004', x

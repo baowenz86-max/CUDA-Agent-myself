@@ -1,38 +1,30 @@
 import torch
 import torch.nn as nn
-import cuda_extension
+
 
 class ModelNew(nn.Module):
     def __init__(self, in_channels, kernel_size, padding_size):
         super().__init__()
-        # Store padding parameters; kernel_size and in_channels are unused but kept for signature compatibility
-        self.in_channels = in_channels
-        self.kernel_size = kernel_size
-        self.padding_size = padding_size
-        # padding_size is expected to be a tuple (left, right, top, bottom) as in nn.ReflectionPad2d
-        if isinstance(padding_size, int):
-            self.pad_left = self.pad_right = self.pad_top = self.pad_bottom = padding_size
-        else:
-            self.pad_left, self.pad_right, self.pad_top, self.pad_bottom = padding_size
+        # Store padding_size as tuple; kernel_size is unused in this reference model
+        self.padding_size = tuple(padding_size)
 
     def forward(self, x):
-        # Call custom op with padding parameters
-        return cuda_extension.custom_ops_forward(
-            x, self.pad_left, self.pad_right, self.pad_top, self.pad_bottom
-        )
+        import cuda_extension
+        x = cuda_extension.reflection_pad2d_forward(x, self.padding_size)
+        x = cuda_extension.ge_scalar_forward(x, 0.0)
+        x = cuda_extension.remainder_scalar_forward(x, 2.0)
+        return x
 
-    def debug_forward(self, x):
-        # Step 1: Reflection pad (custom op)
-        padded = cuda_extension.reflection_pad2d_forward(
-            x, self.pad_left, self.pad_right, self.pad_top, self.pad_bottom
-        )
+    def debug_forward(self, *inputs):
+        import cuda_extension
+        x = inputs[0]
+        padded = cuda_extension.reflection_pad2d_forward(x, self.padding_size)
         yield 'step_001', padded
-        # Step 2: Greater equal zero (custom op)
-        ge = cuda_extension.ge_forward(padded, 0)
-        yield 'step_002', ge
-        # Step 3: Remainder (custom op)
-        rem = cuda_extension.remainder_forward(ge, 2)
-        yield 'step_003', rem
-        # Step 4: Return (same as rem)
-        yield 'step_004', rem
-        return rem
+
+        ge_out = cuda_extension.ge_scalar_forward(padded, 0.0)
+        yield 'step_002', ge_out
+
+        remainder_out = cuda_extension.remainder_scalar_forward(ge_out, 2.0)
+        yield 'step_003', remainder_out
+
+        yield 'step_004', remainder_out

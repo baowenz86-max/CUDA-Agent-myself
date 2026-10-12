@@ -1,0 +1,68 @@
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -33,16 +33,21 @@
+     TORCH_CHECK(mat2.is_cuda(), "mat2 must be a CUDA tensor");
+     TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+     TORCH_CHECK(mat1.is_contiguous(), "mat1 must be contiguous");
+-    TORCH_CHECK(mat2.is_contiguous(), "mat2 must be contiguous");
++    // mat2 may be non-contiguous if it's a transposed view; we will make it contiguous internally if needed,
++    // but since we pass self.weight directly (contiguous), this should not trigger.
++    if (!mat2.is_contiguous()) {
++        mat2 = mat2.contiguous();
++    }
+     TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+     TORCH_CHECK(mat1.dtype() == torch::kFloat32, "mat1 must be float32");
+     TORCH_CHECK(mat2.dtype() == torch::kFloat32, "mat2 must be float32");
+     TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+     TORCH_CHECK(mat1.dim() == 2, "mat1 must be 2D");
+     TORCH_CHECK(mat2.dim() == 2, "mat2 must be 2D");
+-    int N = bias.size(0);
+-    int M = mat1.size(0);
+-    int K = mat1.size(1);
++    int N = bias.size(0);          // hidden_size
++    int M = mat1.size(0);          // batch_size
++    int K = mat1.size(1);          // input_size
++    // mat2 should be [N, K] = [hidden_size, input_size] for the kernel to compute A*B^T
+     TORCH_CHECK(mat2.size(0) == N && mat2.size(1) == K,
+                 "mat2 must have shape [N, K] = [hidden_size, input_size]");
+     auto C = torch::empty({M, N}, mat1.options());
+@@ -70,7 +75,6 @@
+                                total_elements,
+                                static_cast<int>(dim),
+                                stream);
+-    // Unsqueeze to shape [1, *input.sizes()]
+     std::vector<int64_t> out_shape;
+     out_shape.push_back(1);
+     for (auto s : input.sizes()) out_shape.push_back(s);
+--- before/model_new.py
++++ after/model_new.py
+@@ -15,26 +15,20 @@
+ 
+     def forward(self, x):
+         # Step 1: x = torch.addmm(self.bias, x, self.weight.t())
+-        # Custom op: addmm_forward(input, mat1, mat2) -> output
+-        #   input: bias [hidden_size]
+-        #   mat1: x [batch_size, input_size]
+-        #   mat2: weight.t() [input_size, hidden_size]
+-        # 这里约定 addmm_forward 接收三个张量，返回 [batch_size, hidden_size]
+-        x = cuda_extension.addmm_forward(self.bias, x, self.weight.t())
++        # Use original weight as mat2; kernel computes A * B^T
++        x = cuda_extension.addmm_forward(self.bias, x, self.weight)
+ 
+         # Step 2: x = torch.unsqueeze(x, 0)
+-        # Custom op: unsqueeze_forward(input, dim) -> output
+         x = cuda_extension.unsqueeze_forward(x, 0)
+ 
+         # Step 3: x = F.interpolate(x, scale_factor=self.scale_factor, mode='linear', align_corners=False)
+-        # Custom op: interpolate_linear_forward(input, scale_factor) -> output
+         x = cuda_extension.interpolate_linear_forward(x, self.scale_factor)
+ 
+         return x
+ 
+     def debug_forward(self, x):
+         # Step 1
+-        x = cuda_extension.addmm_forward(self.bias, x, self.weight.t())
++        x = cuda_extension.addmm_forward(self.bias, x, self.weight)
+         yield 'step_001', x
+ 
+         # Step 2

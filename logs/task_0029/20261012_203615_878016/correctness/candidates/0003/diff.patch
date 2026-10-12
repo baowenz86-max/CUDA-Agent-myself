@@ -1,0 +1,113 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,13 +1,9 @@
+ #include <cuda_runtime.h>
+ 
+-// Kernel: 对输入形状 (B, C, H, W) 执行 unbind(dim=-1) + max(dim=1)
+-// 输出: values (B, H, W) float32, indices (B, H, W) int64
+-// 每个 block 处理一个 W 切片 (w 由 blockIdx.y 决定)
+-// 每个线程处理一个 (b, h) 输出位置，串行比较 C 个元素，记录第一个最大值索引
+ __global__ void fused_unbind_max_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ values,
+-    long long* __restrict__ indices,
++    int64_t* __restrict__ indices,
+     int B, int C, int H, int W)
+ {
+     int w = blockIdx.y;
+@@ -18,38 +14,32 @@
+         int b = pos / H;
+         int h = pos - b * H;
+ 
+-        float max_val = -3.402823466e+38f; // -FLT_MAX
+-        long long max_idx = 0;
++        float max_val = -3.402823466e+38f;
++        int64_t max_idx = 0;
+         for (int c = 0; c < C; ++c) {
+-            // 输入布局: input[b][c][h][w] = input[(b*C + c)*H*W + h*W + w]
+             float val = input[((long long)(b * C + c) * H + h) * W + w];
+             if (c == 0 || val > max_val) {
+                 max_val = val;
+-                max_idx = (long long)c;
++                max_idx = (int64_t)c;
+             }
+         }
+ 
+-        // 输出布局: values[b][h][w] = values[(b*H + h)*W + w]
+         long long out_idx = ((long long)(b * H) + h) * W + w;
+         values[out_idx] = max_val;
+         indices[out_idx] = max_idx;
+     }
+ }
+ 
+-// Launcher: 由 binding cpp 调用
+-// 参数: input 指针, values 指针, indices 指针, B, C, H, W, stream
+ extern "C" void custom_unbind_max_launcher(
+     const float* input,
+     float* values,
+-    long long* indices,
++    int64_t* indices,
+     int B, int C, int H, int W,
+     cudaStream_t stream)
+ {
+     dim3 block(256);
+-    // grid.x: 覆盖 B*H 个输出的线程
+     int threads_per_output = 256;
+     int grid_x = (B * H + threads_per_output - 1) / threads_per_output;
+-    // grid.y: 每个 W 切片一个 block
+     dim3 grid(grid_x, W);
+ 
+     fused_unbind_max_kernel<<<grid, block, 0, stream>>>(
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -4,20 +4,14 @@
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+-// Launcher declared in custom_ops.cu
+ extern "C" void custom_unbind_max_launcher(
+     const float* input,
+     float* values,
+-    long long* indices,
++    int64_t* indices,
+     int B, int C, int H, int W,
+     cudaStream_t stream);
+ 
+-// Custom op: performs torch.unbind(x, dim=-1) then torch.max(xi, dim=1)
+-// Input: x shape (B, C, H, W) float32 CUDA contiguous
+-// Output: std::vector of W pairs (values, indices), each values/indices shape (B,H)
+-// values dtype float32, indices dtype int64
+ std::vector<std::pair<torch::Tensor, torch::Tensor>> custom_unbind_max(torch::Tensor x) {
+-    // Input checks
+     TORCH_CHECK(x.is_cuda(), "custom_unbind_max: input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_unbind_max: input must be float32");
+     TORCH_CHECK(x.dim() == 4, "custom_unbind_max: input must be 4D (B, C, H, W)");
+@@ -28,16 +22,13 @@
+     int64_t H = x.size(2);
+     int64_t W = x.size(3);
+ 
+-    // Allocate output tensors
+     auto options_float = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
+     auto options_long  = torch::TensorOptions().dtype(torch::kInt64).device(x.device());
+     auto values = torch::empty({B, H, W}, options_float);
+     auto indices = torch::empty({B, H, W}, options_long);
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Launch kernel
+     custom_unbind_max_launcher(
+         x.data_ptr<float>(),
+         values.data_ptr<float>(),
+@@ -49,11 +40,6 @@
+         stream
+     );
+ 
+-    // Build list of W max-tuples. Each max-tuple is (values[..., w], indices[..., w])
+-    // Use slicing to get contiguous views? In fact, values[:, :, w] is not contiguous in memory
+-    // because stride for W is 1, so each slice has stride (H*W, W, 1) -> not contiguous.
+-    // However, torch.max returns contiguous tensors. We should call .contiguous() on each slice.
+-    // But contract shows stride [128,1] for each output, meaning contiguous. So we make them contiguous.
+     std::vector<std::pair<torch::Tensor, torch::Tensor>> result;
+     result.reserve(static_cast<size_t>(W));
+     for (int64_t w = 0; w < W; ++w) {

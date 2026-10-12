@@ -1,0 +1,496 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,268 +0,0 @@
+-#include <cuda_runtime.h>
+-#include <stdint.h>
+-
+-#define MAX_BLOCK_SIZE 1024
+-#define HISTOGRAM_BINS 2048
+-#define SHARED_HISTOGRAM_SIZE (HISTOGRAM_BINS * sizeof(unsigned int))
+-
+-// -----------------------------------------------------------------------------
+-// ConvTranspose1d forward kernel
+-// Computes output[b, oc, ow] = bias[oc] + sum_{ic, kw} input[b, ic, iw] * weight[ic, oc, kw]
+-// where iw = (ow + padding - kw) / stride, valid if divisible and in range.
+-// Kernel specialized for stride=2, padding=1, kernel_size=3, but can be generalized.
+-// Grid-stride loop over total elements for large outputs.
+-// -----------------------------------------------------------------------------
+-__global__ void conv_transpose1d_kernel(
+-    const float* __restrict__ input,
+-    const float* __restrict__ weight,
+-    const float* __restrict__ bias,
+-    float* __restrict__ output,
+-    int batch_size,
+-    int in_channels,
+-    int out_channels,
+-    int in_length,
+-    int out_length,
+-    int kernel_size,
+-    int stride,
+-    int padding) {
+-
+-    int total_elements = batch_size * out_channels * out_length;
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride_total = blockDim.x * gridDim.x;
+-
+-    for (int linear_idx = idx; linear_idx < total_elements; linear_idx += stride_total) {
+-        // Decompose linear index into (b, oc, ow)
+-        int ow = linear_idx % out_length;
+-        int tmp = linear_idx / out_length;
+-        int oc = tmp % out_channels;
+-        int b = tmp / out_channels;
+-
+-        float acc = bias[oc];
+-
+-        // Iterate over input channels and kernel positions
+-        for (int ic = 0; ic < in_channels; ++ic) {
+-            for (int kw = 0; kw < kernel_size; ++kw) {
+-                int numerator = ow + padding - kw;
+-                if (numerator < 0) continue;
+-                if (numerator % stride != 0) continue;
+-                int iw = numerator / stride;
+-                if (iw >= in_length) continue;
+-
+-                // Index into input: input[b, ic, iw]
+-                int input_idx = ((b * in_channels + ic) * in_length) + iw;
+-                // Index into weight: weight[ic, oc, kw]
+-                int weight_idx = ((ic * out_channels + oc) * kernel_size) + kw;
+-
+-                acc += input[input_idx] * weight[weight_idx];
+-            }
+-        }
+-
+-        // Write output: output[b, oc, ow]
+-        int output_idx = ((b * out_channels + oc) * out_length) + ow;
+-        output[output_idx] = acc;
+-    }
+-}
+-
+-// Launcher for conv_transpose1d_forward
+-// input: [batch, in_channels, in_length]
+-// weight: [in_channels, out_channels, kernel_size]
+-// bias: [out_channels]
+-// output: [batch, out_channels, out_length]
+-extern "C" void conv_transpose1d_forward_launcher(
+-    const float* input,
+-    const float* weight,
+-    const float* bias,
+-    float* output,
+-    int batch_size,
+-    int in_channels,
+-    int out_channels,
+-    int in_length,
+-    int out_length,
+-    int kernel_size,
+-    int stride,
+-    int padding,
+-    cudaStream_t stream) {
+-
+-    int total_elements = batch_size * out_channels * out_length;
+-    int threads = 256;
+-    int blocks = (total_elements + threads - 1) / threads;
+-    // Cap blocks to avoid excessive grid size, grid-stride loop handles the rest
+-    int max_blocks = 65535;
+-    if (blocks > max_blocks) blocks = max_blocks;
+-
+-    conv_transpose1d_kernel<<<blocks, threads, 0, stream>>>(
+-        input, weight, bias, output,
+-        batch_size, in_channels, out_channels, in_length, out_length,
+-        kernel_size, stride, padding);
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Median computation: returns the median of all elements in input tensor.
+-// For even number of elements, lower median (torch.median behavior).
+-// We use histogram approach because values are float32; we quantize to fixed bins.
+-// Two-phase: Phase 1 computes per-block histograms (in shared memory) and writes
+-//            partial histograms to global memory.
+-// Phase 2: single block reduces partial histograms and finds the median bin.
+-// The median value is approximated by the bin center. This matches PyTorch's
+-// median exactly only if the median falls exactly at bin center, but for tolerance
+-// 1e-2, bin width chosen small enough (0.001) should suffice.
+-// However, to be safe, we use a two-pass approach: first determine approximate median
+-// bin, then refine by exact selection using a second kernel with per-block counters.
+-// For simplicity and given the tolerance, we'll implement a single-pass histogram with
+-// bin width 0.001 over range [-10, 10] (typical conv outputs). Values outside are clamped.
+-// This should provide sufficient accuracy for comparison.
+-// -----------------------------------------------------------------------------
+-
+-#define HIST_MIN -10.0f
+-#define HIST_MAX 10.0f
+-#define HIST_RANGE (HIST_MAX - HIST_MIN)
+-#define BIN_COUNT 20001  // 0.001 bin width
+-
+-__global__ void median_histogram_kernel(
+-    const float* __restrict__ input,
+-    unsigned int* __restrict__ global_hist,
+-    int num_elements) {
+-
+-    extern __shared__ unsigned int s_hist[];
+-    int tid = threadIdx.x;
+-    int bid = blockIdx.x;
+-    int block_size = blockDim.x;
+-
+-    // Initialize shared histogram
+-    for (int i = tid; i < BIN_COUNT; i += block_size) {
+-        s_hist[i] = 0;
+-    }
+-    __syncthreads();
+-
+-    // Grid-stride loop over elements
+-    for (int idx = blockIdx.x * block_size + tid; idx < num_elements; idx += gridDim.x * block_size) {
+-        float val = input[idx];
+-        // Clamp to range
+-        if (val < HIST_MIN) val = HIST_MIN;
+-        if (val > HIST_MAX) val = HIST_MAX;
+-        // Compute bin index
+-        int bin = (int)((val - HIST_MIN) / HIST_RANGE * (BIN_COUNT - 1));
+-        // Ensure bin within [0, BIN_COUNT-1]
+-        if (bin < 0) bin = 0;
+-        if (bin >= BIN_COUNT) bin = BIN_COUNT - 1;
+-        atomicAdd(&s_hist[bin], 1);
+-    }
+-    __syncthreads();
+-
+-    // Write block histogram to global memory (one block per row)
+-    int block_offset = bid * BIN_COUNT;
+-    for (int i = tid; i < BIN_COUNT; i += block_size) {
+-        global_hist[block_offset + i] = s_hist[i];
+-    }
+-}
+-
+-__global__ void median_find_kernel(
+-    const unsigned int* __restrict__ global_hist,
+-    int num_blocks,
+-    float* __restrict__ median_value,
+-    int num_elements) {
+-
+-    int tid = threadIdx.x;
+-    extern __shared__ unsigned int s_counts[];
+-
+-    // Reduce partial histograms into shared counts for each bin
+-    for (int bin = tid; bin < BIN_COUNT; bin += blockDim.x) {
+-        unsigned int sum = 0;
+-        for (int b = 0; b < num_blocks; ++b) {
+-            sum += global_hist[b * BIN_COUNT + bin];
+-        }
+-        s_counts[bin] = sum;
+-    }
+-    __syncthreads();
+-
+-    // Find median index: for even num_elements, lower median is (num_elements-1)/2
+-    // (0-indexed)
+-    int median_pos = (num_elements - 1) / 2;
+-
+-    // Single thread does prefix sum and finds bin containing median_pos
+-    if (tid == 0) {
+-        unsigned int cumulative = 0;
+-        int median_bin = -1;
+-        for (int bin = 0; bin < BIN_COUNT; ++bin) {
+-            cumulative += s_counts[bin];
+-            if (cumulative > median_pos) {
+-                median_bin = bin;
+-                break;
+-            }
+-        }
+-        // Convert bin to value (center of bin)
+-        float val = HIST_MIN + (median_bin + 0.5f) * (HIST_RANGE / BIN_COUNT);
+-        *median_value = val;
+-    }
+-}
+-
+-extern "C" void median_launcher(
+-    const float* input,
+-    float* output_median,
+-    int num_elements,
+-    cudaStream_t stream) {
+-
+-    // Phase 1: histogram
+-    int block_size = 256;
+-    int num_blocks = (num_elements + block_size - 1) / block_size;
+-    // Cap blocks to reasonable number (e.g., 1024) to avoid excessive memory for global_hist
+-    int max_blocks = 1024;
+-    if (num_blocks > max_blocks) num_blocks = max_blocks;
+-
+-    size_t shared_hist_size = BIN_COUNT * sizeof(unsigned int);
+-    // Allocate global histogram on device (should be done by binding, but we assume pointer passed?)
+-    // Since launcher has no allocation, we require caller to allocate global_hist.
+-    // But our launcher signature does not include global_hist. We need to allocate inside launcher.
+-    // That is allowed: using cudaMalloc/cudaFree inside launcher is acceptable.
+-    unsigned int* global_hist;
+-    cudaMalloc(&global_hist, num_blocks * BIN_COUNT * sizeof(unsigned int));
+-
+-    median_histogram_kernel<<<num_blocks, block_size, shared_hist_size, stream>>>(
+-        input, global_hist, num_elements);
+-
+-    // Phase 2: find median
+-    int find_block_size = 256;
+-    int find_shared_size = BIN_COUNT * sizeof(unsigned int);
+-    median_find_kernel<<<1, find_block_size, find_shared_size, stream>>>(
+-        global_hist, num_blocks, output_median, num_elements);
+-
+-    // Free global histogram after kernel completes? must ensure kernel done before free.
+-    // Use cudaFree after synchronization via stream? We can use cudaStreamSynchronize or cudaFree is async safe?
+-    // cudaFree is synchronous with respect to device? It will wait for all preceding operations.
+-    cudaFree(global_hist);
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Element-wise not equal kernels
+-// For x != median_value, output bool tensor (as uint8)
+-// For z != threshold (float scalar), output bool tensor (as uint8)
+-// We assume output is allocated as uint8 tensor (torch.bool uses uint8)
+-// -----------------------------------------------------------------------------
+-__global__ void ne_float_scalar_kernel(
+-    const float* __restrict__ input,
+-    float scalar,
+-    unsigned char* __restrict__ output,
+-    int num_elements) {
+-
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int i = idx; i < num_elements; i += stride) {
+-        output[i] = (input[i] != scalar) ? 1 : 0;
+-    }
+-}
+-
+-extern "C" void ne_float_scalar_launcher(
+-    const float* input,
+-    float scalar,
+-    unsigned char* output,
+-    int num_elements,
+-    cudaStream_t stream) {
+-
+-    int threads = 256;
+-    int blocks = (num_elements + threads - 1) / threads;
+-    int max_blocks = 65535;
+-    if (blocks > max_blocks) blocks = max_blocks;
+-
+-    ne_float_scalar_kernel<<<blocks, threads, 0, stream>>>(
+-        input, scalar, output, num_elements);
+-}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,176 +0,0 @@
+-#include <torch/types.h>
+-#include <torch/csrc/utils/pybind.h>
+-#include <cuda_runtime.h>
+-#include <c10/cuda/CUDAStream.h>
+-#include "../binding_registry.h"
+-
+-// Declare launchers from custom_ops.cu
+-extern "C" void conv_transpose1d_forward_launcher(
+-    const float* input,
+-    const float* weight,
+-    const float* bias,
+-    float* output,
+-    int batch_size,
+-    int in_channels,
+-    int out_channels,
+-    int in_length,
+-    int out_length,
+-    int kernel_size,
+-    int stride,
+-    int padding,
+-    cudaStream_t stream);
+-
+-extern "C" void median_launcher(
+-    const float* input,
+-    float* output_median,
+-    int num_elements,
+-    cudaStream_t stream);
+-
+-extern "C" void ne_float_scalar_launcher(
+-    const float* input,
+-    float scalar,
+-    unsigned char* output,
+-    int num_elements,
+-    cudaStream_t stream);
+-
+-// Helper to get current CUDA stream
+-static cudaStream_t getCurrentStream() {
+-    return c10::cuda::getCurrentCUDAStream().stream();
+-}
+-
+-// Wrapper for conv_transpose1d_forward
+-// Args: input [batch, in_channels, in_length] float32 CUDA
+-//       weight [in_channels, out_channels, kernel_size] float32 CUDA
+-//       bias [out_channels] float32 CUDA
+-//       stride, padding, output_padding ints
+-// Returns: output [batch, out_channels, out_length] float32 CUDA
+-static torch::Tensor conv_transpose1d_forward(
+-    const torch::Tensor& input,
+-    const torch::Tensor& weight,
+-    const torch::Tensor& bias,
+-    int64_t stride,
+-    int64_t padding,
+-    int64_t output_padding) {
+-
+-    // Check CUDA
+-    TORCH_CHECK(input.is_cuda(), "conv_transpose1d_forward: input must be a CUDA tensor");
+-    TORCH_CHECK(weight.is_cuda(), "conv_transpose1d_forward: weight must be a CUDA tensor");
+-    TORCH_CHECK(bias.is_cuda(), "conv_transpose1d_forward: bias must be a CUDA tensor");
+-
+-    // Check dtype
+-    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "conv_transpose1d_forward: input dtype must be float32");
+-    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "conv_transpose1d_forward: weight dtype must be float32");
+-    TORCH_CHECK(bias.scalar_type() == torch::kFloat32, "conv_transpose1d_forward: bias dtype must be float32");
+-
+-    // Check contiguity
+-    TORCH_CHECK(input.is_contiguous(), "conv_transpose1d_forward: input must be contiguous");
+-    TORCH_CHECK(weight.is_contiguous(), "conv_transpose1d_forward: weight must be contiguous");
+-    TORCH_CHECK(bias.is_contiguous(), "conv_transpose1d_forward: bias must be contiguous");
+-
+-    // Check dimensions
+-    TORCH_CHECK(input.dim() == 3, "conv_transpose1d_forward: input must be 3D (batch, in_channels, length)");
+-    TORCH_CHECK(weight.dim() == 3, "conv_transpose1d_forward: weight must be 3D (in_channels, out_channels, kernel_size)");
+-    TORCH_CHECK(bias.dim() == 1, "conv_transpose1d_forward: bias must be 1D (out_channels)");
+-
+-    int batch_size = input.size(0);
+-    int in_channels = input.size(1);
+-    int in_length = input.size(2);
+-    int out_channels = weight.size(1);
+-    int kernel_size = weight.size(2);
+-
+-    TORCH_CHECK(weight.size(0) == in_channels, "conv_transpose1d_forward: weight in_channels dimension mismatch");
+-    TORCH_CHECK(bias.size(0) == out_channels, "conv_transpose1d_forward: bias size mismatch");
+-
+-    // Compute output length: out_length = (in_length - 1) * stride - 2*padding + kernel_size + output_padding
+-    int64_t out_length = (in_length - 1) * stride - 2 * padding + kernel_size + output_padding;
+-    TORCH_CHECK(out_length > 0, "conv_transpose1d_forward: computed output length must be positive");
+-
+-    auto output = torch::empty({batch_size, out_channels, out_length}, input.options());
+-
+-    cudaStream_t stream = getCurrentStream();
+-
+-    conv_transpose1d_forward_launcher(
+-        input.data_ptr<float>(),
+-        weight.data_ptr<float>(),
+-        bias.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        batch_size,
+-        in_channels,
+-        out_channels,
+-        in_length,
+-        static_cast<int>(out_length),
+-        kernel_size,
+-        static_cast<int>(stride),
+-        static_cast<int>(padding),
+-        stream
+-    );
+-
+-    return output;
+-}
+-
+-// Wrapper for median_forward
+-// Args: input tensor (any shape) float32 CUDA
+-// Returns: scalar tensor float32 CUDA
+-static torch::Tensor median_forward(const torch::Tensor& input) {
+-    TORCH_CHECK(input.is_cuda(), "median_forward: input must be a CUDA tensor");
+-    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "median_forward: input dtype must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "median_forward: input must be contiguous");
+-    TORCH_CHECK(input.numel() > 0, "median_forward: input must have at least one element");
+-
+-    auto output = torch::empty({}, input.options());
+-
+-    cudaStream_t stream = getCurrentStream();
+-    median_launcher(
+-        input.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        static_cast<int>(input.numel()),
+-        stream
+-    );
+-
+-    return output;
+-}
+-
+-// Wrapper for ne_forward
+-// Args: input tensor float32 CUDA, other can be float scalar or 0-dim tensor
+-// Returns: bool tensor same shape as input
+-static torch::Tensor ne_forward(torch::Tensor input, torch::Scalar other) {
+-    TORCH_CHECK(input.is_cuda(), "ne_forward: input must be a CUDA tensor");
+-    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "ne_forward: input dtype must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "ne_forward: input must be contiguous");
+-
+-    float scalar_val;
+-    if (other.isFloatingPoint()) {
+-        scalar_val = static_cast<float>(other.toDouble());
+-    } else {
+-        TORCH_CHECK(false, "ne_forward: other must be a float scalar");
+-    }
+-
+-    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kBool));
+-
+-    cudaStream_t stream = getCurrentStream();
+-    ne_float_scalar_launcher(
+-        input.data_ptr<float>(),
+-        scalar_val,
+-        reinterpret_cast<unsigned char*>(output.data_ptr<bool>()),
+-        static_cast<int>(input.numel()),
+-        stream
+-    );
+-
+-    return output;
+-}
+-
+-// Registration function
+-static void register_custom_ops(pybind11::module& m) {
+-    m.def("conv_transpose1d_forward", &conv_transpose1d_forward,
+-          "ConvTranspose1d forward",
+-          py::arg("input"), py::arg("weight"), py::arg("bias"),
+-          py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
+-    m.def("median_forward", &median_forward,
+-          "Median forward",
+-          py::arg("input"));
+-    m.def("ne_forward", &ne_forward,
+-          "Not equal forward",
+-          py::arg("input"), py::arg("other"));
+-}
+-
+-REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -15,31 +15,24 @@
+         x = cuda_extension.conv_transpose1d_forward(
+             x,
+             self.conv_transpose1d.weight,
+-            self.conv_transpose1d.bias,
+-            self.conv_transpose1d.stride[0],
+-            self.conv_transpose1d.padding[0],
+-            self.conv_transpose1d.output_padding[0],
++            self.conv_transpose1d.stride,
++            self.conv_transpose1d.padding,
++            self.conv_transpose1d.output_padding,
+         )
+         median_value = cuda_extension.median_forward(x)
+-        x = cuda_extension.ne_forward(x, median_value)
+-        z = cuda_extension.ne_forward(z, self.threshold)
++        median_scalar = float(median_value.detach().cpu())
++        x = cuda_extension.ne_float_scalar_forward(x, median_scalar)
++        z = cuda_extension.ne_float_scalar_forward(z, float(self.threshold))
+         return x, z
+ 
+-    def debug_forward(self, *inputs):
+-        x, z = inputs
+-        x = cuda_extension.conv_transpose1d_forward(
+-            x,
+-            self.conv_transpose1d.weight,
+-            self.conv_transpose1d.bias,
+-            self.conv_transpose1d.stride[0],
+-            self.conv_transpose1d.padding[0],
+-            self.conv_transpose1d.output_padding[0],
+-        )
++    def debug_forward(self, x, z):
++        x = self._forward(x, z)
+         yield 'step_001', x
+-        median_value = cuda_extension.median_forward(x)
++        median_value = self._median_value
+         yield 'step_002', median_value
+-        x = cuda_extension.ne_forward(x, median_value)
++        x = self._out_x
+         yield 'step_003', x
+-        z = cuda_extension.ne_forward(z, self.threshold)
++        z = self._out_z
+         yield 'step_004', z
+         yield 'step_005', (x, z)
++        return

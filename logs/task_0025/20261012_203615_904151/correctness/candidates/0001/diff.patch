@@ -1,0 +1,228 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,96 @@
++#include <cuda_runtime.h>
++#include <cmath>
++
++// ReflectionPad2d kernel: 输入四维 (N, C, H_in, W_in)，输出 (N, C, H_out, W_out)
++// 每个线程处理输出张量中的一个元素
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out, int pad) {
++    int out_w = blockIdx.x * blockDim.x + threadIdx.x;
++    int out_h = blockIdx.y * blockDim.y + threadIdx.y;
++    int nc = blockIdx.z;  // 每个 z block 对应一个 (n,c) 平面
++
++    if (nc >= N * C || out_h >= H_out || out_w >= W_out) {
++        return;
++    }
++
++    int n = nc / C;
++    int c = nc % C;
++
++    // 反射索引映射
++    int in_h = out_h - pad;
++    if (in_h < 0) {
++        in_h = -in_h;
++    } else if (in_h >= H_in) {
++        in_h = 2 * (H_in - 1) - in_h;
++    }
++    // 由于 pad <= H_in-1，上述映射后 in_h 必然在 [0, H_in-1] 内，但为防止极端情况再次修正
++    if (in_h < 0) in_h = -in_h;
++    if (in_h >= H_in) in_h = 2 * (H_in - 1) - in_h;
++
++    int in_w = out_w - pad;
++    if (in_w < 0) {
++        in_w = -in_w;
++    } else if (in_w >= W_in) {
++        in_w = 2 * (W_in - 1) - in_w;
++    }
++    if (in_w < 0) in_w = -in_w;
++    if (in_w >= W_in) in_w = 2 * (W_in - 1) - in_w;
++
++    size_t input_idx = ((size_t)n * C + c) * H_in * W_in + (size_t)in_h * W_in + in_w;
++    size_t output_idx = ((size_t)nc) * H_out * W_out + (size_t)out_h * W_out + out_w;
++    output[output_idx] = input[input_idx];
++}
++
++// erf kernel: y = erf(x)
++__global__ void erf_kernel(const float* __restrict__ input, float* __restrict__ output, size_t n) {
++    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    size_t stride = (size_t)blockDim.x * gridDim.x;
++    for (size_t i = idx; i < n; i += stride) {
++        output[i] = erff(input[i]);
++    }
++}
++
++// sin kernel: y = sin(x)
++__global__ void sin_kernel(const float* __restrict__ input, float* __restrict__ output, size_t n) {
++    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    size_t stride = (size_t)blockDim.x * gridDim.x;
++    for (size_t i = idx; i < n; i += stride) {
++        output[i] = sinf(input[i]);
++    }
++}
++
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out, int pad,
++    cudaStream_t stream) {
++    dim3 block(16, 16);
++    dim3 grid(
++        (W_out + block.x - 1) / block.x,
++        (H_out + block.y - 1) / block.y,
++        N * C);
++    reflection_pad2d_kernel<<<grid, block, 0, stream>>>(
++        input, output, N, C, H_in, W_in, H_out, W_out, pad);
++}
++
++extern "C" void erf_launcher(const float* input, float* output, size_t n, cudaStream_t stream) {
++    int block_size = 256;
++    size_t grid_size = (n + block_size - 1) / block_size;
++    if (grid_size > 2147483647) {
++        grid_size = 2147483647;
++    }
++    erf_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(input, output, n);
++}
++
++extern "C" void sin_launcher(const float* input, float* output, size_t n, cudaStream_t stream) {
++    int block_size = 256;
++    size_t grid_size = (n + block_size - 1) / block_size;
++    if (grid_size > 2147483647) {
++        grid_size = 2147483647;
++    }
++    sin_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(input, output, n);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,95 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// 声明 .cu 导出的 launcher
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out, int pad,
++    cudaStream_t stream);
++
++extern "C" void erf_launcher(const float* input, float* output, size_t n, cudaStream_t stream);
++extern "C" void sin_launcher(const float* input, float* output, size_t n, cudaStream_t stream);
++
++// 反射填充包装函数
++torch::Tensor reflection_pad2d_forward(torch::Tensor input, int64_t pad) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(pad >= 0, "pad must be non-negative");
++
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t H_in = input.size(2);
++    int64_t W_in = input.size(3);
++    TORCH_CHECK(pad < H_in && pad < W_in, "pad must be smaller than input spatial dims");
++
++    int64_t H_out = H_in + 2 * pad;
++    int64_t W_out = W_in + 2 * pad;
++
++    auto output = torch::empty({N, C, H_out, W_out}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    reflection_pad2d_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H_in),
++        static_cast<int>(W_in),
++        static_cast<int>(H_out),
++        static_cast<int>(W_out),
++        static_cast<int>(pad),
++        stream);
++
++    return output;
++}
++
++// erf 包装函数
++torch::Tensor erf_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    erf_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<size_t>(input.numel()),
++        stream);
++
++    return output;
++}
++
++// sin 包装函数
++torch::Tensor sin_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    sin_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<size_t>(input.numel()),
++        stream);
++
++    return output;
++}
++
++// 注册函数
++void register_custom_ops(pybind11::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward, "ReflectionPad2d forward",
++          py::arg("input"), py::arg("pad"));
++    m.def("erf_forward", &erf_forward, "Erf forward", py::arg("input"));
++    m.def("sin_forward", &sin_forward, "Sin forward", py::arg("input"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,28 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels):
++        super().__init__()
++        # 参考实现 self.reflection_pad = nn.ReflectionPad2d(in_channels // 2)
++        # 这里保存 pad 数值，实际计算由自定义算子完成
++        self.pad = in_channels // 2
++
++    def forward(self, x):
++        # 顺序执行三个步骤，与参考一致
++        x = cuda_extension.reflection_pad2d_forward(x, self.pad)
++        x = cuda_extension.erf_forward(x)
++        x = cuda_extension.sin_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        # 按 checkpoints 顺序 yield (id, value)
++        x = cuda_extension.reflection_pad2d_forward(x, self.pad)
++        yield 'step_001', x
++        x = cuda_extension.erf_forward(x)
++        yield 'step_002', x
++        x = cuda_extension.sin_forward(x)
++        yield 'step_003', x
++        yield 'step_004', x

@@ -1,0 +1,823 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,147 +1,152 @@
+ #include <cuda_runtime.h>
+ 
+-// ------------------------- ConvTranspose2d Kernel -------------------------
+-// Naive direct convolution for output = input * weight^T + bias
+-// Assumes float32, contiguous tensors, stride=2, padding=1, output_padding=1, kernel_size=3
+-// Output dimensions: outH = (inH-1)*stride - 2*padding + kernel_size + output_padding
+-//                   outW = (inW-1)*stride - 2*padding + kernel_size + output_padding
++// Helper device functions
++__device__ __forceinline__ float clamp_scalar(float x, float lo, float hi) {
++    return fminf(fmaxf(x, lo), hi);
++}
++
++__device__ __forceinline__ float leaky_relu_scalar(float x, float slope) {
++    return (x >= 0.0f) ? x : slope * x;
++}
++
++// ===================== ConvTranspose2d =====================
++// Parameters fixed from model.py: kernel_size=3, stride=2, padding=1, output_padding=1
++// General kernel supports arbitrary parameters via launcher args.
+ __global__ void conv_transpose2d_kernel(
+     const float* __restrict__ input,
+     const float* __restrict__ weight,
+     const float* __restrict__ bias,
+     float* __restrict__ output,
+-    int N, int C_in, int H_in, int W_in,
+-    int C_out, int H_out, int W_out,
+-    int kernel_h, int kernel_w,
+-    int stride_h, int stride_w,
+-    int padding_h, int padding_w
+-) {
+-    int total = N * C_out * H_out * W_out;
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride_total = blockDim.x * gridDim.x;
+-
+-    for (int pos = idx; pos < total; pos += stride_total) {
+-        int w_out = pos % W_out;
+-        int tmp = pos / W_out;
+-        int h_out = tmp % H_out;
+-        tmp /= H_out;
+-        int c_out = tmp % C_out;
+-        int n = tmp / C_out;
+-
+-        float val = (bias != nullptr) ? bias[c_out] : 0.0f;
+-
+-        // Iterate over input channels and kernel positions
+-        for (int c_in = 0; c_in < C_in; ++c_in) {
+-            for (int kh = 0; kh < kernel_h; ++kh) {
+-                // h_in such that h_out = h_in*stride_h - padding_h + kh
+-                int h_in = h_out + padding_h - kh;
+-                if (h_in < 0 || h_in % stride_h != 0) continue;
+-                h_in /= stride_h;
+-                if (h_in >= H_in) continue;
+-
+-                for (int kw = 0; kw < kernel_w; ++kw) {
+-                    int w_in = w_out + padding_w - kw;
+-                    if (w_in < 0 || w_in % stride_w != 0) continue;
+-                    w_in /= stride_w;
+-                    if (w_in >= W_in) continue;
+-
+-                    // weight shape: [C_in, C_out, kernel_h, kernel_w]
+-                    int w_idx = ((c_in * C_out + c_out) * kernel_h + kh) * kernel_w + kw;
+-                    int i_idx = ((n * C_in + c_in) * H_in + h_in) * W_in + w_in;
+-                    val += input[i_idx] * weight[w_idx];
+-                }
+-            }
+-        }
+-        output[pos] = val;
+-    }
+-}
+-
+-extern "C" void conv_transpose_forward_launcher(
+-    const float* input,
+-    const float* weight,
+-    const float* bias,
+-    float* output,
+     int N, int C_in, int H_in, int W_in,
+     int C_out, int H_out, int W_out,
+     int kernel_h, int kernel_w,
+     int stride_h, int stride_w,
+     int padding_h, int padding_w,
+-    cudaStream_t stream
++    int output_padding_h, int output_padding_w
+ ) {
+     int total = N * C_out * H_out * W_out;
+-    int threads = 256;
+-    // Cap grid at 65535 and use grid-stride loop above
+-    int blocks = (total + threads - 1) / threads;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        int w = i % W_out;
++        int h = (i / W_out) % H_out;
++        int c_out = (i / (W_out * H_out)) % C_out;
++        int n = i / (W_out * H_out * C_out);
++
++        float acc = 0.0f;
++        for (int c_in = 0; c_in < C_in; ++c_in) {
++            for (int kh = 0; kh < kernel_h; ++kh) {
++                for (int kw = 0; kw < kernel_w; ++kw) {
++                    int h_in = h + padding_h - kh;
++                    int w_in = w + padding_w - kw;
++                    if (h_in % stride_h != 0 || w_in % stride_w != 0) continue;
++                    h_in /= stride_h;
++                    w_in /= stride_w;
++                    if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
++                        // weight is stored as [C_in][C_out][kh][kw] for ConvTranspose2d
++                        int w_idx = ((c_in * C_out + c_out) * kernel_h + kh) * kernel_w + kw;
++                        int in_idx = ((n * C_in + c_in) * H_in + h_in) * W_in + w_in;
++                        acc += input[in_idx] * weight[w_idx];
++                    }
++                }
++            }
++        }
++        if (bias != nullptr) {
++            acc += bias[c_out];
++        }
++        output[i] = acc;
++    }
++}
++
++extern "C" void conv_transpose2d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int H_out, int W_out,
++    int kernel_h, int kernel_w,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int output_padding_h, int output_padding_w,
++    cudaStream_t stream
++) {
++    int total = N * C_out * H_out * W_out;
++    const int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    // Cap grids to avoid exceeding max grid size, use grid-stride loop inside kernel
+     if (blocks > 65535) blocks = 65535;
+     conv_transpose2d_kernel<<<blocks, threads, 0, stream>>>(
+         input, weight, bias, output,
+-        N, C_in, H_in, W_in, C_out, H_out, W_out,
+-        kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w
+-    );
+-}
+-
+-// ------------------------- Clamp Kernel -------------------------
++        N, C_in, H_in, W_in,
++        C_out, H_out, W_out,
++        kernel_h, kernel_w,
++        stride_h, stride_w,
++        padding_h, padding_w,
++        output_padding_h, output_padding_w
++    );
++}
++
++// ===================== Clamp =====================
+ __global__ void clamp_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
++    float min_val, float max_val,
++    int total
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        output[i] = clamp_scalar(input[i], min_val, max_val);
++    }
++}
++
++extern "C" void clamp_forward_launcher(
++    const float* input,
++    float* output,
++    float min_val, float max_val,
+     int total,
+-    float min_val,
+-    float max_val
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int i = idx; i < total; i += stride) {
+-        float x = input[i];
+-        x = fminf(fmaxf(x, min_val), max_val);
+-        output[i] = x;
+-    }
+-}
+-
+-extern "C" void clamp_forward_launcher(
+-    const float* input,
+-    float* output,
++    cudaStream_t stream
++) {
++    const int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    clamp_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, min_val, max_val, total
++    );
++}
++
++// ===================== Leaky ReLU =====================
++__global__ void leaky_relu_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    float slope,
++    int total
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        output[i] = leaky_relu_scalar(input[i], slope);
++    }
++}
++
++extern "C" void leaky_relu_forward_launcher(
++    const float* input,
++    float* output,
++    float slope,
+     int total,
+-    float min_val,
+-    float max_val,
+-    cudaStream_t stream
+-) {
+-    int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    if (blocks > 65535) blocks = 65535;
+-    clamp_kernel<<<blocks, threads, 0, stream>>>(input, output, total, min_val, max_val);
+-}
+-
+-// ------------------------- Leaky ReLU Kernel -------------------------
+-__global__ void leaky_relu_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    int total,
+-    float negative_slope
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int i = idx; i < total; i += stride) {
+-        float x = input[i];
+-        output[i] = (x > 0.0f) ? x : (x * negative_slope);
+-    }
+-}
+-
+-extern "C" void leaky_relu_forward_launcher(
+-    const float* input,
+-    float* output,
+-    int total,
+-    float negative_slope,
+-    cudaStream_t stream
+-) {
+-    int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    if (blocks > 65535) blocks = 65535;
+-    leaky_relu_kernel<<<blocks, threads, 0, stream>>>(input, output, total, negative_slope);
+-}
+-
+-// ------------------------- Triu Kernel -------------------------
+-// Applies upper triangular mask to last two dimensions (H_out x W_out)
+-// diagonal=0 so keep elements where col >= row
++    cudaStream_t stream
++) {
++    const int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    leaky_relu_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, slope, total
++    );
++}
++
++// ===================== Triu =====================
++// triu with diagonal=0; zero elements below main diagonal in last two dims (H, W)
+ __global__ void triu_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+@@ -151,12 +156,15 @@
+     int total = N * C * H * W;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int stride = blockDim.x * gridDim.x;
+-    for (int pos = idx; pos < total; pos += stride) {
+-        int w = pos % W;
+-        int tmp = pos / W;
+-        int h = tmp % H;
+-        // Remaining dims (C, N) are not needed for indexing input/output
+-        output[pos] = (w >= h + diagonal) ? input[pos] : 0.0f;
++    for (int i = idx; i < total; i += stride) {
++        int w = i % W;
++        int h = (i / W) % H;
++        // batch and channel indices not needed for decision
++        if (w - h < diagonal) {
++            output[i] = 0.0f;
++        } else {
++            output[i] = input[i];
++        }
+     }
+ }
+ 
+@@ -168,14 +176,15 @@
+     cudaStream_t stream
+ ) {
+     int total = N * C * H * W;
+-    int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    if (blocks > 65535) blocks = 65535;
+-    triu_kernel<<<blocks, threads, 0, stream>>>(input, output, N, C, H, W, diagonal);
+-}
+-
+-// ------------------------- Add Kernel (broadcast bias) -------------------------
+-// Adds bias of shape (C_out,1,1) to input of shape (N,C_out,H,W)
++    const int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    triu_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, diagonal
++    );
++}
++
++// ===================== Add (bias shape [C,1,1]) =====================
+ __global__ void add_bias_kernel(
+     const float* __restrict__ input,
+     const float* __restrict__ bias,
+@@ -185,13 +194,11 @@
+     int total = N * C * H * W;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int stride = blockDim.x * gridDim.x;
+-    for (int pos = idx; pos < total; pos += stride) {
+-        int w = pos % W;
+-        int tmp = pos / W;
+-        int h = tmp % H;
+-        tmp /= H;
+-        int c = tmp % C;
+-        output[pos] = input[pos] + bias[c];
++    for (int i = idx; i < total; i += stride) {
++        int w = i % W;
++        int h = (i / W) % H;
++        int c = (i / (W * H)) % C;
++        output[i] = input[i] + bias[c];
+     }
+ }
+ 
+@@ -203,8 +210,10 @@
+     cudaStream_t stream
+ ) {
+     int total = N * C * H * W;
+-    int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    if (blocks > 65535) blocks = 65535;
+-    add_bias_kernel<<<blocks, threads, 0, stream>>>(input, bias, output, N, C, H, W);
+-}
++    const int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    add_bias_kernel<<<blocks, threads, 0, stream>>>(
++        input, bias, output, N, C, H, W
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,14 +1,12 @@
+-// PyTorch binding for custom CUDA kernels
+ #include <torch/types.h>
+-#include <torch/csrc/utils/pybind.h>
++#include <torch/library.h>
++#include <c10/cuda/CUDAStream.h>
+ #include <cuda_runtime.h>
+-#include <c10/cuda/CUDAStream.h>
++#include <ATen/cuda/CUDAContext.h>
+ #include "../binding_registry.h"
+ 
+-namespace py = pybind11;
+-
+ // Declare launchers from custom_ops.cu
+-extern "C" void conv_transpose_forward_launcher(
++extern "C" void conv_transpose2d_forward_launcher(
+     const float* input,
+     const float* weight,
+     const float* bias,
+@@ -18,23 +16,23 @@
+     int kernel_h, int kernel_w,
+     int stride_h, int stride_w,
+     int padding_h, int padding_w,
++    int output_padding_h, int output_padding_w,
+     cudaStream_t stream
+ );
+ 
+ extern "C" void clamp_forward_launcher(
+     const float* input,
+     float* output,
++    float min_val, float max_val,
+     int total,
+-    float min_val,
+-    float max_val,
+     cudaStream_t stream
+ );
+ 
+ extern "C" void leaky_relu_forward_launcher(
+     const float* input,
+     float* output,
++    float slope,
+     int total,
+-    float negative_slope,
+     cudaStream_t stream
+ );
+ 
+@@ -54,36 +52,33 @@
+     cudaStream_t stream
+ );
+ 
+-// Helper to get current CUDA stream
+-static cudaStream_t get_current_stream() {
++// Helper to get current CUDA stream as cudaStream_t
++static inline cudaStream_t get_stream() {
+     return c10::cuda::getCurrentCUDAStream().stream();
+ }
+ 
+-// ConvTranspose2d forward
+-static torch::Tensor conv_transpose_forward(
++// Wrapper functions
++static torch::Tensor conv_transpose2d_forward(
+     torch::Tensor input,
+     torch::Tensor weight,
+     torch::Tensor bias,
+-    std::vector<int64_t> stride,
+-    std::vector<int64_t> padding,
+-    std::vector<int64_t> output_padding
+-) {
+-    // Basic checks
+-    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+-    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+-    TORCH_CHECK(bias.is_cuda(), "bias must be CUDA");
++    int64_t stride_h,
++    int64_t padding_h,
++    int64_t output_padding_h
++) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+     TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+-    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+-    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+-    TORCH_CHECK(input.dim() == 4, "input must be 4D (N,C,H,W)");
+-    TORCH_CHECK(weight.dim() == 4, "weight must be 4D (C_in,C_out,kH,kW)");
+-    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+-    TORCH_CHECK(stride.size() == 2, "stride must have 2 elements");
+-    TORCH_CHECK(padding.size() == 2, "padding must have 2 elements");
+-    TORCH_CHECK(output_padding.size() == 2, "output_padding must have 2 elements");
++
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (N, C, H, W)");
++    TORCH_CHECK(weight.dim() == 4, "weight must be 4D (C_in, C_out, kH, kW)");
++    TORCH_CHECK(bias.dim() == 1, "bias must be 1D (C_out)");
+ 
+     int N = input.size(0);
+     int C_in = input.size(1);
+@@ -92,26 +87,21 @@
+     int C_out = weight.size(1);
+     int kernel_h = weight.size(2);
+     int kernel_w = weight.size(3);
+-    int stride_h = static_cast<int>(stride[0]);
+-    int stride_w = static_cast<int>(stride[1]);
+-    int padding_h = static_cast<int>(padding[0]);
+-    int padding_w = static_cast<int>(padding[1]);
+-    int output_padding_h = static_cast<int>(output_padding[0]);
+-    int output_padding_w = static_cast<int>(output_padding[1]);
+-
+-    // Output dimensions formula from PyTorch ConvTranspose2d
++
++    // Assuming stride_w = stride_h, padding_w = padding_h, output_padding_w = output_padding_h
++    int stride_w = stride_h;
++    int padding_w = padding_h;
++    int output_padding_w = output_padding_h;
++
++    // Compute output spatial dimensions using PyTorch formula
+     int H_out = (H_in - 1) * stride_h - 2 * padding_h + kernel_h + output_padding_h;
+     int W_out = (W_in - 1) * stride_w - 2 * padding_w + kernel_w + output_padding_w;
+ 
+-    TORCH_CHECK(C_in == weight.size(0), "weight C_in mismatch");
+-    TORCH_CHECK(bias.size(0) == C_out, "bias size must equal C_out");
+-    TORCH_CHECK(H_out > 0 && W_out > 0, "invalid output dimensions");
+-
+-    // Allocate output
++    TORCH_CHECK(bias.size(0) == C_out, "bias size must match C_out");
++
+     auto output = torch::empty({N, C_out, H_out, W_out}, input.options());
+ 
+-    // Call launcher
+-    conv_transpose_forward_launcher(
++    conv_transpose2d_forward_launcher(
+         input.data_ptr<float>(),
+         weight.data_ptr<float>(),
+         bias.data_ptr<float>(),
+@@ -121,133 +111,144 @@
+         kernel_h, kernel_w,
+         stride_h, stride_w,
+         padding_h, padding_w,
+-        get_current_stream()
+-    );
+-
+-    return output;
+-}
+-
+-// Clamp forward
+-static torch::Tensor clamp_forward(torch::Tensor input, double min_val, double max_val) {
+-    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+-    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++        output_padding_h, output_padding_w,
++        get_stream()
++    );
++
++    return output;
++}
++
++static torch::Tensor clamp_forward(
++    torch::Tensor input,
++    double min_val,
++    double max_val
++) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+ 
+     auto output = torch::empty_like(input);
+-    int total = static_cast<int>(input.numel());
++    int total = input.numel();
++
+     clamp_forward_launcher(
+         input.data_ptr<float>(),
+         output.data_ptr<float>(),
+-        total,
+         static_cast<float>(min_val),
+         static_cast<float>(max_val),
+-        get_current_stream()
+-    );
+-    return output;
+-}
+-
+-// Leaky ReLU forward
+-static torch::Tensor leaky_relu_forward(torch::Tensor input, double negative_slope) {
+-    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+-    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++        total,
++        get_stream()
++    );
++
++    return output;
++}
++
++static torch::Tensor leaky_relu_forward(
++    torch::Tensor input,
++    double negative_slope
++) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+ 
+     auto output = torch::empty_like(input);
+-    int total = static_cast<int>(input.numel());
++    int total = input.numel();
++
+     leaky_relu_forward_launcher(
+         input.data_ptr<float>(),
+         output.data_ptr<float>(),
++        static_cast<float>(negative_slope),
+         total,
+-        static_cast<float>(negative_slope),
+-        get_current_stream()
+-    );
+-    return output;
+-}
+-
+-// Triu forward
+-static torch::Tensor triu_forward(torch::Tensor input, int64_t diagonal) {
+-    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+-    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++        get_stream()
++    );
++
++    return output;
++}
++
++static torch::Tensor triu_forward(
++    torch::Tensor input,
++    int64_t diagonal
++) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+     TORCH_CHECK(input.dim() >= 2, "input must have at least 2 dimensions");
+ 
+-    int64_t H = input.size(-2);
+-    int64_t W = input.size(-1);
+-    // Compute N*C = product of leading dimensions
+-    int64_t num_batches = input.numel() / (H * W);
+-    int N = static_cast<int>(num_batches); // actually batch*channels collapsed
+-    int C = 1; // not used in kernel; kernel treats N as total leading elements
+-    // Our kernel signature expects (N, C, H, W) but it only uses H and W for masking,
+-    // and N,C are only used for total = N*C*H*W. We can pass N = num_batches, C = 1.
+-    // However, to keep consistency, we pass N=1, C=num_batches? In kernel, total = N*C*H*W,
+-    // so as long as product equals numel, indexing works. We'll pass N=num_batches, C=1.
+-    // Wait: kernel uses total = N*C*H*W, and loops over pos < total.
+-    // It also computes w, h from pos, but doesn't use N or C for indexing, only for stride iteration.
+-    // So it's fine if N*C = num_batches. We set N = num_batches, C = 1.
+-    int total_elements = static_cast<int>(input.numel());
+-    (void) total_elements;
++    int N = 1;
++    int C = 1;
++    if (input.dim() == 4) {
++        N = input.size(0);
++        C = input.size(1);
++        int H = input.size(2);
++        int W = input.size(3);
++        auto output = torch::empty_like(input);
++        triu_forward_launcher(
++            input.data_ptr<float>(),
++            output.data_ptr<float>(),
++            N, C, H, W,
++            static_cast<int>(diagonal),
++            get_stream()
++        );
++        return output;
++    } else {
++        TORCH_CHECK(false, "triu_forward currently supports only 4D tensors");
++    }
++}
++
++static torch::Tensor add_forward(
++    torch::Tensor input,
++    torch::Tensor bias
++) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (N, C, H, W)");
++    TORCH_CHECK(bias.dim() == 3, "bias must be 3D (C, 1, 1)");
++
++    int N = input.size(0);
++    int C = input.size(1);
++    int H = input.size(2);
++    int W = input.size(3);
++
++    TORCH_CHECK(bias.size(0) == C, "bias size must match channels");
++    TORCH_CHECK(bias.size(1) == 1 && bias.size(2) == 1, "bias must have shape (C, 1, 1)");
+ 
+     auto output = torch::empty_like(input);
+-    triu_forward_launcher(
+-        input.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        static_cast<int>(num_batches),
+-        1,
+-        static_cast<int>(H),
+-        static_cast<int>(W),
+-        static_cast<int>(diagonal),
+-        get_current_stream()
+-    );
+-    return output;
+-}
+-
+-// Add bias forward (bias shape (C,1,1) broadcast over N,C,H,W)
+-static torch::Tensor add_forward(torch::Tensor input, torch::Tensor bias) {
+-    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+-    TORCH_CHECK(bias.is_cuda(), "bias must be CUDA");
+-    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+-    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+-    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+-    TORCH_CHECK(input.dim() == 4, "input must be 4D");
+-    TORCH_CHECK(bias.dim() == 3 && bias.size(1) == 1 && bias.size(2) == 1,
+-                "bias must be shape (C,1,1)");
+-
+-    int N = static_cast<int>(input.size(0));
+-    int C = static_cast<int>(input.size(1));
+-    int H = static_cast<int>(input.size(2));
+-    int W = static_cast<int>(input.size(3));
+-    TORCH_CHECK(bias.size(0) == C, "bias C dimension must match input C");
+-
+-    auto output = torch::empty_like(input);
++
+     add_forward_launcher(
+         input.data_ptr<float>(),
+         bias.data_ptr<float>(),
+         output.data_ptr<float>(),
+         N, C, H, W,
+-        get_current_stream()
+-    );
+-    return output;
+-}
+-
+-// Registration
+-static void register_custom_ops(py::module& m) {
+-    m.def("conv_transpose_forward", &conv_transpose_forward,
+-          "ConvTranspose2d forward",
+-          py::arg("input"), py::arg("weight"), py::arg("bias"),
+-          py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
+-    m.def("clamp_forward", &clamp_forward,
+-          "Clamp forward",
+-          py::arg("input"), py::arg("min_val"), py::arg("max_val"));
+-    m.def("leaky_relu_forward", &leaky_relu_forward,
+-          "Leaky ReLU forward",
+-          py::arg("input"), py::arg("negative_slope"));
+-    m.def("triu_forward", &triu_forward,
+-          "Upper triangular mask forward",
+-          py::arg("input"), py::arg("diagonal"));
+-    m.def("add_forward", &add_forward,
+-          "Add bias forward",
+-          py::arg("input"), py::arg("bias"));
++        get_stream()
++    );
++
++    return output;
++}
++
++// Register with torch.ops.cuda_extension
++TORCH_LIBRARY(cuda_extension, m) {
++    m.def("conv_transpose2d_forward(Tensor input, Tensor weight, Tensor bias, int stride_h, int padding_h, int output_padding_h) -> Tensor",
++          &conv_transpose2d_forward);
++    m.def("clamp_forward(Tensor input, float min_val, float max_val) -> Tensor",
++          &clamp_forward);
++    m.def("leaky_relu_forward(Tensor input, float negative_slope) -> Tensor",
++          &leaky_relu_forward);
++    m.def("triu_forward(Tensor input, int diagonal) -> Tensor",
++          &triu_forward);
++    m.def("add_forward(Tensor input, Tensor bias) -> Tensor",
++          &add_forward);
++}
++
++// Also register pybind functions for direct module access
++static void register_custom_ops(pybind11::module& m) {
++    m.def("conv_transpose2d_forward", &conv_transpose2d_forward, "ConvTranspose2d forward");
++    m.def("clamp_forward", &clamp_forward, "Clamp forward");
++    m.def("leaky_relu_forward", &leaky_relu_forward, "LeakyReLU forward");
++    m.def("triu_forward", &triu_forward, "Triu forward");
++    m.def("add_forward", &add_forward, "Add bias forward");
+ }
+ 
+ REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -1,5 +1,6 @@
+ import torch
+ import torch.nn as nn
++import cuda_extension
+ 
+ 
+ class ModelNew(nn.Module):
+@@ -11,34 +12,36 @@
+         self.bias = nn.Parameter(torch.randn(bias_shape))
+ 
+     def forward(self, x):
+-        # 使用自定义 CUDA 算子，禁止 torch 算子
+-        x = torch.ops.cuda_extension.conv_transpose_forward(x, self.conv_transpose.weight, self.conv_transpose.bias,
+-                                                             self.conv_transpose.stride, self.conv_transpose.padding,
+-                                                             self.conv_transpose.output_padding)
+-        x = torch.ops.cuda_extension.clamp_forward(x, 0.0, 1.0)
+-        x = torch.ops.cuda_extension.leaky_relu_forward(x, 0.01)
+-        x = torch.ops.cuda_extension.triu_forward(x, 0)
+-        x = torch.ops.cuda_extension.add_forward(x, self.bias)
++        x = cuda_extension.conv_transpose2d_forward(
++            x,
++            self.conv_transpose.weight,
++            self.conv_transpose.bias,
++            self.conv_transpose.stride[0],
++            self.conv_transpose.padding[0],
++            self.conv_transpose.output_padding[0],
++        )
++        x = cuda_extension.clamp_forward(x, 0.0, 1.0)
++        x = cuda_extension.leaky_relu_forward(x, 0.01)
++        x = cuda_extension.triu_forward(x, 0)
++        x = cuda_extension.add_forward(x, self.bias)
+         return x
+ 
+-    def debug_forward(self, *inputs):
+-        x = inputs[0]
+-        # step_001: conv_transpose
+-        x = torch.ops.cuda_extension.conv_transpose_forward(x, self.conv_transpose.weight, self.conv_transpose.bias,
+-                                                             self.conv_transpose.stride, self.conv_transpose.padding,
+-                                                             self.conv_transpose.output_padding)
+-        yield "step_001", x
+-        # step_002: clamp
+-        x = torch.ops.cuda_extension.clamp_forward(x, 0.0, 1.0)
+-        yield "step_002", x
+-        # step_003: leaky_relu
+-        x = torch.ops.cuda_extension.leaky_relu_forward(x, 0.01)
+-        yield "step_003", x
+-        # step_004: triu
+-        x = torch.ops.cuda_extension.triu_forward(x, 0)
+-        yield "step_004", x
+-        # step_005: add bias
+-        x = torch.ops.cuda_extension.add_forward(x, self.bias)
+-        yield "step_005", x
+-        # step_006: return x
+-        yield "step_006", x
++    def debug_forward(self, x):
++        x = cuda_extension.conv_transpose2d_forward(
++            x,
++            self.conv_transpose.weight,
++            self.conv_transpose.bias,
++            self.conv_transpose.stride[0],
++            self.conv_transpose.padding[0],
++            self.conv_transpose.output_padding[0],
++        )
++        yield 'step_001', x
++        x = cuda_extension.clamp_forward(x, 0.0, 1.0)
++        yield 'step_002', x
++        x = cuda_extension.leaky_relu_forward(x, 0.01)
++        yield 'step_003', x
++        x = cuda_extension.triu_forward(x, 0)
++        yield 'step_004', x
++        x = cuda_extension.add_forward(x, self.bias)
++        yield 'step_005', x
++        yield 'step_006', x
