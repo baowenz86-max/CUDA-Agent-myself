@@ -20,14 +20,12 @@ def source_files(workdir):
 
 
 def invalidate_build(workdir):
-    for p in (workdir / 'cuda_extension.so', workdir / '__pycache__'):
+    # Native artifacts are validated by compile.py; keep Ninja's incremental cache.
+    for p in (workdir / '__pycache__',):
         if p.is_dir():
             shutil.rmtree(p)
         elif p.exists():
             p.unlink()
-    build = workdir / 'build'
-    if build.exists():
-        shutil.rmtree(build)
 
 
 def clean_sources(workdir):
@@ -167,12 +165,18 @@ class CandidateStore:
     def restore_best(self):
         if self.best is None:
             return
-        clean_sources(self.workdir)
+        invalidate_build(self.workdir)
+        for path in source_files(self.workdir):
+            if str(path.relative_to(self.workdir)) not in self.best['manifest']:
+                path.unlink()
         snapshot = Path(self.best['snapshot']) / 'sources'
         for name in self.best['manifest']:
             target = self.workdir / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(snapshot / name, target)
+            source = snapshot / name
+            content = source.read_bytes()
+            if not target.exists() or target.read_bytes() != content:
+                target.write_bytes(content)
         self.last_sources = {name: (self.workdir / name).read_text(encoding='utf-8') for name in self.best['manifest']}
 
     def best_failure(self):

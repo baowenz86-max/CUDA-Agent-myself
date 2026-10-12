@@ -17,6 +17,9 @@ class SourceChecks:
 
 def check_sources(workdir: Path) -> SourceChecks:
     result = SourceChecks()
+    cuda_sources = list((workdir / 'kernels').rglob('*.cu'))
+    if len(cuda_sources) != 1 or cuda_sources[0].relative_to(workdir).as_posix() != 'kernels/custom_ops.cu':
+        result.errors.append('kernels must contain exactly one CUDA source: kernels/custom_ops.cu')
     path = workdir / 'model_new.py'
     try:
         tree = ast.parse(path.read_text(encoding='utf-8'))

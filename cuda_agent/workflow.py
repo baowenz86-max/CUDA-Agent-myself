@@ -47,6 +47,7 @@ DEFAULT_LOG_DIR = REPO_ROOT / "logs"
 DEFAULT_GENERATION_ATTEMPTS = 3
 LOGGER = logging.getLogger(__name__)
 _LOGGING_SETUP_LOCK = threading.Lock()
+_COMPILE_SEMAPHORE = threading.Semaphore(1)
 
 
 # Generation is intentionally split into three calls.  Each call has one
@@ -62,11 +63,11 @@ GENERATION_PROMPTS = (
 只返回 model_new.py 的完整内容；不要返回 kernels 文件，不要修改 model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
     ),
     (
-        "kernels/*.cu",
-        """你负责第二阶段：只生成或修改 kernels/ 下的 CUDA .cu 文件，不要生成或修改 .cpp 或 model_new.py。
+        "kernels/custom_ops.cu",
+        """你负责第二阶段：只生成或修改唯一的 kernels/custom_ops.cu 文件，所有 CUDA kernel 和 launcher 必须放在这个文件中，不要生成或修改 .cpp 或 model_new.py。
 先阅读 SKILL.md、model.py、当前 model_new.py 以及现有 kernels 文件，严格以 model_new.py 已确定的自定义算子名称、参数顺序、返回结构和 dtype/shape 约定为接口契约；不要反过来改 Python 接口。
 只实现参考契约实际使用的 dtype/device，不额外添加未经验证的 half/double 路径。按参考步骤实现完整、可编译的 CUDA kernel 和 host launcher，覆盖 model_new.py 的所有调用路径。重点核对维度/stride、边界和空张量、非连续输入、dtype 分派、数值精度、同步、线程索引和 launch 参数；不得留下伪代码、TODO、占位实现或未定义符号。需要导出给绑定层的 launcher 必须有清晰且稳定的声明，供下一阶段的 binding.cpp 调用。
-只返回需要写入的 .cu 文件完整内容；不要返回 .cpp 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
+必须且只能返回 kernels/custom_ops.cu 的完整内容，不得拆分或新增其他 .cu 文件；不要返回 .cpp 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
     ),
     (
         "kernels/*.cpp",
@@ -227,11 +228,19 @@ def run_command(
     gpu_pool: GPUPool | None = None,
 ) -> tuple[bool, str]:
     """Run one command without a shell and capture its combined output."""
-    LOGGER.info("执行命令：%s", " ".join(command))
-    lease = gpu_pool.acquire() if gpu_pool is not None else nullcontext(None)
+    compile_only = tuple(command) == COMPILE_COMMAND or any(
+        name in command for name in ("cuda_agent.tools.cu_to_ptx", "cuda_agent.tools.cu_to_sass")
+    )
+    resource = "compile" if compile_only else "gpu" if gpu_pool is not None else "none"
+    LOGGER.info("命令等待调度：resource=%s command=%s", resource, " ".join(command))
+    waiting = time.monotonic()
+    lease = _COMPILE_SEMAPHORE if compile_only else gpu_pool.acquire() if gpu_pool is not None else nullcontext(None)
     with lease as gpu_id:
+        wait_seconds = time.monotonic() - waiting
+        started = time.monotonic()
+        LOGGER.info("执行命令：%s；resource=%s wait=%.3fs", " ".join(command), resource, wait_seconds)
         command_env = dict(env)
-        if gpu_id is not None:
+        if not compile_only and gpu_id is not None:
             command_env["CUDA_VISIBLE_DEVICES"] = gpu_id
         try:
             result = subprocess.run(
@@ -244,7 +253,10 @@ def run_command(
             if isinstance(output, bytes):
                 output = output.decode("utf-8", errors="replace")
             LOGGER.error("命令超时：%s", " ".join(command))
-            return False, output + "\nCommand timed out; the GPU lease has been released."
+            return False, output + "\nCommand timed out; the scheduling lease has been released."
+        finally:
+            LOGGER.info("命令计时：resource=%s wait=%.3fs execution=%.3fs command=%s",
+                        resource, wait_seconds, time.monotonic() - started, " ".join(command))
     if result.stdout.strip():
         LOGGER.info("命令输出：\n%s", result.stdout.rstrip())
     LOGGER.info("命令结束：exit_code=%d", result.returncode)
@@ -339,6 +351,9 @@ def generate_kernel_artifacts(
 
 def save_result(task_id: int, workdir: Path, logs: Mapping[str, str]) -> Path:
     """Save a complete snapshot of a successful task."""
+    cuda_sources = list((workdir / "kernels").rglob("*.cu"))
+    if len(cuda_sources) != 1 or cuda_sources[0].relative_to(workdir).as_posix() != "kernels/custom_ops.cu":
+        raise ValueError("Final kernels must contain exactly one CUDA source: kernels/custom_ops.cu")
     save_dir = REPO_ROOT / "results" / f"task_{task_id:04d}"
     if save_dir.exists():
         shutil.rmtree(save_dir)
@@ -445,7 +460,7 @@ def execute_workflow(
                 report.add_stage("artifacts", True, time.monotonic() - started, "best effort")
                 save_result(task_id, config.workdir, {"verification.log": log, "profile.log": profile_log})
                 return True
-            # Restoring always invalidates the binary; evaluate compiles the next repair.
+            # The compile script checks native source fingerprints after each repair.
             store.restore_best()
             if repair + 1 == config.repair_attempts:
                 break
@@ -492,7 +507,12 @@ def run_task(
 
 
 def main() -> int:
+    global _COMPILE_SEMAPHORE
     args = parse_args()
+    compile_workers = int(os.environ.get("CUDA_AGENT_COMPILE_WORKERS", "1"))
+    if compile_workers < 1:
+        raise ValueError("CUDA_AGENT_COMPILE_WORKERS must be at least 1")
+    _COMPILE_SEMAPHORE = threading.Semaphore(compile_workers)
     task_ids = task_ids_from_args(args)
     config = WorkflowConfig()
     if config.generation_attempts < 1 or config.repair_attempts < 1:

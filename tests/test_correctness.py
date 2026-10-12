@@ -60,7 +60,7 @@ class InterfaceTests(unittest.TestCase):
             root = Path(temporary)
             (root / 'model_new.py').write_text('original')
             with self.assertRaises(ValueError):
-                _apply_files({'files': {'model_new.py': 'modified', 'kernels/a.cu': 'bad'}}, root, 'python')
+                _apply_files({'files': {'model_new.py': 'modified', 'kernels/custom_ops.cu': 'bad'}}, root, 'python')
             self.assertEqual((root / 'model_new.py').read_text(), 'original')
 
     def test_repair_analysis_is_required_and_validated(self):
@@ -84,15 +84,16 @@ class InterfaceTests(unittest.TestCase):
                     raise OSError('simulated promotion failure')
                 return real_replace(path, target)
             with patch.object(Path, 'replace', replace), self.assertRaises(OSError):
-                _apply_files({'files': {'model_new.py': 'modified', 'kernels/a.cu': 'new'}}, root)
+                _apply_files({'files': {'model_new.py': 'modified', 'kernels/custom_ops.cu': 'new'}}, root)
             self.assertEqual((root / 'model_new.py').read_text(), 'original')
-            self.assertFalse((root / 'kernels/a.cu').exists())
+            self.assertFalse((root / 'kernels/custom_ops.cu').exists())
 
     def test_missing_binding_and_obvious_prohibited_calls(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'model.py').write_text('')
             (root / 'kernels').mkdir()
+            (root / 'kernels/custom_ops.cu').write_text('')
             (root / 'model_new.py').write_text('''import cuda_extension
 class ModelNew:
     def forward(self,x):
@@ -108,7 +109,7 @@ class ModelNew:
             (root / 'model.py').write_text('torch.tan(x)')
             (root / 'model_new.py').write_text('class ModelNew:\n def forward(self,x): return x')
             (root / 'kernels').mkdir()
-            (root / 'kernels/a.cu').write_text('if (grid_size > 65535) grid_size = 65535; float y = tanhf(x);')
+            (root / 'kernels/custom_ops.cu').write_text('if (grid_size > 65535) grid_size = 65535; float y = tanhf(x);')
             result = check_sources(root)
             self.assertFalse(result.errors)
             self.assertEqual(len(result.warnings), 2)
@@ -144,7 +145,7 @@ class CandidateTests(unittest.TestCase):
         incomplete['verification']['checks'].pop()
         self.assertFalse(better(incomplete, old))
 
-    def test_restore_removes_new_sources_and_stale_binary_and_build(self):
+    def test_restore_removes_new_sources_and_preserves_native_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             work = root / 'work'
@@ -154,6 +155,7 @@ class CandidateTests(unittest.TestCase):
             (work / 'kernels/best.cu').write_text('best kernel')
             store = CandidateStore(work, root / 'run')
             store.capture('verification', False, 'mismatch', verification(.2))
+            native_mtime = (work / 'kernels/best.cu').stat().st_mtime_ns
             (work / 'model_new.py').write_text('regressed')
             (work / 'kernels/new.cu').write_text('new kernel')
             (work / 'cuda_extension.so').write_text('stale')
@@ -164,8 +166,9 @@ class CandidateTests(unittest.TestCase):
             store.restore_best()
             self.assertEqual((work / 'model_new.py').read_text(), 'best')
             self.assertFalse((work / 'kernels/new.cu').exists())
-            self.assertFalse((work / 'cuda_extension.so').exists())
-            self.assertFalse((work / 'build').exists())
+            self.assertEqual((work / 'kernels/best.cu').stat().st_mtime_ns, native_mtime)
+            self.assertTrue((work / 'cuda_extension.so').exists())
+            self.assertTrue((work / 'build/stale.o').exists())
             self.assertEqual(len((root / 'run/history.jsonl').read_text().splitlines()), 2)
 
     def test_snapshot_replay_inputs_survive_atomic_fixture_replacement(self):

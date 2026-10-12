@@ -188,6 +188,8 @@ def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None) ->
             suffix = ".cu" if allowed_stage == "cuda" else ".cpp"
             if len(relative_path.parts) != 2 or relative_path.parts[0] != "kernels" or relative_path.suffix != suffix:
                 raise ValueError(f"{allowed_stage} generation may only write kernels/*{suffix}")
+        if relative_path.suffix == ".cu" and relative_path != Path("kernels/custom_ops.cu"):
+            raise ValueError("CUDA source must be kernels/custom_ops.cu; multiple .cu files are forbidden")
         target = (root / relative_path).resolve()
         if root not in target.parents:
             raise ValueError(f"拒绝越界路径：{relative_name}")
@@ -253,7 +255,8 @@ def run_agent(instruction: str, workdir: str, *, allowed_stage: str | None = Non
 你是 CUDA kernel 优化助手。你不能访问服务器、不能读取本地文件、
 不能执行 shell 命令；所有必要上下文已在用户消息中提供。
 
-只允许修改 model_new.py，或 kernels/ 下的 .cu 与 .cpp 文件。
+只允许修改 model_new.py、kernels/custom_ops.cu，或 kernels/ 下的 .cpp 文件。
+kernels/ 必须且只能有一个 .cu：custom_ops.cu。全部 CUDA kernel 和 launcher 放入该文件；修复时也不得新增其他 .cu。
 禁止修改 model.py、utils/、binding.cpp、binding_registry.h、SKILL.md。
 
 你的回复必须且只能是合法 JSON，不要使用 Markdown 代码块，不要解释。
@@ -266,7 +269,7 @@ def run_agent(instruction: str, workdir: str, *, allowed_stage: str | None = Non
   },
   "files": {
     "model_new.py": "该文件的完整内容",
-    "kernels/example.cu": "该文件的完整内容"
+    "kernels/custom_ops.cu": "该文件的完整内容"
   }
 }
 
