@@ -6,15 +6,20 @@ import cuda_extension
 class ModelNew(nn.Module):
     def __init__(self, in_channels, kernel_size, padding_size):
         super().__init__()
-        self.in_channels = in_channels
-        self.kernel_size = kernel_size
+        # padding_size is a tuple of 4 ints (left, right, top, bottom)
         self.padding_size = padding_size
 
     def forward(self, x):
-        return cuda_extension.pad_ge_remainder_forward(
-            x,
-            self.padding_size[0],
-            self.padding_size[1],
-            self.padding_size[2],
-            self.padding_size[3],
-        )
+        x = cuda_extension.reflection_pad2d_forward(x, self.padding_size)
+        x = cuda_extension.ge_scalar_forward(x, 0)
+        x = cuda_extension.remainder_scalar_forward(x, 2)
+        return x
+
+    def debug_forward(self, x):
+        x = cuda_extension.reflection_pad2d_forward(x, self.padding_size)
+        yield 'step_001', x
+        x = cuda_extension.ge_scalar_forward(x, 0)
+        yield 'step_002', x
+        x = cuda_extension.remainder_scalar_forward(x, 2)
+        yield 'step_003', x
+        yield 'step_004', x

@@ -1,0 +1,248 @@
+// kernels/custom_ops.cu
+#include <cuda_runtime.h>
+#include <pybind11/pybind11.h>
+#include "../binding_registry.h"
+
+namespace py = pybind11;
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            throw std::runtime_error(cudaGetErrorString(err)); \
+        } \
+    } while(0)
+
+// -----------------------------------------------------------------------------
+// Kernel 1: log10 elementwise
+// -----------------------------------------------------------------------------
+__global__ void log10_kernel(const float* __restrict__ input,
+                             float* __restrict__ output,
+                             long long numel) {
+    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = idx; i < numel; i += stride) {
+        float val = input[i];
+        // torch.log10: for input <= 0, returns nan; use standard log10f which yields -inf for 0 and nan for negative
+        output[i] = log10f(val);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Kernel 2: Less than scalar -> bool
+// -----------------------------------------------------------------------------
+__global__ void lt_kernel(const float* __restrict__ input,
+                          bool* __restrict__ output,
+                          float threshold,
+                          long long numel) {
+    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = idx; i < numel; i += stride) {
+        output[i] = (input[i] < threshold);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Kernel 3: ConvTranspose1d direct naive implementation
+// Input: (N, C_in, L_in) float, weight: (C_in, C_out, K) float,
+// bias: (C_out) float, output: (N, C_out, L_out) float
+// L_out = (L_in - 1)*stride - 2*padding + dilation*(K-1) + output_padding + 1
+// -----------------------------------------------------------------------------
+__global__ void conv_transpose1d_kernel(const float* __restrict__ input,
+                                        const float* __restrict__ weight,
+                                        const float* __restrict__ bias,
+                                        float* __restrict__ output,
+                                        int N, int C_in, int C_out, int L_in, int L_out,
+                                        int kernel_size, int stride, int padding,
+                                        int output_padding, int dilation, int groups) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C_out * L_out;
+    if (idx >= total) return;
+
+    int n = idx / (C_out * L_out);
+    int rem = idx - n * C_out * L_out;
+    int co = rem / L_out;
+    int lo = rem - co * L_out;
+
+    int groups_per_input = C_in / groups;
+    int groups_per_output = C_out / groups;
+    // group id = co / groups_per_output
+    int group = co / groups_per_output;
+    int ci_start = group * groups_per_input;
+    int ci_end = ci_start + groups_per_input;
+
+    float acc = bias[co];
+    for (int ci = ci_start; ci < ci_end; ++ci) {
+        for (int k = 0; k < kernel_size; ++k) {
+            // Compute input index:
+            // lo = li * stride - padding + k * dilation
+            // => li = (lo + padding - k * dilation) / stride, if divisible
+            int numerator = lo + padding - k * dilation;
+            if (numerator % stride != 0) continue;
+            int li = numerator / stride;
+            if (li < 0 || li >= L_in) continue;
+            // Access input with contiguous layout: input[n][ci][li]
+            float in_val = input[((long long)n * C_in + ci) * L_in + li];
+            // Access weight with layout: weight[ci][co][k] (since ConvTranspose1d weight shape is [in_channels, out_channels/groups, kernel_size])
+            // In PyTorch, groups=1 default, so groups_per_output = C_out, so weight shape is [C_in, C_out, K]
+            float w_val = weight[((long long)ci * C_out + co) * kernel_size + k];
+            acc += in_val * w_val;
+        }
+    }
+    output[((long long)n * C_out + co) * L_out + lo] = acc;
+}
+
+// -----------------------------------------------------------------------------
+// Kernel 4: Add bias (per-channel)
+// -----------------------------------------------------------------------------
+__global__ void add_bias_kernel(const float* __restrict__ input,
+                                const float* __restrict__ bias,
+                                float* __restrict__ output,
+                                int N, int C, int L) {
+    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    long long total = (long long)N * C * L;
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = idx; i < total; i += stride) {
+        int c = (i / L) % C;
+        output[i] = input[i] + bias[c];
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Launcher functions (extern "C")
+// -----------------------------------------------------------------------------
+
+// Launcher for log10: input float, output float
+extern "C" void custom_log10_launcher(const float* input, float* output, long long numel, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (int)std::min((long long)((numel + threads - 1) / threads), (long long)65535);
+    log10_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Launcher for lt: input float, output bool, threshold float
+extern "C" void custom_lt_launcher(const float* input, bool* output, float threshold, long long numel, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (int)std::min((long long)((numel + threads - 1) / threads), (long long)65535);
+    lt_kernel<<<blocks, threads, 0, stream>>>(input, output, threshold, numel);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Launcher for conv_transpose1d: input float, weight float, bias float, output float
+extern "C" void custom_conv_transpose1d_launcher(
+    const float* input, const float* weight, const float* bias, float* output,
+    int N, int C_in, int C_out, int L_in, int L_out,
+    int kernel_size, int stride, int padding, int output_padding, int dilation, int groups,
+    cudaStream_t stream) {
+    int threads = 256;
+    int total = N * C_out * L_out;
+    int blocks = (total + threads - 1) / threads;
+    conv_transpose1d_kernel<<<blocks, threads, 0, stream>>>(
+        input, weight, bias, output,
+        N, C_in, C_out, L_in, L_out,
+        kernel_size, stride, padding, output_padding, dilation, groups);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Launcher for add_bias: input float, bias float, output float
+extern "C" void custom_add_bias_launcher(
+    const float* input, const float* bias, float* output,
+    int N, int C, int L, cudaStream_t stream) {
+    long long total = (long long)N * C * L;
+    int threads = 256;
+    int blocks = (int)std::min((long long)((total + threads - 1) / threads), (long long)65535);
+    add_bias_kernel<<<blocks, threads, 0, stream>>>(input, bias, output, N, C, L);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// -----------------------------------------------------------------------------
+// PyTorch binding wrappers and registration
+// -----------------------------------------------------------------------------
+
+static torch::Tensor custom_log10(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "Input must be CUDA");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Only float32 supported");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    auto output = torch::empty_like(input);
+    long long numel = input.numel();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    custom_log10_launcher(input.data_ptr<float>(), output.data_ptr<float>(), numel, stream);
+    return output;
+}
+
+static torch::Tensor custom_lt(torch::Tensor input, double threshold) {
+    TORCH_CHECK(input.is_cuda(), "Input must be CUDA");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Only float32 supported");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kBool));
+    long long numel = input.numel();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    custom_lt_launcher(input.data_ptr<float>(), output.data_ptr<bool>(), (float)threshold, numel, stream);
+    return output;
+}
+
+static torch::Tensor custom_conv_transpose1d(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int64_t stride,
+    int64_t padding,
+    int64_t output_padding,
+    int64_t dilation,
+    int64_t groups) {
+    TORCH_CHECK(input.is_cuda() && weight.is_cuda() && bias.is_cuda(), "All tensors must be CUDA");
+    TORCH_CHECK(input.dtype() == torch::kFloat32 && weight.dtype() == torch::kFloat32 && bias.dtype() == torch::kFloat32, "Only float32 supported");
+    TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() && bias.is_contiguous(), "All tensors must be contiguous");
+    TORCH_CHECK(input.dim() == 3, "Input must be 3D (N, C_in, L)");
+    TORCH_CHECK(weight.dim() == 3, "Weight must be 3D (C_in, C_out/groups, K)");
+    TORCH_CHECK(bias.dim() == 1, "Bias must be 1D");
+
+    int N = input.size(0);
+    int C_in = input.size(1);
+    int L_in = input.size(2);
+    int C_out = weight.size(1) * groups; // weight.size(1) is C_out/groups
+    int kernel_size = weight.size(2);
+    TORCH_CHECK(C_in == weight.size(0), "Weight in_channels mismatch");
+    TORCH_CHECK(bias.size(0) == C_out, "Bias size mismatch");
+    TORCH_CHECK(groups >= 1 && C_in % groups == 0 && C_out % groups == 0, "Invalid groups");
+    TORCH_CHECK(kernel_size > 0 && stride > 0 && dilation > 0, "Invalid parameters");
+
+    int L_out = (L_in - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1;
+    auto output = torch::empty({N, C_out, L_out}, input.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    custom_conv_transpose1d_launcher(
+        input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<float>(),
+        N, C_in, C_out, L_in, L_out,
+        kernel_size, (int)stride, (int)padding, (int)output_padding, (int)dilation, (int)groups,
+        stream);
+    return output;
+}
+
+static torch::Tensor custom_add_bias(torch::Tensor input, torch::Tensor bias) {
+    TORCH_CHECK(input.is_cuda() && bias.is_cuda(), "Tensors must be CUDA");
+    TORCH_CHECK(input.dtype() == torch::kFloat32 && bias.dtype() == torch::kFloat32, "Only float32 supported");
+    TORCH_CHECK(input.is_contiguous() && bias.is_contiguous(), "Tensors must be contiguous");
+    TORCH_CHECK(input.dim() == 3, "Input must be 3D");
+    TORCH_CHECK(bias.dim() == 2, "Bias must be 2D (C, 1)");
+    int N = input.size(0);
+    int C = input.size(1);
+    int L = input.size(2);
+    TORCH_CHECK(bias.size(0) == C, "Bias channels mismatch");
+    TORCH_CHECK(bias.size(1) == 1, "Bias must have shape (C, 1)");
+    auto output = torch::empty_like(input);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    custom_add_bias_launcher(input.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<float>(), N, C, L, stream);
+    return output;
+}
+
+// Registration function
+void register_custom_ops(py::module& m) {
+    m.def("custom_log10", &custom_log10, "log10");
+    m.def("custom_lt", &custom_lt, "less than");
+    m.def("custom_conv_transpose1d", &custom_conv_transpose1d, "conv transpose 1d");
+    m.def("custom_add_bias", &custom_add_bias, "add bias");
+}
+
+REGISTER_BINDING(custom_ops, register_custom_ops);

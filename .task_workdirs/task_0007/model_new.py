@@ -9,7 +9,6 @@ class ModelNew(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.bias = bias
-        self.pos_dim = pos_dim
         self.W_q = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.W_k = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.W_v = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -17,26 +16,57 @@ class ModelNew(nn.Module):
         self.pos_enc = nn.Parameter(torch.randn(1, pos_dim, embed_dim))
 
     def forward(self, query, key, value, attn_mask, target):
-        # Ensure inputs are contiguous and on CUDA (custom ops assume this)
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        attn_mask = attn_mask.contiguous()
-        target = target.contiguous()
+        q_weight = self.W_q.weight
+        q_bias = self.W_q.bias
+        k_weight = self.W_k.weight
+        k_bias = self.W_k.bias
+        v_weight = self.W_v.weight
+        v_bias = self.W_v.bias
 
-        # Custom ops
-        qkv = cuda_extension.qkv_proj_pos(
-            query, key, value, self.pos_enc,
-            self.W_q.weight, self.W_k.weight, self.W_v.weight,
-            self.W_q.bias if self.bias else None,
-            self.W_k.bias if self.bias else None,
-            self.W_v.bias if self.bias else None
-        )
-        q, k, v = qkv  # each [B, T, E]
+        q = cuda_extension.linear_forward(query, q_weight, q_bias)
+        k = cuda_extension.linear_forward(key, k_weight, k_bias)
+        v = cuda_extension.linear_forward(value, v_weight, v_bias)
 
-        attn_output = cuda_extension.sdpa(q, k, v, attn_mask)
+        q = cuda_extension.add_pos_enc(q, self.pos_enc)
+        k = cuda_extension.add_pos_enc(k, self.pos_enc)
+        v = cuda_extension.add_pos_enc(v, self.pos_enc)
 
-        logits = cuda_extension.attn_bias_baddbmm(attn_output)
+        attn_output = cuda_extension.scaled_dot_product_attention_forward(q, k, v, attn_mask)
 
-        loss = cuda_extension.bce_with_logits(logits, target)
+        batch2 = attn_output.transpose(-2, -1).contiguous()
+        logits = cuda_extension.baddbmm_forward(torch.zeros_like(target), attn_output, batch2)
+
+        loss = cuda_extension.bce_with_logits_loss(logits, target)
         return loss
+
+    def debug_forward(self, query, key, value, attn_mask, target):
+        q_weight = self.W_q.weight
+        q_bias = self.W_q.bias
+        k_weight = self.W_k.weight
+        k_bias = self.W_k.bias
+        v_weight = self.W_v.weight
+        v_bias = self.W_v.bias
+
+        q = cuda_extension.linear_forward(query, q_weight, q_bias)
+        q = cuda_extension.add_pos_enc(q, self.pos_enc)
+        yield "step_001", q
+
+        k = cuda_extension.linear_forward(key, k_weight, k_bias)
+        k = cuda_extension.add_pos_enc(k, self.pos_enc)
+        yield "step_002", k
+
+        v = cuda_extension.linear_forward(value, v_weight, v_bias)
+        v = cuda_extension.add_pos_enc(v, self.pos_enc)
+        yield "step_003", v
+
+        attn_output = cuda_extension.scaled_dot_product_attention_forward(q, k, v, attn_mask)
+        yield "step_004", attn_output
+
+        batch2 = attn_output.transpose(-2, -1).contiguous()
+        logits = cuda_extension.baddbmm_forward(torch.zeros_like(target), attn_output, batch2)
+        yield "step_005", logits
+
+        loss = cuda_extension.bce_with_logits_loss(logits, target)
+        yield "step_006", loss
+
+        yield "step_007", loss

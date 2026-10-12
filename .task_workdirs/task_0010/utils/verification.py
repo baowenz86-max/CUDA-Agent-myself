@@ -1,60 +1,34 @@
 #!/usr/bin/env python3
-"""Correctness verification for CUDA extension model."""
+"""Reproducible final-forward verification; debug results never grant a pass."""
+
+import argparse
+from contextlib import contextmanager
+import importlib
+import os
+from pathlib import Path
+import sys
+import traceback
 
 import torch
 import torch.nn.functional as F
-from contextlib import contextmanager
 
-from model import Model, get_inputs, get_init_inputs
-from model_new import ModelNew
-
-
-def transform_tensors(tensors, fn):
-    if isinstance(tensors, torch.Tensor):
-        return fn(tensors)
-    if isinstance(tensors, (list, tuple)):
-        return [transform_tensors(x, fn) for x in tensors]
-    if isinstance(tensors, dict):
-        return {k: transform_tensors(v, fn) for k, v in tensors.items()}
-    return tensors
-
-
-def check_equal(actual, expected):
-    assert type(actual) == type(expected), f"{type(actual)=} != {type(expected)=}"
-    if isinstance(actual, (list, tuple)):
-        assert len(actual) == len(expected), f"{len(actual)=} != {len(expected)=}"
-        for x, y in zip(actual, expected):
-            check_equal(x, y)
-    elif isinstance(actual, dict):
-        for key, val in expected.items():
-            assert key in actual, f"Missing key in output: {key}"
-            check_equal(actual[key], val)
-    elif isinstance(actual, (str, float, int)):
-        assert actual == expected, f"{actual=} != {expected=}"
-    elif isinstance(actual, torch.Tensor):
-        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
-    else:
-        raise TypeError(f"Unsupported output type: {type(actual)}")
+from .diagnostics import (
+    ComparisonFailure, check_equal, reference_trace,
+    seed_all, transform_tree, write_json,
+)
 
 
 @contextmanager
 def block_torch_functional(excludes=None):
-    if excludes is None:
-        excludes = set()
-
+    excludes = set() if excludes is None else excludes
     originals = {}
     for name in dir(F):
         attr = getattr(F, name)
-        if callable(attr) and not name.startswith("_") and name not in excludes:
+        if callable(attr) and not name.startswith('_') and name not in excludes:
             originals[name] = attr
-
             def wrapper(*args, __name=name, **kwargs):
-                raise RuntimeError(
-                    f"Function torch.nn.functional.{__name} is not allowed in this context."
-                )
-
+                raise RuntimeError(f'Function torch.nn.functional.{__name} is not allowed in this context.')
             setattr(F, name, wrapper)
-
     try:
         yield
     finally:
@@ -62,42 +36,218 @@ def block_torch_functional(excludes=None):
             setattr(F, name, attr)
 
 
-def initialize_models():
-    init_inputs = get_init_inputs()
-    if not isinstance(init_inputs, (list, tuple)):
-        init_inputs = [init_inputs]
-
-    torch_model = Model(*init_inputs).eval().cuda()
-    cuda_model = ModelNew(*init_inputs).eval().cuda()
-    cuda_model.load_state_dict(torch_model.state_dict())
-    return torch_model, cuda_model
+def fixture_directory():
+    return Path(os.environ.get('CUDA_AGENT_RUN_DIR', '.correctness')).resolve()
 
 
-def build_inputs():
-    torch_inputs = get_inputs()
-    if not isinstance(torch_inputs, (list, tuple)):
-        torch_inputs = [torch_inputs]
-    torch_inputs = transform_tensors(torch_inputs, lambda x: x.cuda())
-    cuda_inputs = transform_tensors(torch_inputs, lambda x: x.clone())
-    return torch_inputs, cuda_inputs
+def make_reference_fixture(directory, seed, device):
+    """Create once per run, independently of any generated model."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / 'reference_fixture.pt'
+    if not path.exists():
+        reference = importlib.import_module('model')
+        seed_all(seed)
+        init = reference.get_init_inputs()
+        init = init if isinstance(init, (tuple, list)) else [init]
+        model = reference.Model(*init).eval().to(device)
+        torch.save({'seed': seed, 'init_inputs': transform_tree(init, lambda t: t.detach().cpu()),
+                    'state_dict': transform_tree(model.state_dict(), lambda t: t.detach().cpu())}, path)
+    fixture = torch.load(path, map_location='cpu', weights_only=False)
+    if fixture['seed'] != seed:
+        raise ValueError('Saved reference fixture seed differs from requested seed; use its replay seed')
+    return fixture
 
 
-def main():
-    torch_model, cuda_model = initialize_models()
-    num_checks = 5
+def initialize_models(directory, seed, device):
+    reference = importlib.import_module('model')
+    fixture = make_reference_fixture(directory, seed, device)
+    seed_all(seed)
+    torch_model = reference.Model(*fixture['init_inputs']).eval().to(device)
+    generated = importlib.import_module('model_new')
+    seed_all(seed)
+    cuda_model = generated.ModelNew(*fixture['init_inputs']).eval().to(device)
+    torch_model.load_state_dict(fixture['state_dict'], strict=True)
+    cuda_model.load_state_dict(fixture['state_dict'], strict=True)
+    return torch_model, cuda_model, fixture
 
-    with torch.no_grad():
-        for i in range(num_checks):
-            torch_inputs, cuda_inputs = build_inputs()
-            torch_output = torch_model(*torch_inputs)
+
+def build_inputs(seed):
+    reference = importlib.import_module('model')
+    seed_all(seed)
+    inputs = reference.get_inputs()
+    inputs = inputs if isinstance(inputs, (list, tuple)) else [inputs]
+    # Retain untouched CPU fixtures even when the forward modifies its inputs.
+    return transform_tree(inputs, lambda t: t.detach().cpu().clone())
+
+
+def device_inputs(inputs, device):
+    return transform_tree(inputs, lambda t: t.to(device).clone())
+
+
+def synchronize(device):
+    if str(device).startswith('cuda'):
+        torch.cuda.synchronize()
+
+
+def runtime_metadata(device):
+    return {'python': sys.version, 'torch': torch.__version__, 'cuda': torch.version.cuda,
+            'device': str(device), 'gpu': torch.cuda.get_device_name() if str(device).startswith('cuda') else None,
+            'deterministic_algorithms': torch.are_deterministic_algorithms_enabled()}
+
+
+def rng_state():
+    import random
+    state = {'python': random.getstate(), 'torch': torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    try:
+        import numpy as np
+        state['numpy'] = np.random.get_state()
+    except ImportError:
+        pass
+    return state
+
+
+def restore_rng(state):
+    import random
+    random.setstate(state['python'])
+    torch.set_rng_state(state['torch'])
+    if 'cuda' in state:
+        torch.cuda.set_rng_state_all(state['cuda'])
+    if 'numpy' in state:
+        import numpy as np
+        np.random.set_state(state['numpy'])
+
+
+def diagnose(torch_model, cuda_model, fixture, inputs, input_seed, device):
+    if not callable(getattr(cuda_model, 'debug_forward', None)):
+        return {'status': 'unavailable', 'reason': 'ModelNew.debug_forward is missing'}
+    try:
+        ref_fn, stages = reference_trace(torch_model)
+        torch_model.load_state_dict(fixture['state_dict'], strict=True)
+        cuda_model.load_state_dict(fixture['state_dict'], strict=True)
+        seed_all(input_seed)
+        initial_rng = rng_state()
+        reference = ref_fn(*device_inputs(inputs, device))
+        with block_torch_functional():
+            actual = iter(cuda_model.debug_forward(*device_inputs(inputs, device)))
+        ref_rng = initial_rng
+        actual_rng = rng_state()
+        matched = 0
+        for stage in stages:
+            restore_rng(ref_rng)
+            expected_id, expected = next(reference)
+            ref_rng = rng_state()
+            restore_rng(actual_rng)
             with block_torch_functional():
-                cuda_output = cuda_model(*cuda_inputs)
-            check_equal(cuda_output, torch_output)
-            print(f"[PASS] check {i + 1}/{num_checks}")
+                checkpoint, value = next(actual)
+                synchronize(device)
+            actual_rng = rng_state()
+            if checkpoint != expected_id:
+                return {'status': 'failed', 'checkpoint': stage, 'kind': 'checkpoint_contract',
+                        'actual_id': str(checkpoint), 'matched_checkpoints': matched}
+            try:
+                check_equal(value, expected, expected_id)
+            except ComparisonFailure as exc:
+                return {'status': 'failed', 'checkpoint': stage, 'error': exc.detail,
+                        'matched_checkpoints': matched}
+            matched += 1
+            del expected, value
+        sentinel = object()
+        with block_torch_functional():
+            if next(actual, sentinel) is not sentinel:
+                return {'status': 'failed', 'kind': 'extra_checkpoint', 'matched_checkpoints': matched}
+        return {'status': 'matched', 'matched_checkpoints': matched,
+                'note': 'Debug checkpoints match; normal forward still failed and remains rejected'}
+    except Exception as exc:
+        return {'status': 'unavailable', 'reason': f'{type(exc).__name__}: {exc}',
+                'traceback': traceback.format_exc()}
 
-    torch.cuda.synchronize()
-    print("[PASS] verify success")
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--seed', type=int, default=int(os.environ.get('CUDA_AGENT_VERIFICATION_SEED', '2026')))
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--replay', type=Path, help='Replay a trusted, locally saved failure_inputs.pt')
+    parser.add_argument('--diagnose', action='store_true', help='Diagnose the saved failure in a fresh process')
+    args = parser.parse_args(argv)
+    directory = args.replay.resolve().parent if args.replay else fixture_directory()
+    report_path = directory / 'verification.json'
+    result = {'status': 'failed', 'seed': args.seed, 'num_checks': 5, 'checks': [],
+              'passed_checks': 0, 'stage': 'initialization'}
+    try:
+        result['environment'] = runtime_metadata(args.device)
+        torch_model, cuda_model, fixture = initialize_models(directory, args.seed, args.device)
+        replay = torch.load(args.replay, map_location='cpu', weights_only=False) if args.replay else None
+        if args.diagnose:
+            failure = replay or torch.load(directory / 'failure_inputs.pt', map_location='cpu', weights_only=False)
+            with torch.no_grad():
+                diagnostic = diagnose(torch_model, cuda_model, fixture, failure['inputs'], failure['seed'], args.device)
+            write_json(directory / 'diagnostic.json', diagnostic)
+            print('[DIAGNOSTIC] ' + str(diagnostic))
+            return 0
+        indices = [replay['check_index']] if replay else range(5)
+        first_failure_saved = False
+        with torch.no_grad():
+            for i in indices:
+                input_seed = replay['seed'] if replay else args.seed + 1 + i
+                inputs = replay['inputs'] if replay else build_inputs(input_seed)
+                row = {'index': i, 'seed': input_seed, 'status': 'failed'}
+                actual = expected = None
+                try:
+                    torch_model.load_state_dict(fixture['state_dict'], strict=True)
+                    cuda_model.load_state_dict(fixture['state_dict'], strict=True)
+                    seed_all(input_seed)
+                    result['stage'] = 'reference'
+                    expected = torch_model(*device_inputs(inputs, args.device))
+                    synchronize(args.device)
+                    seed_all(input_seed)
+                    result['stage'] = 'forward'
+                    with block_torch_functional():
+                        actual = cuda_model(*device_inputs(inputs, args.device))
+                        synchronize(args.device)
+                    result['stage'] = 'comparison'
+                    check_equal(actual, expected)
+                    row['status'] = 'passed'
+                    result['passed_checks'] += 1
+                    print(f'[PASS] check {i + 1}/5')
+                except Exception as exc:
+                    row.update(stage=result['stage'], error=exc.detail if isinstance(exc, ComparisonFailure)
+                               else {'kind': 'runtime', 'message': f'{type(exc).__name__}: {exc}'},
+                               traceback=traceback.format_exc())
+                    print(row['traceback'])
+                    if not first_failure_saved:
+                        result['first_failure'] = row
+                        # Never overwrite a replay fixture while reading it.
+                        if not args.replay:
+                            temporary = directory / 'failure_inputs.tmp.pt'
+                            torch.save({'inputs': inputs, 'seed': input_seed, 'check_index': i}, temporary)
+                            temporary.replace(directory / 'failure_inputs.pt')
+                        first_failure_saved = True
+                finally:
+                    result['checks'].append(row)
+                    write_json(report_path if not args.replay else directory / 'replay_verification.json', result)
+                    del actual, expected, inputs
+                if row.get('stage') in ('reference', 'forward') and row['status'] == 'failed':
+                    # A failed CUDA context cannot be reused safely; diagnose in a new subprocess.
+                    break
+        result['status'] = 'passed' if result['checks'] and all(r['status'] == 'passed' for r in result['checks']) and (replay or len(result['checks']) == 5) else 'failed'
+        result['stage'] = 'verification'
+    except Exception as exc:
+        result.update(error={'kind': 'initialization', 'message': f'{type(exc).__name__}: {exc}'},
+                      traceback=traceback.format_exc())
+        print(result['traceback'])
+    if args.diagnose:
+        write_json(directory / 'diagnostic.json', {'status': 'unavailable', 'reason': result.get('error'), 'traceback': result.get('traceback')})
+        return 1
+    result['replay_command'] = f'{sys.executable} -m utils.verification --seed {args.seed} --device {args.device} --replay {directory / "failure_inputs.pt"}'
+    write_json(report_path if not args.replay else directory / 'replay_verification.json', result)
+    if result['status'] == 'passed':
+        print('[PASS] verify success')
+        return 0
+    print('[FAIL] Structured report: ' + str(report_path))
+    return 1
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    raise SystemExit(main())

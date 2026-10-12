@@ -2,6 +2,7 @@
 """Simplified compile script: force-compile root and kernels CUDA/C++ sources."""
 
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -55,6 +56,18 @@ def compile_kernels() -> int:
     if output_so.exists():
         output_so.unlink()
 
+    # Correctness-first builds do not enable approximate math by default.
+    cuda_flags = ['-O3', f'-ccbin={HOST_CXX}']
+    if os.environ.get('CUDA_AGENT_FAST_MATH') == '1':
+        cuda_flags.append('--use_fast_math')
+    source_text = '\n'.join(Path(source).read_text(encoding='utf-8') for source in sources)
+    libraries = []
+    source_text = re.sub(r'/\*.*?\*/|//[^\n]*', '', source_text, flags=re.S)
+    if re.search(r'#\s*include\s*[<"]cublas|\bcublas[A-Z]\w*\s*\(', source_text):
+        libraries.append('-lcublas')
+    if re.search(r'#\s*include\s*[<"]cudnn|\bcudnn[A-Z]\w*\s*\(', source_text):
+        libraries.append('-lcudnn')
+
     try:
         cpp_ext.load(
             name='cuda_extension',
@@ -63,11 +76,8 @@ def compile_kernels() -> int:
             verbose=False,
             with_cuda=True,
             extra_cflags=['-O3', '-std=c++20'],
-            extra_cuda_cflags=[
-                '-O3',
-                '--use_fast_math',
-                f'-ccbin={HOST_CXX}',
-            ],
+            extra_cuda_cflags=cuda_flags,
+            extra_ldflags=libraries,
         )
     except Exception as exc:
         print('Compilation failed.')

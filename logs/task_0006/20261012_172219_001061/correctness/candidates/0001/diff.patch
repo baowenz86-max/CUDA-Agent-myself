@@ -1,0 +1,414 @@
+--- before/kernels/ge_scalar.cu
++++ after/kernels/ge_scalar.cu
+@@ -0,0 +1,53 @@
++#include <cuda_runtime.h>
++#include <torch/types.h>
++#include <c10/cuda/CUDAStream.h>
++#include <pybind11/pybind11.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++__global__ void ge_scalar_kernel(
++    const float* __restrict__ input,
++    bool* __restrict__ output,
++    float scalar,
++    long total_elements)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (long i = idx; i < total_elements; i += stride) {
++        output[i] = (input[i] >= scalar);
++    }
++}
++
++torch::Tensor ge_scalar_forward(torch::Tensor input, double scalar) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Only float32 is implemented");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++
++    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kBool));
++
++    long total_elements = input.numel();
++    int threads = 256;
++    int blocks = (total_elements + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    ge_scalar_kernel<<<blocks, threads, 0, stream>>>(
++        input.data_ptr<float>(),
++        output.data_ptr<bool>(),
++        (float)scalar,
++        total_elements
++    );
++
++    return output;
++}
++
++void register_ge_scalar(py::module& m) {
++    m.def("ge_scalar_forward", &ge_scalar_forward,
++          "Greater than or equal scalar forward",
++          py::arg("input"), py::arg("scalar"));
++}
++
++REGISTER_BINDING(ge_scalar, register_ge_scalar);
+--- before/kernels/ge_scalar_binding.cpp
++++ after/kernels/ge_scalar_binding.cpp
+@@ -0,0 +1,44 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++extern "C" void ge_scalar_launcher(
++    const float* input,
++    bool* output,
++    float scalar,
++    long total_elements,
++    cudaStream_t stream
++);
++
++torch::Tensor ge_scalar_forward(torch::Tensor input, double scalar) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Only float32 is implemented");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++
++    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kBool));
++
++    long total_elements = input.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    ge_scalar_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<bool>(),
++        (float)scalar,
++        total_elements,
++        stream
++    );
++
++    return output;
++}
++
++void register_ge_scalar(py::module& m) {
++    m.def("ge_scalar_forward", &ge_scalar_forward,
++          "Greater than or equal scalar forward",
++          py::arg("input"), py::arg("scalar"));
++}
++
++REGISTER_BINDING(ge_scalar, register_ge_scalar);
+--- before/kernels/reflection_pad2d.cu
++++ after/kernels/reflection_pad2d.cu
+@@ -0,0 +1,95 @@
++#include <cuda_runtime.h>
++#include <torch/types.h>
++#include <c10/cuda/CUDAStream.h>
++#include <pybind11/pybind11.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int batch,
++    int channels,
++    int in_h,
++    int in_w,
++    int out_h,
++    int out_w,
++    int pad_left,
++    int pad_right,
++    int pad_top,
++    int pad_bottom,
++    long total_elements)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (long linear_idx = idx; linear_idx < total_elements; linear_idx += stride) {
++        int ow = linear_idx % out_w;
++        int oh = (linear_idx / out_w) % out_h;
++        long plane = linear_idx / (long)(out_w * out_h);
++        int c = plane % channels;
++        int b = plane / channels;
++
++        int iw = ow - pad_left;
++        int ih = oh - pad_top;
++
++        // reflect indices
++        if (iw < 0) iw = -iw;
++        if (iw >= in_w) iw = 2 * in_w - 2 - iw;
++        if (ih < 0) ih = -ih;
++        if (ih >= in_h) ih = 2 * in_h - 2 - ih;
++
++        long input_idx = ((long)b * channels + c) * in_h * in_w + (long)ih * in_w + iw;
++        output[linear_idx] = input[input_idx];
++    }
++}
++
++torch::Tensor reflection_pad2d_forward(torch::Tensor input, std::vector<int64_t> padding) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N,C,H,W)");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Only float32 is implemented");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(padding.size() == 4, "Padding must be a 4-element vector (left, right, top, bottom)");
++
++    int64_t pad_left = padding[0];
++    int64_t pad_right = padding[1];
++    int64_t pad_top = padding[2];
++    int64_t pad_bottom = padding[3];
++
++    int batch = input.size(0);
++    int channels = input.size(1);
++    int in_h = input.size(2);
++    int in_w = input.size(3);
++    int out_h = in_h + pad_top + pad_bottom;
++    int out_w = in_w + pad_left + pad_right;
++
++    TORCH_CHECK(out_h >= 1 && out_w >= 1, "Output size must be positive");
++
++    auto output = torch::empty({batch, channels, out_h, out_w}, input.options());
++
++    long total_elements = (long)batch * channels * out_h * out_w;
++    int threads = 256;
++    int blocks = (total_elements + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch, channels, in_h, in_w, out_h, out_w,
++        pad_left, pad_right, pad_top, pad_bottom,
++        total_elements
++    );
++
++    return output;
++}
++
++void register_reflection_pad2d(py::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "Reflection padding 2D forward",
++          py::arg("input"), py::arg("padding"));
++}
++
++REGISTER_BINDING(reflection_pad2d, register_reflection_pad2d);
+--- before/kernels/reflection_pad2d_binding.cpp
++++ after/kernels/reflection_pad2d_binding.cpp
+@@ -0,0 +1,70 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int batch,
++    int channels,
++    int in_h,
++    int in_w,
++    int out_h,
++    int out_w,
++    int pad_left,
++    int pad_right,
++    int pad_top,
++    int pad_bottom,
++    long total_elements,
++    cudaStream_t stream
++);
++
++torch::Tensor reflection_pad2d_forward(torch::Tensor input, std::vector<int64_t> padding) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N,C,H,W)");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Only float32 is implemented");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(padding.size() == 4, "Padding must be a 4-element vector (left, right, top, bottom)");
++
++    int64_t pad_left = padding[0];
++    int64_t pad_right = padding[1];
++    int64_t pad_top = padding[2];
++    int64_t pad_bottom = padding[3];
++
++    int batch = input.size(0);
++    int channels = input.size(1);
++    int in_h = input.size(2);
++    int in_w = input.size(3);
++    int out_h = in_h + pad_top + pad_bottom;
++    int out_w = in_w + pad_left + pad_right;
++
++    TORCH_CHECK(out_h >= 1 && out_w >= 1, "Output size must be positive");
++
++    auto output = torch::empty({batch, channels, out_h, out_w}, input.options());
++
++    long total_elements = (long)batch * channels * out_h * out_w;
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    reflection_pad2d_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch, channels, in_h, in_w, out_h, out_w,
++        pad_left, pad_right, pad_top, pad_bottom,
++        total_elements,
++        stream
++    );
++
++    return output;
++}
++
++void register_reflection_pad2d(py::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "Reflection padding 2D forward",
++          py::arg("input"), py::arg("padding"));
++}
++
++REGISTER_BINDING(reflection_pad2d, register_reflection_pad2d);
+--- before/kernels/remainder_scalar.cu
++++ after/kernels/remainder_scalar.cu
+@@ -0,0 +1,62 @@
++#include <cuda_runtime.h>
++#include <torch/types.h>
++#include <c10/cuda/CUDAStream.h>
++#include <pybind11/pybind11.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++__global__ void remainder_scalar_kernel(
++    const bool* __restrict__ input,
++    int64_t* __restrict__ output,
++    int64_t divisor,
++    long total_elements)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (long i = idx; i < total_elements; i += stride) {
++        int64_t value = (int64_t)input[i];
++        // Python-like modulo for non-negative divisor (here 2) but avoid division by zero
++        if (divisor == 0) {
++            output[i] = 0; // mimic torch? Actually torch.remainder with zero gives NaN for float, but inputs are ints, undefined. We'll set 0.
++        } else {
++            int64_t rem = value % divisor;
++            // Adjust for Python semantics if divisor positive: rem is non-negative
++            if (rem < 0) rem += divisor;
++            output[i] = rem;
++        }
++    }
++}
++
++torch::Tensor remainder_scalar_forward(torch::Tensor input, int64_t divisor) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.scalar_type() == torch::kBool, "Only bool input is implemented");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++
++    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kInt64));
++
++    long total_elements = input.numel();
++    int threads = 256;
++    int blocks = (total_elements + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    remainder_scalar_kernel<<<blocks, threads, 0, stream>>>(
++        input.data_ptr<bool>(),
++        output.data_ptr<int64_t>(),
++        divisor,
++        total_elements
++    );
++
++    return output;
++}
++
++void register_remainder_scalar(py::module& m) {
++    m.def("remainder_scalar_forward", &remainder_scalar_forward,
++          "Remainder scalar forward",
++          py::arg("input"), py::arg("divisor"));
++}
++
++REGISTER_BINDING(remainder_scalar, register_remainder_scalar);
+--- before/kernels/remainder_scalar_binding.cpp
++++ after/kernels/remainder_scalar_binding.cpp
+@@ -0,0 +1,44 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++extern "C" void remainder_scalar_launcher(
++    const bool* input,
++    int64_t* output,
++    int64_t divisor,
++    long total_elements,
++    cudaStream_t stream
++);
++
++torch::Tensor remainder_scalar_forward(torch::Tensor input, int64_t divisor) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.scalar_type() == torch::kBool, "Only bool input is implemented");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++
++    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kInt64));
++
++    long total_elements = input.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    remainder_scalar_launcher(
++        input.data_ptr<bool>(),
++        output.data_ptr<int64_t>(),
++        divisor,
++        total_elements,
++        stream
++    );
++
++    return output;
++}
++
++void register_remainder_scalar(py::module& m) {
++    m.def("remainder_scalar_forward", &remainder_scalar_forward,
++          "Remainder scalar forward",
++          py::arg("input"), py::arg("divisor"));
++}
++
++REGISTER_BINDING(remainder_scalar, register_remainder_scalar);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,25 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, kernel_size, padding_size):
++        super().__init__()
++        # padding_size is a tuple of 4 ints (left, right, top, bottom)
++        self.padding_size = padding_size
++
++    def forward(self, x):
++        x = cuda_extension.reflection_pad2d_forward(x, self.padding_size)
++        x = cuda_extension.ge_scalar_forward(x, 0)
++        x = cuda_extension.remainder_scalar_forward(x, 2)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.reflection_pad2d_forward(x, self.padding_size)
++        yield 'step_001', x
++        x = cuda_extension.ge_scalar_forward(x, 0)
++        yield 'step_002', x
++        x = cuda_extension.remainder_scalar_forward(x, 2)
++        yield 'step_003', x
++        yield 'step_004', x

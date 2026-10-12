@@ -1,0 +1,152 @@
+--- before/kernels/all_bindings.cpp
++++ after/kernels/all_bindings.cpp
+@@ -0,0 +1,124 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++
++// Forward declarations of launchers
++extern "C" void conv2d_launcher(const float* input, const float* weight, const float* bias, float* output,
++                                int N, int C, int H, int W, int K, int R, int S, cudaStream_t stream);
++extern "C" void triu_launcher(const float* input, float* output, int N, int C, int H, int W, cudaStream_t stream);
++extern "C" void bitwise_xor_launcher(const uint8_t* input1, const uint8_t* bias, uint8_t* output,
++                                     int N, int C, int H, int W, cudaStream_t stream);
++extern "C" void cast_float_launcher(const uint8_t* input, float* output, int total, cudaStream_t stream);
++
++// Forward declarations of wrapper functions
++static torch::Tensor conv2d_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
++    TORCH_CHECK(input.is_cuda() && weight.is_cuda() && bias.is_cuda(), "All tensors must be CUDA");
++    TORCH_CHECK(input.dtype() == torch::kFloat32 && weight.dtype() == torch::kFloat32 && bias.dtype() == torch::kFloat32, "All tensors must be float32");
++    TORCH_CHECK(input.dim() == 4 && weight.dim() == 4 && bias.dim() == 1, "Invalid dimensions");
++    int N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
++    int K = weight.size(0), R = weight.size(2), S = weight.size(3);
++    TORCH_CHECK(weight.size(1) == C, "Weight input channels mismatch");
++    TORCH_CHECK(bias.size(0) == K, "Bias length mismatch");
++    int H_out = H - R + 1, W_out = W - S + 1;
++    auto output = torch::empty({N, K, H_out, W_out}, input.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    conv2d_launcher(input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
++                    output.data_ptr<float>(), N, C, H, W, K, R, S, stream);
++    return output;
++}
++
++static torch::Tensor triu_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kFloat32, "Input must be CUDA float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D");
++    int N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    triu_launcher(input.data_ptr<float>(), output.data_ptr<float>(), N, C, H, W, stream);
++    return output;
++}
++
++static torch::Tensor bitwise_xor_forward(torch::Tensor input, torch::Tensor bias) {
++    TORCH_CHECK(input.is_cuda() && bias.is_cuda(), "Input and bias must be CUDA");
++    TORCH_CHECK(input.dtype() == torch::kUInt8, "Input must be uint8");
++    TORCH_CHECK(bias.dtype() == torch::kUInt8, "Bias must be uint8");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D");
++    int N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
++    // Accept bias of any shape as long as the number of elements equals C
++    TORCH_CHECK(bias.numel() == C, "Bias must have C elements");
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    // Ensure bias is contiguous
++    auto bias_contig = bias.contiguous();
++    bitwise_xor_launcher(input.data_ptr<uint8_t>(), bias_contig.data_ptr<uint8_t>(), output.data_ptr<uint8_t>(),
++                         N, C, H, W, stream);
++    return output;
++}
++
++static torch::Tensor cast_float_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kUInt8, "Input must be CUDA uint8");
++    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kFloat32));
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    cast_float_launcher(input.data_ptr<uint8_t>(), output.data_ptr<float>(), input.numel(), stream);
++    return output;
++}
++
++// Explicit registration function
++extern "C" void register_all_bindings(pybind11::module& m) {
++    m.def("conv2d_forward", &conv2d_forward, "Conv2d forward");
++    m.def("triu_forward", &triu_forward, "Triu forward");
++    m.def("bitwise_xor_forward", &bitwise_xor_forward, "Bitwise XOR forward");
++    m.def("cast_float_forward", &cast_float_forward, "Cast to float forward");
++}
++
++// Register using a static object, but ensure it is linked by using a global variable with constructor
++static struct RegisterBindings {
++    RegisterBindings() {
++        // Directly add to binding registry if available, else we need a separate mechanism.
++        // Since binding_registry.h provides REGISTER_BINDING, we can use it here.
++        // However, to avoid dependency, we'll use a custom approach: we'll register in PYBIND11_MODULE later.
++        // Instead, we'll provide an init function to be called from binding.cpp? But binding.cpp is fixed.
++        // So we must rely on auto-registration. But we are not using REGISTER_BINDING macro; we are defining a separate function.
++        // That won't be called. Need to integrate with binding.cpp somehow. Since binding.cpp is fixed and calls BindingRegistry::getInstance().applyBindings(m),
++        // we need to add our function to that registry. We can do that by including "../binding_registry.h" and using REGISTER_BINDING.
++        // But the macro creates a static registrar object that is initialized before main, so it will be collected.
++        // That is what we already had, but it failed. Perhaps due to static initialization order fiasco? But in a single shared library, it usually works.
++        // The original individual _binding.cpp files used REGISTER_BINDING and still failed to register some functions, while bitwise_xor_binding.cpp worked (since it didn't appear in error list, but later failed on dtype).
++        // So maybe the issue is that some _binding.cpp files were not compiled? No, compile log shows 9 files including all.
++        // Let's check: the error list says conv2d_forward, triu_forward, cast_float_forward missing, but bitwise_xor_forward is not missing. That suggests bitwise_xor_binding.cpp's REGISTER_BINDING worked, while others didn't.
++        // Why? Possibly because in those files, the register function name did not match? Let's inspect: in conv2d_binding.cpp, register function is register_conv2d_forward, and REGISTER_BINDING(conv2d, register_conv2d_forward). But the macro expects the function to be in the same namespace? It passes the function pointer to lambda; should work.
++        // Could be a typo? But we haven't seen the exact code in current workspace; we need to see the provided files. From the file listing, conv2d_binding.cpp is present and looks correct. So why not registered?
++        // Perhaps the static registrar object was optimized out because it is unused? The compiler may remove unused static objects if not referenced elsewhere. In some linkers with --as-needed, unused static objects from shared libraries might be dropped.
++        // To ensure registration, we can explicitly call the binding registration in a function that is guaranteed to run at module import, but binding.cpp is fixed and only calls applyBindings, which iterates over registered bindings collected from static objects. If some static objects are dropped, they won't be in the registry.
++        // One way to force inclusion is to use __attribute__((used)) on the registrar variable, but we cannot modify binding_registry.h (fixed). However, we can define a global variable in our new file that references the registrar, but that's tricky.
++        // Another approach: modify binding.cpp? Not allowed.
++        // Alternative: Instead of relying on auto-registration, we can use pybind11's PYBIND11_MODULE in another file, but binding.cpp already defines PYBIND11_MODULE, causing conflict.
++        // So we must make the auto-registration work. We can combine all bindings into one file and use a single REGISTER_BINDING, but the individual files already do that; maybe the issue is that the static objects from separate translation units are not all linked in because the linker only includes object files that are referenced. In a shared library, all object files are linked, so their static initialization code should run when the library is loaded, unless the linker does garbage collection of unused sections.
++        // The compile command uses -O3 but no -ffunction-sections or -fdata-sections, so unused sections may not be collected. However, PyTorch's build system might add those flags. If so, static objects not referenced from outside might be dropped. To force inclusion, we can add a reference from a function that is definitely called, like the registration function itself, but we can't modify binding.cpp.
++        // We could create a new file that defines a function that calls all register functions and then somehow triggers it at module load. But pybind11 module initialization is in binding.cpp, we can't add code there. However, we can use a constructor attribute on a function that runs at load time to populate the registry before applyBindings is called. But applyBindings is called during module init, which happens after all static initializations. If we can ensure our constructor runs before module init, we can add bindings to the registry.
++        // We can define a static object with constructor in our new file that adds to the registry. But we already do that via REGISTER_BINDING; the problem is that the static object from certain files may be dropped. If we combine all registrations into one file, that file's static object is more likely to be included because it has other referenced symbols? Not necessarily.
++        // We can force inclusion by using a volatile pointer or __attribute__((used)) on the static registrar object. But REGISTER_BINDING macro defines `_registrar_name` as static, so we can't easily add attributes. However, we can define our own static object in the combined file and also use REGISTER_BINDING? That would double-register if the individual files are still present. We'll remove the individual files and only keep all_bindings.cpp. In all_bindings.cpp, we can define a static object with constructor that calls register_all_bindings or directly adds to registry using BindingRegistry::getInstance().registerBinding(). To ensure the object is not discarded, we can make it non-static global? But then it might conflict if multiple translation units? Since we only have one such object, we can define it as `__attribute__((used)) static BindingRegistrar ...`? The attribute ensures the symbol is emitted. But we can't modify binding_registry.h, but we can write our own static object with constructor that uses `__attribute__((constructor))` to run at load time and add to registry. This is more reliable.
++        // However, pybind11 module initialization may happen after constructors, so if our constructor adds a binding to the registry, applyBindings will then include it. So we can do:
++        // __attribute__((constructor)) void init_bindings() { BindingRegistry::getInstance().registerBinding("all", [](py::module& m){ m.def(...); }); }
++        // But we need to ensure this translation unit is linked. The __attribute__((constructor)) function is referenced from .init_array, so the linker will include it.
++        // So we can create a new file all_bindings.cpp that defines the wrapper functions and a constructor function to register them. Then remove the individual _binding.cpp files to avoid duplicate symbols.
++    }
++} register_bindings_instance;
++
++// Actually implement the constructor approach:
++#include "../binding_registry.h"
++
++// Wrapper functions as above...
++
++// Constructor function to register bindings
++__attribute__((constructor))
++static void register_all_bindings_constructor() {
++    BindingRegistry::getInstance().registerBinding("all_bindings", [](pybind11::module& m) {
++        m.def("conv2d_forward", &conv2d_forward, "Conv2d forward");
++        m.def("triu_forward", &triu_forward, "Triu forward");
++        m.def("bitwise_xor_forward", &bitwise_xor_forward, "Bitwise XOR forward");
++        m.def("cast_float_forward", &cast_float_forward, "Cast to float forward");
++    });
++}
++
++// Note: The individual binding files will be removed from the directory to avoid duplicate symbol definitions.
+--- before/model_new.py
++++ after/model_new.py
+@@ -11,7 +11,10 @@
+     def forward(self, x):
+         x = cuda_extension.conv2d_forward(x, self.conv2d.weight, self.conv2d.bias)
+         x = cuda_extension.triu_forward(x)
+-        x = cuda_extension.bitwise_xor_forward(x, self.bias)
++        # Cast to uint8 for bitwise XOR, as in reference
++        x_uint8 = x.to(torch.uint8)
++        bias_uint8 = self.bias.to(torch.uint8)
++        x = cuda_extension.bitwise_xor_forward(x_uint8, bias_uint8)
+         x = cuda_extension.cast_float_forward(x)
+         return x
+ 
+@@ -20,7 +23,9 @@
+         yield 'step_001', x
+         x = cuda_extension.triu_forward(x)
+         yield 'step_002', x
+-        x = cuda_extension.bitwise_xor_forward(x, self.bias)
++        x_uint8 = x.to(torch.uint8)
++        bias_uint8 = self.bias.to(torch.uint8)
++        x = cuda_extension.bitwise_xor_forward(x_uint8, bias_uint8)
+         yield 'step_003', x
+         x = cuda_extension.cast_float_forward(x)
+         yield 'step_004', x
