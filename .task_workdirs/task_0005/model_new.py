@@ -12,15 +12,16 @@ class ModelNew(nn.Module):
         self.bias = nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x):
-        x = torch.log10(x)
-        x = torch.lt(x, 0.5)
-        x = cuda_extension.conv_transpose1d_custom(
-            x.float(),
+        x = cuda_extension.log10_lt_forward(x, threshold=0.5)
+        x = cuda_extension.conv_transpose1d_forward(
+            x,
             self.conv_transpose1d.weight,
             self.conv_transpose1d.bias,
-            self.conv_transpose1d.stride[0],
-            self.conv_transpose1d.padding[0],
-            self.conv_transpose1d.output_padding[0]
+            stride=self.conv_transpose1d.stride[0],
+            padding=self.conv_transpose1d.padding[0],
+            output_padding=self.conv_transpose1d.output_padding[0],
+            dilation=self.conv_transpose1d.dilation[0],
+            groups=self.conv_transpose1d.groups,
         )
-        x = x + self.bias
+        x = cuda_extension.bias_add_forward(x, self.bias)
         return x

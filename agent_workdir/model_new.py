@@ -1,26 +1,27 @@
 import torch
+import torch.nn as nn
 import cuda_extension
 
 
-class ModelNew(torch.nn.Module):
-    def __init__(self, embed_dim, num_heads, bias, batch_first, stack_dim):
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
         super().__init__()
-        self.multihead_attn = torch.nn.MultiheadAttention(
-            embed_dim, num_heads, bias=bias, batch_first=batch_first
+        self.conv_transpose1d = nn.ConvTranspose1d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding
         )
-        self.num_heads = num_heads
-        self.stack_dim = stack_dim
+        self.bias = nn.Parameter(torch.randn(bias_shape))
 
-    def forward(self, x1, x2, x3, key_padding_mask):
-        return cuda_extension.mha_stack_forward(
-            x1,
-            x2,
-            x3,
-            key_padding_mask,
-            self.multihead_attn.in_proj_weight,
-            self.multihead_attn.in_proj_bias,
-            self.multihead_attn.out_proj.weight,
-            self.multihead_attn.out_proj.bias,
-            self.num_heads,
-            self.stack_dim,
+    def forward(self, x):
+        x = cuda_extension.log10_lt_forward(x, threshold=0.5)
+        x = cuda_extension.conv_transpose1d_forward(
+            x,
+            self.conv_transpose1d.weight,
+            self.conv_transpose1d.bias,
+            stride=self.conv_transpose1d.stride[0],
+            padding=self.conv_transpose1d.padding[0],
+            output_padding=self.conv_transpose1d.output_padding[0],
+            dilation=self.conv_transpose1d.dilation[0],
+            groups=self.conv_transpose1d.groups,
         )
+        x = cuda_extension.bias_add_forward(x, self.bias)
+        return x
