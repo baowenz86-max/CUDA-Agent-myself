@@ -94,7 +94,7 @@ def _read_file(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _build_context(workdir: Path) -> str:
+def _build_context(workdir: Path, run_dir: Path | None = None) -> str:
     kernel_sources = []
 
     kernels_dir = workdir / "kernels"
@@ -105,6 +105,12 @@ def _build_context(workdir: Path) -> str:
                     f"\n===== {path.relative_to(workdir)} =====\n{_read_file(path)}"
                 )
 
+    readonly = ["binding.cpp", "binding_registry.h", "utils/verification.py", "utils/diagnostics.py", "utils/compile.py"]
+    extra = "".join(f"\n===== READ ONLY: {name} =====\n{_read_file(workdir / name)}\n" for name in readonly)
+    if run_dir is not None:
+        for name in ("task_contract.json", "source_checks.json", "interface.json", "verification.json", "diagnostic.json", "repair_context.json"):
+            if (run_dir / name).exists():
+                extra += f"\n===== READ ONLY: {name} =====\n{_read_file(run_dir / name)}\n"
     return f"""
 ===== SKILL.md =====
 {_read_file(workdir / "SKILL.md")}
@@ -117,6 +123,7 @@ def _build_context(workdir: Path) -> str:
 
 ===== 现有 CUDA/C++ kernel 文件 =====
 {"".join(kernel_sources) if kernel_sources else "(当前没有 kernel 文件)"}
+{extra}
 """
 
 
@@ -158,7 +165,7 @@ def _is_allowed_path(relative_path: Path) -> bool:
     )
 
 
-def _apply_files(data: dict, workdir: Path) -> None:
+def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None) -> None:
     """Validate the complete response, then atomically apply every file."""
     root = workdir.resolve()
     files = data["files"]
@@ -172,35 +179,72 @@ def _apply_files(data: dict, workdir: Path) -> None:
             raise ValueError("files 中的文件名和内容必须都是字符串。")
 
         relative_path = Path(relative_name)
-        if not _is_allowed_path(relative_path):
+        if len(relative_path.parts) > 2 or not _is_allowed_path(relative_path):
             raise ValueError(f"拒绝写入不允许的路径：{relative_name}")
 
+        if allowed_stage == "python" and relative_path != Path("model_new.py"):
+            raise ValueError("Python generation may only write model_new.py")
+        if allowed_stage in {"cuda", "binding"}:
+            suffix = ".cu" if allowed_stage == "cuda" else ".cpp"
+            if len(relative_path.parts) != 2 or relative_path.parts[0] != "kernels" or relative_path.suffix != suffix:
+                raise ValueError(f"{allowed_stage} generation may only write kernels/*{suffix}")
         target = (root / relative_path).resolve()
         if root not in target.parents:
             raise ValueError(f"拒绝越界路径：{relative_name}")
 
         validated_files.append((relative_path, target, content))
 
-    for relative_path, target, content in validated_files:
-        target.parent.mkdir(parents=True, exist_ok=True)
+    backups = {target: target.read_bytes() if target.exists() else None for _, target, _ in validated_files}
+    temporaries = []
+    try:
+        # Stage every file before promoting any of them; rollback the bundle on I/O failure.
+        for relative_path, target, content in validated_files:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as temp_file:
+                temp_file.write(content)
+                temporaries.append((Path(temp_file.name), target))
+        for temporary, target in temporaries:
+            temporary.replace(target)
+            LOGGER.info("API 已更新文件：%s", target.relative_to(root))
+    except OSError:
+        for target, original in backups.items():
+            if original is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.write_bytes(original)
+        raise
+    finally:
+        for temporary, _ in temporaries:
+            temporary.unlink(missing_ok=True)
 
-        # 同目录临时文件保证 os.replace 在同一文件系统上原子执行。
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=target.parent, delete=False
-        ) as temp_file:
-            temp_file.write(content)
-            temp_path = Path(temp_file.name)
-        temp_path.replace(target)
 
-        LOGGER.info("API 已更新文件：%s", relative_path)
+def _validate_analysis(data: dict, required: bool) -> dict | None:
+    analysis = data.get("analysis")
+    if analysis is None and not required:
+        return None
+    if not isinstance(analysis, dict) or not isinstance(analysis.get("hypothesis"), str) or not analysis["hypothesis"].strip():
+        raise ValueError("修复回复必须提供 analysis.hypothesis 根因假设")
+    for field in ("evidence", "changes"):
+        if not isinstance(analysis.get(field), list) or not analysis[field] or not all(isinstance(x, str) and x.strip() for x in analysis[field]):
+            raise ValueError(f"修复回复必须提供非空字符串列表 analysis.{field}")
+    return analysis
 
 
-def run_agent(instruction: str, workdir: str) -> bool:
+def _record_call(run_dir, **event):
+    if run_dir is not None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with (run_dir / "api_calls.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def run_agent(instruction: str, workdir: str, *, allowed_stage: str | None = None,
+              run_dir: Path | None = None, require_analysis: bool = False) -> bool:
     """请求远程模型，并将其返回的受限文件变更写入 agent_workdir。"""
     try:
         config = DeepSeekAPIConfig.from_env()
     except ValueError as exc:
         LOGGER.error("DeepSeek API 配置错误：%s", exc)
+        _record_call(run_dir, stage=allowed_stage or "repair", success=False, error=str(exc))
         return False
 
     workdir_path = Path(workdir)
@@ -215,13 +259,18 @@ def run_agent(instruction: str, workdir: str) -> bool:
 你的回复必须且只能是合法 JSON，不要使用 Markdown 代码块，不要解释。
 格式如下：
 {
+  "analysis": {
+    "hypothesis": "待验证的根因假设；生成时说明语义与接口选择",
+    "evidence": ["来自参考契约或失败诊断的具体证据"],
+    "changes": ["本次修改及预期验证结果"]
+  },
   "files": {
     "model_new.py": "该文件的完整内容",
     "kernels/example.cu": "该文件的完整内容"
   }
 }
 
-files 中只放需要新增或修改的完整文件。不要返回 shell 命令。
+files 中只放需要新增或修改的完整文件。不要返回 shell 命令。修复必须提供 analysis，但其中内容是待验证假设，不能宣称已经运行测试。
 """.strip()
 
     user_prompt = f"""
@@ -229,7 +278,7 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
 {instruction}
 
 以下是工作目录中的文件内容：
-{_build_context(workdir_path)}
+{_build_context(workdir_path, run_dir)}
 """.strip()
 
     payload = {
@@ -273,22 +322,32 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
         content = _response_content(response_data)
 
         LOGGER.debug("API response (%d chars):\n%s", len(content), content)
-        _apply_files(_extract_json(content), workdir_path)
+        data = _extract_json(content)
+        analysis = _validate_analysis(data, require_analysis)
+        _apply_files(data, workdir_path, allowed_stage)
+        _record_call(run_dir, stage=allowed_stage or "repair", success=True, analysis=analysis,
+                     files=sorted(data["files"]), elapsed_seconds=time.monotonic() - started_at)
         LOGGER.info("DeepSeek API 调用成功，耗时 %.2fs", time.monotonic() - started_at)
         return True
 
-    except TimeoutError:
+    except TimeoutError as exc:
+        failure = f"TimeoutError: {exc}"
         LOGGER.error(
             "DeepSeek API 请求超时（等待 %d 秒仍未收到响应）。",
             config.timeout_seconds,
         )
 
     except HTTPError as exc:
+        failure = f"HTTPError: {exc}"
         body = exc.read().decode("utf-8", errors="replace")
         LOGGER.error("DeepSeek API HTTP 错误：%s\n%s", exc.code, body)
     except URLError as exc:
+        failure = f"URLError: {exc}"
         LOGGER.error("无法连接 DeepSeek API：%s", exc.reason)
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+    except (KeyError, IndexError, TypeError, ValueError, OSError) as exc:
+        failure = f"{type(exc).__name__}: {exc}"
         LOGGER.error("DeepSeek API 回复或文件变更格式错误：%s", exc)
 
+    _record_call(run_dir, stage=allowed_stage or "repair", success=False, error=failure,
+                 elapsed_seconds=time.monotonic() - started_at)
     return False

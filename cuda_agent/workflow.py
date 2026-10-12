@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import argparse #解析命令行参数
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from cuda_agent.api import run_agent
+from cuda_agent.candidates import CandidateStore, clean_sources, read_json
+from cuda_agent.validation import check_sources
 from cuda_agent.log_setup import CURRENT_TASK_ID, configure_logging
 from cuda_agent.report import WorkflowReport
 from cuda_agent.tools.toolchain import build_environment
@@ -53,8 +56,8 @@ GENERATION_PROMPTS = (
     (
         "model_new.py",
         """你负责第一阶段：只生成 model_new.py，不要生成或修改任何 .cu/.cpp 文件。
-请阅读 SKILL.md、model.py 和当前工作目录，完整梳理参考实现的输入输出 shape、dtype、device、广播、边界条件和数值语义。
-先保证与 model.py 语义等价、接口可用，再考虑性能。model_new.py 只能调用后续 CUDA 源码中会实现的自定义算子；请明确、统一地设计算子名称、参数顺序、返回值结构和 dtype/shape 约定，避免伪代码、TODO、占位实现或未定义调用。
+请阅读只读 task_contract.json、验证器、绑定基础设施、SKILL.md 和 model.py；以实际参考代码而非 ops 标注为准，完整梳理参考实现的输入输出 shape、dtype、device、广播、边界条件和数值语义。
+先保证与 model.py 语义等价、接口可用。本轮逐参考计算步骤实现，不做跨步骤融合；必须保持 state_dict 键和 forward 参数一致。task_contract.json 可追踪时必须提供 debug_forward(*inputs)，按 checkpoints 顺序 yield (id, value)，包括最终返回。正常 forward 仍返回参考结果，调试接口不能改变计算公式。model_new.py 只能调用后续 CUDA 源码中会实现的自定义算子；请明确、统一地设计算子名称、参数顺序、返回值结构和 dtype/shape 约定，避免伪代码、TODO、占位实现或未定义调用。
 保留非 CUDA 或特殊输入路径。禁止使用 torch 算子实现本应下沉到自定义扩展的计算。
 只返回 model_new.py 的完整内容；不要返回 kernels 文件，不要修改 model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
     ),
@@ -62,7 +65,7 @@ GENERATION_PROMPTS = (
         "kernels/*.cu",
         """你负责第二阶段：只生成或修改 kernels/ 下的 CUDA .cu 文件，不要生成或修改 .cpp 或 model_new.py。
 先阅读 SKILL.md、model.py、当前 model_new.py 以及现有 kernels 文件，严格以 model_new.py 已确定的自定义算子名称、参数顺序、返回结构和 dtype/shape 约定为接口契约；不要反过来改 Python 接口。
-实现完整、可编译的 CUDA kernel 和 host launcher，覆盖 model_new.py 的所有调用路径。重点核对维度/stride、边界和空张量、非连续输入、dtype 分派、数值精度、同步、线程索引和 launch 参数；不得留下伪代码、TODO、占位实现或未定义符号。需要导出给绑定层的 launcher 必须有清晰且稳定的声明，供下一阶段的 binding.cpp 调用。
+只实现参考契约实际使用的 dtype/device，不额外添加未经验证的 half/double 路径。按参考步骤实现完整、可编译的 CUDA kernel 和 host launcher，覆盖 model_new.py 的所有调用路径。重点核对维度/stride、边界和空张量、非连续输入、dtype 分派、数值精度、同步、线程索引和 launch 参数；不得留下伪代码、TODO、占位实现或未定义符号。需要导出给绑定层的 launcher 必须有清晰且稳定的声明，供下一阶段的 binding.cpp 调用。
 只返回需要写入的 .cu 文件完整内容；不要返回 .cpp 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
     ),
     (
@@ -230,27 +233,35 @@ def run_command(
         command_env = dict(env)
         if gpu_id is not None:
             command_env["CUDA_VISIBLE_DEVICES"] = gpu_id
-        result = subprocess.run(
-            list(command), cwd=workdir, env=command_env, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
-        )
+        try:
+            result = subprocess.run(
+                list(command), cwd=workdir, env=command_env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+                timeout=int(command_env.get("CUDA_AGENT_COMMAND_TIMEOUT", "600")),
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = exc.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            LOGGER.error("命令超时：%s", " ".join(command))
+            return False, output + "\nCommand timed out; the GPU lease has been released."
     if result.stdout.strip():
         LOGGER.info("命令输出：\n%s", result.stdout.rstrip())
     LOGGER.info("命令结束：exit_code=%d", result.returncode)
     return result.returncode == 0, result.stdout
 
 
-def generate_cuda(workdir: Path) -> bool:
+def generate_cuda(workdir: Path, run_dir: Path | None = None) -> bool:
     """Generate Python, CUDA, and binding sources in separate API calls."""
     for stage, (target, prompt) in enumerate(GENERATION_PROMPTS, start=1):
         LOGGER.info("生成阶段 %d/3：%s", stage, target)
-        if not run_agent(prompt, str(workdir)):
+        if not run_agent(prompt, str(workdir), allowed_stage=("python", "cuda", "binding")[stage - 1], run_dir=run_dir):
             LOGGER.error("生成阶段 %d 失败：%s", stage, target)
             return False
     return True
 
 
-def send_feedback(error_log: str, workdir: Path, stage: str) -> bool:
+def send_feedback(error_log: str, workdir: Path, stage: str, run_dir: Path | None = None) -> bool:
     repair_prompt = REPAIR_PROMPTS.get(stage)
     if repair_prompt is None:
         repair_prompt = (
@@ -261,12 +272,16 @@ def send_feedback(error_log: str, workdir: Path, stage: str) -> bool:
         f"""{repair_prompt}
 
 当前失败阶段：{stage}
+当前源码可能已恢复为最好候选。请结合 repair_context.json 区分当前主版本与被拒绝的修改，
+保留正确部分，按第一个错误检查点做最小修改。若连续两轮没有改善，必须提出不同且可验证的根因。
+只支持本任务实际使用的 dtype。不得修改诊断/验证器、放宽容限或以填零掩盖未写输出。
+回复必须含 analysis.hypothesis、analysis.evidence 和 analysis.changes；这是待验证假设。
 
 完整错误日志（优先处理最早出现的根因）：
 ----------------
 {error_log}
 ----------------""",
-        str(workdir),
+        str(workdir), run_dir=run_dir, require_analysis=True,
     )
 
 
@@ -351,76 +366,94 @@ def execute_workflow(
     gpu_pool: GPUPool,
 ) -> bool:
     env = build_environment()
+    run_dir = report.log_path.parent / "correctness"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    seed = int(os.environ.get("CUDA_AGENT_VERIFICATION_SEED", "2026")) + task_id * 100
+    env.update(CUDA_AGENT_RUN_DIR=str(run_dir.resolve()), CUDA_AGENT_VERIFICATION_SEED=str(seed))
+    store = CandidateStore(config.workdir, run_dir)
     sample = load_task(task_id)
     report.operators = str(sample.get("ops", "unknown"))
     reset_generated_workspace(config.workdir)
+    clean_sources(config.workdir)
     prepare_model(sample, config.workdir)
+    started = time.monotonic()
+    ready, reference_log = run_command((sys.executable, "-m", "utils.preflight"), config.workdir, env, gpu_pool)
+    report.add_stage("reference contract", ready, time.monotonic() - started)
+    if not ready:
+        report.failure_reason = "Reference preflight failed: " + reference_log[-6000:]
+        return False
 
-    for attempt in range(1, config.generation_attempts + 1):
-        LOGGER.info("生成尝试 %d/%d", attempt, config.generation_attempts)
-        started = time.monotonic()
-        generated = generate_cuda(config.workdir)
-        report.add_stage(
-            f"generation #{attempt}", generated, time.monotonic() - started,
-            "DeepSeek API",
-        )
-        if not generated:
-            continue
-        started = time.monotonic()
-        compiled, compile_log = run_stage_with_repairs(
-            "compile", COMPILE_COMMAND, config, env, gpu_pool=gpu_pool
-        )
-        report.add_stage("compile", compiled, time.monotonic() - started)
+    def evaluate():
+        # Reports belong to a specific source version; never reuse stale results.
+        for name in ("interface.json", "verification.json", "diagnostic.json"):
+            (run_dir / name).unlink(missing_ok=True)
+        checks = check_sources(config.workdir)
+        (run_dir / "source_checks.json").write_text(json.dumps(checks.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        for warning in checks.warnings:
+            LOGGER.warning("源代码诊断：%s", warning)
+        if checks.errors:
+            return "sources", False, "\n".join(checks.errors), None, None
+        compiled, compile_log = run_command(COMPILE_COMMAND, config.workdir, env, gpu_pool)
         if not compiled:
-            continue
-        started = time.monotonic()
+            return "compile", False, compile_log, None, None
+        interface_ok, interface_log = run_command((sys.executable, "-m", "utils.preflight", "--compiled"), config.workdir, env, gpu_pool)
+        if not interface_ok:
+            return "interface", False, compile_log + "\n" + interface_log, None, None
+        verified, verify_log = run_command(VERIFY_COMMAND, config.workdir, env, gpu_pool)
+        verification = read_json(run_dir / "verification.json", {})
+        # Exit code alone cannot establish that all fixed normal-forward checks ran.
+        rows = verification.get("checks", [])
+        verified = verified and verification.get("status") == "passed" and len(rows) == 5 and all(row.get("status") == "passed" for row in rows)
+        diagnostic = None
+        if not verified and (run_dir / "failure_inputs.pt").exists() and verification.get("first_failure"):
+            _, diagnostic_log = run_command((*VERIFY_COMMAND, "--diagnose"), config.workdir, env, gpu_pool)
+            diagnostic = read_json(run_dir / "diagnostic.json", {"status": "unavailable", "reason": diagnostic_log[-6000:]})
+            sanitizer = shutil.which("compute-sanitizer", path=env.get("PATH"))
+            failure_text = verify_log.lower()
+            if sanitizer and any(word in failure_text for word in ("illegal memory", "launch failure", "out of bounds")):
+                _, sanitizer_log = run_command((sanitizer, "--tool", "memcheck", "--error-exitcode", "86", *VERIFY_COMMAND,
+                                                "--replay", str(run_dir / "failure_inputs.pt")), config.workdir, env, gpu_pool)
+                diagnostic["sanitizer_log"] = sanitizer_log[-12000:]
+                (run_dir / "diagnostic.json").write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding="utf-8")
+        return "verification", verified, compile_log + "\n" + interface_log + "\n" + verify_log, verification, diagnostic
 
-        def recompile_after_verification_repair() -> tuple[bool, str]:
-            nonlocal compile_log
-            compile_started = time.monotonic()
-            recompiled, recompile_log = run_stage_with_repairs(
-                "compile", COMPILE_COMMAND, config, env, gpu_pool=gpu_pool
-            )
-            compile_log += (
-                "\n\n=== compile after verification repair ===\n"
-                f"{recompile_log}"
-            )
-            report.add_stage(
-                "compile after verification repair",
-                recompiled,
-                time.monotonic() - compile_started,
-            )
-            return recompiled, recompile_log
-
-        verified, verify_log = run_stage_with_repairs(
-            "verification",
-            VERIFY_COMMAND,
-            config,
-            env,
-            before_retry=recompile_after_verification_repair,
-            gpu_pool=gpu_pool,
-        )
-        report.add_stage("verification", verified, time.monotonic() - started)
-        if not verified:
-            continue
+    for generation in range(1, config.generation_attempts + 1):
+        clean_sources(config.workdir)
+        for name in ("source_checks.json", "interface.json", "verification.json", "diagnostic.json"):
+            (run_dir / name).unlink(missing_ok=True)
         started = time.monotonic()
-        profiled, profile_log = run_command(
-            PROFILE_COMMAND, config.workdir, env, gpu_pool
-        )
-        report.add_stage("profiling", profiled, time.monotonic() - started)
-        if not profiled:
-            LOGGER.error("profiling 失败；本轮不会标记为成功")
+        generated = generate_cuda(config.workdir, run_dir)
+        report.add_stage(f"generation #{generation}", generated, time.monotonic() - started, "DeepSeek API")
+        if not generated:
+            store.capture("sources", False, "Generation failed; see workflow.log and api_calls.jsonl")
             continue
-
-        started = time.monotonic()
-        generate_kernel_artifacts(env, config.workdir, gpu_pool)
-        report.add_stage("artifacts", True, time.monotonic() - started, "best effort")
-        save_result(task_id, config.workdir, {
-            "compile.log": compile_log,
-            "verification.log": verify_log,
-            "profile.log": profile_log,
-        })
-        return True
+        for repair in range(config.repair_attempts):
+            started = time.monotonic()
+            stage, success, log, verification, diagnostic = evaluate()
+            record = store.capture(stage, success, log, verification, diagnostic)
+            report.best_candidate = str(Path(store.best["snapshot"]).relative_to(report.log_path.parent))
+            report.add_stage(f"{stage} candidate #{record['id']}", success, time.monotonic() - started, record["decision"])
+            if success:
+                started = time.monotonic()
+                profiled, profile_log = run_command(PROFILE_COMMAND, config.workdir, env, gpu_pool)
+                report.add_stage("profiling", profiled, time.monotonic() - started)
+                if not profiled:
+                    report.failure_reason = "Correctness passed, but profiling failed: " + profile_log[-6000:]
+                    return False
+                started = time.monotonic()
+                generate_kernel_artifacts(env, config.workdir, gpu_pool)
+                report.add_stage("artifacts", True, time.monotonic() - started, "best effort")
+                save_result(task_id, config.workdir, {"verification.log": log, "profile.log": profile_log})
+                return True
+            # Restoring always invalidates the binary; evaluate compiles the next repair.
+            store.restore_best()
+            if repair + 1 == config.repair_attempts:
+                break
+            if not send_feedback(log, config.workdir, stage if stage == "compile" else "verification", run_dir):
+                report.add_stage("repair API", False, 0, "No changes applied; best candidate retained")
+                break
+    store.restore_best()
+    report.failure_reason = store.best_failure()
     return False
 
 
@@ -442,7 +475,7 @@ def run_task(
     try:
         success = execute_workflow(task_id, config, report, gpu_pool)
         if not success:
-            error = "All generation attempts were exhausted. See workflow.log."
+            error = report.failure_reason or "All generation attempts were exhausted. See workflow.log."
     except Exception as exc:  # preserve a report for unexpected failures
         error = f"{type(exc).__name__}: {exc}"
         LOGGER.exception("工作流异常终止")

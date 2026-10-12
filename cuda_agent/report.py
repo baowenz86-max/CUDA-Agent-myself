@@ -22,6 +22,8 @@ class WorkflowReport:
     started_at: datetime = field(default_factory=datetime.now)
     stages: list[StageResult] = field(default_factory=list)
     operators: str = "unknown"
+    failure_reason: str = ""
+    best_candidate: str = ""
 
     def add_stage(
         self, name: str, success: bool, duration_seconds: float, details: str = ""
@@ -50,6 +52,8 @@ class WorkflowReport:
 - Finished: `{finished_at.isoformat(timespec='seconds')}`
 - Duration: `{duration:.2f}s`
 - Full log: `{self.log_path.name}`
+- Best correctness candidate: `{self.best_candidate or "none"}`
+- Correctness evidence: `correctness/` (contract, fixtures, history and candidate snapshots)
 
 ## Stage Summary
 

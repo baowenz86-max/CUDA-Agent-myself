@@ -15,16 +15,16 @@ CUDA-Agent-Ops-6K
 读取 task / 写入 model.py
         │
         ▼
-DeepSeek API 生成 model_new.py + kernels/*
+固定 seed 采集参考契约 → DeepSeek API 三阶段生成
         │
         ▼
-编译 ──失败──► 错误日志反馈给 DeepSeek API ──► 修复
+编译 ──失败──► 契约、失败证据与候选历史反馈 ──► 修复并重新编译
         │成功
         ▼
-正确性验证 ──失败──► 错误日志反馈给 DeepSeek API ──► 修复
+正确性验证 ──失败──► 契约、失败证据与候选历史反馈 ──► 修复并重新编译
         │成功
         ▼
-性能分析 ──失败──► 重新进入下一轮生成
+性能分析 ──失败──► 保存正确候选并记录 profiling 失败
         │成功
         ▼
 生成 PTX/SASS + 保存 results 快照
@@ -73,3 +73,81 @@ logs/task_0000/20260924_120000_000000/
 1. 用 DeepSeek API 做一个最小任务联调，确认 JSON 响应和代码质量。
 2. 根据 API 限额调整超时时间、最大 token 数和并发策略。
 3. 从多次运行报告中提取统一指标，再增加 CSV/JSON 汇总脚本用于横向比较。
+
+## 正确性修复流程
+
+生成前先在固定 seed 下采集参考契约；之后按 Python、CUDA、binding 三阶段生成。
+初始实现按参考 `forward` 的计算步骤拆分，暂不做跨步骤融合。参考契约给出
+已安装 PyTorch 的 API 签名、shape/dtype/stride、参数键和逐语句检查点；无法安全
+插桩的控制流会明确标记，不改变参考代码，也不阻止正常最终输出验证。
+
+`ModelNew` 保留构造函数、`forward` 的参数和 `state_dict` 层级；参考可追踪时还须
+提供 `debug_forward(*inputs)`，依次 `yield (checkpoint_id, value)`，包含最终返回。
+元组赋值的检查点必须保留元组结构，包括参考返回的辅助值。禁止算子的限制同样
+适用于调试执行。调试接口只定位错误，不能替代正常 `forward` 的五次验证。
+
+每轮修复接收当前最好源码、固定失败输入的信息、第一个错误检查点和近期历史，
+并返回如下根因假设（未经执行的假设不能视为事实）：
+
+```json
+{
+  "analysis": {
+    "hypothesis": "输出 grid 被截断，但 kernel 没有 grid-stride loop",
+    "evidence": ["错误从后面的 batch 开始", "launcher 将 grid 限制为 65535"],
+    "changes": ["增加 grid-stride loop，使每个输出元素都被写入"]
+  },
+  "files": {"kernels/example.cu": "完整修改后源码"}
+}
+```
+
+生成阶段文件范围由代码强制执行；远程模型始终不能修改参考模型、验证器或基础设施。
+修复后重新检查接口、编译、严格加载参数，再验证。候选按五次正常验证通过情况、
+通过用例数、失败阶段和相同失败用例的误差选择；同等结果保留较早版本，退化候选
+会被回退。回退删除新添源码与旧构建产物，下一次必须重新编译。
+
+外层每轮完整生成使用干净的生成文件集合；历史最好候选单独保存。默认每轮初始
+生成后最多评估 3 个候选（初始版本加两次修复），共最多 3 轮完整生成。
+
+### 诊断资料和重放
+
+每次运行的 `correctness/` 目录保存：
+
+- `task_contract.json`：参考步骤、运行时 API 签名和接口信息。
+- `reference_fixture.pt`：固定初始化参数；`failure_inputs.pt`：首个失败输入。
+- `verification.json`：正常验证的结构化结果；`diagnostic.json`：独立进程中的中间诊断。
+- `api_calls.jsonl`、`history.jsonl`、`repair_context.json`：API 分析、候选结果和回退记录。
+- `candidates/NNNN/`：完整生成源码、哈希清单、diff、命令日志及该版本的诊断和重放输入。
+
+在匹配候选源码的工作目录中重新编译，然后使用该候选保存的输入重放：
+
+```bash
+bash utils/compile.sh
+python -m utils.verification --seed 2026 --replay /absolute/path/correctness/candidates/0001/failure_inputs.pt
+python -m utils.verification --seed 2026 --replay /absolute/path/correctness/candidates/0001/failure_inputs.pt --diagnose
+```
+
+实际 seed 见 `verification.json`；默认任务 seed 为 `2026 + task_id * 100`，输入 seed
+依次为任务 seed 加 1 到 5。只重放本地可信的 `.pt` 文件。重放结果单独写入
+`replay_verification.json`，不能覆盖正常验收结果。候选的 `sources/` 只含生成文件；
+重放时将其放入具备原参考模型与 `utils/` 的独立工作目录，避免使用其他候选的扩展。
+
+配置新增 `CUDA_AGENT_VERIFICATION_SEED`（基数默认 2026）和
+`CUDA_AGENT_COMMAND_TIMEOUT`（外部命令默认 600 秒）。seed 固定随机数据，不保证
+所有 GPU 算法逐位确定；设备、PyTorch/CUDA 版本也记录在报告中。
+
+编译默认关闭 `--use_fast_math`，避免近似数学改变正确性；显式设置
+`CUDA_AGENT_FAST_MATH=1` 可恢复。生成源码使用 cuBLAS/cuDNN 时链接对应库，目标
+环境须提供这些库。此改动不增加性能达标门槛或自动融合优化循环。
+
+### 测试
+
+```bash
+python -m unittest discover -v
+CUDA_AGENT_GPU_TESTS=1 python -m unittest tests.test_tensor_diagnostics -v
+python main.py --task-start 0 --task-end 10
+```
+
+无 PyTorch 时，张量回归测试会明确跳过；无 CUDA 时，大输出覆盖的 CUDA 回归测试
+会跳过。GPU 回归覆盖 grid 截断与完整写入，其余张量测试覆盖位置参数、分组轴、
+卷积索引、histogram 过滤、NaN/Inf、逐步定位及失败输入重放。目标任务重跑前后应
+分别比较接口、编译和正确性通过率，不能仅比较 SUCCESS 数量。
