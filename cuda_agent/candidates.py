@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import shutil
 
+from .repair import error_fingerprint
+
 
 def read_json(path, default=None):
     return json.loads(path.read_text(encoding='utf-8')) if path.exists() else default
@@ -39,42 +41,84 @@ def progress(record):
     rows = verification.get('checks', [])
     fully_passed = bool(record.get('success')) and verification.get('status') == 'passed' and len(rows) == 5 and all(r.get('status') == 'passed' for r in rows)
     passed = sum(r.get('status') == 'passed' for r in rows)
-    level = {'sources': 0, 'compile': 1, 'interface': 2, 'verification': 3}.get(record['stage'], 0)
+    level = {'sources': 0, 'compile': 1, 'interface': 2, 'verification': 4}.get(record['stage'], 0)
     # Initialization and runtime failures are weaker evidence than value comparisons.
     if record['stage'] == 'verification' and (not rows or any(r.get('stage') in {'reference', 'forward'} for r in rows)):
-        level = 2
+        level = 3
     return (fully_passed, passed, level)
 
 
 def better(candidate, best):
     if best is None:
         return True
-    if progress(candidate) != progress(best):
-        return progress(candidate) > progress(best)
     cv, bv = candidate.get('verification') or {}, best.get('verification') or {}
-    if cv.get('seed') != bv.get('seed'):
+    if cv and bv and cv.get('seed') != bv.get('seed'):
         return False
     crows = {r['index']: r for r in cv.get('checks', [])}
     brows = {r['index']: r for r in bv.get('checks', [])}
     # Missing observations or newly failing cases cannot improve a candidate.
-    if crows.keys() != brows.keys() or any(r.get('status') == 'passed' and crows[i].get('status') != 'passed' for i, r in brows.items()):
+    if not brows.keys() <= crows.keys() or any(
+        current.get('seed') != previous.get('seed') or
+        (previous.get('status') == 'passed' and current.get('status') != 'passed')
+        for i, previous in brows.items() for current in [crows[i]]
+    ):
+        return False
+    # Checkpoint progress is comparable only on the same saved failing input.
+    cd, bd = candidate.get('diagnostic') or {}, best.get('diagnostic') or {}
+    cd = cd.get('comparison', cd)
+    comparable = (bd.get('status') in {'failed', 'matched'} and cd.get('status') in {'failed', 'matched'}
+                  and bd.get('input_seed') is not None
+                  and bd.get('input_seed') == cd.get('input_seed'))
+    if bd.get('status') in {'failed', 'matched'} and not progress(candidate)[0]:
+        if not comparable:
+            return False
+        if cd.get('matched_checkpoints', 0) < bd.get('matched_checkpoints', 0):
+            return False
+    if progress(candidate) != progress(best):
+        return progress(candidate) > progress(best)
+    if not crows or crows.keys() != brows.keys():
         return False
     improvements = False
     for i, previous in brows.items():
         current = crows[i]
         if previous.get('status') == 'passed':
             continue
+        if current.get('status') == 'passed':
+            improvements = True
+            continue
         ce, be = current.get('error', {}), previous.get('error', {})
+        levels = {'runtime': 0, 'type': 1, 'length': 1, 'keys': 1,
+                  'tensor_structure': 2, 'tensor_values': 3}
+        cl, bl = levels.get(ce.get('kind')), levels.get(be.get('kind'))
+        if cl is None or bl is None or cl < bl:
+            return False
+        if cl > bl:
+            old_path, new_path = be.get('path'), ce.get('path')
+            if old_path and (not new_path or not (new_path == old_path or new_path.startswith(old_path + '['))):
+                return False
+            # A corrected container can reveal a failure at a child path.
+            # Shared seed/observations and no checkpoint regression are required.
+            if old_path == new_path and be.get('expected') != ce.get('expected'):
+                return False
+            improvements = True
+            continue
+        if ce.get('path') != be.get('path') or ce.get('expected') != be.get('expected'):
+            if comparable and cd.get('matched_checkpoints', 0) > bd.get('matched_checkpoints', 0):
+                improvements = True
+                continue
+            return False
         if ce.get('kind') != 'tensor_values' or be.get('kind') != 'tensor_values':
-            return False
-        if ce.get('path') != be.get('path') or ce.get('expected') != be.get('expected') or current.get('seed') != previous.get('seed'):
-            return False
+            # Advancing checkpoints is useful even when the next error has the same kind.
+            if not comparable or cd.get('matched_checkpoints', 0) <= bd.get('matched_checkpoints', 0):
+                return False
+            improvements = True
+            continue
         def score(e):
             return (e.get('mismatch_ratio', 1), float(e.get('max_absolute_error', math.inf)))
         if score(ce) > score(be):
             return False
         improvements |= score(ce) < score(be)
-    return improvements
+    return improvements or (comparable and cd.get('matched_checkpoints', 0) > bd.get('matched_checkpoints', 0))
 
 
 class CandidateStore:
@@ -109,7 +153,7 @@ class CandidateStore:
                     os.link(artifact, destination / name)
                 except OSError:
                     shutil.copy2(artifact, destination / name)
-        for name in ("source_checks.json", "interface.json", "task_contract.json"):
+        for name in ("source_checks.json", "interface.json", "task_contract.json", "custom_ops_contract.json"):
             artifact = self.directory / name
             if artifact.exists():
                 shutil.copy2(artifact, destination / name)
@@ -118,9 +162,10 @@ class CandidateStore:
                 (destination / name).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         api_path = self.directory / 'api_calls.jsonl'
         api_lines = api_path.read_text(encoding='utf-8').splitlines() if api_path.exists() else []
+        last_call = json.loads(api_lines[-1]) if api_lines else {}
         record = {'id': index, 'stage': stage, 'success': success, 'manifest': manifest,
                   'verification': verification, 'diagnostic': diagnostic,
-                  'api_analysis': json.loads(api_lines[-1]).get('analysis') if api_lines else None,
+                  'api_analysis': last_call.get('analysis'), 'api_stage': last_call.get('stage'),
                   'error': log[-12000:] if not success else '', 'snapshot': str(destination),
                   'replay_inputs': str(destination / 'failure_inputs.pt') if (destination / 'failure_inputs.pt').exists() else None}
         accepted = better(record, self.best)
@@ -139,7 +184,7 @@ class CandidateStore:
 
     @staticmethod
     def _summary(record):
-        summary = {k: record[k] for k in ('id', 'stage', 'success', 'decision', 'best_candidate', 'api_analysis')}
+        summary = {k: record[k] for k in ('id', 'stage', 'success', 'decision', 'best_candidate', 'api_analysis', 'manifest', 'api_stage')}
         verification = record.get('verification') or {}
         summary['verification'] = {
             'seed': verification.get('seed'), 'status': verification.get('status'),
@@ -155,9 +200,11 @@ class CandidateStore:
             for record in self.records:
                 handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
         recent = self.records[-6:]
-        fingerprints = [json.dumps((r.get('verification') or {}).get('first_failure', {}).get('error', r['error'][-2000:]), sort_keys=True) for r in recent[-2:]]
-        stagnant = len(recent) >= 2 and (fingerprints[0] == fingerprints[1] or all(r['decision'] == 'rejected' for r in recent[-2:]))
+        fingerprints = [error_fingerprint(r) for r in recent[-2:]]
+        stagnant = len(recent) >= 2 and all(r['decision'] == 'rejected' for r in recent[-2:])
         context = {'best_candidate': self._summary(self.best), 'recent_candidates': [self._summary(r) for r in recent],
+                   'base_candidate_id': self.best['id'], 'base_manifest': self.best['manifest'],
+                   'recent_failure_fingerprints': fingerprints,
                    'different_hypothesis_required': stagnant,
                    'instruction': 'Diagnose the recorded evidence. If two attempts did not improve, propose a different testable cause. Rejected changes have been rolled back.'}
         (self.directory / 'repair_context.json').write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -178,6 +225,19 @@ class CandidateStore:
             if not target.exists() or target.read_bytes() != content:
                 target.write_bytes(content)
         self.last_sources = {name: (self.workdir / name).read_text(encoding='utf-8') for name in self.best['manifest']}
+        # Restore evidence as well as sources. A rejected candidate's report must
+        # never describe the version the next repair actually edits.
+        for name in ('source_checks.json', 'interface.json', 'verification.json',
+                     'diagnostic.json', 'failure_inputs.pt', 'custom_ops_contract.json'):
+            target = self.directory / name
+            artifact = snapshot.parent / name
+            if artifact.exists():
+                temporary = target.with_suffix(target.suffix + '.restore')
+                shutil.copy2(artifact, temporary)
+                temporary.replace(target)  # preserve immutable snapshot hardlinks
+            else:
+                target.unlink(missing_ok=True)
+        self._write_context()
 
     def best_failure(self):
         if self.best is None:

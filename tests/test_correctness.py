@@ -291,12 +291,16 @@ class WorkflowTests(unittest.TestCase):
                     # A forged successful process with incomplete results cannot pass.
                     data['status'] = 'passed'
                     (run / 'verification.json').write_text(json.dumps(data))
-                return True, 'command output'
+                return True, 'first failure' if calls <= 1 else 'rejected failure'
             def generate(*args):
                 (work / 'model_new.py').write_text('best original')
                 return True
             def repair(*args):
                 bases.append((work / 'model_new.py').read_text())
+                self.assertIn('first failure', args[0])
+                self.assertNotIn('rejected failure', args[0])
+                self.assertEqual(args[2], 'numerical')
+                self.assertEqual(json.loads((run / 'repair_context.json').read_text())['base_candidate_id'], 1)
                 (work / 'model_new.py').write_text('bad repair')
                 return True
             with patch('cuda_agent.workflow.load_task', return_value={'code': '', 'ops': []}), \

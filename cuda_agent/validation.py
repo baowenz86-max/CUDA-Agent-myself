@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 
+from agent_workdir.utils.operator_contract import RETURN_CONSTRUCTORS, contract_call_errors
+
 
 def native_structure_errors(name: str, text: str) -> list[str]:
     """Check the ownership boundary without trying to parse arbitrary C++."""
@@ -30,7 +32,7 @@ class SourceChecks:
         return {'status': 'failed' if self.errors else 'passed', 'errors': self.errors, 'warnings': self.warnings}
 
 
-def check_sources(workdir: Path) -> SourceChecks:
+def check_sources(workdir: Path, contract=None) -> SourceChecks:
     result = SourceChecks()
     cuda_sources = list((workdir / 'kernels').rglob('*.cu'))
     if len(cuda_sources) != 1 or cuda_sources[0].relative_to(workdir).as_posix() != 'kernels/custom_ops.cu':
@@ -79,8 +81,10 @@ def check_sources(workdir: Path) -> SourceChecks:
                 result.errors.append(f'{method.name}: {name} is incompatible with the pybind cuda_extension module')
             if name.startswith(('F.', 'torch.nn.functional.')):
                 result.errors.append(f'{method.name}: prohibited functional computation {name}')
-            if name.startswith('torch.') and name.split('.')[1] not in allowed and not name.startswith('torch.ops.'):
+            if name.startswith('torch.') and name.split('.')[1] not in allowed and not name.startswith('torch.ops.') and name not in RETURN_CONSTRUCTORS:
                 result.errors.append(f'{method.name}: prohibited torch computation {name}')
+    if contract is not None:
+        result.errors.extend(contract_call_errors(path.read_text(encoding='utf-8'), contract))
     # Source heuristics cannot prove correct math or memory safety. Actual imports,
     # strict state loading and normal-forward tests remain authoritative.
     return result

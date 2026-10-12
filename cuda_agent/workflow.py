@@ -21,6 +21,7 @@ from typing import Callable, Mapping, Sequence
 from cuda_agent.api import run_agent
 from cuda_agent.candidates import CandidateStore, clean_sources, read_json
 from cuda_agent.validation import check_sources
+from cuda_agent.repair import failure_category, concise_log
 from cuda_agent.log_setup import CURRENT_TASK_ID, configure_logging
 from cuda_agent.report import WorkflowReport
 from cuda_agent.tools.toolchain import build_environment
@@ -43,7 +44,7 @@ LOCAL_DATASET = (
 COMPILE_COMMAND = ("bash", "utils/compile.sh")
 VERIFY_COMMAND = (sys.executable, "-m", "utils.verification")
 PROFILE_COMMAND = (sys.executable, "-m", "utils.profiling")
-DEFAULT_LOG_DIR = REPO_ROOT / "logs"
+DEFAULT_LOG_DIR = Path(os.environ.get('CUDA_AGENT_LOG_DIR', str(REPO_ROOT / 'logs')))
 DEFAULT_GENERATION_ATTEMPTS = 3
 LOGGER = logging.getLogger(__name__)
 _LOGGING_SETUP_LOCK = threading.Lock()
@@ -58,25 +59,29 @@ GENERATION_PROMPTS = (
         "model_new.py",
         """你负责第一阶段：只生成 model_new.py，不要生成或修改任何 .cu/.cpp 文件。
 请阅读只读 task_contract.json、验证器、绑定基础设施、SKILL.md 和 model.py；以实际参考代码而非 ops 标注为准，完整梳理参考实现的输入输出 shape、dtype、device、广播、边界条件和数值语义。
-先保证与 model.py 语义等价、接口可用。本轮逐参考计算步骤实现，不做跨步骤融合；必须保持 state_dict 键和 forward 参数一致。task_contract.json 可追踪时必须提供 debug_forward(*inputs)，按 checkpoints 顺序 yield (id, value)，包括最终返回。正常 forward 仍返回参考结果，调试接口不能改变计算公式。model_new.py 只能调用后续 CUDA 源码中会实现的自定义算子；请明确、统一地设计算子名称、参数顺序、返回值结构和 dtype/shape 约定，避免伪代码、TODO、占位实现或未定义调用。
+先保证与 model.py 语义等价、接口可用。本轮逐参考计算步骤实现，不做跨步骤融合；必须保持 state_dict 键和 forward 参数一致。task_contract.json 可追踪时必须提供 debug_forward(*inputs)，按 checkpoints 顺序 yield (id, value)，包括最终返回。正常 forward 仍返回参考结果，调试接口不能改变计算公式。model_new.py 只能调用后续 CUDA/C++ 扩展中会实现的自定义算子；请明确、统一地设计算子名称、参数顺序、返回值结构和 dtype/shape 约定，避免伪代码、TODO、占位实现或未定义调用。
 保留非 CUDA 或特殊输入路径。禁止使用 torch 算子实现本应下沉到自定义扩展的计算。
-只返回 model_new.py 的完整内容；不要返回 kernels 文件，不要修改 model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
+返回合法 JSON，files 只含 model_new.py 的完整内容，并必须提供顶层 operator_contract：
+{"operators": [{"name": "custom_op", "parameters": [{"name": "x", "kind": "tensor", "dtype": "torch.float32", "device": "cuda", "shape": "same as reference step", "layout": "supports strides", "nullable": false, "optional": false}], "returns": {"type": "tensor", "dtype": "torch.float32", "device": "cuda", "shape": "same as x"}, "semantics": ["对应参考语句、实际 bias、广播与轴、顺序、返回结构"]}], "reference_steps": [{"checkpoint": "step_001", "source": "照抄 task_contract 对应 source", "semantics": ["实际计算语义"]}]}
+parameters 顺序固定；kind 只能是 tensor/int/float/bool。optional 表示可省略参数，必须带 default；nullable 表示可传 None。每个 tensor 参数必须记录 dtype/device/shape/layout。覆盖 forward/debug_forward 全部扩展调用，按顺序复制所有参考检查点 source。operator_contract 是元数据，不是 files 中的文件。后两阶段不能重定义接口。
+参考 F.conv* 省略 bias 时必须传 None，不能因模块有 bias 就加入。返回 torch.return_types.max 等结构必须保留；其构造器仅构造容器，不得借此调用 torch 计算。
+不要返回 kernels 文件，不要修改固定基础设施。""",
     ),
     (
         "kernels/custom_ops.cu",
         """你负责第二阶段：只生成或修改唯一的 kernels/custom_ops.cu 文件，所有 CUDA kernel 和 launcher 必须放在这个文件中，不要生成或修改 .cpp 或 model_new.py。
 .cu 只放 CUDA kernel 与原始指针/标量/cudaStream_t launcher，禁止包含 torch、ATen、c10、pybind 头文件、Tensor 包装函数或 REGISTER_BINDING。Tensor 参数检查、分配、stream 获取和注册由下一阶段的 *_binding.cpp 实现。
 先阅读 SKILL.md、model.py、当前 model_new.py 以及现有 kernels 文件，严格以 model_new.py 已确定的自定义算子名称、参数顺序、返回结构和 dtype/shape 约定为接口契约；不要反过来改 Python 接口。
-只实现参考契约实际使用的 dtype/device，不额外添加未经验证的 half/double 路径。按参考步骤实现完整、可编译的 CUDA kernel 和 host launcher，覆盖 model_new.py 的所有调用路径。重点核对维度/stride、边界和空张量、非连续输入、dtype 分派、数值精度、同步、线程索引和 launch 参数；不得留下伪代码、TODO、占位实现或未定义符号。需要导出给绑定层的 launcher 必须有清晰且稳定的声明，供下一阶段的 binding.cpp 调用。
-必须且只能返回 kernels/custom_ops.cu 的完整内容，不得拆分或新增其他 .cu 文件；不要返回 .cpp 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
+只实现参考契约实际使用的 dtype/device，不额外添加未经验证的 half/double 路径。按参考步骤实现完整、可编译的非卷积 CUDA kernel 和 host launcher。Conv/ConvTranspose 必须使用 cuDNN，由第三阶段的 C++ 实现；不要手写卷积 kernel。若没有非卷积 CUDA 计算，唯一 .cu 文件可以仅含 cuda_runtime.h 和说明注释。重点核对维度/stride、边界和空张量、非连续输入、dtype 分派、数值精度、同步、线程索引和 launch 参数；不得留下伪代码、TODO、占位实现或未定义符号。需要导出给绑定层的 launcher 必须有清晰且稳定的声明，供下一阶段的 binding.cpp 调用。
+返回合法 JSON，files 必须且只能包含 kernels/custom_ops.cu 的完整内容；不得拆分或新增其他 .cu 文件；不要返回 .cpp 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
     ),
     (
         "kernels/*.cpp",
         """你负责第三阶段：只生成或修改 kernels/ 下的绑定 .cpp 文件，不要生成或修改 .cu 或 model_new.py。
-绑定文件只声明并调用 .cu 导出的原始 launcher；Tensor 包装函数和 pybind 注册只在 *_binding.cpp 定义一次，不得复制 .cu 的函数实现。
+绑定文件声明并调用 .cu 导出的非卷积 launcher；Conv/ConvTranspose 必须在 kernels/*.cpp 中使用 cuDNN 实现。Tensor 包装函数和 pybind 注册只在 *_binding.cpp 定义一次，不得复制 .cu 的函数实现。
 先阅读 SKILL.md、model.py、model_new.py 以及当前 kernels/*.cu，严格对齐 Python 调用接口和 CUDA launcher 的函数声明。为每个自定义算子提供完整的 PyTorch tensor 参数检查、必要的 dtype/device/shape 处理、正确的 launcher 调用、返回值构造和 REGISTER_BINDING 注册；不得在 .cpp 中实现 CUDA kernel，不得调用 torch:: 算子完成计算。
 逐项核对注册名、参数顺序、include、命名空间、声明、返回结构和 dtype 分派，确保 binding.cpp 能独立编译并与 .cu 正确链接。不要留下伪代码、TODO、占位实现或未定义符号。
-只返回需要写入的 .cpp 文件完整内容；不要返回 .cu 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
+返回合法 JSON，files 只含需要写入的 .cpp 文件完整内容；不要返回 .cu 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
     ),
 )
 
@@ -88,6 +93,25 @@ REPAIR_PROMPTS = {
 重点排查：维度/stride 与线性索引、广播和 reduction 边界、线程间同步、越界访问、初始化、mask、in-place 副作用、float/half 精度转换、NaN/Inf 处理以及 Python 返回值结构。修复目标是与 model.py 的参考结果严格一致；不要为了掩盖误差而放宽验证，也不要在没有证据时改动性能无关代码。
 修复后确认编译接口仍完整，并只修改 model_new.py 或 kernels/ 下的 .cu/.cpp，禁止修改固定基础设施和验证脚本。""",
 }
+
+SEMANTIC_RULES = """以实际参考语句为准，不要根据算子标注或模块参数猜公式。
+Conv/ConvTranspose 使用 cuDNN，Python 调用与 reference_steps 的实际 bias、stride、padding 等一致。
+masked_select 必须保持原张量遍历顺序；atomicAdd 分配输出位置不能保证稳定顺序，使用扫描或等价稳定压缩。
+广播遵循参考 shape；转置输入按实际 stride 处理或显式连续化，不得假设转置后的矩阵是连续行主序。
+张量 dtype/device 与契约一致，CPU 指针绝不能传入 CUDA kernel；获取当前 CUDA stream，kernel launch 后检查错误。
+int64 Tensor 指针使用 int64_t；声明、launcher 和 data_ptr 类型一致。不要暴露 c10::Scalar 作为 pybind 标量参数，使用 double/int64_t。
+返回容器类型和检查点 ID/顺序完全匹配。只允许 torch.return_types.max/min/median/sort/topk/kthvalue 构造已有结果容器，不允许 torch 算子计算。
+逐步骤保证语义正确，再处理精度和性能；不得放宽容限或用填零掩盖未写输出。"""
+
+REPAIR_PROMPTS.update({
+    "sources": "源码检查失败：先修正扩展调用方式、遗漏注册、算子契约或禁止计算。使用 import cuda_extension，不能使用 torch.ops.cuda_extension。检查 forward 和 debug_forward 所有调用。",
+    "interface": "模型接口失败：核对构造与 forward 参数、state_dict 键、检查点和编译后绑定签名。保持参考模块参数命名；只修复接口不重写正确算法。",
+    "runtime": "运行调用失败：逐项对照 Python 实际调用、operator_contract 与 pybind 签名，检查参数个数、标量/元组、None、dtype、device、shape、stride 和广播。同步修改相关调用与绑定，不能只修改报错的一端。",
+    "structure": "输出结构失败：先恢复容器类型、长度、shape、dtype/device，再处理值误差。torch.return_types.max 不能替换为普通 tuple。不得通过截断、补零或改变参考公式掩盖问题。",
+    "numerical": "数值失败：优先检查首个失败检查点的参考公式、实际 bias、权重布局、广播、reduction 轴和输出顺序。确认语义一致后再检查累加精度与后端配置。sign、median/ne、rsqrt/softmax 对前序误差敏感，应查看边界样本，不只盯最终输出。",
+    "memory": "CUDA 内存错误：使用 memcheck/launch 诊断定位 kernel，核对指针 device、索引上界、分配大小、stride、stream 和对象生命周期。检查是否将 CPU Tensor 指针传给 CUDA kernel。诊断 unavailable 不能视为通过。",
+})
+
 
 
 @dataclass(frozen=True)
@@ -269,7 +293,7 @@ def generate_cuda(workdir: Path, run_dir: Path | None = None) -> bool:
     """Generate Python, CUDA, and binding sources in separate API calls."""
     for stage, (target, prompt) in enumerate(GENERATION_PROMPTS, start=1):
         LOGGER.info("生成阶段 %d/3：%s", stage, target)
-        if not run_agent(prompt, str(workdir), allowed_stage=("python", "cuda", "binding")[stage - 1], run_dir=run_dir):
+        if not run_agent(prompt + "\n" + SEMANTIC_RULES, str(workdir), allowed_stage=("python", "cuda", "binding")[stage - 1], run_dir=run_dir):
             LOGGER.error("生成阶段 %d 失败：%s", stage, target)
             return False
     return True
@@ -289,12 +313,15 @@ def send_feedback(error_log: str, workdir: Path, stage: str, run_dir: Path | Non
 当前源码可能已恢复为最好候选。请结合 repair_context.json 区分当前主版本与被拒绝的修改，
 保留正确部分，按第一个错误检查点做最小修改。若连续两轮没有改善，必须提出不同且可验证的根因。
 只支持本任务实际使用的 dtype。不得修改诊断/验证器、放宽容限或以填零掩盖未写输出。
+修复基准的 candidate_id 与源码哈希见 repair_context.base_candidate_id/base_manifest，当前失败证据必须对应这一版本。
+连续无改善时 different_hypothesis_required=true：依据错误类别更换诊断方向，禁止提交已评估的相同源码。
 回复必须含 analysis.hypothesis、analysis.evidence 和 analysis.changes；这是待验证假设。
 
-完整错误日志（优先处理最早出现的根因）：
+根因日志摘要（完整日志保存在候选 command.log，优先处理最早根因）：
 ----------------
-{error_log}
-----------------""",
+{concise_log(error_log)}
+----------------
+{SEMANTIC_RULES}""",
         str(workdir), run_dir=run_dir, require_analysis=True,
     )
 
@@ -404,7 +431,7 @@ def execute_workflow(
         # Reports belong to a specific source version; never reuse stale results.
         for name in ("interface.json", "verification.json", "diagnostic.json"):
             (run_dir / name).unlink(missing_ok=True)
-        checks = check_sources(config.workdir)
+        checks = check_sources(config.workdir, read_json(run_dir / "custom_ops_contract.json"))
         (run_dir / "source_checks.json").write_text(json.dumps(checks.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         for warning in checks.warnings:
             LOGGER.warning("源代码诊断：%s", warning)
@@ -425,6 +452,17 @@ def execute_workflow(
         if not verified and (run_dir / "failure_inputs.pt").exists() and verification.get("first_failure"):
             _, diagnostic_log = run_command((*VERIFY_COMMAND, "--diagnose"), config.workdir, env, gpu_pool)
             diagnostic = read_json(run_dir / "diagnostic.json", {"status": "unavailable", "reason": diagnostic_log[-6000:]})
+            previous_diagnostic = (store.best or {}).get('diagnostic') or {}
+            if (store.best and store.best.get('replay_inputs') and
+                    previous_diagnostic.get('input_seed') is not None and
+                    diagnostic.get('input_seed') != previous_diagnostic['input_seed']):
+                # Diagnose the previous failing input as well, so passing it does
+                # not lose comparable checkpoint evidence. Never write snapshots.
+                _, comparison_log = run_command((*VERIFY_COMMAND, "--diagnose", "--diagnostic-replay",
+                                                 store.best['replay_inputs']), config.workdir, env, gpu_pool)
+                diagnostic['comparison'] = read_json(run_dir / 'diagnostic.json',
+                                                     {'status': 'unavailable', 'reason': comparison_log[-2000:]})
+                (run_dir / 'diagnostic.json').write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding='utf-8')
             sanitizer = shutil.which("compute-sanitizer", path=env.get("PATH"))
             failure_text = verify_log.lower()
             if sanitizer and any(word in failure_text for word in ("illegal memory", "launch failure", "out of bounds")):
@@ -436,7 +474,7 @@ def execute_workflow(
 
     for generation in range(1, config.generation_attempts + 1):
         clean_sources(config.workdir)
-        for name in ("source_checks.json", "interface.json", "verification.json", "diagnostic.json"):
+        for name in ("source_checks.json", "interface.json", "verification.json", "diagnostic.json", "failure_inputs.pt", "custom_ops_contract.json", "repair_context.json"):
             (run_dir / name).unlink(missing_ok=True)
         started = time.monotonic()
         generated = generate_cuda(config.workdir, run_dir)
@@ -466,7 +504,9 @@ def execute_workflow(
             store.restore_best()
             if repair + 1 == config.repair_attempts:
                 break
-            if not send_feedback(log, config.workdir, stage if stage == "compile" else "verification", run_dir):
+            base = store.best
+            LOGGER.info("修复基准：candidate=%s category=%s", base['id'], failure_category(base))
+            if not send_feedback(base['error'], config.workdir, failure_category(base), run_dir):
                 report.add_stage("repair API", False, 0, "No changes applied; best candidate retained")
                 break
     store.restore_best()

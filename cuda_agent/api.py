@@ -1,6 +1,7 @@
 """通过 DeepSeek Chat Completions API 调用远程 CUDA 代码生成模型。"""
 
 import json
+import hashlib
 import logging
 import tempfile
 import time
@@ -14,6 +15,84 @@ from cuda_agent.config import DeepSeekAPIConfig
 
 ALLOWED_SUFFIXES = {".cu", ".cpp"}
 LOGGER = logging.getLogger(__name__)
+
+
+def _compact(value):
+    """Keep concrete evidence while omitting duplicated tracebacks/tensor dumps."""
+    if isinstance(value, dict):
+        return {k: _compact(v) for k, v in value.items()
+                if k not in {'traceback', 'error_excerpt', 'documentation'}
+                and not (k == 'message' and value.get('kind') in {'tensor_values', 'tensor_structure'})}
+    if isinstance(value, list):
+        return [_compact(x) for x in value]
+    if isinstance(value, str) and len(value) > 2000:
+        return value[:2000] + ' ... (full evidence retained in the run directory)'
+    return value
+
+
+def _allowed_files(stage):
+    return {'python': 'model_new.py', 'cuda': 'kernels/custom_ops.cu',
+            'binding': 'kernels/*.cpp'}.get(stage, 'model_new.py, kernels/custom_ops.cu, kernels/*.cpp')
+
+
+def _example_path(stage):
+    return {'cuda': 'kernels/custom_ops.cu', 'binding': 'kernels/custom_ops_binding.cpp'}.get(stage, 'model_new.py')
+
+
+def _response_metadata(response):
+    if not isinstance(response, dict):
+        return {}
+    choices = response.get('choices')
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    return {'finish_reason': choice.get('finish_reason') if isinstance(choice, dict) else None,
+            'usage': response.get('usage')}
+
+
+def _response_contract(data, workdir, run_dir, stage):
+    from agent_workdir.utils.operator_contract import validate_contract, contract_call_errors
+    if stage == 'python' and 'operator_contract' not in data:
+        raise ValueError('Python generation must return operator_contract metadata')
+    existing = run_dir / 'custom_ops_contract.json' if run_dir else None
+    contract = data.get('operator_contract')
+    if contract is None and existing and existing.exists():
+        contract = json.loads(existing.read_text())
+    if contract is None:
+        return None  # legacy direct repairs without a generated contract
+    reference_path = run_dir / 'task_contract.json' if run_dir else None
+    reference = json.loads(reference_path.read_text()) if reference_path and reference_path.exists() else None
+    validate_contract(contract, reference)
+    if stage in {'cuda', 'binding'} and 'operator_contract' in data:
+        if not existing or not existing.exists() or contract != json.loads(existing.read_text()):
+            raise ValueError('CUDA/binding generation cannot change the established operator_contract')
+    source = data['files'].get('model_new.py', _read_file(workdir / 'model_new.py'))
+    errors = contract_call_errors(source, contract)
+    if errors:
+        raise ValueError('\n'.join(errors))
+    if 'operator_contract' in data:
+        if run_dir is None:
+            raise ValueError('operator_contract metadata requires a run directory')
+        return (run_dir / 'custom_ops_contract.json', contract)
+    return None
+
+
+def _reject_repeated_sources(data, workdir, run_dir):
+    from .candidates import source_files
+    sources = {str(p.relative_to(workdir)): p.read_text() for p in source_files(workdir)}
+    proposed = dict(sources)
+    proposed.update(data['files'])
+    for name in data.get('delete_files', []):
+        proposed.pop(name, None)
+    if proposed == sources:
+        raise ValueError('Repair has no source changes; submit a different evidence-backed fix')
+    path = run_dir / 'repair_context.json' if run_dir else None
+    if not path or not path.exists():
+        return
+    context = json.loads(path.read_text())
+    if not context.get('different_hypothesis_required'):
+        return
+    manifest = {name: hashlib.sha256(source.encode()).hexdigest() for name, source in proposed.items()}
+    if any(manifest == r.get('manifest') for r in context.get('recent_candidates', [])):
+        raise ValueError('Repair repeats an evaluated source version; use a different testable hypothesis')
 
 
 def _content_as_text(content: Any) -> str:
@@ -58,6 +137,8 @@ def _response_content(response_data: Any) -> str:
         )
 
     content = _content_as_text(message.get("content"))
+    if choice.get('finish_reason') == 'length':
+        raise ValueError('API response truncated (finish_reason=length); do not apply partial source files')
     if content:
         return content
 
@@ -105,12 +186,13 @@ def _build_context(workdir: Path, run_dir: Path | None = None) -> str:
                     f"\n===== {path.relative_to(workdir)} =====\n{_read_file(path)}"
                 )
 
-    readonly = ["binding.cpp", "binding_registry.h", "utils/verification.py", "utils/diagnostics.py", "utils/compile.py"]
+    readonly = ["binding.cpp", "binding_registry.h", "utils/operator_contract.py"]
     extra = "".join(f"\n===== READ ONLY: {name} =====\n{_read_file(workdir / name)}\n" for name in readonly)
     if run_dir is not None:
-        for name in ("task_contract.json", "source_checks.json", "interface.json", "verification.json", "diagnostic.json", "repair_context.json"):
+        for name in ("task_contract.json", "custom_ops_contract.json", "source_checks.json", "interface.json", "verification.json", "diagnostic.json", "repair_context.json"):
             if (run_dir / name).exists():
-                extra += f"\n===== READ ONLY: {name} =====\n{_read_file(run_dir / name)}\n"
+                data = json.loads(_read_file(run_dir / name))
+                extra += f"\n===== READ ONLY: {name} =====\n{json.dumps(_compact(data), ensure_ascii=False)}\n"
     return f"""
 ===== SKILL.md =====
 {_read_file(workdir / "SKILL.md")}
@@ -123,6 +205,10 @@ def _build_context(workdir: Path, run_dir: Path | None = None) -> str:
 
 ===== 现有 CUDA/C++ kernel 文件 =====
 {"".join(kernel_sources) if kernel_sources else "(当前没有 kernel 文件)"}
+===== 固定验证规则摘要 =====
+先检查源码限制、严格 state_dict/签名与编译后接口，再执行五个固定输入的正常 forward。
+类型/容器、shape、dtype、device 必须与参考一致；Tensor 值 atol=1e-2、rtol=1e-2。
+debug_forward 仅定位错误，不能替代正常 forward 验证；不得修改验证规则或容限。
 {extra}
 """
 
@@ -146,6 +232,8 @@ def _extract_json(text: str) -> dict:
     data = json.loads(text[start : end + 1])
     if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
         raise ValueError('模型回复必须是 {"files": {...}} 格式。')
+    if not all(isinstance(name, str) and isinstance(content, str) for name, content in data['files'].items()):
+        raise ValueError('files 中的文件名和内容必须都是字符串。')
 
     return data
 
@@ -165,7 +253,7 @@ def _is_allowed_path(relative_path: Path) -> bool:
     )
 
 
-def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None) -> None:
+def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None, *, metadata=None) -> None:
     """Validate the complete response, then atomically apply every file."""
     root = workdir.resolve()
     files = data["files"]
@@ -220,6 +308,13 @@ def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None) ->
         if errors:
             raise ValueError("\n".join(errors))
 
+    # Trusted orchestrator metadata participates in the same rollback bundle.
+    # Models cannot choose its destination or write arbitrary metadata files.
+    if metadata is not None:
+        target, contract = metadata
+        validated_files.append((Path('custom_ops_contract.json'), target,
+                                json.dumps(contract, ensure_ascii=False, indent=2, allow_nan=False)))
+
     backups = {target: target.read_bytes() if target.exists() else None for _, target, _ in validated_files}
     backups.update({target: target.read_bytes() if target.exists() else None for target in deletions})
     temporaries = []
@@ -232,7 +327,7 @@ def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None) ->
                 temporaries.append((Path(temp_file.name), target))
         for temporary, target in temporaries:
             temporary.replace(target)
-            LOGGER.info("API 已更新文件：%s", target.relative_to(root))
+            LOGGER.info("API 已更新文件：%s", target.name)
         for target in deletions:
             target.unlink(missing_ok=True)
             LOGGER.info("API 已删除文件：%s", target.relative_to(root))
@@ -289,21 +384,18 @@ kernels/ 必须且只能有一个 .cu：custom_ops.cu。全部 CUDA kernel 和 l
 禁止修改 model.py、utils/、binding.cpp、binding_registry.h、SKILL.md。
 
 你的回复必须且只能是合法 JSON，不要使用 Markdown 代码块，不要解释。
-格式如下：
-{
-  "analysis": {
-    "hypothesis": "待验证的根因假设；生成时说明语义与接口选择",
-    "evidence": ["来自参考契约或失败诊断的具体证据"],
-    "changes": ["本次修改及预期验证结果"]
-  },
-  "files": {
-    "model_new.py": "该文件的完整内容",
-    "kernels/custom_ops.cu": "该文件的完整内容"
-  }
-}
+格式示例由当前阶段决定，见下文。全部文件内容必须放入 files 的 JSON 字符串中。
 
 files 中只放需要新增或修改的完整文件。省略文件不会删除文件。仅修复阶段可以额外返回 "delete_files": ["kernels/obsolete_binding.cpp"] 显式删除 kernels/ 下生成的源码；不能删除固定基础设施，不能同时写入和删除同一路径。仅删除时 files 可以为空对象。不要返回 shell 命令。修复必须提供 analysis，但其中内容是待验证假设，不能宣称已经运行测试。
 """.strip()
+
+    example = {"analysis": {"hypothesis": "根因假设或接口选择", "evidence": ["具体证据"],
+                             "changes": ["修改和预期检查结果"]},
+               "files": {_example_path(allowed_stage): "该文件的完整内容"}}
+    system_prompt += "\n当前阶段允许文件：" + _allowed_files(allowed_stage)
+    system_prompt += "\nJSON 格式示例：" + json.dumps(example, ensure_ascii=False)
+    if allowed_stage == "python":
+        system_prompt += "\n第一阶段还必须返回顶层 operator_contract，具体字段见任务要求。"
 
     user_prompt = f"""
 任务要求：
@@ -327,59 +419,55 @@ files 中只放需要新增或修改的完整文件。省略文件不会删除�
     if config.thinking_mode == "enabled":
         payload["reasoning_effort"] = config.reasoning_effort
 
-    request = Request(
-        url=config.chat_completions_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.api_key}",
-        },
-        method="POST",
-    )
-
     started_at = time.monotonic()
-    LOGGER.info(
-        "调用 DeepSeek API：model=%s endpoint=%s max_tokens=%d thinking=%s reasoning_effort=%s",
-        config.model,
-        request.full_url,
-        config.max_tokens,
-        config.thinking_mode,
-        config.reasoning_effort if config.thinking_mode == "enabled" else "n/a",
-    )
-    LOGGER.debug("API user prompt (%d chars):\n%s", len(user_prompt), user_prompt)
-    try:
-        with urlopen(request, timeout=config.timeout_seconds) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
-
-        content = _response_content(response_data)
-
-        LOGGER.debug("API response (%d chars):\n%s", len(content), content)
-        data = _extract_json(content)
-        analysis = _validate_analysis(data, require_analysis)
-        _apply_files(data, workdir_path, allowed_stage)
-        _record_call(run_dir, stage=allowed_stage or "repair", success=True, analysis=analysis,
-                     files=sorted(data["files"]), delete_files=data.get("delete_files", []), elapsed_seconds=time.monotonic() - started_at)
-        LOGGER.info("DeepSeek API 调用成功，耗时 %.2fs", time.monotonic() - started_at)
-        return True
-
-    except TimeoutError as exc:
-        failure = f"TimeoutError: {exc}"
-        LOGGER.error(
-            "DeepSeek API 请求超时（等待 %d 秒仍未收到响应）。",
-            config.timeout_seconds,
-        )
-
-    except HTTPError as exc:
-        failure = f"HTTPError: {exc}"
-        body = exc.read().decode("utf-8", errors="replace")
-        LOGGER.error("DeepSeek API HTTP 错误：%s\n%s", exc.code, body)
-    except URLError as exc:
-        failure = f"URLError: {exc}"
-        LOGGER.error("无法连接 DeepSeek API：%s", exc.reason)
-    except (KeyError, IndexError, TypeError, ValueError, OSError) as exc:
-        failure = f"{type(exc).__name__}: {exc}"
-        LOGGER.error("DeepSeek API 回复或文件变更格式错误：%s", exc)
-
-    _record_call(run_dir, stage=allowed_stage or "repair", success=False, error=failure,
-                 elapsed_seconds=time.monotonic() - started_at)
+    LOGGER.info("调用 DeepSeek API：model=%s stage=%s", config.model, allowed_stage or "repair")
+    # Correct response framing locally, without rerunning generation or consuming
+    # an algorithm-repair attempt. Transport/I/O failures are not format retries.
+    for correction in range(3):
+        response_data = None
+        content = ""
+        try:
+            request = Request(config.chat_completions_url,
+                              data=json.dumps(payload).encode("utf-8"),
+                              headers={"Content-Type": "application/json",
+                                       "Authorization": f"Bearer {config.api_key}"}, method="POST")
+            with urlopen(request, timeout=config.timeout_seconds) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+            content = _response_content(response_data)
+            data = _extract_json(content)
+            analysis = _validate_analysis(data, require_analysis)
+            metadata = _response_contract(data, workdir_path, run_dir, allowed_stage)
+            if require_analysis:
+                _reject_repeated_sources(data, workdir_path, run_dir)
+            _apply_files(data, workdir_path, allowed_stage, metadata=metadata)
+            _record_call(run_dir, stage=allowed_stage or "repair", success=True,
+                         correction_attempt=correction, analysis=analysis,
+                         files=sorted(data["files"]), delete_files=data.get("delete_files", []),
+                         elapsed_seconds=time.monotonic() - started_at, **_response_metadata(response_data))
+            return True
+        except (TimeoutError, HTTPError, URLError, OSError) as exc:
+            LOGGER.error("DeepSeek API transport/I/O failure: %s", exc)
+            _record_call(run_dir, stage=allowed_stage or "repair", success=False,
+                         failure_category="transport_or_io", error=f"{type(exc).__name__}: {exc}",
+                         correction_attempt=correction, elapsed_seconds=time.monotonic() - started_at,
+                         **_response_metadata(response_data))
+            return False
+        except (KeyError, IndexError, TypeError, ValueError, SyntaxError) as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+            category = "truncated" if "finish_reason=length" in failure else (
+                "json" if isinstance(exc, json.JSONDecodeError) or '没有 JSON 对象' in failure else "response_validation")
+            LOGGER.warning("API response rejected (%s): %s", category, failure)
+            _record_call(run_dir, stage=allowed_stage or "repair", success=False,
+                         failure_category=category, error=failure, correction_attempt=correction,
+                         elapsed_seconds=time.monotonic() - started_at, **_response_metadata(response_data))
+            if correction == 2:
+                return False
+            # Keep the original task/context; provide the exact validation error
+            # and a small response excerpt instead of growing full-code history.
+            payload["messages"] = payload["messages"][:2] + [{"role": "user", "content": (
+                "上一响应未应用，原源码保持不变。请纠正响应并重新提交完整合法 JSON。\n"
+                f"验证错误：{failure}\n当前阶段：{allowed_stage or 'repair'}\n"
+                f"允许文件：{_allowed_files(allowed_stage)}\n"
+                "字符串必须正确转义；不得修改不属于当前阶段的文件；不得返回截断内容。\n"
+                f"上一响应开头：{content[:1200]}") }]
     return False

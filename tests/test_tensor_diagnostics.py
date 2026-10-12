@@ -12,7 +12,7 @@ try:
 except ImportError:
     torch = None
 
-from agent_workdir.utils.diagnostics import ComparisonFailure, check_equal, tensor_error
+from agent_workdir.utils.diagnostics import ComparisonFailure, check_equal, tensor_error, boundary_context
 
 
 if torch is not None:
@@ -37,9 +37,40 @@ if torch is not None:
             yield 'step_002', x
             yield 'step_003', x
 
+    class SignReference(torch.nn.Module):
+        def forward(self, x):
+            x = x * 1.0
+            x = torch.sign(x)
+            return x
+
+    class SignGenerated(SignReference):
+        def debug_forward(self, x):
+            x = x + 1e-6
+            yield 'step_001', x
+            x = torch.sign(x)
+            yield 'step_002', x
+            yield 'step_003', x
+
 
 @unittest.skipIf(torch is None, 'PyTorch is not installed')
 class TensorDiagnosticsTests(unittest.TestCase):
+    def test_sensitive_sign_failure_contains_prior_near_zero_values(self):
+        diagnostic = diagnose(SignReference(), SignGenerated(), {'state_dict': {}},
+                              [torch.tensor([-1e-7, 1.])], 2027, 'cpu')
+        self.assertEqual(diagnostic['checkpoint']['id'], 'step_002')
+        self.assertEqual(diagnostic['input_seed'], 2027)
+        prior = diagnostic['boundary_context'][0]
+        self.assertEqual(prior['expected']['near_zero_count'], 1)
+        self.assertAlmostEqual(prior['expected']['min_absolute_value'], 1e-7)
+        self.assertGreater(float(prior['actual']['near_zero_samples'][0]['value']), 0)
+
+    def test_boundary_scalar_and_nonfinite_samples_are_json_safe(self):
+        import json
+        self.assertEqual(boundary_context(torch.tensor(.5))['scalar'], '0.5')
+        detail = boundary_context(torch.tensor([float('nan'), float('inf'), 0.]))
+        self.assertEqual(detail['near_zero_count'], 1)
+        json.dumps(detail, allow_nan=False)
+
     def test_int64_promotion_and_value_error(self):
         with self.assertRaises(ComparisonFailure) as raised:
             check_equal(torch.tensor([1.], dtype=torch.float32), torch.tensor([1], dtype=torch.int64))
@@ -157,6 +188,13 @@ class ModelNew(Model):
                 self.assertEqual(verify_main(['--device', 'cpu', '--diagnose']), 0)
                 self.assertEqual(json.loads((root / 'diagnostic.json').read_text())['status'], 'matched')
                 self.assertEqual(json.loads((root / 'verification.json').read_text())['status'], 'failed')
+                snapshot = root / 'snapshot'; snapshot.mkdir()
+                failure = snapshot / 'failure_inputs.pt'
+                failure.write_bytes((root / 'failure_inputs.pt').read_bytes())
+                original_bytes = failure.read_bytes()
+                self.assertEqual(verify_main(['--device', 'cpu', '--diagnose', '--diagnostic-replay', str(failure)]), 0)
+                self.assertEqual(failure.read_bytes(), original_bytes)
+                self.assertFalse((snapshot / 'diagnostic.json').exists())
                 self.assertEqual(verify_main(['--device', 'cpu', '--replay', str(root / 'failure_inputs.pt')]), 1)
                 replay = json.loads((root / 'replay_verification.json').read_text())
                 self.assertEqual(original['first_failure']['error'], replay['first_failure']['error'])
