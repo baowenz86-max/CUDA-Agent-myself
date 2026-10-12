@@ -1,0 +1,109 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -7,9 +7,6 @@
+ 
+ namespace py = pybind11;
+ 
+-// Fused kernel: reflection padding, ge(0), remainder(2)
+-// Input: float tensor (N, C, H, W)
+-// Output: int64 tensor (N, C, H+pad_top+pad_bottom, W+pad_left+pad_right)
+ __global__ void fused_pad_ge_remainder_kernel(
+     const float* __restrict__ input,
+     int64_t* __restrict__ output,
+@@ -29,7 +26,6 @@
+         int c = tmp % C;
+         int n = tmp / C;
+ 
+-        // Reflection padding index calculation for width
+         int iw;
+         if (ow < pad_left) {
+             iw = pad_left - ow;
+@@ -39,7 +35,6 @@
+             iw = ow - pad_left;
+         }
+ 
+-        // Reflection padding index calculation for height
+         int ih;
+         if (oh < pad_top) {
+             ih = pad_top - oh;
+@@ -51,19 +46,14 @@
+ 
+         float val = input[((long)n * C + c) * H * W + (long)ih * W + iw];
+ 
+-        // greater-than-equal zero: returns 1.0f if true, 0.0f if false
+         float ge_result = (val >= 0.0f) ? 1.0f : 0.0f;
+ 
+-        // remainder with 2: result is ge_result - floor(ge_result/2)*2
+-        // Since ge_result is 0 or 1, floor division by 2 gives 0, remainder is ge_result
+-        // So remainder = ge_result
+         int64_t rem_result = (int64_t)(ge_result);
+ 
+         output[i] = rem_result;
+     }
+ }
+ 
+-// Host launcher for the fused operation
+ torch::Tensor custom_ops_forward(
+     torch::Tensor input,
+     int64_t pad_left,
+@@ -75,7 +65,6 @@
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(input.dim() == 4, "Input must be 4D (N,C,H,W)");
+ 
+-    // Make input contiguous if not already
+     if (!input.is_contiguous()) {
+         input = input.contiguous();
+     }
+@@ -99,7 +88,6 @@
+ 
+     int block_size = 256;
+     int grid_size = (total_elements + block_size - 1) / block_size;
+-    // Cap grid size to 65535 and use grid-stride loop if needed
+     if (grid_size > 65535) {
+         grid_size = 65535;
+     }
+@@ -116,7 +104,6 @@
+     return output;
+ }
+ 
+-// Binding registration
+ void register_custom_ops(py::module& m) {
+     m.def("custom_ops_forward", &custom_ops_forward,
+           "Fused reflection pad + ge + remainder",
+--- before/model_new.py
++++ after/model_new.py
+@@ -5,34 +5,15 @@
+ class ModelNew(nn.Module):
+     def __init__(self, in_channels, kernel_size, padding_size):
+         super().__init__()
+-        # Store padding parameters; kernel_size and in_channels are unused but kept for signature compatibility
+         self.in_channels = in_channels
+         self.kernel_size = kernel_size
+         self.padding_size = padding_size
+-        # padding_size is expected to be a tuple (left, right, top, bottom) as in nn.ReflectionPad2d
+         if isinstance(padding_size, int):
+             self.pad_left = self.pad_right = self.pad_top = self.pad_bottom = padding_size
+         else:
+             self.pad_left, self.pad_right, self.pad_top, self.pad_bottom = padding_size
+ 
+     def forward(self, x):
+-        # Call custom op with padding parameters
+         return cuda_extension.custom_ops_forward(
+             x, self.pad_left, self.pad_right, self.pad_top, self.pad_bottom
+         )
+-
+-    def debug_forward(self, x):
+-        # Step 1: Reflection pad (custom op)
+-        padded = cuda_extension.reflection_pad2d_forward(
+-            x, self.pad_left, self.pad_right, self.pad_top, self.pad_bottom
+-        )
+-        yield 'step_001', padded
+-        # Step 2: Greater equal zero (custom op)
+-        ge = cuda_extension.ge_forward(padded, 0)
+-        yield 'step_002', ge
+-        # Step 3: Remainder (custom op)
+-        rem = cuda_extension.remainder_forward(ge, 2)
+-        yield 'step_003', rem
+-        # Step 4: Return (same as rem)
+-        yield 'step_004', rem
+-        return rem

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Simplified compile script: force-compile root and kernels CUDA/C++ sources."""
+"""Simplified compile script: incrementally compile root and kernels CUDA/C++ sources."""
 
 import os
+import hashlib
+import json
 import re
 import shutil
 import sys
@@ -38,6 +40,28 @@ def find_sources() -> list[str]:
     return sorted(set(root_sources + kernel_sources))
 
 
+def build_fingerprint(sources, cuda_flags, libraries, arch_flags):
+    """Python model changes do not affect the native extension cache key."""
+    digest = hashlib.sha256()
+    inputs = sorted(set(Path(p) for p in sources) | {
+        p for p in Path('.').rglob('*')
+        if p.suffix in {'.h', '.hpp', '.cuh'} and 'build' not in p.parts
+    } | {Path(__file__)})
+    for path in inputs:
+        digest.update(str(path).encode())
+        digest.update(path.read_bytes())
+    settings = {
+        'cuda_flags': cuda_flags, 'libraries': libraries, 'arch_flags': arch_flags,
+        'torch': cpp_ext.torch.__version__, 'python': sys.version,
+        'env': {key: os.environ.get(key) for key in (
+            'TORCH_CUDA_ARCH_LIST', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'CUDA_AGENT_FAST_MATH')},
+        'toolchain': [(name, Path(name).stat().st_mtime_ns, Path(name).stat().st_size)
+                      for name in (HOST_CXX, f'{CUDA_HOME}/bin/nvcc')],
+    }
+    digest.update(json.dumps(settings, sort_keys=True).encode())
+    return digest.hexdigest()
+
+
 def compile_kernels() -> int:
     build_dir = Path('build/forced_compile')
     output_so = Path('cuda_extension.so')
@@ -49,12 +73,9 @@ def compile_kernels() -> int:
 
     print(f'Compiling {len(sources)} files: {", ".join(sources)}')
 
-    if build_dir.exists():
-        shutil.rmtree(build_dir)
     build_dir.mkdir(parents=True, exist_ok=True)
-
-    if output_so.exists():
-        output_so.unlink()
+    cache_manifest = build_dir / 'cache_manifest.json'
+    built_so = build_dir / 'cuda_extension.so'
 
     # Correctness-first builds do not enable approximate math by default.
     cuda_flags = ['-O3', f'-ccbin={HOST_CXX}']
@@ -69,6 +90,21 @@ def compile_kernels() -> int:
         libraries.append('-lcudnn')
 
     try:
+        arch_flags = cpp_ext._get_cuda_arch_flags()
+        fingerprint = build_fingerprint(sources, cuda_flags, libraries, arch_flags)
+        try:
+            cached = json.loads(cache_manifest.read_text())
+        except (OSError, ValueError):
+            cached = {}
+        if (cached.get('fingerprint') == fingerprint and built_so.exists()
+                and cached.get('binary_sha256') == hashlib.sha256(built_so.read_bytes()).hexdigest()):
+            shutil.copy2(built_so, output_so)
+            print('Compile cache hit: native sources unchanged; reused cuda_extension.so')
+            return 0
+        # Never expose a previous binary after a failed build.
+        output_so.unlink(missing_ok=True)
+        cache_manifest.unlink(missing_ok=True)
+        print('Compile cache miss: incremental Ninja build')
         cpp_ext.load(
             name='cuda_extension',
             sources=sources,
@@ -76,17 +112,19 @@ def compile_kernels() -> int:
             verbose=False,
             with_cuda=True,
             extra_cflags=['-O3', '-std=c++20'],
-            extra_cuda_cflags=cuda_flags,
+            extra_cuda_cflags=cuda_flags + arch_flags,
             extra_ldflags=libraries,
         )
     except Exception as exc:
+        output_so.unlink(missing_ok=True)
         print('Compilation failed.')
         print(str(exc))
         return 1
 
-    built_so = build_dir / 'cuda_extension.so'
     if built_so.exists():
         shutil.copy2(built_so, output_so)
+        cache_manifest.write_text(json.dumps({'fingerprint': fingerprint,
+            'binary_sha256': hashlib.sha256(built_so.read_bytes()).hexdigest()}))
         print(f'Compile success: {output_so}')
         return 0
 
