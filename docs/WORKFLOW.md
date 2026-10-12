@@ -96,7 +96,8 @@ logs/task_0000/20260924_120000_000000/
     "evidence": ["错误从后面的 batch 开始", "launcher 将 grid 限制为 65535"],
     "changes": ["增加 grid-stride loop，使每个输出元素都被写入"]
   },
-  "files": {"kernels/example.cu": "完整修改后源码"}
+  "files": {"kernels/custom_ops.cu": "完整修改后源码"},
+  "delete_files": ["kernels/obsolete_binding.cpp"]
 }
 ```
 
@@ -155,6 +156,13 @@ python main.py --task-start 0 --task-end 10
 ### 单 CUDA 文件、调度与增量编译
 
 生成与修复统一使用 `kernels/custom_ops.cu`，其中可以包含多个 kernel 和 launcher。
+`.cu` 只包含 CUDA kernel 和原始指针、标量、`cudaStream_t` launcher；Tensor 包装、
+检查、分配、stream 获取和 pybind 注册放在 `kernels/*_binding.cpp`。
+API 写入前与编译前的源码检查均拒绝 `.cu` 中的 torch/ATen/c10/pybind 依赖及注册，
+也拒绝 `.cpp` 中的 CUDA kernel 或 launch 语法。
+修复响应可用 `delete_files` 显式删除生成的 kernels 源码；省略文件不会删除。
+删除不能与写入冲突，也不能指向固定基础设施或符号链接。仅删除时 `files` 可为空对象。
+所有路径和内容先检查，写入或删除失败时回滚整组变更。生成阶段禁止删除。
 API 拒绝其他 `.cu` 路径；源码检查和结果保存再次检查 `kernels/` 中恰有这一个
 CUDA 文件（包含对子目录的检查）。绑定仍可拆为多个 `.cpp`。
 

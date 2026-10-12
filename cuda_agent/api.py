@@ -170,7 +170,12 @@ def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None) ->
     root = workdir.resolve()
     files = data["files"]
 
-    if not files:
+    delete_files = data.get("delete_files", [])
+    if not isinstance(delete_files, list) or not all(isinstance(name, str) for name in delete_files):
+        raise ValueError("delete_files 必须是文件路径字符串列表。")
+    if delete_files and allowed_stage is not None:
+        raise ValueError("只有修复阶段允许 delete_files。")
+    if not files and not delete_files:
         raise ValueError("模型没有返回任何待修改文件。")
 
     validated_files = []
@@ -191,12 +196,32 @@ def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None) ->
         if relative_path.suffix == ".cu" and relative_path != Path("kernels/custom_ops.cu"):
             raise ValueError("CUDA source must be kernels/custom_ops.cu; multiple .cu files are forbidden")
         target = (root / relative_path).resolve()
-        if root not in target.parents:
+        if root not in target.parents or target != root / relative_path:
             raise ValueError(f"拒绝越界路径：{relative_name}")
 
         validated_files.append((relative_path, target, content))
 
+    deletions = []
+    for name in delete_files:
+        relative_path = Path(name)
+        if len(relative_path.parts) != 2 or relative_path.parts[0] != "kernels" or not _is_allowed_path(relative_path):
+            raise ValueError(f"拒绝删除不允许的路径：{name}")
+        if relative_path.suffix == ".cu" and relative_path != Path("kernels/custom_ops.cu"):
+            raise ValueError(f"拒绝删除不允许的 CUDA 路径：{name}")
+        target = (root / relative_path).resolve()
+        if root not in target.parents or target != root / relative_path or target in deletions or any(target == item[1] for item in validated_files):
+            raise ValueError(f"删除路径越界、重复或与写入冲突：{name}")
+        deletions.append(target)
+
+    # Reject misplaced wrappers before proceeding to the next generation stage.
+    from .validation import native_structure_errors
+    for relative_path, _, content in validated_files:
+        errors = native_structure_errors(relative_path.as_posix(), content)
+        if errors:
+            raise ValueError("\n".join(errors))
+
     backups = {target: target.read_bytes() if target.exists() else None for _, target, _ in validated_files}
+    backups.update({target: target.read_bytes() if target.exists() else None for target in deletions})
     temporaries = []
     try:
         # Stage every file before promoting any of them; rollback the bundle on I/O failure.
@@ -208,6 +233,9 @@ def _apply_files(data: dict, workdir: Path, allowed_stage: str | None = None) ->
         for temporary, target in temporaries:
             temporary.replace(target)
             LOGGER.info("API 已更新文件：%s", target.relative_to(root))
+        for target in deletions:
+            target.unlink(missing_ok=True)
+            LOGGER.info("API 已删除文件：%s", target.relative_to(root))
     except OSError:
         for target, original in backups.items():
             if original is None:
@@ -257,6 +285,7 @@ def run_agent(instruction: str, workdir: str, *, allowed_stage: str | None = Non
 
 只允许修改 model_new.py、kernels/custom_ops.cu，或 kernels/ 下的 .cpp 文件。
 kernels/ 必须且只能有一个 .cu：custom_ops.cu。全部 CUDA kernel 和 launcher 放入该文件；修复时也不得新增其他 .cu。
+.cu 只能包含 CUDA kernel 与使用原始指针、标量、cudaStream_t 的 launcher，禁止 torch/ATen/c10/pybind 依赖、Tensor 包装与注册。Tensor 检查、分配、当前 stream 获取与 pybind 注册统一放在 kernels/*_binding.cpp；.cpp 不得包含 CUDA kernel 或 launch 语法。
 禁止修改 model.py、utils/、binding.cpp、binding_registry.h、SKILL.md。
 
 你的回复必须且只能是合法 JSON，不要使用 Markdown 代码块，不要解释。
@@ -273,7 +302,7 @@ kernels/ 必须且只能有一个 .cu：custom_ops.cu。全部 CUDA kernel 和 l
   }
 }
 
-files 中只放需要新增或修改的完整文件。不要返回 shell 命令。修复必须提供 analysis，但其中内容是待验证假设，不能宣称已经运行测试。
+files 中只放需要新增或修改的完整文件。省略文件不会删除文件。仅修复阶段可以额外返回 "delete_files": ["kernels/obsolete_binding.cpp"] 显式删除 kernels/ 下生成的源码；不能删除固定基础设施，不能同时写入和删除同一路径。仅删除时 files 可以为空对象。不要返回 shell 命令。修复必须提供 analysis，但其中内容是待验证假设，不能宣称已经运行测试。
 """.strip()
 
     user_prompt = f"""
@@ -329,7 +358,7 @@ files 中只放需要新增或修改的完整文件。不要返回 shell 命令�
         analysis = _validate_analysis(data, require_analysis)
         _apply_files(data, workdir_path, allowed_stage)
         _record_call(run_dir, stage=allowed_stage or "repair", success=True, analysis=analysis,
-                     files=sorted(data["files"]), elapsed_seconds=time.monotonic() - started_at)
+                     files=sorted(data["files"]), delete_files=data.get("delete_files", []), elapsed_seconds=time.monotonic() - started_at)
         LOGGER.info("DeepSeek API 调用成功，耗时 %.2fs", time.monotonic() - started_at)
         return True
 

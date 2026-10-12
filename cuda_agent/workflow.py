@@ -65,6 +65,7 @@ GENERATION_PROMPTS = (
     (
         "kernels/custom_ops.cu",
         """你负责第二阶段：只生成或修改唯一的 kernels/custom_ops.cu 文件，所有 CUDA kernel 和 launcher 必须放在这个文件中，不要生成或修改 .cpp 或 model_new.py。
+.cu 只放 CUDA kernel 与原始指针/标量/cudaStream_t launcher，禁止包含 torch、ATen、c10、pybind 头文件、Tensor 包装函数或 REGISTER_BINDING。Tensor 参数检查、分配、stream 获取和注册由下一阶段的 *_binding.cpp 实现。
 先阅读 SKILL.md、model.py、当前 model_new.py 以及现有 kernels 文件，严格以 model_new.py 已确定的自定义算子名称、参数顺序、返回结构和 dtype/shape 约定为接口契约；不要反过来改 Python 接口。
 只实现参考契约实际使用的 dtype/device，不额外添加未经验证的 half/double 路径。按参考步骤实现完整、可编译的 CUDA kernel 和 host launcher，覆盖 model_new.py 的所有调用路径。重点核对维度/stride、边界和空张量、非连续输入、dtype 分派、数值精度、同步、线程索引和 launch 参数；不得留下伪代码、TODO、占位实现或未定义符号。需要导出给绑定层的 launcher 必须有清晰且稳定的声明，供下一阶段的 binding.cpp 调用。
 必须且只能返回 kernels/custom_ops.cu 的完整内容，不得拆分或新增其他 .cu 文件；不要返回 .cpp 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",
@@ -72,6 +73,7 @@ GENERATION_PROMPTS = (
     (
         "kernels/*.cpp",
         """你负责第三阶段：只生成或修改 kernels/ 下的绑定 .cpp 文件，不要生成或修改 .cu 或 model_new.py。
+绑定文件只声明并调用 .cu 导出的原始 launcher；Tensor 包装函数和 pybind 注册只在 *_binding.cpp 定义一次，不得复制 .cu 的函数实现。
 先阅读 SKILL.md、model.py、model_new.py 以及当前 kernels/*.cu，严格对齐 Python 调用接口和 CUDA launcher 的函数声明。为每个自定义算子提供完整的 PyTorch tensor 参数检查、必要的 dtype/device/shape 处理、正确的 launcher 调用、返回值构造和 REGISTER_BINDING 注册；不得在 .cpp 中实现 CUDA kernel，不得调用 torch:: 算子完成计算。
 逐项核对注册名、参数顺序、include、命名空间、声明、返回结构和 dtype 分派，确保 binding.cpp 能独立编译并与 .cu 正确链接。不要留下伪代码、TODO、占位实现或未定义符号。
 只返回需要写入的 .cpp 文件完整内容；不要返回 .cu 文件，不要修改 model_new.py、model.py、utils/、binding.cpp、binding_registry.h 或 SKILL.md。""",

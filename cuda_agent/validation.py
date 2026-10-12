@@ -6,6 +6,21 @@ from pathlib import Path
 import re
 
 
+def native_structure_errors(name: str, text: str) -> list[str]:
+    """Check the ownership boundary without trying to parse arbitrary C++."""
+    text = re.sub(r'/\*.*?\*/|//[^\n]*', '', text, flags=re.S)
+    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+    errors = []
+    if name.endswith('.cu'):
+        if re.search(r'#\s*include\s*[<"](?:torch/|ATen/|c10/|pybind11/|[^>"\n]*binding_registry)', text) or re.search(
+            r'\b(?:torch|at|c10|pybind11|py)::|\b(?:REGISTER_BINDING|PYBIND11_MODULE|TORCH_CHECK)\s*\(', code
+        ):
+            errors.append(f'{name}: CUDA source must contain only kernels and raw launchers; move tensor wrappers and pybind registration to kernels/*_binding.cpp')
+    elif name.endswith('.cpp') and re.search(r'\b__(?:global|device)__\b|<<<', code):
+        errors.append(f'{name}: CUDA kernels and launch syntax belong in kernels/custom_ops.cu')
+    return errors
+
+
 @dataclass
 class SourceChecks:
     errors: list[str] = field(default_factory=list)
@@ -42,6 +57,7 @@ def check_sources(workdir: Path) -> SourceChecks:
     registrations = set()
     for source in sources:
         text = source.read_text(encoding='utf-8')
+        result.errors.extend(native_structure_errors(source.name, text))
         registrations.update(re.findall(r'\b\w+\s*\.\s*def\s*\(\s*"([^"]+)"', text))
         if re.search(r'grid\w*\s*>\s*65535', text) and not re.search(r'\b(?:for|while)\s*\(', text):
             result.warnings.append(f'{source.name}: grid is capped at 65535 without a visible loop; check complete output coverage')

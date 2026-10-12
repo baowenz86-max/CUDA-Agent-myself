@@ -55,6 +55,91 @@ class TraceTests(unittest.TestCase):
 
 
 class InterfaceTests(unittest.TestCase):
+    def test_explicit_deletion_and_omitted_file_preservation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'kernels').mkdir()
+            stale = root / 'kernels/custom_ops_binding.cpp'
+            stale.write_text('duplicate wrapper')
+            _apply_files({'files': {'model_new.py': 'new'}}, root)
+            self.assertTrue(stale.exists())
+            _apply_files({'files': {}, 'delete_files': ['kernels/custom_ops_binding.cpp']}, root)
+            self.assertFalse(stale.exists())
+
+    def test_invalid_deletion_rejects_entire_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'model_new.py').write_text('original')
+            for names, stage in [(['model.py'], None), (['../outside.cpp'], None),
+                                 (['kernels/../../outside.cpp'], None),
+                                 (['kernels/x.cpp', 'kernels/x.cpp'], None),
+                                 (['kernels/x.cpp'], 'binding'), ('kernels/x.cpp', None),
+                                 (['model_new.py'], None)]:
+                with self.subTest(names=names, stage=stage), self.assertRaises(ValueError):
+                    _apply_files({'files': {'model_new.py': 'changed'}, 'delete_files': names}, root, stage)
+                self.assertEqual((root / 'model_new.py').read_text(), 'original')
+            with self.assertRaises(ValueError):
+                _apply_files({'files': {'kernels/x.cpp': 'new'}, 'delete_files': ['kernels/x.cpp']}, root)
+
+    def test_deletion_failure_restores_writes_and_deleted_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'kernels').mkdir()
+            (root / 'model_new.py').write_text('original')
+            first, second = root / 'kernels/first.cpp', root / 'kernels/second.cpp'
+            first.write_text('first'); second.write_text('second')
+            real_unlink = Path.unlink
+            def unlink(path, *args, **kwargs):
+                if path == second:
+                    raise OSError('simulated deletion failure')
+                return real_unlink(path, *args, **kwargs)
+            with patch.object(Path, 'unlink', unlink), self.assertRaises(OSError):
+                _apply_files({'files': {'model_new.py': 'changed'},
+                              'delete_files': ['kernels/first.cpp', 'kernels/second.cpp']}, root)
+            self.assertEqual((root / 'model_new.py').read_text(), 'original')
+            self.assertEqual(first.read_text(), 'first')
+            self.assertEqual(second.read_text(), 'second')
+
+    def test_symlink_cannot_delete_protected_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'kernels').mkdir()
+            protected = root / 'model.py'
+            protected.write_text('reference')
+            (root / 'kernels/alias.cpp').symlink_to(protected)
+            with self.assertRaises(ValueError):
+                _apply_files({'files': {}, 'delete_files': ['kernels/alias.cpp']}, root)
+            self.assertEqual(protected.read_text(), 'reference')
+
+    def test_task6_snapshot_rejected_before_compilation(self):
+        fixture = Path(__file__).resolve().parents[1] / 'logs/task_0006/20261012_183438_355055/correctness/candidates/0003/sources'
+        if not fixture.exists():
+            self.skipTest('archived task6 snapshot unavailable')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'model.py').write_text('')
+            (root / 'model_new.py').write_text((fixture / 'model_new.py').read_text())
+            (root / 'kernels').mkdir()
+            for source in (fixture / 'kernels').iterdir():
+                (root / 'kernels' / source.name).write_text(source.read_text())
+            self.assertTrue(any('move tensor wrappers' in error for error in check_sources(root).errors))
+
+    def test_native_ownership_checked_before_writes(self):
+        bad_sources = {'kernels/custom_ops.cu': '#include <torch/types.h>\ntorch::Tensor custom_ops_forward() {}',
+                       'kernels/x_binding.cpp': '__global__ void kernel() {}'}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'model_new.py').write_text('original')
+            for name, content in bad_sources.items():
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    _apply_files({'files': {'model_new.py': 'changed', name: content}}, root)
+                self.assertEqual((root / 'model_new.py').read_text(), 'original')
+            _apply_files({'files': {'kernels/custom_ops.cu':
+                '#include <cuda_runtime.h>\n// torch::Tensor and REGISTER_BINDING are forbidden\n'
+                '__global__ void kernel(float* out) {}\n'
+                'extern "C" void launch(float* out, cudaStream_t stream) { kernel<<<1, 32, 0, stream>>>(out); }',
+                'kernels/x_binding.cpp': '#include <torch/types.h>\nREGISTER_BINDING(x, register_x);'}}, root)
+
     def test_generation_owner_enforced_before_any_write(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
