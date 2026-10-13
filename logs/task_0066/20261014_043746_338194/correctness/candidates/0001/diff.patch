@@ -1,0 +1,414 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,107 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Element-wise greater-than-or-equal kernel: output[i] = (input[i] >= threshold)
++__global__ void ge_kernel(const float* __restrict__ input,
++                          bool* __restrict__ output,
++                          int64_t numel,
++                          float threshold) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = (input[i] >= threshold);
++    }
++}
++
++// Element-wise ReLU6 kernel: output[i] = min(max(input[i], 0), 6)
++__global__ void relu6_kernel(const float* __restrict__ input,
++                             float* __restrict__ output,
++                             int64_t numel) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float val = input[i];
++        val = fminf(fmaxf(val, 0.0f), 6.0f);
++        output[i] = val;
++    }
++}
++
++// Element-wise multiplication kernel: output[i] = input[i] * mask[i]
++__global__ void mul_kernel(const float* __restrict__ input,
++                           const float* __restrict__ mask,
++                           float* __restrict__ output,
++                           int64_t numel) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = input[i] * mask[i];
++    }
++}
++
++// Helper to get a reasonably sized grid
++static inline int get_grid_size(int64_t numel, int block_size) {
++    // Use enough blocks to cover all elements, but limit to a reasonable max to avoid excessive launch overhead
++    int64_t blocks = (numel + block_size - 1) / block_size;
++    if (blocks > 65535) {
++        blocks = 65535; // gridDim.x limit, but grid-stride loop handles the rest
++    }
++    return static_cast<int>(blocks);
++}
++
++// Launcher for ge_forward
++// Output is bool tensor of same shape as input
++// threshold is passed as float
++// stream is current CUDA stream
++extern "C" void ge_forward_launcher(const float* input,
++                                    bool* output,
++                                    int64_t numel,
++                                    float threshold,
++                                    cudaStream_t stream) {
++    constexpr int block_size = 256;
++    int grid_size = get_grid_size(numel, block_size);
++    ge_kernel<<<grid_size, block_size, 0, stream>>>(input, output, numel, threshold);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Let binding layer handle error; here just ignore or optionally assert
++        // We could write to stderr, but keep simple: no throw in .cu launcher
++#ifdef DEBUG
++        printf("CUDA error in ge_forward_launcher: %s\n", cudaGetErrorString(err));
++#endif
++    }
++}
++
++// Launcher for relu6_forward
++// Output is float tensor of same shape as input
++extern "C" void relu6_forward_launcher(const float* input,
++                                       float* output,
++                                       int64_t numel,
++                                       cudaStream_t stream) {
++    constexpr int block_size = 256;
++    int grid_size = get_grid_size(numel, block_size);
++    relu6_kernel<<<grid_size, block_size, 0, stream>>>(input, output, numel);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++#ifdef DEBUG
++        printf("CUDA error in relu6_forward_launcher: %s\n", cudaGetErrorString(err));
++#endif
++    }
++}
++
++// Launcher for mul_forward
++// Output is float tensor of same shape as input
++// mask must be float tensor of same shape
++extern "C" void mul_forward_launcher(const float* input,
++                                     const float* mask,
++                                     float* output,
++                                     int64_t numel,
++                                     cudaStream_t stream) {
++    constexpr int block_size = 256;
++    int grid_size = get_grid_size(numel, block_size);
++    mul_kernel<<<grid_size, block_size, 0, stream>>>(input, mask, output, numel);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++#ifdef DEBUG
++        printf("CUDA error in mul_forward_launcher: %s\n", cudaGetErrorString(err));
++#endif
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,259 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cudnn.h>
++#include <vector>
++#include <stdexcept>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void ge_forward_launcher(const float* input, bool* output, int64_t numel, float threshold, cudaStream_t stream);
++extern "C" void relu6_forward_launcher(const float* input, float* output, int64_t numel, cudaStream_t stream);
++extern "C" void mul_forward_launcher(const float* input, const float* mask, float* output, int64_t numel, cudaStream_t stream);
++
++// Helper to check CUDA errors
++static void checkCudaError(cudaError_t err, const char* msg) {
++    if (err != cudaSuccess) {
++        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(err));
++    }
++}
++
++static void checkCudnnError(cudnnStatus_t status, const char* msg) {
++    if (status != CUDNN_STATUS_SUCCESS) {
++        throw std::runtime_error(std::string(msg) + ": " + cudnnGetErrorString(status));
++    }
++}
++
++// cuDNN-based ConvTranspose1d forward
++static torch::Tensor conv_transpose1d_forward_impl(
++    const torch::Tensor& input,
++    const torch::Tensor& weight,
++    const torch::Tensor& bias,
++    int64_t stride,
++    int64_t padding,
++    int64_t output_padding
++) {
++    // Input checks
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D (batch, channels, length)");
++    TORCH_CHECK(weight.dim() == 3, "weight must be 3D (in_channels, out_channels, kernel_size)");
++    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
++
++    // Convert to contiguous if needed (we need contiguous for cuDNN)
++    auto input_contig = input.contiguous();
++    auto weight_contig = weight.contiguous();
++    auto bias_contig = bias.contiguous();
++
++    int64_t batch = input_contig.size(0);
++    int64_t in_channels = input_contig.size(1);
++    int64_t input_length = input_contig.size(2);
++    int64_t out_channels = weight_contig.size(1);
++    int64_t kernel_size = weight_contig.size(2);
++
++    TORCH_CHECK(weight_contig.size(0) == in_channels, "weight size[0] must match input channels");
++    TORCH_CHECK(bias_contig.size(0) == out_channels, "bias size must equal out_channels");
++
++    // Compute output length
++    int64_t output_length = (input_length - 1) * stride - 2 * padding + kernel_size + output_padding;
++    TORCH_CHECK(output_length > 0, "output length must be positive");
++
++    // Allocate output tensor (float32, CUDA)
++    auto output = torch::empty({batch, out_channels, output_length}, input_contig.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // cuDNN handle
++    cudnnHandle_t cudnn_handle;
++    checkCudnnError(cudnnCreate(&cudnn_handle), "cudnnCreate failed");
++    checkCudnnError(cudnnSetStream(cudnn_handle, stream), "cudnnSetStream failed");
++
++    // Set up tensor descriptors
++    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
++    cudnnFilterDescriptor_t filter_desc;
++    cudnnConvolutionDescriptor_t conv_desc;
++
++    checkCudnnError(cudnnCreateTensorDescriptor(&input_desc), "cudnnCreateTensorDescriptor input");
++    checkCudnnError(cudnnCreateTensorDescriptor(&output_desc), "cudnnCreateTensorDescriptor output");
++    checkCudnnError(cudnnCreateTensorDescriptor(&bias_desc), "cudnnCreateTensorDescriptor bias");
++    checkCudnnError(cudnnCreateFilterDescriptor(&filter_desc), "cudnnCreateFilterDescriptor");
++    checkCudnnError(cudnnCreateConvolutionDescriptor(&conv_desc), "cudnnCreateConvolutionDescriptor");
++
++    // Set tensor descriptors: input shape [N, C, L] -> [N, C, 1, L] for cuDNN 2D spatial
++    int input_dims[4] = {static_cast<int>(batch), static_cast<int>(in_channels), 1, static_cast<int>(input_length)};
++    int input_strides[4] = {static_cast<int>(in_channels * input_length), static_cast<int>(input_length), input_length, 1};
++    checkCudnnError(cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
++                                              input_dims[0], input_dims[1], input_dims[2], input_dims[3]),
++                   "cudnnSetTensor4dDescriptor input");
++
++    int output_dims[4] = {static_cast<int>(batch), static_cast<int>(out_channels), 1, static_cast<int>(output_length)};
++    int output_strides[4] = {static_cast<int>(out_channels * output_length), static_cast<int>(output_length), output_length, 1};
++    checkCudnnError(cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
++                                               output_dims[0], output_dims[1], output_dims[2], output_dims[3]),
++                   "cudnnSetTensor4dDescriptor output");
++
++    // Bias descriptor: [1, C, 1, 1]
++    int bias_dims[4] = {1, static_cast<int>(out_channels), 1, 1};
++    int bias_strides[4] = {static_cast<int>(out_channels), 1, 1, 1};
++    checkCudnnError(cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
++                                               bias_dims[0], bias_dims[1], bias_dims[2], bias_dims[3]),
++                   "cudnnSetTensor4dDescriptor bias");
++
++    // Filter descriptor: weight shape [in_channels, out_channels, kernel_size] -> [out_channels, in_channels, 1, kernel_size]
++    int filter_dims[4] = {static_cast<int>(out_channels), static_cast<int>(in_channels), 1, static_cast<int>(kernel_size)};
++    checkCudnnError(cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
++                                               filter_dims[0], filter_dims[1], filter_dims[2], filter_dims[3]),
++                   "cudnnSetFilter4dDescriptor");
++
++    // Convolution descriptor: 2D but with height=1, stride (1, stride), pad (0, padding)
++    // Note: For transposed conv, padding is typically pa = kernel_size - 1 - padding
++    int conv_pad_h = 0;
++    int conv_pad_w = static_cast<int>(padding);
++    int conv_stride_h = 1;
++    int conv_stride_w = static_cast<int>(stride);
++    int conv_dilation_h = 1;
++    int conv_dilation_w = 1;
++    checkCudnnError(cudnnSetConvolution2dDescriptor(conv_desc,
++                                                     conv_pad_h, conv_pad_w,
++                                                     conv_stride_h, conv_stride_w,
++                                                     conv_dilation_h, conv_dilation_w,
++                                                     CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT),
++                   "cudnnSetConvolution2dDescriptor");
++
++    // Determine algorithm
++    cudnnConvolutionBwdDataAlgo_t algo;
++    int requested_algo_count = 1, returned_algo_count = 0;
++    checkCudnnError(cudnnGetConvolutionBackwardDataAlgorithm(
++                        cudnn_handle, filter_desc, output_desc, conv_desc, input_desc,
++                        CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST, 0, &algo),
++                   "cudnnGetConvolutionBackwardDataAlgorithm failed");
++
++    // Workspace size
++    size_t workspace_size = 0;
++    checkCudnnError(cudnnGetConvolutionBackwardDataWorkspaceSize(
++                        cudnn_handle, filter_desc, output_desc, conv_desc, input_desc, algo, &workspace_size),
++                   "cudnnGetConvolutionBackwardDataWorkspaceSize failed");
++
++    // Allocate workspace
++    void* workspace = nullptr;
++    if (workspace_size > 0) {
++        checkCudaError(cudaMalloc(&workspace, workspace_size), "cudaMalloc workspace failed");
++    }
++
++    // Perform backward data convolution (input = weight * output)
++    float alpha = 1.0f, beta = 0.0f;
++    checkCudnnError(cudnnConvolutionBackwardData(
++                        cudnn_handle,
++                        &alpha,
++                        filter_desc, weight_contig.data_ptr<float>(),
++                        output_desc, output.data_ptr<float>(),
++                        conv_desc, algo,
++                        workspace, workspace_size,
++                        &beta,
++                        input_desc, input_contig.data_ptr<float>()),
++                   "cudnnConvolutionBackwardData failed");
++
++    // Add bias: use cudnnAddTensor
++    float bias_alpha = 1.0f, bias_beta = 1.0f;
++    checkCudnnError(cudnnAddTensor(cudnn_handle, &bias_alpha, bias_desc, bias_contig.data_ptr<float>(),
++                                   &bias_beta, output_desc, output.data_ptr<float>()),
++                   "cudnnAddTensor bias failed");
++
++    // Cleanup
++    if (workspace != nullptr) cudaFree(workspace);
++    cudnnDestroyTensorDescriptor(input_desc);
++    cudnnDestroyTensorDescriptor(output_desc);
++    cudnnDestroyTensorDescriptor(bias_desc);
++    cudnnDestroyFilterDescriptor(filter_desc);
++    cudnnDestroyConvolutionDescriptor(conv_desc);
++    cudnnDestroy(cudnn_handle);
++
++    return output;
++}
++
++// Python binding functions
++torch::Tensor conv_transpose1d_forward(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    int64_t stride,
++    int64_t padding,
++    int64_t output_padding
++) {
++    return conv_transpose1d_forward_impl(input, weight, bias, stride, padding, output_padding);
++}
++
++torch::Tensor ge_forward(torch::Tensor input, double threshold) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    auto input_contig = input.contiguous();
++    auto output = torch::empty(input_contig.sizes(), input_contig.options().dtype(torch::kBool));
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    ge_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<bool>(),
++        input_contig.numel(),
++        static_cast<float>(threshold),
++        stream
++    );
++    return output;
++}
++
++torch::Tensor relu6_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    auto input_contig = input.contiguous();
++    auto output = torch::empty_like(input_contig);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    relu6_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input_contig.numel(),
++        stream
++    );
++    return output;
++}
++
++torch::Tensor mul_forward(torch::Tensor input, torch::Tensor mask) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(mask.is_cuda(), "mask must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(mask.dtype() == torch::kFloat32, "mask must be float32");
++    TORCH_CHECK(input.sizes() == mask.sizes(), "input and mask must have same shape");
++    auto input_contig = input.contiguous();
++    auto mask_contig = mask.contiguous();
++    auto output = torch::empty_like(input_contig);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    mul_forward_launcher(
++        input_contig.data_ptr<float>(),
++        mask_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input_contig.numel(),
++        stream
++    );
++    return output;
++}
++
++void register_custom_ops_binding(pybind11::module& m) {
++    m.def("conv_transpose1d_forward", &conv_transpose1d_forward,
++          "ConvTranspose1d forward using cuDNN",
++          py::arg("input"), py::arg("weight"), py::arg("bias"),
++          py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
++    m.def("ge_forward", &ge_forward,
++          "element-wise greater than or equal",
++          py::arg("input"), py::arg("threshold"));
++    m.def("relu6_forward", &relu6_forward,
++          "ReLU6 activation",
++          py::arg("input"));
++    m.def("mul_forward", &mul_forward,
++          "element-wise multiplication",
++          py::arg("input"), py::arg("mask"));
++}
++
++REGISTER_BINDING(custom_ops_binding, register_custom_ops_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,39 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, threshold):
++        super().__init__()
++        self.conv_transpose1d = nn.ConvTranspose1d(
++            in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding
++        )
++        self.threshold = threshold
++        self.relu6 = nn.ReLU6()
++
++    def forward(self, x, y):
++        x = cuda_extension.conv_transpose1d_forward(
++            x, self.conv_transpose1d.weight, self.conv_transpose1d.bias,
++            self.conv_transpose1d.stride[0], self.conv_transpose1d.padding[0],
++            self.conv_transpose1d.output_padding[0]
++        )
++        mask = cuda_extension.ge_forward(x, self.threshold)
++        x = cuda_extension.relu6_forward(x)
++        x = cuda_extension.mul_forward(x, mask.float())
++        return x
++
++    def debug_forward(self, x, y):
++        x = cuda_extension.conv_transpose1d_forward(
++            x, self.conv_transpose1d.weight, self.conv_transpose1d.bias,
++            self.conv_transpose1d.stride[0], self.conv_transpose1d.padding[0],
++            self.conv_transpose1d.output_padding[0]
++        )
++        yield 'step_001', x
++        mask = cuda_extension.ge_forward(x, self.threshold)
++        yield 'step_002', mask
++        x = cuda_extension.relu6_forward(x)
++        yield 'step_003', x
++        x = cuda_extension.mul_forward(x, mask.float())
++        yield 'step_004', x
++        yield 'step_005', x

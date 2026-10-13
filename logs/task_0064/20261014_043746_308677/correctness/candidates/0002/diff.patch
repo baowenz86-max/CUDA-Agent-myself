@@ -1,0 +1,356 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,5 +1,6 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
++#include <cmath>
+ 
+ // ReflectionPad2d kernel
+ // x: input pointer (float32)
+@@ -82,13 +83,68 @@
+     }
+ }
+ 
++// conv2d kernel: direct convolution with loops over kernel and input channels
++// x: input [N, C_in, H_in, W_in]
++// weight: [C_out, C_in, KH, KW]
++// bias: [C_out] (optional, may be null)
++// out: [N, C_out, H_out, W_out]
++// stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w
++// in_strides: input strides (4)
++// weight_strides: weight strides (4)
++// out_strides: output strides (4)
++__global__ void conv2d_kernel(
++    const float* __restrict__ x,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ out,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int KH, int KW,
++    int H_out, int W_out,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    int64_t in_stride_n, int64_t in_stride_c, int64_t in_stride_h, int64_t in_stride_w,
++    int64_t weight_stride_o, int64_t weight_stride_i, int64_t weight_stride_h, int64_t weight_stride_w,
++    int64_t out_stride_n, int64_t out_stride_c, int64_t out_stride_h, int64_t out_stride_w
++) {
++    int64_t total = (int64_t)N * C_out * H_out * W_out;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int w_out = i % W_out;
++        int64_t tmp = i / W_out;
++        int h_out = tmp % H_out;
++        tmp /= H_out;
++        int c_out = tmp % C_out;
++        int n = tmp / C_out;
++
++        float sum = 0.0f;
++        for (int c_in = 0; c_in < C_in; ++c_in) {
++            for (int kh = 0; kh < KH; ++kh) {
++                int h_in = h_out * stride_h - padding_h + kh * dilation_h;
++                if (h_in < 0 || h_in >= H_in) continue;
++                for (int kw = 0; kw < KW; ++kw) {
++                    int w_in = w_out * stride_w - padding_w + kw * dilation_w;
++                    if (w_in < 0 || w_in >= W_in) continue;
++                    int64_t x_idx = (int64_t)n * in_stride_n + (int64_t)c_in * in_stride_c
++                                    + (int64_t)h_in * in_stride_h + (int64_t)w_in * in_stride_w;
++                    int64_t w_idx = (int64_t)c_out * weight_stride_o + (int64_t)c_in * weight_stride_i
++                                    + (int64_t)kh * weight_stride_h + (int64_t)kw * weight_stride_w;
++                    sum += x[x_idx] * weight[w_idx];
++                }
++            }
++        }
++        if (bias != nullptr) {
++            sum += bias[c_out];
++        }
++        int64_t out_idx = (int64_t)n * out_stride_n + (int64_t)c_out * out_stride_c
++                        + (int64_t)h_out * out_stride_h + (int64_t)w_out * out_stride_w;
++        out[out_idx] = sum;
++    }
++}
++
+ // Host launcher for reflection_pad2d
+-// x, out: raw device pointers (float32)
+-// N, C, H, W: input dims
+-// pad_left, pad_right, pad_top, pad_bottom
+-// in_strides: array of 4 int64 strides
+-// out_strides: array of 4 int64 strides
+-// stream: CUDA stream
+ extern "C" void reflection_pad2d_launcher(
+     const float* x,
+     float* out,
+@@ -102,7 +158,6 @@
+     if (total == 0) return;
+     int block = 256;
+     int grid = (int)((total + block - 1) / block);
+-    // Cap grid at 65535*4? Better use a reasonable max and rely on grid-stride loop.
+     int maxGrid = 65535 * 4;
+     if (grid > maxGrid) grid = maxGrid;
+     reflection_pad2d_kernel<<<grid, block, 0, stream>>>(
+@@ -114,11 +169,6 @@
+ }
+ 
+ // Host launcher for nansum_dim12
+-// x: input pointer
+-// out: output pointer pre-zeroed (float32)
+-// N, C, H, W: dims
+-// in_strides: array of 4 int64 strides
+-// stream
+ extern "C" void nansum_dim12_launcher(
+     const float* x,
+     float* out,
+@@ -137,3 +187,40 @@
+         in_strides[0], in_strides[1], in_strides[2], in_strides[3]
+     );
+ }
++
++// Host launcher for conv2d
++extern "C" void conv2d_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,  // may be nullptr for no bias
++    float* out,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int KH, int KW,
++    int H_out, int W_out,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    const int64_t* in_strides,
++    const int64_t* weight_strides,
++    const int64_t* out_strides,
++    cudaStream_t stream
++) {
++    int64_t total = (int64_t)N * C_out * H_out * W_out;
++    if (total == 0) return;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    int maxGrid = 65535 * 4;
++    if (grid > maxGrid) grid = maxGrid;
++    conv2d_kernel<<<grid, block, 0, stream>>>(
++        x, weight, bias, out,
++        N, C_in, H_in, W_in,
++        C_out, KH, KW,
++        H_out, W_out,
++        stride_h, stride_w,
++        padding_h, padding_w,
++        dilation_h, dilation_w,
++        in_strides[0], in_strides[1], in_strides[2], in_strides[3],
++        weight_strides[0], weight_strides[1], weight_strides[2], weight_strides[3],
++        out_strides[0], out_strides[1], out_strides[2], out_strides[3]
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,7 +2,6 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include <cstdint>
+ #include "../binding_registry.h"
+@@ -26,16 +25,27 @@
+     cudaStream_t stream
+ );
+ 
++extern "C" void conv2d_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    float* out,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int KH, int KW,
++    int H_out, int W_out,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    const int64_t* in_strides,
++    const int64_t* weight_strides,
++    const int64_t* out_strides,
++    cudaStream_t stream
++);
++
+ // Helper: check CUDA error
+ #define CHECK_CUDA(call) { \
+     cudaError_t err = call; \
+     TORCH_CHECK(err == cudaSuccess, "CUDA error: ", cudaGetErrorString(err)); \
+-}
+-
+-// Helper: check cuDNN error
+-#define CHECK_CUDNN(call) { \
+-    cudnnStatus_t err = call; \
+-    TORCH_CHECK(err == CUDNN_STATUS_SUCCESS, "cuDNN error: ", cudnnGetErrorString(err)); \
+ }
+ 
+ // reflection_pad2d wrapper
+@@ -84,7 +94,10 @@
+     return out;
+ }
+ 
+-// conv2d wrapper using cuDNN
++// conv2d wrapper using custom CUDA kernel
++// Note: bias is required parameter, but may be None? The contract says bias is optional (nullable, optional: false means required parameter but can be null)
++// Actually in contract, bias has optional: false, nullable: true, so it must be passed but can be None.
++// In Python call, we pass self.conv.bias, which is not None. But handle nullptr.
+ torch::Tensor conv2d(
+     torch::Tensor x,
+     torch::Tensor weight,
+@@ -125,108 +138,37 @@
+ 
+     auto out = torch::empty({N, C_out, H_out, W_out}, x.options());
+ 
+-    // Create cuDNN handle
+-    cudnnHandle_t cudnn_handle;
+-    CHECK_CUDNN(cudnnCreate(&cudnn_handle));
+-
+-    // Set stream
++    // Prepare stride arrays
++    std::vector<int64_t> in_strides(4), weight_strides(4), out_strides(4);
++    for (int i = 0; i < 4; ++i) {
++        in_strides[i] = x.stride(i);
++        weight_strides[i] = weight.stride(i);
++        out_strides[i] = out.stride(i);
++    }
++
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    CHECK_CUDNN(cudnnSetStream(cudnn_handle, stream));
+-
+-    // Describe tensors
+-    cudnnTensorDescriptor_t x_desc, y_desc;
+-    cudnnFilterDescriptor_t w_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-    cudnnTensorDescriptor_t bias_desc;
+-
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&x_desc));
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&y_desc));
+-    CHECK_CUDNN(cudnnCreateFilterDescriptor(&w_desc));
+-    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&bias_desc));
+-
+-    // Set tensor descriptors to NCHW float32
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C_in, H_in, W_in));
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C_out, H_out, W_out));
+-    CHECK_CUDNN(cudnnSetFilter4dDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, C_out, C_in, KH, KW));
+-    CHECK_CUDNN(cudnnSetConvolution2dDescriptor(
+-        conv_desc,
+-        padding_h, padding_w,
+-        stride_h, stride_w,
+-        dilation_h, dilation_w,
+-        CUDNN_CROSS_CORRELATION,
+-        CUDNN_DATA_FLOAT
+-    ));
+-
+-    // Set bias descriptor: one bias per output channel
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, C_out, 1, 1));
+-
+-    // Find best algorithm (forward)
+-    cudnnConvolutionFwdAlgo_t algo;
+-    CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm(
+-        cudnn_handle,
+-        x_desc, w_desc, conv_desc, y_desc,
+-        CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
+-        0,
+-        &algo
+-    ));
+-
+-    // Allocate workspace
+-    size_t workspace_size = 0;
+-    CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(
+-        cudnn_handle, x_desc, w_desc, conv_desc, y_desc, algo, &workspace_size
+-    ));
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        CHECK_CUDA(cudaMalloc(&workspace, workspace_size));
+-    }
+-
+-    float alpha = 1.0f;
+-    float beta = 0.0f;
+-
++
++    const float* bias_ptr = nullptr;
+     if (bias.has_value()) {
+-        // Compute convolution without bias activation, then add bias
+-        CHECK_CUDNN(cudnnConvolutionForward(
+-            cudnn_handle,
+-            &alpha,
+-            x_desc, x.data_ptr<float>(),
+-            w_desc, weight.data_ptr<float>(),
+-            conv_desc,
+-            algo,
+-            workspace, workspace_size,
+-            &beta,
+-            y_desc, out.data_ptr<float>()
+-        ));
+-        // Add bias: use cudnnAddTensor
+-        CHECK_CUDNN(cudnnAddTensor(
+-            cudnn_handle,
+-            &alpha,
+-            bias_desc, bias.value().data_ptr<float>(),
+-            &alpha,
+-            y_desc, out.data_ptr<float>()
+-        ));
+-    } else {
+-        CHECK_CUDNN(cudnnConvolutionForward(
+-            cudnn_handle,
+-            &alpha,
+-            x_desc, x.data_ptr<float>(),
+-            w_desc, weight.data_ptr<float>(),
+-            conv_desc,
+-            algo,
+-            workspace, workspace_size,
+-            &beta,
+-            y_desc, out.data_ptr<float>()
+-        ));
+-    }
+-
+-    // Cleanup
+-    if (workspace) cudaFree(workspace);
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyFilterDescriptor(w_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroyTensorDescriptor(bias_desc);
+-    cudnnDestroy(cudnn_handle);
++        bias_ptr = bias.value().data_ptr<float>();
++    }
++
++    conv2d_launcher(
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias_ptr,
++        out.data_ptr<float>(),
++        N, C_in, H_in, W_in,
++        C_out, KH, KW,
++        H_out, W_out,
++        (int)stride_h, (int)stride_w,
++        (int)padding_h, (int)padding_w,
++        (int)dilation_h, (int)dilation_w,
++        in_strides.data(),
++        weight_strides.data(),
++        out_strides.data(),
++        stream
++    );
+     CHECK_CUDA(cudaGetLastError());
+ 
+     return out;
+@@ -243,6 +185,7 @@
+     int H = x.size(2);
+     int W = x.size(3);
+ 
++    // Output shape [N, W]
+     auto out = torch::zeros({N, W}, x.options());
+ 
+     std::vector<int64_t> in_strides(4);
+@@ -267,7 +210,7 @@
+ void register_custom_ops(pybind11::module& m) {
+     m.def("reflection_pad2d", &reflection_pad2d, "ReflectionPad2d forward",
+           py::arg("x"), py::arg("pad_left"), py::arg("pad_right"), py::arg("pad_top"), py::arg("pad_bottom"));
+-    m.def("conv2d", &conv2d, "Conv2d forward using cuDNN",
++    m.def("conv2d", &conv2d, "Conv2d forward using custom CUDA kernel",
+           py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("stride_h"), py::arg("stride_w"),
+           py::arg("padding_h"), py::arg("padding_w"), py::arg("dilation_h"), py::arg("dilation_w"));
+     m.def("nansum_dim12", &nansum_dim12, "nansum over dims 1 and 2", py::arg("x"));

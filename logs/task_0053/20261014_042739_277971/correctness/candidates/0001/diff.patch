@@ -1,0 +1,628 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,299 @@
++#include <cuda_runtime.h>
++#include <float.h>
++
++// Helper: get current device property for max block dimensions (not needed if we use fixed block sizes)
++
++// -----------------------------------------------------------------------------
++// Softmax / LogSoftmax along dimension 1 (C) for 3D tensor [B, C, D]
++// Input may have arbitrary strides (given as stride_b, stride_c, stride_d)
++// Output has same shape and is assumed contiguous (stride_c_out = D, etc.) but we'll use same strides as input for simplicity; output allocated as contiguous by binding layer.
++// We'll use one block per (b, d) pair, with blockDim.x covering C.
++// If C > blockDim.x, we use grid-stride loop within block and shared memory reduction.
++// For C up to 1024, use 512 threads per block and two passes.
++// We'll implement a generic reduction with shared memory.
++
++__global__ void softmax_kernel(const float* __restrict__ input, float* __restrict__ output,
++                               int B, int C, int D,
++                               long long stride_b, long long stride_c, long long stride_d,
++                               long long out_stride_b, long long out_stride_c, long long out_stride_d) {
++    int b = blockIdx.y;
++    int d = blockIdx.x;
++    if (b >= B || d >= D) return;
++
++    // index of first element along C for this (b,d)
++    const long long base = b * stride_b + d * stride_d;
++    const long long out_base = b * out_stride_b + d * out_stride_d;
++
++    // Find max along C for numerical stability
++    float max_val = -FLT_MAX;
++    for (int c = threadIdx.x; c < C; c += blockDim.x) {
++        float val = input[base + c * stride_c];
++        max_val = fmaxf(max_val, val);
++    }
++    // Block reduction for max
++    __shared__ float smem[512];
++    int tid = threadIdx.x;
++    smem[tid] = max_val;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] = fmaxf(smem[tid], smem[tid + s]);
++        }
++        __syncthreads();
++    }
++    max_val = smem[0];
++    __syncthreads();
++
++    // Compute sum of exp(x - max)
++    float sum = 0.0f;
++    for (int c = tid; c < C; c += blockDim.x) {
++        float val = input[base + c * stride_c];
++        sum += __expf(val - max_val);
++    }
++    // Block reduction for sum
++    smem[tid] = sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] += smem[tid + s];
++        }
++        __syncthreads();
++    }
++    sum = smem[0];
++    __syncthreads();
++
++    // Write softmax output
++    for (int c = tid; c < C; c += blockDim.x) {
++        float val = input[base + c * stride_c];
++        output[out_base + c * out_stride_c] = __expf(val - max_val) / sum;
++    }
++}
++
++__global__ void log_softmax_kernel(const float* __restrict__ input, float* __restrict__ output,
++                                   int B, int C, int D,
++                                   long long stride_b, long long stride_c, long long stride_d,
++                                   long long out_stride_b, long long out_stride_c, long long out_stride_d) {
++    int b = blockIdx.y;
++    int d = blockIdx.x;
++    if (b >= B || d >= D) return;
++
++    const long long base = b * stride_b + d * stride_d;
++    const long long out_base = b * out_stride_b + d * out_stride_d;
++
++    float max_val = -FLT_MAX;
++    for (int c = threadIdx.x; c < C; c += blockDim.x) {
++        float val = input[base + c * stride_c];
++        max_val = fmaxf(max_val, val);
++    }
++    __shared__ float smem[512];
++    int tid = threadIdx.x;
++    smem[tid] = max_val;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] = fmaxf(smem[tid], smem[tid + s]);
++        }
++        __syncthreads();
++    }
++    max_val = smem[0];
++    __syncthreads();
++
++    float sum = 0.0f;
++    for (int c = tid; c < C; c += blockDim.x) {
++        sum += __expf(val - max_val);
++    }
++    smem[tid] = sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] += smem[tid + s];
++        }
++        __syncthreads();
++    }
++    sum = smem[0];
++    __syncthreads();
++
++    for (int c = tid; c < C; c += blockDim.x) {
++        float val = input[base + c * stride_c];
++        output[out_base + c * out_stride_c] = (val - max_val) - logf(sum);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// KL Divergence Loss with batchmean reduction
++// input_log: log_softmax output [B, C, D], target_prob: softmax target [B, C, D]
++// Returns sum(target_prob * (log(target_prob) - input_log)) / B
++// We'll do a two-stage reduction: each thread processes multiple elements, then block reduction, then atomicAdd to global.
++
++__global__ void kl_div_loss_kernel(const float* __restrict__ input_log, const float* __restrict__ target_prob,
++                                   float* __restrict__ output, int B, int C, int D,
++                                   long long stride_b, long long stride_c, long long stride_d) {
++    __shared__ float smem[512];
++    int tid = threadIdx.x;
++    int total = B * C * D;
++    float sum = 0.0f;
++    // Each thread sums over strided elements
++    for (int idx = blockIdx.x * blockDim.x + tid; idx < total; idx += blockDim.x * gridDim.x) {
++        int b = idx / (C * D);
++        int rem = idx % (C * D);
++        int c = rem / D;
++        int d = rem % D;
++        long long offset = b * stride_b + c * stride_c + d * stride_d;
++        float log_p = input_log[offset];
++        float p = target_prob[offset];
++        sum += p * (logf(p) - log_p);
++    }
++    smem[tid] = sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] += smem[tid + s];
++        }
++        __syncthreads();
++    }
++    if (tid == 0) {
++        atomicAdd(output, smem[0] / (float)B);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Cross Entropy Loss with mean reduction
++// input: [B, C, D] float32, target: [B, D] int64 class indices
++// Returns mean over all B*D positions of -log(softmax(input)[target])
++// We compute per-position loss by first finding max along C, then sum exp, then compute loss.
++// Use one block per (b, d) to avoid expensive global reductions; block reduces sum of losses and atomicAdd to global.
++
++__global__ void cross_entropy_loss_kernel(const float* __restrict__ input, const int64_t* __restrict__ target,
++                                          float* __restrict__ output, int B, int C, int D,
++                                          long long stride_b, long long stride_c, long long stride_d,
++                                          long long target_stride_b, long long target_stride_d) {
++    int b = blockIdx.y;
++    int d = blockIdx.x;
++    if (b >= B || d >= D) return;
++
++    const long long base = b * stride_b + d * stride_d;
++    int t_idx = b * target_stride_b + d * target_stride_d;
++    int target_class = (int)target[t_idx];
++    if (target_class < 0 || target_class >= C) {
++        // Invalid target, but PyTorch would error; we'll just skip contribution (should not happen)
++        return;
++    }
++
++    // Find max along C for numerical stability
++    float max_val = -FLT_MAX;
++    for (int c = threadIdx.x; c < C; c += blockDim.x) {
++        max_val = fmaxf(max_val, input[base + c * stride_c]);
++    }
++    __shared__ float smem[512];
++    int tid = threadIdx.x;
++    smem[tid] = max_val;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] = fmaxf(smem[tid], smem[tid + s]);
++        }
++        __syncthreads();
++    }
++    max_val = smem[0];
++    __syncthreads();
++
++    // Compute sum of exp(x - max)
++    float sum = 0.0f;
++    for (int c = tid; c < C; c += blockDim.x) {
++        sum += __expf(input[base + c * stride_c] - max_val);
++    }
++    smem[tid] = sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] += smem[tid + s];
++        }
++        __syncthreads();
++    }
++    sum = smem[0];
++    __syncthreads();
++
++    // Compute loss for this position: -log(softmax[target_class])
++    float target_logit = input[base + target_class * stride_c];
++    float loss = -(target_logit - max_val) + logf(sum);
++
++    // Reduce losses across block (all threads have same loss, but we can just have thread 0 atomicAdd)
++    if (tid == 0) {
++        atomicAdd(output, loss / (float)(B * D));
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Simple scalar add: output = a + b
++__global__ void add_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ output) {
++    if (threadIdx.x == 0 && blockIdx.x == 0) {
++        output[0] = a[0] + b[0];
++    }
++}
++
++// Simple scalar remainder: output = fmod(input, divisor) (torch.remainder for float uses fmod? Actually remainder as in C fmod for positive divisor; torch.remainder returns remainder with sign of divisor, so for positive divisor it's fmod)
++__global__ void remainder_kernel(const float* __restrict__ input, float divisor, float* __restrict__ output) {
++    if (threadIdx.x == 0 && blockIdx.x == 0) {
++        output[0] = fmodf(input[0], divisor);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Launchers (extern "C")
++
++extern "C" void log_softmax_forward_launcher(const float* input, float* output,
++                                             int B, int C, int D,
++                                             long long stride_b, long long stride_c, long long stride_d,
++                                             long long out_stride_b, long long out_stride_c, long long out_stride_d,
++                                             cudaStream_t stream) {
++    dim3 grid(D, B); // (x, y) = (d, b)
++    int block = 256; // blockDim.x
++    log_softmax_kernel<<<grid, block, 0, stream>>>(input, output, B, C, D,
++                                                   stride_b, stride_c, stride_d,
++                                                   out_stride_b, out_stride_c, out_stride_d);
++}
++
++extern "C" void softmax_forward_launcher(const float* input, float* output,
++                                         int B, int C, int D,
++                                         long long stride_b, long long stride_c, long long stride_d,
++                                         long long out_stride_b, long long out_stride_c, long long out_stride_d,
++                                         cudaStream_t stream) {
++    dim3 grid(D, B);
++    int block = 256;
++    softmax_kernel<<<grid, block, 0, stream>>>(input, output, B, C, D,
++                                               stride_b, stride_c, stride_d,
++                                               out_stride_b, out_stride_c, out_stride_d);
++}
++
++extern "C" void kl_div_loss_forward_launcher(const float* input_log, const float* target_prob,
++                                             float* output, int B, int C, int D,
++                                             long long stride_b, long long stride_c, long long stride_d,
++                                             cudaStream_t stream) {
++    // Use grid-stride loop with enough blocks
++    int total = B * C * D;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    if (grid > 65535) grid = 65535; // cap
++    kl_div_loss_kernel<<<grid, block, 0, stream>>>(input_log, target_prob, output, B, C, D,
++                                                   stride_b, stride_c, stride_d);
++}
++
++extern "C" void cross_entropy_loss_forward_launcher(const float* input, const int64_t* target,
++                                                    float* output, int B, int C, int D,
++                                                    long long stride_b, long long stride_c, long long stride_d,
++                                                    long long target_stride_b, long long target_stride_d,
++                                                    cudaStream_t stream) {
++    dim3 grid(D, B);
++    int block = 256;
++    cross_entropy_loss_kernel<<<grid, block, 0, stream>>>(input, target, output, B, C, D,
++                                                          stride_b, stride_c, stride_d,
++                                                          target_stride_b, target_stride_d);
++}
++
++extern "C" void add_forward_launcher(const float* a, const float* b, float* output, cudaStream_t stream) {
++    add_kernel<<<1, 1, 0, stream>>>(a, b, output);
++}
++
++extern "C" void remainder_forward_launcher(const float* input, float divisor, float* output, cudaStream_t stream) {
++    remainder_kernel<<<1, 1, 0, stream>>>(input, divisor, output);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,272 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void log_softmax_forward_launcher(const float* input, float* output,
++                                             int B, int C, int D,
++                                             long long stride_b, long long stride_c, long long stride_d,
++                                             long long out_stride_b, long long out_stride_c, long long out_stride_d,
++                                             cudaStream_t stream);
++
++extern "C" void softmax_forward_launcher(const float* input, float* output,
++                                         int B, int C, int D,
++                                         long long stride_b, long long stride_c, long long stride_d,
++                                         long long out_stride_b, long long out_stride_c, long long out_stride_d,
++                                         cudaStream_t stream);
++
++extern "C" void kl_div_loss_forward_launcher(const float* input_log, const float* target_prob,
++                                             float* output, int B, int C, int D,
++                                             long long stride_b, long long stride_c, long long stride_d,
++                                             cudaStream_t stream);
++
++extern "C" void cross_entropy_loss_forward_launcher(const float* input, const int64_t* target,
++                                                    float* output, int B, int C, int D,
++                                                    long long stride_b, long long stride_c, long long stride_d,
++                                                    long long target_stride_b, long long target_stride_d,
++                                                    cudaStream_t stream);
++
++extern "C" void add_forward_launcher(const float* a, const float* b, float* output, cudaStream_t stream);
++
++extern "C" void remainder_forward_launcher(const float* input, float divisor, float* output, cudaStream_t stream);
++
++// Helper to get current CUDA stream
++static cudaStream_t getCurrentStream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// -----------------------------------------------------------------------------
++// log_softmax_forward
++// -----------------------------------------------------------------------------
++torch::Tensor log_softmax_forward(torch::Tensor input, int64_t dim) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 3, "Input must be 3D (B, C, D)");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported");
++
++    int B = input.size(0);
++    int C = input.size(1);
++    int D = input.size(2);
++
++    auto output = torch::empty_like(input);
++
++    // Strides for input (may be non-contiguous)
++    long long stride_b = input.stride(0);
++    long long stride_c = input.stride(1);
++    long long stride_d = input.stride(2);
++
++    // Output is contiguous (torch::empty_like of contiguous? Actually empty_like preserves strides, so use contiguous output)
++    // Force contiguous output for simplicity, matching launcher assumption of contiguous output.
++    auto output_contig = output.contiguous();
++    long long out_stride_b = output_contig.stride(0);
++    long long out_stride_c = output_contig.stride(1);
++    long long out_stride_d = output_contig.stride(2);
++
++    cudaStream_t stream = getCurrentStream();
++
++    log_softmax_forward_launcher(
++        input.data_ptr<float>(),
++        output_contig.data_ptr<float>(),
++        B, C, D,
++        stride_b, stride_c, stride_d,
++        out_stride_b, out_stride_c, out_stride_d,
++        stream
++    );
++
++    return output_contig;
++}
++
++// -----------------------------------------------------------------------------
++// softmax_forward
++// -----------------------------------------------------------------------------
++torch::Tensor softmax_forward(torch::Tensor input, int64_t dim) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 3, "Input must be 3D (B, C, D)");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported");
++
++    int B = input.size(0);
++    int C = input.size(1);
++    int D = input.size(2);
++
++    auto output = torch::empty_like(input);
++
++    long long stride_b = input.stride(0);
++    long long stride_c = input.stride(1);
++    long long stride_d = input.stride(2);
++
++    auto output_contig = output.contiguous();
++    long long out_stride_b = output_contig.stride(0);
++    long long out_stride_c = output_contig.stride(1);
++    long long out_stride_d = output_contig.stride(2);
++
++    cudaStream_t stream = getCurrentStream();
++
++    softmax_forward_launcher(
++        input.data_ptr<float>(),
++        output_contig.data_ptr<float>(),
++        B, C, D,
++        stride_b, stride_c, stride_d,
++        out_stride_b, out_stride_c, out_stride_d,
++        stream
++    );
++
++    return output_contig;
++}
++
++// -----------------------------------------------------------------------------
++// kl_div_loss_forward
++// -----------------------------------------------------------------------------
++torch::Tensor kl_div_loss_forward(torch::Tensor input_log, torch::Tensor target_prob) {
++    TORCH_CHECK(input_log.is_cuda(), "input_log must be CUDA tensor");
++    TORCH_CHECK(target_prob.is_cuda(), "target_prob must be CUDA tensor");
++    TORCH_CHECK(input_log.dtype() == torch::kFloat32, "input_log must be float32");
++    TORCH_CHECK(target_prob.dtype() == torch::kFloat32, "target_prob must be float32");
++    TORCH_CHECK(input_log.dim() == 3, "input_log must be 3D");
++    TORCH_CHECK(target_prob.dim() == 3, "target_prob must be 3D");
++    TORCH_CHECK(input_log.size(0) == target_prob.size(0) && input_log.size(1) == target_prob.size(1) && input_log.size(2) == target_prob.size(2),
++                "Shapes must match");
++
++    int B = input_log.size(0);
++    int C = input_log.size(1);
++    int D = input_log.size(2);
++
++    // Allocate scalar output tensor
++    auto output = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(input_log.device()));
++
++    long long stride_b = input_log.stride(0);
++    long long stride_c = input_log.stride(1);
++    long long stride_d = input_log.stride(2);
++    // Note: target_prob should have same shape and strides? Not necessarily, but launcher expects same strides as provided for input_log.
++    // We need to ensure both tensors have same shape, which is checked. Strides can differ but launcher ignores target strides and assumes same as input_log?
++    // Looking at kl_div_loss_kernel, it uses stride_b, stride_c, stride_d for both input_log and target_prob offset calculation,
++    // thus it assumes same strides for both. To be safe, we make both contiguous and use contiguous strides for both.
++    auto input_log_contig = input_log.contiguous();
++    auto target_prob_contig = target_prob.contiguous();
++    stride_b = input_log_contig.stride(0);
++    stride_c = input_log_contig.stride(1);
++    stride_d = input_log_contig.stride(2);
++
++    cudaStream_t stream = getCurrentStream();
++
++    kl_div_loss_forward_launcher(
++        input_log_contig.data_ptr<float>(),
++        target_prob_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B, C, D,
++        stride_b, stride_c, stride_d,
++        stream
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// cross_entropy_loss_forward
++// -----------------------------------------------------------------------------
++torch::Tensor cross_entropy_loss_forward(torch::Tensor input, torch::Tensor target) {
++    TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
++    TORCH_CHECK(target.is_cuda(), "target must be CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(target.dtype() == torch::kInt64, "target must be int64");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D (B, C, D)");
++    TORCH_CHECK(target.dim() == 2, "target must be 2D (B, D)");
++    TORCH_CHECK(input.size(0) == target.size(0) && input.size(2) == target.size(1),
++                "Batch and D dimensions must match");
++
++    int B = input.size(0);
++    int C = input.size(1);
++    int D = input.size(2);
++
++    auto output = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
++
++    // Ensure input is contiguous for kernel simplicity (kernel uses stride_b, stride_c, stride_d)
++    auto input_contig = input.contiguous();
++    auto target_contig = target.contiguous();
++
++    long long stride_b = input_contig.stride(0);
++    long long stride_c = input_contig.stride(1);
++    long long stride_d = input_contig.stride(2);
++    long long target_stride_b = target_contig.stride(0);
++    long long target_stride_d = target_contig.stride(1);
++
++    cudaStream_t stream = getCurrentStream();
++
++    cross_entropy_loss_forward_launcher(
++        input_contig.data_ptr<float>(),
++        target_contig.data_ptr<int64_t>(),
++        output.data_ptr<float>(),
++        B, C, D,
++        stride_b, stride_c, stride_d,
++        target_stride_b, target_stride_d,
++        stream
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// add_forward
++// -----------------------------------------------------------------------------
++torch::Tensor add_forward(torch::Tensor a, torch::Tensor b) {
++    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "Both inputs must be CUDA tensors");
++    TORCH_CHECK(a.dtype() == torch::kFloat32 && b.dtype() == torch::kFloat32, "Both inputs must be float32");
++    TORCH_CHECK(a.numel() == 1 && b.numel() == 1, "Both inputs must be scalar tensors (shape [])");
++
++    auto output = torch::empty_like(a);
++
++    cudaStream_t stream = getCurrentStream();
++
++    add_forward_launcher(
++        a.data_ptr<float>(),
++        b.data_ptr<float>(),
++        output.data_ptr<float>(),
++        stream
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// remainder_forward
++// -----------------------------------------------------------------------------
++torch::Tensor remainder_forward(torch::Tensor input, double divisor) {
++    TORCH_CHECK(input.is_cuda(), "Input must be CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.numel() == 1, "Input must be scalar tensor (shape [])");
++
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = getCurrentStream();
++
++    remainder_forward_launcher(
++        input.data_ptr<float>(),
++        static_cast<float>(divisor),
++        output.data_ptr<float>(),
++        stream
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// Registration
++// -----------------------------------------------------------------------------
++void register_custom_ops(pybind11::module& m) {
++    m.def("log_softmax_forward", &log_softmax_forward, "LogSoftmax forward",
++          py::arg("input"), py::arg("dim"));
++    m.def("softmax_forward", &softmax_forward, "Softmax forward",
++          py::arg("input"), py::arg("dim"));
++    m.def("kl_div_loss_forward", &kl_div_loss_forward, "KLDivLoss forward",
++          py::arg("input_log"), py::arg("target_prob"));
++    m.def("cross_entropy_loss_forward", &cross_entropy_loss_forward, "CrossEntropyLoss forward",
++          py::arg("input"), py::arg("target"));
++    m.def("add_forward", &add_forward, "Add two scalar tensors",
++          py::arg("a"), py::arg("b"));
++    m.def("remainder_forward", &remainder_forward, "Remainder of scalar tensor by float",
++          py::arg("input"), py::arg("divisor"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,48 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_classes, scaling_factor):
++        super().__init__()
++        self.scaling_factor = scaling_factor
++
++    def forward(self, input, target, target_labels):
++        # step_001: kl_loss = self.kl_div_loss(F.log_softmax(input, dim=1), F.softmax(target, dim=1))
++        log_softmax_input = cuda_extension.log_softmax_forward(input, 1)
++        softmax_target = cuda_extension.softmax_forward(target, 1)
++        kl_loss = cuda_extension.kl_div_loss_forward(log_softmax_input, softmax_target)
++
++        # step_002: ce_loss = self.cross_entropy_loss(input, target_labels)
++        ce_loss = cuda_extension.cross_entropy_loss_forward(input, target_labels)
++
++        # step_003: combined_loss = kl_loss + ce_loss
++        combined_loss = cuda_extension.add_forward(kl_loss, ce_loss)
++
++        # step_004: remainder_loss = torch.remainder(combined_loss, self.scaling_factor)
++        remainder_loss = cuda_extension.remainder_forward(combined_loss, self.scaling_factor)
++
++        return remainder_loss
++
++    def debug_forward(self, input, target, target_labels):
++        # step_001
++        log_softmax_input = cuda_extension.log_softmax_forward(input, 1)
++        softmax_target = cuda_extension.softmax_forward(target, 1)
++        kl_loss = cuda_extension.kl_div_loss_forward(log_softmax_input, softmax_target)
++        yield ("step_001", kl_loss)
++
++        # step_002
++        ce_loss = cuda_extension.cross_entropy_loss_forward(input, target_labels)
++        yield ("step_002", ce_loss)
++
++        # step_003
++        combined_loss = cuda_extension.add_forward(kl_loss, ce_loss)
++        yield ("step_003", combined_loss)
++
++        # step_004
++        remainder_loss = cuda_extension.remainder_forward(combined_loss, self.scaling_factor)
++        yield ("step_004", remainder_loss)
++
++        # step_005: final return
++        yield ("step_005", remainder_loss)
