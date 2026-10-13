@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 from cuda_agent.api import run_agent
 from cuda_agent.candidates import CandidateStore, clean_sources, read_json
@@ -45,7 +45,7 @@ COMPILE_COMMAND = ("bash", "utils/compile.sh")
 VERIFY_COMMAND = (sys.executable, "-m", "utils.verification")
 PROFILE_COMMAND = (sys.executable, "-m", "utils.profiling")
 DEFAULT_LOG_DIR = Path(os.environ.get('CUDA_AGENT_LOG_DIR', str(REPO_ROOT / 'logs')))
-DEFAULT_GENERATION_ATTEMPTS = 3
+MAX_CONSECUTIVE_REPAIR_API_FAILURES = 3
 LOGGER = logging.getLogger(__name__)
 _LOGGING_SETUP_LOCK = threading.Lock()
 _COMPILE_SEMAPHORE = threading.Semaphore(1)
@@ -117,8 +117,11 @@ REPAIR_PROMPTS.update({
 @dataclass(frozen=True)
 class WorkflowConfig:
     workdir: Path = DEFAULT_WORKDIR
-    generation_attempts: int = DEFAULT_GENERATION_ATTEMPTS
-    repair_attempts: int = 3
+    repair_attempts: int = 3  # Successfully generated repairs, excluding initial evaluation.
+
+    def __post_init__(self):
+        if self.repair_attempts < 0:
+            raise ValueError("repair_attempts must be non-negative")
 
 
 class GPUPool:
@@ -326,40 +329,6 @@ def send_feedback(error_log: str, workdir: Path, stage: str, run_dir: Path | Non
     )
 
 
-def run_stage_with_repairs(
-    name: str,
-    command: Sequence[str],
-    config: WorkflowConfig,
-    env: Mapping[str, str],
-    before_retry: Callable[[], tuple[bool, str]] | None = None,
-    gpu_pool: GPUPool | None = None,
-) -> tuple[bool, str]:
-    """Run a stage, optionally preparing dependent stages after each repair."""
-    last_log = ""
-    for attempt in range(1, config.repair_attempts + 1):
-        LOGGER.info("%s 尝试 %d/%d", name, attempt, config.repair_attempts)
-        success, last_log = run_command(command, config.workdir, env, gpu_pool)
-        if success:
-            LOGGER.info("%s 成功", name)
-            return True, last_log
-        if attempt < config.repair_attempts and not send_feedback(
-            last_log, config.workdir, name
-        ):
-            LOGGER.error("%s 的 API 修复请求失败", name)
-            break
-        if attempt < config.repair_attempts and before_retry is not None:
-            prepared, preparation_log = before_retry()
-            if not prepared:
-                LOGGER.error("%s 修复后的前置步骤失败", name)
-                if preparation_log.strip():
-                    last_log += (
-                        "\n\n修复后、重试该阶段前的准备步骤失败：\n"
-                        f"{preparation_log}"
-                    )
-                break
-    return False, last_log
-
-
 def generate_kernel_artifacts(
     env: Mapping[str, str], workdir: Path, gpu_pool: GPUPool | None = None
 ) -> None:
@@ -472,45 +441,75 @@ def execute_workflow(
                 (run_dir / "diagnostic.json").write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding="utf-8")
         return "verification", verified, compile_log + "\n" + interface_log + "\n" + verify_log, verification, diagnostic
 
-    for generation in range(1, config.generation_attempts + 1):
-        clean_sources(config.workdir)
-        for name in ("source_checks.json", "interface.json", "verification.json", "diagnostic.json", "failure_inputs.pt", "custom_ops_contract.json", "repair_context.json"):
-            (run_dir / name).unlink(missing_ok=True)
+    report.repair_budget = config.repair_attempts
+    started = time.monotonic()
+    generated = generate_cuda(config.workdir, run_dir)
+    report.add_stage("generation #1", generated, time.monotonic() - started, "Single Python → CUDA → C++ binding generation")
+    if not generated:
+        record = store.capture("sources", False, "Generation failed; see workflow.log and api_calls.jsonl")
+        report.best_candidate = str(Path(record["snapshot"]).relative_to(report.log_path.parent))
+        report.failure_reason = "Initial three-stage generation failed; no regeneration or repair."
+        return False
+
+    def evaluate_candidate(label):
+        LOGGER.info("评估%s；已消耗修复次数 %d/%d", label, report.repairs_used, config.repair_attempts)
         started = time.monotonic()
-        generated = generate_cuda(config.workdir, run_dir)
-        report.add_stage(f"generation #{generation}", generated, time.monotonic() - started, "DeepSeek API")
-        if not generated:
-            store.capture("sources", False, "Generation failed; see workflow.log and api_calls.jsonl")
+        stage, success, log, verification, diagnostic = evaluate()
+        record = store.capture(stage, success, log, verification, diagnostic)
+        report.candidates_evaluated += 1
+        report.best_candidate = str(Path(store.best["snapshot"]).relative_to(report.log_path.parent))
+        details = record["decision"]
+        if not success:
+            details += "; " + concise_log(log)
+            LOGGER.warning("%s失败：stage=%s reason=%s", label, stage, concise_log(log))
+        report.add_stage(f"{label}: {stage} candidate #{record['id']}", success, time.monotonic() - started, details)
+        return success, log
+
+    success, log = evaluate_candidate("initial candidate")
+    api_failures = 0
+    api_calls = 0
+    while not success and report.repairs_used < config.repair_attempts:
+        repair = report.repairs_used + 1
+        store.restore_best()
+        base = store.best
+        api_calls += 1
+        LOGGER.info("修复 %d/%d；基准 candidate=%s category=%s", repair, config.repair_attempts, base['id'], failure_category(base))
+        started = time.monotonic()
+        repaired = send_feedback(base['error'], config.workdir, failure_category(base), run_dir)
+        if repaired:
+            report.repairs_used = repair
+        report.add_stage(f"repair API call #{api_calls}", repaired, time.monotonic() - started,
+                         f"Code repairs used: {report.repairs_used}/{config.repair_attempts}; base candidate #{base['id']}" +
+                         ("" if repaired else "; API failed; best candidate retained; see api_calls.jsonl"))
+        if not repaired:
+            api_failures += 1
+            LOGGER.warning("修复 API 连续失败 %d/%d；不消耗代码修复额度，已使用 %d/%d",
+                           api_failures, MAX_CONSECUTIVE_REPAIR_API_FAILURES,
+                           report.repairs_used, config.repair_attempts)
+            if api_failures >= MAX_CONSECUTIVE_REPAIR_API_FAILURES:
+                store.restore_best()
+                report.failure_reason = (f"Repair API failed {api_failures} consecutive times; "
+                                         f"code repairs used {report.repairs_used}/{config.repair_attempts}. " +
+                                         store.best_failure())
+                return False
             continue
-        for repair in range(config.repair_attempts):
-            started = time.monotonic()
-            stage, success, log, verification, diagnostic = evaluate()
-            record = store.capture(stage, success, log, verification, diagnostic)
-            report.best_candidate = str(Path(store.best["snapshot"]).relative_to(report.log_path.parent))
-            report.add_stage(f"{stage} candidate #{record['id']}", success, time.monotonic() - started, record["decision"])
-            if success:
-                started = time.monotonic()
-                profiled, profile_log = run_command(PROFILE_COMMAND, config.workdir, env, gpu_pool)
-                report.add_stage("profiling", profiled, time.monotonic() - started)
-                if not profiled:
-                    report.failure_reason = "Correctness passed, but profiling failed: " + profile_log[-6000:]
-                    return False
-                started = time.monotonic()
-                generate_kernel_artifacts(env, config.workdir, gpu_pool)
-                report.add_stage("artifacts", True, time.monotonic() - started, "best effort")
-                save_result(task_id, config.workdir, {"verification.log": log, "profile.log": profile_log})
-                return True
-            # The compile script checks native source fingerprints after each repair.
-            store.restore_best()
-            if repair + 1 == config.repair_attempts:
-                break
-            base = store.best
-            LOGGER.info("修复基准：candidate=%s category=%s", base['id'], failure_category(base))
-            if not send_feedback(base['error'], config.workdir, failure_category(base), run_dir):
-                report.add_stage("repair API", False, 0, "No changes applied; best candidate retained")
-                break
+        api_failures = 0
+        success, log = evaluate_candidate(f"repair #{repair}")
+
+    if success:
+        started = time.monotonic()
+        profiled, profile_log = run_command(PROFILE_COMMAND, config.workdir, env, gpu_pool)
+        report.add_stage("profiling", profiled, time.monotonic() - started)
+        if not profiled:
+            report.failure_reason = "Correctness passed, but profiling failed: " + profile_log[-6000:]
+            return False
+        started = time.monotonic()
+        generate_kernel_artifacts(env, config.workdir, gpu_pool)
+        report.add_stage("artifacts", True, time.monotonic() - started, "best effort")
+        save_result(task_id, config.workdir, {"verification.log": log, "profile.log": profile_log})
+        return True
     store.restore_best()
-    report.failure_reason = store.best_failure()
+    report.failure_reason = f"Repair budget exhausted ({report.repairs_used}/{config.repair_attempts}). " + store.best_failure()
     return False
 
 
@@ -532,7 +531,7 @@ def run_task(
     try:
         success = execute_workflow(task_id, config, report, gpu_pool)
         if not success:
-            error = report.failure_reason or "All generation attempts were exhausted. See workflow.log."
+            error = report.failure_reason or "Workflow failed. See workflow.log."
     except Exception as exc:  # preserve a report for unexpected failures
         error = f"{type(exc).__name__}: {exc}"
         LOGGER.exception("工作流异常终止")
@@ -557,8 +556,6 @@ def main() -> int:
     _COMPILE_SEMAPHORE = threading.Semaphore(compile_workers)
     task_ids = task_ids_from_args(args)
     config = WorkflowConfig()
-    if config.generation_attempts < 1 or config.repair_attempts < 1:
-        raise ValueError("Attempt counts must be at least 1")
 
     task_id_list = list(task_ids)
     gpu_pool = GPUPool(gpu_ids_from_environment())
@@ -573,7 +570,7 @@ def main() -> int:
             shutil.rmtree(task_workdir)
         shutil.copytree(config.workdir, task_workdir)
         task_config = WorkflowConfig(
-            task_workdir, config.generation_attempts, config.repair_attempts
+            workdir=task_workdir, repair_attempts=config.repair_attempts
         )
         return run_task(task_id, task_config, args, gpu_pool)
 

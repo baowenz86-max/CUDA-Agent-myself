@@ -308,15 +308,87 @@ class WorkflowTests(unittest.TestCase):
                  patch('cuda_agent.workflow.send_feedback', side_effect=repair), \
                  patch('cuda_agent.workflow.check_sources', return_value=types.SimpleNamespace(errors=[], warnings=[], as_dict=lambda: {})), \
                  patch('cuda_agent.workflow.run_command', side_effect=command):
-                success = execute_workflow(0, WorkflowConfig(work, 1, 3), report, None)
+                success = execute_workflow(0, WorkflowConfig(work, repair_attempts=3), report, None)
             self.assertFalse(success)
-            self.assertEqual(bases, ['best original', 'best original'])
+            self.assertEqual(bases, ['best original'] * 3)
             self.assertEqual((work / 'model_new.py').read_text(), 'best original')
-            self.assertEqual(sum(c == ('bash', 'utils/compile.sh') for c in commands), 3)
+            self.assertEqual(sum(c == ('bash', 'utils/compile.sh') for c in commands), 4)
             self.assertTrue(report.failure_reason)
             self.assertFalse(any(c[-1] == 'utils.profiling' for c in commands))
 
 class AdditionalWorkflowTests(unittest.TestCase):
+    def test_shared_repair_budget_scenarios(self):
+        scenarios = [
+            ('initial passes', ['passed'], [], True, 0, True),
+            ('compile exhausted', ['compile'] * 4, [True] * 3, False, 3, True),
+            ('stage transition', ['compile', 'verification', 'verification', 'verification'], [True] * 3, False, 3, True),
+            ('third repair passes', ['compile'] * 3 + ['passed'], [True] * 3, True, 3, True),
+            ('API failure continues', ['compile', 'compile', 'passed'], [False, True, True], True, 2, True),
+            ('API failures reset', ['compile', 'compile', 'compile', 'passed'], [False, False, True, False, False, True, False, False, True], True, 3, True),
+            ('all APIs fail', ['compile'], [False] * 3, False, 0, True),
+            ('source and interface share budget', ['sources', 'interface', 'compile', 'passed'], [True] * 3, True, 3, True),
+            ('profiling fails', ['passed'], [], False, 0, False),
+        ]
+        for name, outcomes, api_results, expected, repairs, profile_ok in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                work = root / 'work'
+                work.mkdir()
+                run = root / 'correctness'
+                report = WorkflowReport(0, root / 'workflow.log')
+                evaluated, bases = [], []
+                def generate(*args):
+                    (work / 'model_new.py').write_text('initial')
+                    return True
+                def sources(*args):
+                    outcome = outcomes[len(evaluated)]
+                    evaluated.append(outcome)
+                    errors = ['source error'] if outcome == 'sources' else []
+                    return types.SimpleNamespace(errors=errors, warnings=[], as_dict=lambda: {'errors': errors})
+                def command(argv, *args):
+                    if argv[-1] == 'utils.preflight':
+                        return True, 'reference ready'
+                    outcome = evaluated[-1]
+                    if argv[-1] == 'utils/compile.sh':
+                        return outcome != 'compile', 'compile error'
+                    if argv[-1] == '--compiled':
+                        return outcome != 'interface', 'interface error'
+                    if argv[-1] == 'utils.verification':
+                        data = verification(.5, passed=5 if outcome == 'passed' else 0)
+                        data['status'] = 'passed' if outcome == 'passed' else 'failed'
+                        (run / 'verification.json').write_text(json.dumps(data))
+                        return outcome == 'passed', 'verification error'
+                    if argv[-1] == 'utils.profiling':
+                        return profile_ok, 'profile error'
+                    raise AssertionError(argv)
+                def repair(*args):
+                    bases.append((work / 'model_new.py').read_text())
+                    result = api_results[len(bases) - 1]
+                    # Even a failed API that leaves partial changes must be rolled back.
+                    (work / 'model_new.py').write_text(f'repair {len(bases)}')
+                    return result
+                with patch('cuda_agent.workflow.load_task', return_value={'code': '', 'ops': []}), \
+                     patch('cuda_agent.workflow.generate_cuda', side_effect=generate) as generated, \
+                     patch('cuda_agent.workflow.check_sources', side_effect=sources), \
+                     patch('cuda_agent.workflow.send_feedback', side_effect=repair) as feedback, \
+                     patch('cuda_agent.workflow.run_command', side_effect=command), \
+                     patch('cuda_agent.workflow.generate_kernel_artifacts'), \
+                     patch('cuda_agent.workflow.save_result') as saved:
+                    self.assertEqual(execute_workflow(0, WorkflowConfig(work), report, None), expected)
+                generated.assert_called_once()
+                self.assertEqual(feedback.call_count, len(api_results))
+                self.assertEqual(report.repairs_used, repairs)
+                self.assertEqual(evaluated, outcomes)
+                self.assertEqual(report.candidates_evaluated, len(outcomes))
+                self.assertEqual(saved.call_count, int(expected))
+                if name == 'all APIs fail':
+                    self.assertIn('Repair API failed 3 consecutive times', report.failure_reason)
+                    self.assertEqual(bases, ['initial'] * 3)
+                    self.assertEqual((work / 'model_new.py').read_text(), 'initial')
+                content = report.write(expected, report.failure_reason).read_text()
+                self.assertIn(f'Code repairs used: `{repairs}/3`', content)
+                self.assertIn('initial candidate', content)
+
     def test_reference_failure_stops_generation_with_specific_reason(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -330,7 +402,7 @@ class AdditionalWorkflowTests(unittest.TestCase):
             generate.assert_not_called()
             self.assertIn('invalid inputs', report.failure_reason)
 
-    def test_new_generation_does_not_inherit_old_kernels(self):
+    def test_failed_generation_stops_without_regeneration(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             work = root / 'work'
@@ -346,8 +418,8 @@ class AdditionalWorkflowTests(unittest.TestCase):
             with patch('cuda_agent.workflow.load_task', return_value={'code': '', 'ops': []}), \
                  patch('cuda_agent.workflow.run_command', return_value=(True, 'reference ready')), \
                  patch('cuda_agent.workflow.generate_cuda', side_effect=generate):
-                self.assertFalse(execute_workflow(0, WorkflowConfig(work, 2, 1), report, None))
-            self.assertEqual(observed, [[], []])
+                self.assertFalse(execute_workflow(0, WorkflowConfig(work, repair_attempts=3), report, None))
+            self.assertEqual(observed, [[]])
 
     def test_command_timeout_releases_gpu_lease(self):
         import subprocess

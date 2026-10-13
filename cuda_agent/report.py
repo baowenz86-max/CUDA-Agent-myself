@@ -24,6 +24,9 @@ class WorkflowReport:
     operators: str = "unknown"
     failure_reason: str = ""
     best_candidate: str = ""
+    repair_budget: int = 3
+    repairs_used: int = 0
+    candidates_evaluated: int = 0
 
     def add_stage(
         self, name: str, success: bool, duration_seconds: float, details: str = ""
@@ -52,6 +55,9 @@ class WorkflowReport:
 - Finished: `{finished_at.isoformat(timespec='seconds')}`
 - Duration: `{duration:.2f}s`
 - Full log: `{self.log_path.name}`
+- Generation: one three-stage generation (Python → CUDA → C++ binding)
+- Code repairs used: `{self.repairs_used}/{self.repair_budget}` (initial evaluation excluded)
+- Candidates evaluated: `{self.candidates_evaluated}`
 - Best correctness candidate: `{self.best_candidate or "none"}`
 - Correctness evidence: `correctness/` (contract, fixtures, history and candidate snapshots)
 

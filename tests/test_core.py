@@ -67,6 +67,25 @@ class ReportTests(unittest.TestCase):
 
 
 class TaskSelectionTests(unittest.TestCase):
+    def test_batch_uses_shared_repair_config(self):
+        from cuda_agent.workflow import WorkflowConfig, main
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / 'template'
+            work.mkdir()
+            config = WorkflowConfig(workdir=work, repair_attempts=3)
+            with patch('cuda_agent.workflow.REPO_ROOT', root), \
+                 patch('cuda_agent.workflow.WorkflowConfig', return_value=config) as factory, \
+                 patch('cuda_agent.workflow.parse_args', return_value=Namespace(task_start=2, task_end=3)), \
+                 patch('cuda_agent.workflow.run_task', return_value=True) as task, \
+                 patch.dict(os.environ, {'CUDA_AGENT_GENERATION_WORKERS': '1'}):
+                self.assertEqual(main(), 0)
+            self.assertEqual(task.call_count, 2)
+            self.assertEqual(factory.call_args_list[1].kwargs,
+                             {'workdir': root / '.task_workdirs/task_0002', 'repair_attempts': 3})
+            self.assertEqual(factory.call_args_list[2].kwargs,
+                             {'workdir': root / '.task_workdirs/task_0003', 'repair_attempts': 3})
+
     def test_range_is_inclusive(self) -> None:
         args = Namespace(task_id=None, task_start=0, task_end=10)
         self.assertEqual(list(task_ids_from_args(args)), list(range(11)))

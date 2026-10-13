@@ -125,7 +125,7 @@ export CUDA_AGENT_REASONING_EFFORT=low
 python main.py --task-start 0 --task-end 0
 ```
 
-默认的生成重试次数为 3 次。连续处理一段任务时，可指定包含首尾的任务范围；
+每个任务只完整生成一次（Python → CUDA → C++ binding），然后评估初始候选。源码检查、编译、接口检查和正确性验证共用最多三次修复机会，因此最多评估四个候选。连续处理一段任务时，可指定包含首尾的任务范围；
 例如依次处理 task 0 到 task 10：
 
 ```bash
@@ -133,8 +133,7 @@ python main.py --task-start 0 --task-end 10
 ```
 
 每个任务仍会写入各自的日志、报告和成功结果；单个任务失败不会中断后续任务，
-但批次中有失败任务时命令会以非零状态退出。可用
-`--generation-attempts` 覆盖默认生成重试次数。
+但批次中有失败任务时命令会以非零状态退出。每次修复前恢复最好候选及对应证据；修复 API 失败不消耗代码修复额度；只有成功返回修复代码并重新评估才计次。API 连续失败三次时保存最好候选并结束，成功返回代码后重置连续 API 失败计数。初始生成失败直接结束；测速失败不进入修复循环。API 内部的 JSON 格式纠正重试保留，不额外消耗代码修复次数。
 
 After `uv sync`, the same workflow is available as an installed command:
 
