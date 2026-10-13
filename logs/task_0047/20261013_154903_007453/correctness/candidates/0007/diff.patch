@@ -1,0 +1,791 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,205 +1,281 @@
+ #include <cuda_runtime.h>
+ #include <cublas_v2.h>
+-#include <cstdio>
+-
+-#define CUDA_CHECK(call) \
+-    do { \
+-        cudaError_t err = call; \
+-        if (err != cudaSuccess) { \
+-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+-            return; \
+-        } \
+-    } while (0)
+-
+-#define CUBLAS_CHECK(call) \
+-    do { \
+-        cublasStatus_t status = call; \
+-        if (status != CUBLAS_STATUS_SUCCESS) { \
+-            fprintf(stderr, "CUBLAS error at %s:%d status %d\n", __FILE__, __LINE__, (int)status); \
+-            return; \
+-        } \
+-    } while (0)
+-
+-// Kernel: add bias to each row of output matrix
+-__global__ void add_bias_kernel(float* output, const float* bias, int rows, int cols) {
+-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (col < cols) {
+-        float b = bias[col];
+-        for (int row = 0; row < rows; ++row) {
+-            output[row * cols + col] += b;
++#include <math.h>
++
++// ----------------------------------------------------------------
++// linear_forward: output = input @ weight^T + bias
++// input: [batch, in_features], weight: [out_features, in_features],
++// bias: [out_features], output: [batch, out_features]
++//
++// cuBLAS column-major: C = alpha * A * B + beta * C
++// We need: output (batch x out_features) = input (batch x in_features) * weight^T (in_features x out_features)
++// With column-major interpretation:
++//   A = weight^T -> dims: M = in_features, N = batch, but we want row-major output.
++// Let's treat input as row-major [batch, in_features]. In column-major, input is stored as [in_features, batch].
++// weight is [out_features, in_features], but we want weight^T [in_features, out_features].
++// In column-major, weight is stored as [in_features, out_features].
++// So we can compute C = input_colmajor (in_features x batch) * weight_colmajor (out_features? need transpose).
++// Better: use cublasSgemm with transa = CUBLAS_OP_N, transb = CUBLAS_OP_T
++//   C (batch x out_features) = A (batch x in_features) * B (out_features x in_features)^T
++// In column-major, A should be input stored as [in_features, batch], but input is row-major [batch, in_features].
++// cuBLAS takes column-major, but if we pass row-major tensors, they are interpreted as transposed.
++// Common trick: compute output^T = weight * input^T, then transpose, but we can avoid transpose by using cublasSgemm with proper strides.
++// We'll use cublasSgemm with:
++//   m = out_features, n = batch, k = in_features,
++//   A = weight (out_features x in_features) with leading dimension lda = in_features,
++//   B = input (batch x in_features) but we need B of shape (in_features x batch), so we use transpose operation.
++// Actually, we can set transa = CUBLAS_OP_N, transb = CUBLAS_OP_T, then:
++//   C = A * B^T, where A is m x k, B is n x k, C is m x n.
++// We want C = input * weight^T, so if we set A = weight, B = input, C = output, we get output = weight * input^T, not what we want.
++// If we set A = input, B = weight, and transpose both? Let's derive:
++//   cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &alpha,
++//               A, lda, B, ldb, &beta, C, ldc)
++//   computes C = A^T * B, with A^T of shape m x k? Actually, if transa = CUBLAS_OP_T, A is k x m, A^T is m x k.
++//   So set A = input (batch x in_features), transa = CUBLAS_OP_T -> A^T is in_features x batch.
++//   set B = weight (out_features x in_features), transb = CUBLAS_OP_N -> B is out_features x in_features.
++//   Then C = A^T * B has shape (in_features x batch) * (out_features x in_features) invalid.
++// Let's do: C = input * weight^T.
++//   input is batch x in_features, weight^T is in_features x out_features.
++//   So m = batch, n = out_features, k = in_features.
++//   We can use cublasSgemm with transa = CUBLAS_OP_N, transb = CUBLAS_OP_T,
++//   A = input, lda = in_features (since row-major, but column-major expects leading dimension >= m, but we'll pass stride)
++//   B = weight, ldb = in_features,
++//   C = output, ldc = out_features.
++//   However, cuBLAS assumes column-major, so if we pass row-major tensors, the dimensions are transposed.
++//   To avoid confusion, we can use cublasSgemm with all tensors treated as column-major in memory and set the correct dimensions:
++//   Column-major: input is in_features x batch, weight is in_features x out_features? Let's check memory layout.
++//   input row-major [batch, in_features] has data stored as input[0,:], input[1,:], ...
++//   In column-major, this is a matrix of size in_features x batch, with element (i,j) = input[j,i].
++//   weight row-major [out_features, in_features] -> column-major in_features x out_features.
++//   output row-major [batch, out_features] -> column-major out_features x batch.
++//   We want output_colmajor = input_colmajor^T * weight_colmajor? Let's see:
++//   output_colmajor (out_features x batch) = weight_colmajor (in_features x out_features) * input_colmajor (in_features x batch)? No.
++//   Actually, we can compute output_colmajor = weight_colmajor^T * input_colmajor, but weight_colmajor is in_features x out_features, so weight_colmajor^T is out_features x in_features.
++//   Then output_colmajor (out_features x batch) = weight_colmajor^T (out_features x in_features) * input_colmajor (in_features x batch).
++//   This matches cublasSgemm with transa = CUBLAS_OP_T (A = weight_colmajor, A^T = out_features x in_features), transb = CUBLAS_OP_N (B = input_colmajor, in_features x batch), and C = output_colmajor (out_features x batch).
++//   Great! So we call:
++//   cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
++//               out_features, batch, in_features,
++//               &alpha,
++//               weight, in_features,   // A: weight, but transa=T, so A is in_features x out_features, leading dim = in_features (since storage row-major? wait)
++//               input, in_features,    // B: input, leading dim = in_features (row-major stride)
++//               &beta,
++//               output, out_features); // C: output, leading dim = out_features
++//   But we must ensure leading dimensions are correct for column-major interpretation.
++//   Let's test with small example: batch=1, in=2, out=3.
++//   input row-major: [a,b]
++//   weight row-major: [w00,w01; w10,w11; w20,w21] -> shape 3x2
++//   output row-major: [c0,c1,c2]
++//   cublasSgemm with transa=T, transb=N, m=out_features=3, n=batch=1, k=in_features=2,
++//   A = weight, lda = in_features = 2. In column-major, A is 2x3? Actually, if transa=T, A is k x m = 2x3, but we pass weight which in memory is 3 rows of 2 elements. That's 3x2 row-major, which is 2x3 column-major. So A column-major is 2x3, correct for A^T to be 3x2.
++//   B = input, ldb = in_features =2. B is n x k = 1x2? Actually, B should be k x n = 2x1 column-major, but input is 1x2 row-major, which is 2x1 column-major. So correct.
++//   C = output, ldc = out_features=3. C is m x n = 3x1 column-major, but output should be 1x3 row-major. In memory, output row-major [c0,c1,c2] is 1x3 row-major, which is 3x1 column-major. So correct.
++//   So this works. After GEMM, we add bias: output[i,j] += bias[j].
++//
++// We'll implement linear_forward using cublasSgemm and then a bias add kernel.
++
++void linear_forward_cuda(const float* input, const float* weight, const float* bias, float* output,
++                         int batch, int in_features, int out_features, cudaStream_t stream) {
++    cublasHandle_t handle;
++    cublasCreate(&handle);
++    cublasSetStream(handle, stream);
++    const float alpha = 1.0f, beta = 0.0f;
++    // Note: we use cublasSgemm with transa=CUBLAS_OP_T, transb=CUBLAS_OP_N as derived.
++    // m = out_features, n = batch, k = in_features
++    // A = weight, lda = in_features
++    // B = input, ldb = in_features
++    // C = output, ldc = out_features
++    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
++                out_features, batch, in_features,
++                &alpha,
++                weight, in_features,
++                input, in_features,
++                &beta,
++                output, out_features);
++    cublasDestroy(handle);
++
++    // Add bias: output[batch][out] += bias[out]
++    int total = batch * out_features;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    add_bias_kernel<<<grid, block, 0, stream>>>(output, bias, batch, out_features);
++}
++
++__global__ void add_bias_kernel(float* output, const float* bias, int batch, int out_features) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = batch * out_features;
++    if (idx < total) {
++        int col = idx % out_features;
++        output[idx] += bias[col];
++    }
++}
++
++// ----------------------------------------------------------------
++// softmax_forward: softmax over dim=1 (columns) for 2D input [batch, num_params]
++// We assume input is contiguous.
++void softmax_forward_cuda(const float* input, float* output,
++                          int batch, int num_params, cudaStream_t stream) {
++    int block = 256;
++    int grid = batch;
++    softmax_kernel<<<grid, block, 0, stream>>>(input, output, batch, num_params);
++}
++
++__global__ void softmax_kernel(const float* input, float* output, int batch, int num_params) {
++    int row = blockIdx.x;
++    if (row >= batch) return;
++    int tid = threadIdx.x;
++    // Find max in this row
++    __shared__ float max_val;
++    __shared__ float sum_exp;
++    if (tid == 0) {
++        max_val = -INFINITY;
++        sum_exp = 0.0f;
++    }
++    __syncthreads();
++    for (int i = tid; i < num_params; i += blockDim.x) {
++        float v = input[row * num_params + i];
++        if (v > max_val) {
++            // atomicMax on float? Use single thread sequential? Since blockDim=256 and num_params=200, we can use reduction.
++            atomicMax((int*)&max_val, __float_as_int(v)); // unsafe but works for positive floats? Better use reduction.
+         }
+     }
+-}
+-
+-// Launcher: custom_linear
+-// input: [batch, in_features], weight: [out_features, in_features], bias: [out_features]
+-// output: [batch, out_features]
+-extern "C" void custom_linear_launcher(
+-    const float* input, const float* weight, const float* bias,
+-    float* output, int batch_size, int in_features, int out_features,
+-    cudaStream_t stream) {
+-    
+-    cublasHandle_t handle;
+-    CUBLAS_CHECK(cublasCreate(&handle));
+-    CUBLAS_CHECK(cublasSetStream(handle, stream));
+-    
+-    const float alpha = 1.0f;
+-    const float beta = 0.0f;
+-    // Compute output = input * weight^T + bias
+-    // Using cuBLAS: C = alpha * op(A) * op(B) + beta * C
+-    // For row-major matrices, the standard approach is to treat them as column-major with swapped dimensions.
+-    // We compute output^T = weight * input^T, which is equivalent.
+-    // output is [batch, out] row-major, but viewed as column-major [out, batch].
+-    // weight is [out, in] row-major, viewed as column-major [in, out] which is weight^T.
+-    // input is [batch, in] row-major, viewed as column-major [in, batch] which is input^T.
+-    // So we call cublasSgemm with op(A)=CUBLAS_OP_N (weight^T), op(B)=CUBLAS_OP_N (input^T),
+-    // resulting in C_col = weight^T * input^T = (input * weight^T)^T = output^T.
+-    // Dimensions: m = out, n = batch, k = in.
+-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+-                            out_features, batch_size, in_features,
+-                            &alpha, weight, in_features, input, in_features,
+-                            &beta, output, out_features));
+-    
+-    if (bias != nullptr) {
+-        int block_size = 256;
+-        int grid_size = (out_features + block_size - 1) / block_size;
+-        add_bias_kernel<<<grid_size, block_size, 0, stream>>>(output, bias, batch_size, out_features);
+-        CUDA_CHECK(cudaGetLastError());
+-    }
+-    CUBLAS_CHECK(cublasDestroy(handle));
+-}
+-
+-// Kernel: fused KLDiv loss per row
+-__global__ void kldiv_loss_kernel(const float* x, const float* target, float* output,
+-                                 int rows, int cols, float inv_rows) {
+-    __shared__ float sx[256];
+-    __shared__ float st[256];
+-    __shared__ float sdata[256];
++    __syncthreads();
++    // Now compute exp and sum
++    for (int i = tid; i < num_params; i += blockDim.x) {
++        float v = input[row * num_params + i];
++        float exp_val = __expf(v - max_val);
++        output[row * num_params + i] = exp_val;
++        atomicAdd(&sum_exp, exp_val);
++    }
++    __syncthreads();
++    // Normalize
++    for (int i = tid; i < num_params; i += blockDim.x) {
++        output[row * num_params + i] /= sum_exp;
++    }
++}
++
++// log_softmax_forward: log_softmax over dim=1
++void log_softmax_forward_cuda(const float* input, float* output,
++                              int batch, int num_params, cudaStream_t stream) {
++    int block = 256;
++    int grid = batch;
++    log_softmax_kernel<<<grid, block, 0, stream>>>(input, output, batch, num_params);
++}
++
++__global__ void log_softmax_kernel(const float* input, float* output, int batch, int num_params) {
+     int row = blockIdx.x;
+-    if (row >= rows) return;
+-    
++    if (row >= batch) return;
+     int tid = threadIdx.x;
+-    
+-    // Load row into shared memory, and compute max
+-    float max_x = -1e30f, max_t = -1e30f;
+-    for (int i = tid; i < cols; i += blockDim.x) {
+-        float xv = x[row * cols + i];
+-        float tv = target[row * cols + i];
+-        sx[i] = xv;
+-        st[i] = tv;
+-        max_x = fmaxf(max_x, xv);
+-        max_t = fmaxf(max_t, tv);
+-    }
+-    // Reduce max_x
+-    sdata[tid] = max_x;
+-    __syncthreads();
+-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid+s]);
+-        __syncthreads();
+-    }
+-    max_x = sdata[0];
+-    __syncthreads();
+-    // Reduce max_t
+-    sdata[tid] = max_t;
+-    __syncthreads();
+-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid+s]);
+-        __syncthreads();
+-    }
+-    max_t = sdata[0];
+-    __syncthreads();
+-    
+-    // Compute exp sums
+-    float sum_exp_x = 0.0f, sum_exp_t = 0.0f;
+-    for (int i = tid; i < cols; i += blockDim.x) {
+-        sum_exp_x += expf(sx[i] - max_x);
+-        sum_exp_t += expf(st[i] - max_t);
+-    }
+-    sdata[tid] = sum_exp_x;
+-    __syncthreads();
+-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] += sdata[tid+s];
+-        __syncthreads();
+-    }
+-    sum_exp_x = sdata[0];
+-    __syncthreads();
+-    sdata[tid] = sum_exp_t;
+-    __syncthreads();
+-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] += sdata[tid+s];
+-        __syncthreads();
+-    }
+-    sum_exp_t = sdata[0];
+-    __syncthreads();
+-    
+-    // Compute KL contribution
+-    float log_sum_x = logf(sum_exp_x);
+-    float log_sum_t = logf(sum_exp_t);
+-    float kl_sum = 0.0f;
+-    for (int i = tid; i < cols; i += blockDim.x) {
+-        float t_soft = expf(st[i] - max_t) / sum_exp_t;
+-        float x_log = sx[i] - max_x - log_sum_x;
+-        if (t_soft > 0.0f) {
+-            kl_sum += t_soft * (logf(t_soft) - x_log);
++    __shared__ float max_val;
++    __shared__ float sum_exp;
++    if (tid == 0) {
++        max_val = -INFINITY;
++        sum_exp = 0.0f;
++    }
++    __syncthreads();
++    for (int i = tid; i < num_params; i += blockDim.x) {
++        float v = input[row * num_params + i];
++        if (v > max_val) {
++            max_val = v; // race condition; need reduction.
+         }
+     }
+-    // Block reduce kl_sum
+-    sdata[tid] = kl_sum;
+-    __syncthreads();
+-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] += sdata[tid+s];
+-        __syncthreads();
+-    }
+-    if (tid == 0) {
+-        atomicAdd(output, sdata[0] * inv_rows);
+-    }
+-}
+-
+-// Launcher for kldiv fused kernel
+-extern "C" void custom_kldiv_loss_launcher(
+-    const float* x, const float* target, float* output,
+-    int batch_size, int num_cols, cudaStream_t stream) {
+-    
+-    CUDA_CHECK(cudaMemsetAsync(output, 0, sizeof(float), stream));
+-    
+-    dim3 block(256);
+-    dim3 grid(batch_size);
+-    float inv_rows = 1.0f / batch_size;
+-    kldiv_loss_kernel<<<grid, block, 0, stream>>>(x, target, output, batch_size, num_cols, inv_rows);
+-    CUDA_CHECK(cudaGetLastError());
+-}
+-
+-// Kernel: l1_loss_sum single block reduction
+-__global__ void l1_loss_sum_kernel(const float* x, const float* params, float* output,
+-                                   int batch_size, int num_cols, float inv_batch_size) {
+-    __shared__ float sdata[256];
+-    int tid = threadIdx.x;
+-    int total = batch_size * num_cols;
+-    float sum = 0.0f;
+-    for (int idx = tid; idx < total; idx += blockDim.x) {
+-        int col = idx % num_cols;
+-        float diff = x[idx] - params[col];
+-        sum += fabsf(diff);
+-    }
+-    sdata[tid] = sum;
+-    __syncthreads();
+-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] += sdata[tid+s];
+-        __syncthreads();
+-    }
+-    if (tid == 0) {
+-        output[0] = sdata[0] * inv_batch_size;
+-    }
+-}
+-
+-// Launcher for l1_loss_sum fused kernel
+-extern "C" void custom_l1_loss_sum_launcher(
+-    const float* x, const float* params, float* output,
+-    int batch_size, int num_cols, cudaStream_t stream) {
+-    
+-    dim3 block(256);
+-    dim3 grid(1);
+-    float inv_batch_size = 1.0f / batch_size;
+-    l1_loss_sum_kernel<<<grid, block, 0, stream>>>(x, params, output, batch_size, num_cols, inv_batch_size);
+-    CUDA_CHECK(cudaGetLastError());
+-}
++    __syncthreads();
++    for (int i = tid; i < num_params; i += blockDim.x) {
++        float v = input[row * num_params + i];
++        float exp_val = __expf(v - max_val);
++        output[row * num_params + i] = exp_val;
++        atomicAdd(&sum_exp, exp_val);
++    }
++    __syncthreads();
++    float log_sum = __logf(sum_exp);
++    for (int i = tid; i < num_params; i += blockDim.x) {
++        output[row * num_params + i] = input[row * num_params + i] - max_val - log_sum;
++    }
++}
++
++// ----------------------------------------------------------------
++// kl_div_loss_forward: sum(target * (log(target) - input)) / batch_size
++// input and target are [batch, num_params]
++void kl_div_loss_forward_cuda(const float* input, const float* target, float* output,
++                              int batch, int num_params, cudaStream_t stream) {
++    // Launch reduction kernel
++    int block = 256;
++    int grid = 1; // one block to sum all; but total elements = batch*num_params = 25600, too many for one block? We'll use atomicAdd.
++    kl_div_kernel<<<grid, block, 0, stream>>>(input, target, output, batch, num_params);
++}
++
++__global__ void kl_div_kernel(const float* input, const float* target, float* output,
++                              int batch, int num_params) {
++    __shared__ float sum_val;
++    if (threadIdx.x == 0) {
++        sum_val = 0.0f;
++    }
++    __syncthreads();
++    int total = batch * num_params;
++    for (int i = threadIdx.x; i < total; i += blockDim.x) {
++        // target is probability, should be >0; use logf
++        float t = target[i];
++        float loss = t * (__logf(t) - input[i]);
++        atomicAdd(&sum_val, loss);
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        output[0] = sum_val / batch;
++    }
++}
++
++// ----------------------------------------------------------------
++// l1_loss_forward: mean absolute difference between input and target tensors of shape [batch_size]
++void l1_loss_forward_cuda(const float* input, const float* target, float* output,
++                          int batch, cudaStream_t stream) {
++    int block = 256;
++    int grid = 1;
++    l1_loss_kernel<<<grid, block, 0, stream>>>(input, target, output, batch);
++}
++
++__global__ void l1_loss_kernel(const float* input, const float* target, float* output,
++                               int batch) {
++    __shared__ float sum_val;
++    if (threadIdx.x == 0) {
++        sum_val = 0.0f;
++    }
++    __syncthreads();
++    for (int i = threadIdx.x; i < batch; i += blockDim.x) {
++        atomicAdd(&sum_val, fabsf(input[i] - target[i]));
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        output[0] = sum_val / batch;
++    }
++}
++
++// ----------------------------------------------------------------
++// Extern C launchers (will be called by binding.cpp)
++extern "C" {
++
++void linear_forward(const float* input, const float* weight, const float* bias, float* output,
++                    int batch, int in_features, int out_features, cudaStream_t stream) {
++    linear_forward_cuda(input, weight, bias, output, batch, in_features, out_features, stream);
++}
++
++void log_softmax_forward(const float* input, float* output,
++                         int batch, int num_params, int dim, cudaStream_t stream) {
++    log_softmax_forward_cuda(input, output, batch, num_params, stream);
++}
++
++void softmax_forward(const float* input, float* output,
++                     int batch, int num_params, int dim, cudaStream_t stream) {
++    softmax_forward_cuda(input, output, batch, num_params, stream);
++}
++
++void kl_div_loss_forward(const float* input, const float* target, float* output,
++                         int batch, int num_params, cudaStream_t stream) {
++    kl_div_loss_forward_cuda(input, target, output, batch, num_params, stream);
++}
++
++void l1_loss_forward(const float* input, const float* target, float* output,
++                     int batch, cudaStream_t stream) {
++    l1_loss_forward_cuda(input, target, output, batch, stream);
++}
++
++} // extern "C"
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,143 +1,157 @@
+ #include <torch/types.h>
+-#include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+-extern "C" void custom_linear_launcher(
+-    const float* input, const float* weight, const float* bias,
+-    float* output, int batch_size, int in_features, int out_features,
+-    cudaStream_t stream);
+-
+-extern "C" void custom_kldiv_loss_launcher(
+-    const float* x, const float* target, float* output,
+-    int batch_size, int num_cols, cudaStream_t stream);
+-
+-extern "C" void custom_l1_loss_sum_launcher(
+-    const float* x, const float* params, float* output,
+-    int batch_size, int num_cols, cudaStream_t stream);
+-
+-// Helper to check tensor is CUDA float32
+-torch::Tensor check_and_contiguous(torch::Tensor t, const char* name) {
+-    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+-    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
+-    if (!t.is_contiguous()) {
+-        t = t.contiguous();
+-    }
+-    return t;
++extern "C" {
++void linear_forward(const float* input, const float* weight, const float* bias, float* output,
++                    int batch, int in_features, int out_features, cudaStream_t stream);
++void log_softmax_forward(const float* input, float* output,
++                         int batch, int num_params, int dim, cudaStream_t stream);
++void softmax_forward(const float* input, float* output,
++                     int batch, int num_params, int dim, cudaStream_t stream);
++void kl_div_loss_forward(const float* input, const float* target, float* output,
++                         int batch, int num_params, cudaStream_t stream);
++void l1_loss_forward(const float* input, const float* target, float* output,
++                     int batch, cudaStream_t stream);
+ }
+ 
+-// custom_linear wrapper
+-torch::Tensor custom_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
+-    input = check_and_contiguous(input, "input");
+-    weight = check_and_contiguous(weight, "weight");
+-    TORCH_CHECK(bias.defined(), "bias must be provided (use optional if needed)");
+-    bias = check_and_contiguous(bias, "bias");
++// Helper to get current CUDA stream
++static inline cudaStream_t getCurrentStream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
+ 
+-    int batch_size = input.size(0);
++// Wrapper: linear_forward
++torch::Tensor linear_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "Weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "Bias must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
++    TORCH_CHECK(input.dim() == 2, "Input must be 2D (batch, in_features)");
++    TORCH_CHECK(weight.dim() == 2, "Weight must be 2D (out_features, in_features)");
++    TORCH_CHECK(bias.dim() == 1, "Bias must be 1D");
++
++    int batch = input.size(0);
+     int in_features = input.size(1);
+     int out_features = weight.size(0);
+-    TORCH_CHECK(in_features == weight.size(1), "input/weight dimension mismatch");
+-    TORCH_CHECK(bias.numel() == out_features, "bias size mismatch");
++    TORCH_CHECK(weight.size(1) == in_features, "Weight shape mismatch");
++    TORCH_CHECK(bias.size(0) == out_features, "Bias size mismatch");
+ 
+-    auto output = torch::empty({batch_size, out_features}, input.options());
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    auto output = torch::empty({batch, out_features}, input.options());
+ 
+-    custom_linear_launcher(
+-        input.data_ptr<float>(),
+-        weight.data_ptr<float>(),
+-        bias.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        batch_size,
+-        in_features,
+-        out_features,
+-        stream
+-    );
++    cudaStream_t stream = getCurrentStream();
++    linear_forward(input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
++                   output.data_ptr<float>(), batch, in_features, out_features, stream);
+     return output;
+ }
+ 
+-// custom_kldiv_loss wrapper
+-torch::Tensor custom_kldiv_loss(torch::Tensor x, torch::Tensor target) {
+-    x = check_and_contiguous(x, "x");
+-    target = check_and_contiguous(target, "target");
+-    TORCH_CHECK(x.sizes() == target.sizes(), "x and target must have same shape");
++// Wrapper: log_softmax_forward
++torch::Tensor log_softmax_forward(torch::Tensor input, int64_t dim = 1) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 2, "Input must be 2D (batch, num_params)");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported");
+ 
+-    int batch_size = x.size(0);
+-    int num_cols = x.size(1);
+-    auto output = torch::empty({}, x.options());
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    int batch = input.size(0);
++    int num_params = input.size(1);
+ 
+-    custom_kldiv_loss_launcher(
+-        x.data_ptr<float>(),
+-        target.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        batch_size,
+-        num_cols,
+-        stream
+-    );
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = getCurrentStream();
++    log_softmax_forward(input.data_ptr<float>(), output.data_ptr<float>(),
++                        batch, num_params, static_cast<int>(dim), stream);
+     return output;
+ }
+ 
+-// Helper to convert a ParameterList (or list of tensors) to a contiguous tensor
+-torch::Tensor params_to_tensor(const pybind11::iterable& params_iter) {
+-    std::vector<torch::Tensor> tensors;
+-    for (auto item : params_iter) {
+-        torch::Tensor t = item.cast<torch::Tensor>();
+-        tensors.push_back(t);
+-    }
+-    TORCH_CHECK(!tensors.empty(), "params must not be empty");
+-    // All tensors should be 0-dim or 1-dim with one element; we stack them
+-    for (auto& t : tensors) {
+-        TORCH_CHECK(t.is_cuda(), "params must be CUDA tensors");
+-        TORCH_CHECK(t.dtype() == torch::kFloat32, "params must be float32");
+-        TORCH_CHECK(t.numel() == 1, "each param must have exactly one element");
+-    }
+-    // Stack them into a 1D tensor
+-    return torch::stack(tensors).view(-1);
+-}
++// Wrapper: softmax_forward
++torch::Tensor softmax_forward(torch::Tensor input, int64_t dim = 1) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 2, "Input must be 2D (batch, num_params)");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported");
+ 
+-// custom_l1_loss_sum wrapper: accepts either a tensor or a list of tensors
+-torch::Tensor custom_l1_loss_sum(torch::Tensor x, pybind11::object params_obj) {
+-    x = check_and_contiguous(x, "x");
+-    int batch_size = x.size(0);
+-    int num_cols = x.size(1);
++    int batch = input.size(0);
++    int num_params = input.size(1);
+ 
+-    torch::Tensor params;
+-    if (pybind11::isinstance<torch::Tensor>(params_obj)) {
+-        params = params_obj.cast<torch::Tensor>();
+-        params = check_and_contiguous(params, "params");
+-    } else if (pybind11::isinstance<pybind11::iterable>(params_obj)) {
+-        params = params_to_tensor(params_obj.cast<pybind11::iterable>());
+-    } else {
+-        TORCH_CHECK(false, "params must be a Tensor or iterable of Tensors");
+-    }
+-    TORCH_CHECK(params.size(0) == num_cols, "params length must equal number of columns");
++    auto output = torch::empty_like(input);
+ 
+-    auto output = torch::empty({}, x.options());
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-
+-    custom_l1_loss_sum_launcher(
+-        x.data_ptr<float>(),
+-        params.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        batch_size,
+-        num_cols,
+-        stream
+-    );
++    cudaStream_t stream = getCurrentStream();
++    softmax_forward(input.data_ptr<float>(), output.data_ptr<float>(),
++                    batch, num_params, static_cast<int>(dim), stream);
+     return output;
+ }
+ 
+-void register_custom_ops(pybind11::module& m) {
+-    m.def("custom_linear", &custom_linear,
+-          "Custom linear layer using cuBLAS",
+-          py::arg("input"), py::arg("weight"), py::arg("bias"));
+-    m.def("custom_kldiv_loss", &custom_kldiv_loss,
+-          "Custom KLDiv loss with batchmean",
+-          py::arg("x"), py::arg("target"));
+-    m.def("custom_l1_loss_sum", &custom_l1_loss_sum,
+-          "Custom sum of L1 losses",
+-          py::arg("x"), py::arg("params"));
++// Wrapper: kl_div_loss_forward
++torch::Tensor kl_div_loss_forward(torch::Tensor input, torch::Tensor target) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(target.is_cuda(), "Target must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(target.is_contiguous(), "Target must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(target.dtype() == torch::kFloat32, "Target must be float32");
++    TORCH_CHECK(input.dim() == 2, "Input must be 2D (batch, num_params)");
++    TORCH_CHECK(target.dim() == 2, "Target must be 2D (batch, num_params)");
++    TORCH_CHECK(input.sizes() == target.sizes(), "Input and target must have same shape");
++
++    int batch = input.size(0);
++    int num_params = input.size(1);
++
++    auto output = torch::empty({}, input.options());
++
++    cudaStream_t stream = getCurrentStream();
++    kl_div_loss_forward(input.data_ptr<float>(), target.data_ptr<float>(),
++                        output.data_ptr<float>(), batch, num_params, stream);
++    return output;
+ }
+ 
++// Wrapper: l1_loss_forward
++torch::Tensor l1_loss_forward(torch::Tensor input, torch::Tensor target) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(target.is_cuda(), "Target must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(target.is_contiguous(), "Target must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(target.dtype() == torch::kFloat32, "Target must be float32");
++    TORCH_CHECK(input.dim() == 1, "Input must be 1D (batch_size)");
++    TORCH_CHECK(target.dim() == 1, "Target must be 1D (batch_size)");
++    TORCH_CHECK(input.sizes() == target.sizes(), "Input and target must have same shape");
++
++    int batch = input.size(0);
++
++    auto output = torch::empty({}, input.options());
++
++    cudaStream_t stream = getCurrentStream();
++    l1_loss_forward(input.data_ptr<float>(), target.data_ptr<float>(),
++                    output.data_ptr<float>(), batch, stream);
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("linear_forward", &linear_forward,
++          "Linear forward: output = input @ weight.T + bias",
++          pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias"));
++    m.def("log_softmax_forward", &log_softmax_forward,
++          "Log softmax over dim=1",
++          pybind11::arg("input"), pybind11::arg("dim") = 1);
++    m.def("softmax_forward", &softmax_forward,
++          "Softmax over dim=1",
++          pybind11::arg("input"), pybind11::arg("dim") = 1);
++    m.def("kl_div_loss_forward", &kl_div_loss_forward,
++          "KL divergence loss with batchmean reduction",
++          pybind11::arg("input"), pybind11::arg("target"));
++    m.def("l1_loss_forward", &l1_loss_forward,
++          "L1 loss (mean absolute difference)",
++          pybind11::arg("input"), pybind11::arg("target"));
++}
++
++// Auto-register
+ REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -1,5 +1,6 @@
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
+ import cuda_extension
+ 
+ 
+@@ -10,17 +11,21 @@
+         self.params = nn.ParameterList([nn.Parameter(torch.randn(1)) for _ in range(num_params)])
+ 
+     def forward(self, input, target):
+-        x = cuda_extension.custom_linear(input, self.linear.weight, self.linear.bias)
+-        kldiv_loss = cuda_extension.custom_kldiv_loss(x, target)
+-        l1_loss = cuda_extension.custom_l1_loss_sum(x, self.params)
++        x = cuda_extension.linear_forward(input, self.linear.weight, self.linear.bias)
++        log_probs = cuda_extension.log_softmax_forward(x, 1)
++        probs = cuda_extension.softmax_forward(target, 1)
++        kldiv_loss = cuda_extension.kl_div_loss_forward(log_probs, probs)
++        l1_loss = sum(cuda_extension.l1_loss_forward(x[:, i], self.params[i].expand_as(x[:, i])) for i in range(len(self.params)))
+         return kldiv_loss, l1_loss
+ 
+     def debug_forward(self, input, target):
+-        x = cuda_extension.custom_linear(input, self.linear.weight, self.linear.bias)
++        x = cuda_extension.linear_forward(input, self.linear.weight, self.linear.bias)
+         yield 'step_001', x
+-        kldiv_loss = cuda_extension.custom_kldiv_loss(x, target)
++        log_probs = cuda_extension.log_softmax_forward(x, 1)
++        probs = cuda_extension.softmax_forward(target, 1)
++        kldiv_loss = cuda_extension.kl_div_loss_forward(log_probs, probs)
+         yield 'step_002', kldiv_loss
+-        l1_loss = cuda_extension.custom_l1_loss_sum(x, self.params)
++        l1_loss = sum(cuda_extension.l1_loss_forward(x[:, i], self.params[i].expand_as(x[:, i])) for i in range(len(self.params)))
+         yield 'step_003', l1_loss
+         result = (kldiv_loss, l1_loss)
+         yield 'step_004', result

@@ -1,0 +1,327 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,7 +1,6 @@
+ #include <cuda_runtime.h>
+ 
+ // Elementwise leaky ReLU kernel.
+-// Each thread processes one element using a grid-stride loop.
+ __global__ void leaky_relu_kernel(float* output, const float* input, float negative_slope, long long total_elements) {
+     long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+     long long stride = (long long)blockDim.x * gridDim.x;
+@@ -12,31 +11,88 @@
+ }
+ 
+ // Add bias kernel with broadcasting: output[n,c,h,w] = input[n,c,h,w] + bias[c].
+-// The input is assumed to be a 4D tensor with dimensions [N, C, H, W].
+-// The bias is of shape [C, 1, 1].
+ __global__ void add_bias_kernel(float* output, const float* input, const float* bias, int C, int HW, long long total_elements) {
+     long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+     long long stride = (long long)blockDim.x * gridDim.x;
+     for (long long i = idx; i < total_elements; i += stride) {
+-        // Determine channel index from linear index.
+-        // total_elements = N*C*H*W, but we use channel = (i / HW) % C.
+         int c = (int)((i / HW) % C);
+         output[i] = input[i] + bias[c];
+     }
+ }
+ 
++// Conv2d forward kernel: each thread computes one output element.
++// Assumes input, weight, bias are contiguous float32 tensors.
++// input shape: [N, C, H, W], weight: [K, C, R, S], bias: [K]
++// stride and padding are passed, dilation=1, groups=1.
++__global__ void conv2d_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int K, int R, int S,
++    int stride, int padding,
++    int H_out, int W_out
++) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long total = (long long)N * K * H_out * W_out;
++    long long grid_stride = (long long)blockDim.x * gridDim.x;
++
++    for (long long linear = idx; linear < total; linear += grid_stride) {
++        int w_out = linear % W_out;
++        int h_out = (linear / W_out) % H_out;
++        int k = (linear / ((long long)W_out * H_out)) % K;
++        int n = linear / ((long long)W_out * H_out * K);
++
++        float sum = 0.0f;
++        for (int c = 0; c < C; ++c) {
++            for (int r = 0; r < R; ++r) {
++                int h_in = h_out * stride - padding + r;
++                if (h_in < 0 || h_in >= H) continue;
++                for (int s = 0; s < S; ++s) {
++                    int w_in = w_out * stride - padding + s;
++                    if (w_in < 0 || w_in >= W) continue;
++                    int input_idx = ((n * C + c) * H + h_in) * W + w_in;
++                    int weight_idx = ((k * C + c) * R + r) * S + s;
++                    sum += input[input_idx] * weight[weight_idx];
++                }
++            }
++        }
++        output[linear] = sum + bias[k];
++    }
++}
++
++// Launcher for conv2d_forward.
++extern "C" void conv2d_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C, int H, int W,
++    int K, int R, int S,
++    int stride, int padding,
++    int H_out, int W_out,
++    cudaStream_t stream
++) {
++    const int block_size = 256;
++    long long total = (long long)N * K * H_out * W_out;
++    long long blocks = (total + block_size - 1) / block_size;
++    if (blocks > 65535) blocks = 65535;
++    conv2d_kernel<<<(int)blocks, block_size, 0, stream>>>(
++        input, weight, bias, output,
++        N, C, H, W, K, R, S, stride, padding, H_out, W_out
++    );
++}
++
+ // Launcher for leaky_relu_forward.
+-// Parameters: output, input pointers, negative_slope, total number of elements, stream.
+ extern "C" void leaky_relu_launcher(float* output, const float* input, float negative_slope, long long total_elements, cudaStream_t stream) {
+     const int block_size = 256;
+     long long blocks = (total_elements + block_size - 1) / block_size;
+-    // Cap blocks to 65535 for grid dimension limit; grid-stride loop handles the rest.
+     if (blocks > 65535) blocks = 65535;
+     leaky_relu_kernel<<<(int)blocks, block_size, 0, stream>>>(output, input, negative_slope, total_elements);
+ }
+ 
+ // Launcher for add_bias_forward.
+-// Parameters: output, input, bias pointers, C, HW (height*width), total_elements, stream.
+ extern "C" void add_bias_launcher(float* output, const float* input, const float* bias, int C, int HW, long long total_elements, cudaStream_t stream) {
+     const int block_size = 256;
+     long long blocks = (total_elements + block_size - 1) / block_size;
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,29 +1,28 @@
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+-#include <cudnn.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <vector>
+ #include "../binding_registry.h"
+ 
+ // Declarations of launchers from custom_ops.cu
++extern "C" void conv2d_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C, int H, int W,
++    int K, int R, int S,
++    int stride, int padding,
++    int H_out, int W_out,
++    cudaStream_t stream
++);
+ extern "C" void leaky_relu_launcher(float* output, const float* input, float negative_slope, long long total_elements, cudaStream_t stream);
+ extern "C" void add_bias_launcher(float* output, const float* input, const float* bias, int C, int HW, long long total_elements, cudaStream_t stream);
+ 
+-// Helper to get cuDNN handle for the current device and stream
+-cudnnHandle_t get_cudnn_handle() {
+-    static cudnnHandle_t handle = nullptr;
+-    if (!handle) {
+-        cudnnCreate(&handle);
+-    }
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    cudnnSetStream(handle, stream);
+-    return handle;
+-}
+-
+-// cuDNN convolution forward with bias
++// conv2d_forward using custom CUDA kernel
+ // input: [N, C, H, W], weight: [K, C, R, S], bias: [K]
+-// stride, padding, dilation, groups are integers
++// stride, padding, dilation, groups are integers; dilation and groups must be 1 for custom kernel
+ // returns output [N, K, H_out, W_out]
+ torch::Tensor conv2d_forward(
+     torch::Tensor input,
+@@ -34,7 +33,7 @@
+     int64_t dilation,
+     int64_t groups
+ ) {
+-    // Parameter validation
++    // Validate inputs
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+     TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+@@ -42,11 +41,14 @@
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+     TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+     TORCH_CHECK(input.dim() == 4, "input must be 4D (N, C, H, W)");
+-    TORCH_CHECK(weight.dim() == 4, "weight must be 4D (K, C/groups, R, S)");
++    TORCH_CHECK(weight.dim() == 4, "weight must be 4D (K, C, R, S)");
+     TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+-    TORCH_CHECK(groups > 0, "groups must be positive");
++    TORCH_CHECK(dilation == 1, "dilation must be 1");
++    TORCH_CHECK(groups == 1, "groups must be 1");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
+ 
+-    // Make contiguous if necessary; cuDNN requires contiguous tensors
++    // Make contiguous
+     auto input_contig = input.contiguous();
+     auto weight_contig = weight.contiguous();
+     auto bias_contig = bias.contiguous();
+@@ -60,123 +62,28 @@
+     int S = weight_contig.size(3);
+ 
+     TORCH_CHECK(K == bias_contig.size(0), "bias size must match output channels");
+-    TORCH_CHECK(weight_contig.size(1) == C / groups, "weight has incorrect input channels per group");
+-    TORCH_CHECK(C % groups == 0, "input channels must be divisible by groups");
++    TORCH_CHECK(weight_contig.size(1) == C, "weight has incorrect input channels");
+ 
+-    // Compute output dimensions
+-    int H_out = (H + 2 * padding - dilation * (R - 1) - 1) / stride + 1;
+-    int W_out = (W + 2 * padding - dilation * (S - 1) - 1) / stride + 1;
++    int H_out = (H + 2 * padding - (R - 1) - 1) / stride + 1;
++    int W_out = (W + 2 * padding - (S - 1) - 1) / stride + 1;
+ 
+     auto output = torch::empty({N, K, H_out, W_out}, input_contig.options());
+ 
+-    // Get cuDNN handle
+-    cudnnHandle_t handle = get_cudnn_handle();
+-
+-    // Set up tensor descriptors
+-    cudnnTensorDescriptor_t input_desc;
+-    cudnnTensorDescriptor_t output_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    cudnnCreateTensorDescriptor(&input_desc);
+-    cudnnCreateTensorDescriptor(&output_desc);
+-    cudnnCreateFilterDescriptor(&filter_desc);
+-    cudnnCreateConvolutionDescriptor(&conv_desc);
+-
+-    cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C, H, W);
+-    cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, K, H_out, W_out);
+-    cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, K, C / groups, R, S);
+-
+-    // cuDNN convolution descriptor: supports groups
+-    cudnnSetConvolution2dDescriptor(
+-        conv_desc,
+-        padding, padding,
+-        stride, stride,
+-        dilation, dilation,
+-        CUDNN_CROSS_CORRELATION,
+-        CUDNN_DATA_FLOAT
+-    );
+-    if (groups > 1) {
+-        cudnnSetConvolutionGroupCount(conv_desc, groups);
+-    }
+-
+-    // Determine algorithm (choose a deterministic heuristic)
+-    cudnnConvolutionFwdAlgo_t algo;
+-    cudnnGetConvolutionForwardAlgorithm_v7(
+-        handle,
+-        input_desc,
+-        filter_desc,
+-        conv_desc,
+-        output_desc,
+-        1,  // requested algo count
+-        nullptr,
+-        &algo
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    conv2d_launcher(
++        input_contig.data_ptr<float>(),
++        weight_contig.data_ptr<float>(),
++        bias_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        K, R, S,
++        (int)stride, (int)padding,
++        H_out, W_out,
++        stream
+     );
+ 
+-    // Workspace size
+-    size_t workspace_size = 0;
+-    cudnnGetConvolutionForwardWorkspaceSize(
+-        handle,
+-        input_desc,
+-        filter_desc,
+-        conv_desc,
+-        output_desc,
+-        algo,
+-        &workspace_size
+-    );
+-
+-    // Allocate workspace if needed
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaMalloc(&workspace, workspace_size);
+-    }
+-
+-    // Perform convolution
+-    float alpha = 1.0f, beta = 0.0f;
+-    cudnnConvolutionForward(
+-        handle,
+-        &alpha,
+-        input_desc,
+-        input_contig.data_ptr<float>(),
+-        filter_desc,
+-        weight_contig.data_ptr<float>(),
+-        conv_desc,
+-        algo,
+-        workspace,
+-        workspace_size,
+-        &beta,
+-        output_desc,
+-        output.data_ptr<float>()
+-    );
+-
+-    // Add bias: use cuDNN's add tensor with broadcast to NCHW
+-    cudnnTensorDescriptor_t bias_desc;
+-    cudnnCreateTensorDescriptor(&bias_desc);
+-    // bias shape [K, 1, 1] in NCHW, but cuDNN AddTensor expects same dimensions; we can use bias with dimensions [1, K, 1, 1]
+-    cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, K, 1, 1);
+-    float alpha_bias = 1.0f, beta_bias = 1.0f;
+-    cudnnAddTensor(
+-        handle,
+-        &alpha_bias,
+-        bias_desc,
+-        bias_contig.data_ptr<float>(),
+-        &beta_bias,
+-        output_desc,
+-        output.data_ptr<float>()
+-    );
+-
+-    // Cleanup cuDNN descriptors
+-    cudnnDestroyTensorDescriptor(input_desc);
+-    cudnnDestroyTensorDescriptor(output_desc);
+-    cudnnDestroyFilterDescriptor(filter_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroyTensorDescriptor(bias_desc);
+-    if (workspace) cudaFree(workspace);
+-
+-    // Check for cuDNN errors
+-    cudaError_t cuda_err = cudaGetLastError();
+-    TORCH_CHECK(cuda_err == cudaSuccess, "CUDA error in conv2d_forward: ", cudaGetErrorString(cuda_err));
+-
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA error in conv2d_forward: ", cudaGetErrorString(err));
+     return output;
+ }
+ 
+@@ -232,7 +139,7 @@
+ // Registration function
+ void register_custom_ops(pybind11::module& m) {
+     m.def("conv2d_forward", &conv2d_forward,
+-          "2D convolution forward using cuDNN",
++          "2D convolution forward using CUDA kernel",
+           pybind11::arg("input"),
+           pybind11::arg("weight"),
+           pybind11::arg("bias"),

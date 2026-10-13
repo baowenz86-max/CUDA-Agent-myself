@@ -1,0 +1,458 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -2,7 +2,6 @@
+ #include <cublas_v2.h>
+ #include <cstdio>
+ 
+-// Error checking macro
+ #define CUDA_CHECK(call) \
+     do { \
+         cudaError_t err = call; \
+@@ -32,143 +31,6 @@
+     }
+ }
+ 
+-// Kernel: compute log_softmax along rows
+-__global__ void log_softmax_kernel(float* out, const float* in, int rows, int cols) {
+-    int row = blockIdx.x;
+-    if (row >= rows) return;
+-    const float* in_row = in + row * cols;
+-    float* out_row = out + row * cols;
+-    
+-    // Find max for numerical stability
+-    float max_val = in_row[0];
+-    for (int i = 1; i < cols; ++i) {
+-        max_val = fmaxf(max_val, in_row[i]);
+-    }
+-    
+-    // Compute sum of exp
+-    float sum = 0.0f;
+-    for (int i = 0; i < cols; ++i) {
+-        sum += expf(in_row[i] - max_val);
+-    }
+-    float log_sum = logf(sum);
+-    
+-    // Write log_softmax values
+-    for (int i = 0; i < cols; ++i) {
+-        out_row[i] = in_row[i] - max_val - log_sum;
+-    }
+-}
+-
+-// Kernel: compute softmax along rows
+-__global__ void softmax_kernel(float* out, const float* in, int rows, int cols) {
+-    int row = blockIdx.x;
+-    if (row >= rows) return;
+-    const float* in_row = in + row * cols;
+-    float* out_row = out + row * cols;
+-    
+-    float max_val = in_row[0];
+-    for (int i = 1; i < cols; ++i) {
+-        max_val = fmaxf(max_val, in_row[i]);
+-    }
+-    
+-    float sum = 0.0f;
+-    for (int i = 0; i < cols; ++i) {
+-        sum += expf(in_row[i] - max_val);
+-    }
+-    
+-    for (int i = 0; i < cols; ++i) {
+-        out_row[i] = expf(in_row[i] - max_val) / sum;
+-    }
+-}
+-
+-// Kernel: one block per row computes KL contribution for that row
+-// result[row] = sum(target_softmax * (log(target_softmax) - log_softmax_x))
+-__global__ void kldiv_row_reduce_kernel(const float* log_softmax_x,
+-                                        const float* softmax_target,
+-                                        float* row_sums,
+-                                        int rows, int cols) {
+-    __shared__ float sdata[256];
+-    int row = blockIdx.x;
+-    if (row >= rows) return;
+-    
+-    int tid = threadIdx.x;
+-    float sum = 0.0f;
+-    for (int i = tid; i < cols; i += blockDim.x) {
+-        float p = softmax_target[row * cols + i];
+-        float log_p = logf(p);
+-        float q = log_softmax_x[row * cols + i];
+-        // KL contribution: p * (log_p - q), with 0*log(0)=0 handled by p==0
+-        if (p > 0.0f) {
+-            sum += p * (log_p - q);
+-        }
+-    }
+-    sdata[tid] = sum;
+-    __syncthreads();
+-    
+-    // Reduce within block
+-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) {
+-            sdata[tid] += sdata[tid + s];
+-        }
+-        __syncthreads();
+-    }
+-    
+-    if (tid == 0) {
+-        row_sums[row] = sdata[0];
+-    }
+-}
+-
+-// Kernel: sum row_sums and divide by batch_size
+-__global__ void sum_and_divide_kernel(const float* row_sums, float* output, int rows) {
+-    __shared__ float sdata[256];
+-    int tid = threadIdx.x;
+-    float sum = 0.0f;
+-    for (int i = tid; i < rows; i += blockDim.x) {
+-        sum += row_sums[i];
+-    }
+-    sdata[tid] = sum;
+-    __syncthreads();
+-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] += sdata[tid + s];
+-        __syncthreads();
+-    }
+-    if (tid == 0) {
+-        output[0] = sdata[0] / rows;
+-    }
+-}
+-
+-// Kernel: per-column L1 mean computation
+-// output[col] = mean(|x[:,col] - param[col]|)
+-__global__ void l1_column_mean_kernel(const float* x, const float* params,
+-                                     float* col_means, int batch_size, int num_cols) {
+-    int col = blockIdx.x;
+-    if (col >= num_cols) return;
+-    float param_val = params[col];
+-    float sum = 0.0f;
+-    for (int i = 0; i < batch_size; ++i) {
+-        sum += fabsf(x[i * num_cols + col] - param_val);
+-    }
+-    col_means[col] = sum / batch_size;
+-}
+-
+-// Kernel: sum col_means into scalar
+-__global__ void sum_reduce_kernel(const float* col_means, float* output, int num_cols) {
+-    __shared__ float sdata[256];
+-    int tid = threadIdx.x;
+-    float sum = 0.0f;
+-    for (int i = tid; i < num_cols; i += blockDim.x) {
+-        sum += col_means[i];
+-    }
+-    sdata[tid] = sum;
+-    __syncthreads();
+-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] += sdata[tid + s];
+-        __syncthreads();
+-    }
+-    if (tid == 0) {
+-        output[0] = sdata[0];
+-    }
+-}
+-
+ // Launcher: custom_linear
+ // input: [batch, in_features], weight: [out_features, in_features], bias: [out_features]
+ // output: [batch, out_features]
+@@ -183,134 +45,21 @@
+     
+     const float alpha = 1.0f;
+     const float beta = 0.0f;
+-    // Compute output = alpha * input * weight^T + beta * output
+-    // Note: cuBLAS uses column-major, but we can treat row-major as transposed.
+-    // For row-major output [batch, out_features] = input [batch, in_features] * weight^T [in_features, out_features]
+-    // In column-major, this is equivalent to C^T = B^T * A^T, so use cublasSgemm with
+-    // op(A)=CUBLAS_OP_T (weight^T as A => A is weight [out_features, in_features]),
+-    // op(B)=CUBLAS_OP_N (input as B), leading dimensions accordingly.
+-    // Actually standard approach: C = alpha * op(A) * op(B) + beta * C,
+-    // where A is weight [out_features, in_features] (column-major storage as row-major?)
+-    // Better: use cublasSgemm with column-major interpretation:
+-    // C (row-major) = input (row-major) * weight^T (row-major)
+-    // In column-major, C_col = weight_col * input_col?
+-    // Let's use the common trick: treat row-major arrays as column-major with swapped dimensions.
+-    // We want output^T = weight * input^T (since (input*weight^T)^T = weight*input^T).
+-    // So compute output^T [out_features, batch] = weight [out_features, in_features] * input^T [in_features, batch]
+-    // using column-major representation:
+-    // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 
+-    //             out_features, batch_size, in_features,
+-    //             &alpha, weight, out_features, input, in_features, &beta, output, out_features);
+-    // But output is row-major [batch, out_features]; in column-major it's viewed as [out_features, batch].
+-    // This is correct because column-major layout of [out_features, batch] is same as row-major [batch, out_features]?
+-    // Let's be careful: row-major [batch, out_features] has element (i,j) at i*out_features+j.
+-    // Column-major matrix of dimensions [out_features, batch] has element (j,i) at i*out_features+j, same!
+-    // So we can use output as a column-major [out_features, batch] matrix.
+-    // Similarly, input row-major [batch, in_features] treated as column-major [in_features, batch].
+-    // weight row-major [out_features, in_features] treated as column-major [in_features, out_features], which is transpose.
+-    // Therefore standard approach: C = alpha * A * B, with A = weight^T? Let's derive:
+-    // We want C_col [out_features, batch] = weight_col [out_features, in_features] * input_col [in_features, batch]
+-    // But we stored weight row-major [out_features, in_features]; its column-major interpretation is [in_features, out_features] with element (k,j) = weight[j*in_features+k] = weight[j][k].
+-    // So actually weight view as column-major is [in_features, out_features], which is weight^T.
+-    // So to compute C_col = (weight^T) * input_col? But dimensions would be [in_features, out_features] * [in_features, batch] mismatch.
+-    // Easier: use cublasSgemm with op(A)=CUBLAS_OP_T on weight stored as row-major [out_features, in_features].
+-    // When you pass row-major matrix as column-major, it is transposed.
+-    // Standard formula: C (row-major) = A (row-major) * B (row-major), treat all as column-major? Actually many examples:
+-    // For row-major C = A * B, use cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, B, n, A, k, &beta, C, n) if matrices are stored row-major? 
+-    // Let's instead avoid confusion: use row-major directly by setting appropriate leading dimensions and using transposes.
+-    // Since cuBLAS assumes column-major, if we have row-major but want to compute C = A * B, we can compute C^T = B^T * A^T.
+-    // Here we want output^T = weight * input^T.
+-    // weight is [out_features, in_features] row-major, so its column-major representation is [in_features, out_features] and is weight^T.
+-    // input^T is [in_features, batch] row-major, column-major representation of input^T is same as row-major because transpose of row-major [in_features, batch] is column-major [batch, in_features]? Wait.
+-    // This is getting messy. Let's use a known correct approach:
+-    // For C = A * B with row-major storage, use cublasSgemm with CUBLAS_OP_T for A and B, swapping m and n.
+-    // Many references: cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N)
+-    // where A is MxK, B is KxN, stored row-major.
+-    // Apply: A = input [M=bat, K=in], B = weight^T? Actually weight is [out, in], so weight^T is [in, out].
+-    // Then B = weight^T has dimensions K x N? If C = input * weight^T, then M=bat, K=in, N=out.
+-    // B = weight^T is [in, out] = K x N.
+-    // According to the above formula: cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N)
+-    // Here N=out, M=bat, K=in.
+-    // So cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, out, batch, in, &alpha, weight, out, input, in, &beta, output, out)
+-    // Wait, B argument should be weight^T stored row-major, but we pass weight with leading dimension out_features. Let's check dimensions:
+-    // In the formula, B is K x N = in x out, stored row-major, leading dimension = N = out.
+-    // Indeed, weight^T is in x out, row-major leading dim = out. And weight stored in memory is row-major out x in, but its memory layout is the same as row-major in x out? No, not same. If we pass weight pointer, the memory is laid out as out rows of in elements each, but we want in rows of out elements. That is not the same unless we transpose. However, in the formula with CUBLAS_OP_N for B, cuBLAS expects column-major B of dimensions K x N. But if we pass weight pointer, it will interpret it as column-major matrix of dimensions K x N? Let's be precise.
+-    // I'll use the well-known trick: For row-major matrices A (MxK) and B (KxN) and C (MxN), we can call:
+-    // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N)
+-    // where we pass pointers to row-major B, A, C, but treat them as column-major with swapped dimensions. This works because column-major order of a MxN matrix equals row-major order of its NxM transpose. So the memory layout is consistent.
+-    // So in our case: B is weight^T (K x N = in x out) stored row-major, but its pointer is weight (which is actually stored row-major out x in). The memory layout of row-major in x out is not the same as row-major out x in; they are transposes. Since we don't have weight^T contiguous, we cannot use this trick directly without transposing weight. However, we can instead compute output^T = weight * input^T. That may be easier.
+-    // output^T is [out, batch] row-major; in memory, output is row-major [batch, out], which is the same as row-major [out, batch]? No, row-major [batch, out] element (i,j) at i*out+j; row-major [out, batch] element (j,i) at j*batch+i. Not the same.
+-    // This is confusing. Let's just use cublasSgemm with proper transposes and leading dimensions:
+-    // We want C = A * B, where A is input [M x K] row-major, B is weight^T [K x N] row-major.
+-    // Since we have weight in row-major [N x K], we can set B as weight with op(B)=CUBLAS_OP_T.
+-    // cuBLAS is column-major, but if we pass row-major matrices, we can tell cuBLAS they are transposed.
+-    // Standard formula from NVIDIA forums:
+-    // To compute row-major C = A * B with A (MxK) row-major, B (KxN) row-major, use:
+-    // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N)
+-    // This treats A as column-major KxM, but since it's row-major MxK, the memory layout matches if we swap M and K and treat as column-major? Let's test with small example.
+-    // I'll implement using cublasSgemm with op(A)=CUBLAS_OP_N, op(B)=CUBLAS_OP_T as that directly matches standard linear layer implementations found in PyTorch C++ extensions.
+-    // The common approach for linear layer: cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, out_features, batch_size, in_features, &alpha, weight, in_features, input, in_features, &beta, output, out_features)
+-    // This is used in many examples (e.g., caffe). Let's verify: weight is out x in row-major, but with op(A)=CUBLAS_OP_T, cuBLAS interprets A as column-major of dimensions in x out? Actually, when you pass a pointer to a row-major matrix and specify op(A)=CUBLAS_OP_T, cuBLAS treats the matrix as column-major of original dimensions (out x in) and transposes it to in x out. But the memory layout of column-major out x in is the same as row-major in x out, which is exactly weight^T. So this works if we pass weight as if it were column-major of out x in, but the memory is actually row-major out x in? No, column-major out x in memory layout is: for each column (in columns) we have out elements contiguous. Row-major out x in layout is: for each row (out rows) we have in elements contiguous. They are not the same unless out=in. So that's wrong.
+-    // Okay, let's use the reliable method: use cublasSgemm with CUBLAS_OP_N and swap order, and pass pointers accordingly to get correct result. I will test mentally with small matrix.
+-    // Actually, the PyTorch linear layer itself uses cublasSgemm with column-major storage, but PyTorch tensors are row-major, so they internally transpose. Let's just use cuBLAS with explicit transposes and correct leading dimensions:
+-    // We want output^T = weight * input^T (so output^T is out x bat).
+-    // weight is out x in (row-major). We can treat weight as column-major out x in? No. But we can call cublasSgemm with op(A)=CUBLAS_OP_N, where A is weight with lda=in_features? Wait, weight row-major has lda = in_features, but column-major expectation is lda >= rows (out_features). That violates lda requirement. So we must copy or transpose. However, cuBLAS allows lda >= max(1, m) for column-major, but our row-major weight has lda = in_features, which is less than out_features if out>in? Here out=200, in=768, so in_features=768 > out_features=200, so lda=768 >= 200, so it's fine? Actually for column-major matrix of dimensions m x n (out x in), lda must be >= m (out=200). Our lda=768 >=200, so it's acceptable. So we can interpret weight as column-major of dimensions out x in with lda=in_features. But is the memory layout correct? Column-major storage means element (row, col) at row + col*lda. Our weight memory is row-major: element (i,j) at i*in_features + j. If we interpret as column-major with lda=in_features, then element (i,j) would be at i + j*in_features. These are not the same. So it's transposed. Therefore, treating weight as column-major with lda=in_features gives us weight^T actually? Let's check: weight[i][j] in row-major is at i*in+j. Column-major with lda=in: element at row r, column c is r + c*in. If row r = j, column c = i, then address is j + i*in, which is not i*in+j unless i=j. They are swapped. So it's actually the transpose. So weight viewed as column-major of dimensions in x out? The column-major interpretation of a memory buffer with lda=in and m=out gives a matrix of shape out x in, but the element ordering is transposed relative to the original row-major matrix. That means if we treat it as a column-major matrix of shape out x in, we get a matrix W_col where W_col(i,j) = original(j,i). That is weight^T. So indeed, W_col = weight^T (as a matrix). So we can use W_col as A in a matrix multiplication to compute output^T? 
+-    // We want output^T = weight * input^T, where output^T is out x bat, weight is out x in, input^T is in x bat.
+-    // We have W_col = weight^T, which is in x out.
+-    // So we can compute something using W_col and input? Let's try to compute output^T using W_col: output^T = (W_col)^T * input^T? That would be weight * input^T, correct.
+-    // So we need W_col^T, but we can just use cublasSgemm with op(A)=CUBLAS_OP_T on W_col to get W_col^T = weight.
+-    // Then we need input^T: input is row-major bat x in, with lda=in. Treat as column-major with m=bat, n=in, lda=in? Again lda must be >= bat, but if bat=128, in=768, lda=768 >=128, so fine. The column-major interpretation gives us a matrix of shape bat x in but transposed relative to original, i.e., input_col = input^T (in x bat)? Let's check: input original (i,j) at i*in+j. Column-major with lda=in: element (r,c) at r + c*in. If r=j, c=i, then address j + i*in = original(i,j). So actually column-major element (j,i) equals original (i,j), so input_col = input^T (as in x bat).
+-    // So if we have input_col = input^T, and we want output^T = weight * input^T = weight * input_col.
+-    // weight can be obtained as W_col^T (op(A)=CUBLAS_OP_T on W_col).
+-    // So we call cublasSgemm with A = W_col (with op(A)=CUBLAS_OP_T), B = input_col (with op(B)=CUBLAS_OP_N).
+-    // Dimensions: A after op is weight: out x in. B is input^T: in x bat. Result C = weight * input^T: out x bat.
+-    // In cuBLAS column-major, we need to specify m=out, n=bat, k=in. A dimensions: m x k = out x in. Since A is W_col with op(A)=CUBLAS_OP_T, the original A (W_col) has dimensions k x m? Wait, if op(A)=CUBLAS_OP_T, then A is transposed before multiplication. cuBLAS expects A to be of dimensions m x k if op is N, or k x m if op is T. So if we want A to represent weight (out x in) after transpose, then before transpose A must be in x out. That matches W_col dimensions? W_col as column-major with lda=in and m=out gives shape out x in? But we said W_col = weight^T, so it's in x out. So if we set m=out, k=in, and op(A)=T, cuBLAS expects A to be k x m = in x out, which is W_col. And lda must be >= k = in. We have lda=in. Good.
+-    // For B: we want input^T (in x bat) with op N, so B is k x n = in x bat. We have input_col = input^T, which is in x bat. But input_col is the column-major interpretation of input with lda=in, m=bat? That would make it bat x in, not in x bat. Let's recalc: input (bat x in) row-major, lda=in. If we treat it as column-major with m=bat, n=in, lda=in, then the matrix is bat x in, but element (r,c) = original(c,r). Wait, original (i,j) at i*in+j. Column-major element (r,c) at r + c*in. Set r = j, c = i, then address j + i*in = original(i,j). So column-major element (j,i) = original(i,j), so the column-major matrix has shape bat x in, and its (j,i) entry is original(i,j). This is exactly input^T (in x bat) if we consider it? No, input^T has dimensions in x bat, entry (j,i) = original(i,j). The column-major matrix we have is bat x in, entry (row=j, col=i) = original(i,j). So it's not input^T; it's the transpose with swapped dimensions. But if we set m=bat, n=in, it's bat x in. However, for B we need k x n = in x bat. So we need to treat input as column-major with m=in, n=bat, lda=bat? But original input has lda=in, not bat. So that doesn't work.
+-    // This is a known issue: row-major matrices cannot be directly passed to cuBLAS without considering transposes. The correct approach is to use cublasSgemm with op(A)=CUBLAS_OP_T and op(B)=CUBLAS_OP_N and swapped m,n,k as many examples do.
+-    // Let's look up common code for linear layer: 
+-    // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, out_features, batch_size, in_features, &alpha, weight, in_features, input, in_features, &beta, output, out_features);
+-    // This is used in many implementations (e.g., https://github.com/ROCm/MIOpen/blob/develop/test/gtest/gemm.cpp). I'll trust it because it's standard.
+-    // Why does it work? weight is row-major out x in with lda=in (since row-major), but we pass lda=in and op=T. cuBLAS interprets A as column-major of dimensions k x m? Let's see: op=T means A is k x m (since final A after op is m x k). Here m=out, k=in, so A before op is in x out. lda must be >= k = in. We pass lda=in, ok. The memory layout of A before op (in x out column-major) requires element (r,c) at r + c*lda = r + c*in. Our weight memory has element (original row i, col j) at i*in+j. If we map (r,c) of A to (i,j) such that r = j, c = i, then address = j + i*in. But original address for (i,j) is i*in+j. They differ. So it's not the same memory. Therefore this common code is actually wrong for row-major weight unless weight is stored column-major. But maybe PyTorch stores weight in column-major? No, PyTorch tensors are row-major by default. However, cuBLAS can work with row-major if you use cublasSgemm with CUBLAS_OP_N for both and swap dimensions. Let's not dwell; I'll use the following correct method:
+-    // Since we can allocate temporary transposed matrices if needed, but to avoid extra memory and time, we can use cublasSgemm with the appropriate transpose flags and leading dimensions. A foolproof method is to use cublasSgemm with row-major support via cublasSetMatrix? No, cuBLAS is column-major only. The trick is to compute C^T = B^T * A^T when you have row-major matrices. So for row-major A (MxK), B (KxN), C (MxN), call:
+-    // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N)
+-    // where B is passed as row-major KxN but cuBLAS thinks it's column-major NxK? Actually this formula is widely cited. I'll implement a small test in my head: M=2,K=3,N=2.
+-    // A row-major: a00 a01 a02 a10 a11 a12
+-    // B row-major (3x2): b00 b01 b10 b11 b20 b21
+-    // C = A*B (2x2): c00 = a00*b00+a01*b10+a02*b20, c01 = a00*b01+a01*b11+a02*b21, c10 = a10*b00+a11*b10+a12*b20, c11 = a10*b01+a11*b11+a12*b21.
+-    // Now call cublasSgemm as above: it expects column-major A, B, C. It will compute C_col = op(A_col)*op(B_col) with dimensions: m=N=2, n=M=2, k=K=3.
+-    // It takes A pointer (which points to B row-major memory as column-major NxK? Actually we pass B pointer as first matrix A, with lda=N=2.
+-    // B row-major memory: [b00,b01,b10,b11,b20,b21]. Interpret as column-major 2x3: element (row r, col c) at r + c*2. So matrix:
+-    // col0: r0=b00, r1=b01
+-    // col1: r0=b10, r1=b11
+-    // col2: r0=b20, r1=b21
+-    // This is actually B^T (3x2)? B^T is:
+-    // [b00, b10, b20]
+-    // [b01, b11, b21]
+-    // The column-major 2x3 matrix above is:
+-    // row0: b00, b10, b20
+-    // row1: b01, b11, b21
+-    // Yes, that's exactly B^T (2x3). So A_col = B^T.
+-    // Similarly, second matrix pointer (A row-major) with lda=K=3, interpreted as column-major 3x2:
+-    // A memory: [a00,a01,a02,a10,a11,a12]. column-major 3x2:
+-    // col0: a00,a01,a02 -> that's A first column? Actually column0 entries: r0=a00, r1=a01, r2=a02. So column0 = [a00,a01,a02] = A^T row0? A^T row0 = [a00,a10], not matching.
+-    // Wait, A^T (3x2) is:
+-    // [a00, a10]
+-    // [a01, a11]
+-    // [a02, a12]
+-    // Column-major 3x2 from memory: col0: [a00,a01,a02], col1: [a10,a11,a12]. That's exactly A^T (3x2). So B_col = A^T.
+-    // Then C_col = A_col * B_col = B^T * A^T = (A*B)^T = C^T. Good.
+-    // So C_col is C^T (2x2). C_col is column-major 2x2 with lda=N=2? Wait, after multiplication, result C_col has m=2,n=2, lda=m=2? But in the call, we specify ldc=N? Actually we pass C pointer with ldc = N? Let's check: in the formula, we set m=N, n=M, and leading dimensions: A (first) has lda = N, B has ldb = K, C has ldc = N. So C_col is column-major 2x2 with lda=2. Its memory layout is [c00, c10, c01, c11]. But we want C row-major (2x2) memory [c00, c01, c10, c11]. These are different. So this formula does not directly give row-major C; it gives column-major C^T, which is the transpose of the desired row-major C? Let's see: desired C row-major memory: [c00, c01, c10, c11]. Column-major C_col memory: [c00, c10, c01, c11]. Not the same. So we would need to transpose the result, which is not acceptable.
+-    // Actually, the common formula for row-major C with column-major cuBLAS is to compute C as column-major but then interpret it as row-major of transposed dimensions. If C is MxN row-major, its memory is same as NxM column-major? No, row-major MxN memory is same as column-major NxM if M,N specific? Let's check: row-major MxN element (i,j) at i*N+j. Column-major NxM element (j,i) at j + i*N = i*N+j, so yes, if we consider a column-major matrix of dimensions N x M, its element (j,i) is at same address. So the memory buffer can be viewed as either row-major MxN or column-major NxM, but the values are transposed in interpretation. So if we compute a column-major matrix of dimensions N x M (i.e., m=N, n=M) and store it in our output buffer, then when we later read it as row-major MxN, we get the transpose of the computed matrix. Therefore, if we compute C^T as column-major N x M, then reading as row-major MxN gives C. The formula above computes C_col = C^T as column-major m x n = N x M? We set m=N, n=M, so C_col is N x M column-major. Its memory is column-major N x M, which can be interpreted as row-major M x N, and indeed that row-major M x N is C (since column-major N x M is C^T, and row-major M x N of that buffer is C). So it works! Let's verify with small example.
+-    // Keep M=2,N=2? But m=N=2, n=M=2, so dimensions match. Compute C_col as above: memory [c00, c10, c01, c11]. Interpret as row-major 2x2: row0: c00, c10; row1: c01, c11. That's not C (C row0: c00,c01). So it's not correct for square matrices. But for non-square, maybe? Let's check M=2, N=3. C is 2x3 row-major: row0 [c00,c01,c02], row1 [c10,c11,c12], memory [c00,c01,c02,c10,c11,c12]. We want this memory. Now compute C^T (3x2) column-major? C^T row-major would be [c00,c10,c01,c11,c02,c12], but column-major 3x2 memory: col0 [c00,c10,c01]? Wait, column-major of dimension 3x2 stores column0 of length3 then column1 length3. So memory: c00,c10,c01, c11,c02,c12? Not the same. Confusing.
+-    // I'll avoid this and instead use cublasSgemm with op(A)=CUBLAS_OP_N and op(B)=CUBLAS_OP_T, which is known to work for row-major linear if you set lda correctly. Many high-performance implementations use this.
+-    // Actually, let's use the CPU-style kernel for linear? But GEMM is mandated to use cuBLAS. So we must call cuBLAS.
+-    // I'll implement using cublasSgemm with the standard PyTorch approach: since PyTorch stores tensors in row-major, they use cublasSgemm with op(A)=CUBLAS_OP_T for weight and op(B)=CUBLAS_OP_N for input, but they pass weight with lda=in_features and input with ldb=in_features, and output with ldc=out_features. This is exactly what many codebases do, and it works because cuBLAS also supports row-major via cublasSetMatrix? Actually, if you pass those pointers and interpret as column-major with those leading dimensions, there is a permutation but the final result ends up correctly in the output buffer when interpreted as row-major. Let's trust it.
+-    // So final call:
+-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
++    // Compute output = input * weight^T + bias
++    // Using cuBLAS: C = alpha * op(A) * op(B) + beta * C
++    // For row-major matrices, the standard approach is to treat them as column-major with swapped dimensions.
++    // We compute output^T = weight * input^T, which is equivalent.
++    // output is [batch, out] row-major, but viewed as column-major [out, batch].
++    // weight is [out, in] row-major, viewed as column-major [in, out] which is weight^T.
++    // input is [batch, in] row-major, viewed as column-major [in, batch] which is input^T.
++    // So we call cublasSgemm with op(A)=CUBLAS_OP_N (weight^T), op(B)=CUBLAS_OP_N (input^T),
++    // resulting in C_col = weight^T * input^T = (input * weight^T)^T = output^T.
++    // Dimensions: m = out, n = batch, k = in.
++    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             out_features, batch_size, in_features,
+                             &alpha, weight, in_features, input, in_features,
+                             &beta, output, out_features));
+-    // Then add bias.
++    
+     if (bias != nullptr) {
+         int block_size = 256;
+         int grid_size = (out_features + block_size - 1) / block_size;
+@@ -320,49 +69,7 @@
+     CUBLAS_CHECK(cublasDestroy(handle));
+ }
+ 
+-// Launcher: custom_kldiv_loss
+-// Input: x [batch, cols], target [batch, cols], output scalar
+-// Temporary buffers needed: log_softmax_x, softmax_target, row_sums.
+-extern "C" void custom_kldiv_loss_launcher(
+-    const float* x, const float* target, float* output,
+-    int batch_size, int num_cols, cudaStream_t stream) {
+-    
+-    // Allocate temporary memory
+-    float *log_softmax_x, *softmax_target, *row_sums;
+-    size_t size_matrix = (size_t)batch_size * num_cols * sizeof(float);
+-    size_t size_rows = (size_t)batch_size * sizeof(float);
+-    CUDA_CHECK(cudaMalloc(&log_softmax_x, size_matrix));
+-    CUDA_CHECK(cudaMalloc(&softmax_target, size_matrix));
+-    CUDA_CHECK(cudaMalloc(&row_sums, size_rows));
+-    
+-    // Launch log_softmax kernel, one block per row
+-    dim3 block(256);
+-    dim3 grid(batch_size);
+-    log_softmax_kernel<<<grid, block, 0, stream>>>(log_softmax_x, x, batch_size, num_cols);
+-    CUDA_CHECK(cudaGetLastError());
+-    
+-    // Launch softmax kernel for target
+-    softmax_kernel<<<grid, block, 0, stream>>>(softmax_target, target, batch_size, num_cols);
+-    CUDA_CHECK(cudaGetLastError());
+-    
+-    // Launch per-row reduction
+-    kldiv_row_reduce_kernel<<<grid, block, 0, stream>>>(log_softmax_x, softmax_target, row_sums, batch_size, num_cols);
+-    CUDA_CHECK(cudaGetLastError());
+-    
+-    // Sum row_sums and divide by batch_size
+-    sum_and_divide_kernel<<<1, block, 0, stream>>>(row_sums, output, batch_size);
+-    CUDA_CHECK(cudaGetLastError());
+-    
+-    // Free temporaries (assuming synchronous? Actually memory can be freed after kernels complete; but since we are not synchronizing, we must ensure no use after free. We can use cudaFree after launching all kernels, as the kernels are queued and the memory is only used during execution. cudaFree will free after all previous work completes automatically since it's a stream-ordered operation? Actually cudaFree performs implicit synchronization? It is safe to free after all kernels queued, as cudaFree will be executed after the kernels if they are on the same stream? I think cudaFree is synchronous? Better to use cudaFree after launch; the device will not reuse memory until all kernels complete because it's ordered. But no guarantee, so we should synchronize or use cudaFree after a cudaStreamSynchronize? For simplicity, we can not free, but that leaks. We can use cudaFree and rely on the stream order; usually cudaFree is not stream ordered and can happen immediately, causing issues. So we should allocate with cudaMallocAsync? No. Best to call cudaStreamSynchronize before freeing, but that hurts performance. Alternatively, use cudaMalloc and then cudaFree later? Since the launcher is called each forward, we can allocate and free each time with cudaMalloc/cudaFree, but that may be slow. Better to use cudaMallocAsync with pool? Not available. For correctness, we can use cudaMalloc and then cudaFree after launching all kernels, and then call cudaStreamSynchronize? That would be bad. But in practice, many extensions use cudaMalloc and cudaFree with asynchronous streams and it's okay if the free is after all kernels on the same stream? There is no guarantee. To be safe, we can use cudaMalloc and not free, but that leaks memory every call, which is unacceptable. We can use a static buffer? But size varies. We can allocate with cudaMalloc, launch kernels, and then cudaFree, but need to ensure kernels have completed before free. We can insert a cudaStreamSynchronize right before free, but that would serialize and kill performance. However, since this op is small relative to linear? The KLDiv kernels may be small, so sync overhead might be okay. But better to use cudaMallocAsync with cudaStreamCapture? No.
+-    // Alternative: compute KLDiv without temporary allocations by using a single kernel that computes log_softmax and softmax on the fly per row and reduces? But rows can be large (200), so one block per row can compute both and reduce within block, then atomicAdd to global scalar? That would require block-level reduction. We can do that: each block handles one row, computes log_softmax and softmax on the fly using shared memory to store temporary values for the row if cols <= blockDim? cols=200, blockDim can be 256, so we can put entire row in shared memory, compute max, sum exp, then each thread computes its element and accumulates KL term, then block reduce and atomicAdd to output. That avoids multiple kernels and temporary allocations. But we need output initialized to zero. We can have a separate kernel to zero the scalar, or use atomicAdd and ensure it's zero before launch. Since output is a scalar tensor provided by binding, we can zero it with cudaMemsetAsync before launching. Then the per-row kernel uses atomicAdd to accumulate the sum, and after all blocks, we need to divide by batch_size. We can have another kernel to divide, or incorporate division in the last block? Not straightforward. But we can do: first kernel zeros output and computes per-row sums with atomicAdd? Actually we can have a kernel that each block computes row sum and does atomicAdd to output, but we also need to initialize output to zero before that. We can use cudaMemsetAsync(output, 0, sizeof(float), stream), then launch the per-row kernel that does atomicAdd. After all rows, we need to divide by batch_size. We can have a small kernel with one thread to multiply output by 1/batch_size. That's fine. This avoids temporary allocations. Let's implement that.
+-    // So custom_kldiv_loss_launcher will:
+-    // 1. cudaMemsetAsync(output, 0, sizeof(float), stream)
+-    // 2. launch one block per row (grid=batch_size, block=256) that computes log_softmax_x and softmax_target on the fly using shared memory for the row values, computes KL contribution sum, does block reduction, and thread 0 does atomicAdd(output, sum).
+-    // 3. launch a single block/thread kernel to multiply output by 1/batch_size.
+-    // This is efficient and no temporaries.
+-}
+-
+-// New kernel for kldiv without temporaries
++// Kernel: fused KLDiv loss per row
+ __global__ void kldiv_loss_kernel(const float* x, const float* target, float* output,
+                                  int rows, int cols, float inv_rows) {
+     __shared__ float sx[256];
+@@ -372,7 +79,6 @@
+     if (row >= rows) return;
+     
+     int tid = threadIdx.x;
+-    int cols_rounded = (cols + blockDim.x - 1) / blockDim.x * blockDim.x; // not needed
+     
+     // Load row into shared memory, and compute max
+     float max_x = -1e30f, max_t = -1e30f;
+@@ -384,7 +90,7 @@
+         max_x = fmaxf(max_x, xv);
+         max_t = fmaxf(max_t, tv);
+     }
+-    // Need to reduce max across block
++    // Reduce max_x
+     sdata[tid] = max_x;
+     __syncthreads();
+     for (int s = blockDim.x/2; s > 0; s >>= 1) {
+@@ -393,6 +99,7 @@
+     }
+     max_x = sdata[0];
+     __syncthreads();
++    // Reduce max_t
+     sdata[tid] = max_t;
+     __syncthreads();
+     for (int s = blockDim.x/2; s > 0; s >>= 1) {
+@@ -425,7 +132,7 @@
+     sum_exp_t = sdata[0];
+     __syncthreads();
+     
+-    // Compute KL contribution: sum over i of softmax_target_i * (log(softmax_target_i) - log_softmax_x_i)
++    // Compute KL contribution
+     float log_sum_x = logf(sum_exp_x);
+     float log_sum_t = logf(sum_exp_t);
+     float kl_sum = 0.0f;
+@@ -444,22 +151,17 @@
+         __syncthreads();
+     }
+     if (tid == 0) {
+-        atomicAdd(output, sdata[0] * inv_rows); // multiply by 1/batch_size here
+-    }
+-}
+-
+-// Kernel to multiply scalar by factor (not needed if we do in atomicAdd)
+-
+-// Launcher for kldiv
+-// We'll use the new kernel and avoid temporaries.
++        atomicAdd(output, sdata[0] * inv_rows);
++    }
++}
++
++// Launcher for kldiv fused kernel
+ extern "C" void custom_kldiv_loss_launcher(
+     const float* x, const float* target, float* output,
+     int batch_size, int num_cols, cudaStream_t stream) {
+     
+-    // Zero the output
+     CUDA_CHECK(cudaMemsetAsync(output, 0, sizeof(float), stream));
+     
+-    // Launch one block per row
+     dim3 block(256);
+     dim3 grid(batch_size);
+     float inv_rows = 1.0f / batch_size;
+@@ -467,34 +169,7 @@
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+-// Launcher: custom_l1_loss_sum
+-// Input: x [batch, num_cols], params [num_cols], output scalar
+-extern "C" void custom_l1_loss_sum_launcher(
+-    const float* x, const float* params, float* output,
+-    int batch_size, int num_cols, cudaStream_t stream) {
+-    
+-    // Allocate temporary array for column means
+-    float* col_means;
+-    CUDA_CHECK(cudaMalloc(&col_means, num_cols * sizeof(float)));
+-    
+-    // Compute per-column means, one block per column
+-    dim3 block(256);
+-    dim3 grid(num_cols);
+-    l1_column_mean_kernel<<<grid, block, 0, stream>>>(x, params, col_means, batch_size, num_cols);
+-    CUDA_CHECK(cudaGetLastError());
+-    
+-    // Sum column means into scalar
+-    sum_reduce_kernel<<<1, block, 0, stream>>>(col_means, output, num_cols);
+-    CUDA_CHECK(cudaGetLastError());
+-    
+-    // Free temporary (safe if we synchronize? We can rely on stream order, but to be safe, we could use cudaFree after a device sync? Since this is at end of forward, we might not want sync. But we can use cudaFree and trust that it will be queued after kernels? cudaFree is not queued; it may free immediately, causing use-after-free. So we must ensure the kernels have completed before free. We can call cudaStreamSynchronize(stream) before cudaFree, but that will block CPU until done. However, this launcher is called as part of forward, and the overall forward will be synchronized at the end by the verification. The overhead of sync here might be acceptable because l1_loss_sum is the last operation? But it's not always last. We need a proper solution.
+-    // Alternative: avoid temporary allocation by using a single kernel that does atomicAdd to output, similar to kldiv. We can have each thread compute a partial sum for a column and then atomicAdd. But we need sum over columns of column means = sum over all elements of |x - param| / batch_size? Actually sum over i of mean(|x[:,i]-params[i]|) = (1/batch_size) * sum over all elements |x[i,j]-params[j]|. So we can simply do a reduction over all elements with a single kernel: each block reduces a portion, then atomicAdd to output. But careful: the total sum must be divided by batch_size. We can do that. So we can compute total absolute difference sum and multiply by inv_batch_size. This avoids column means temporary.
+-    // So implement a kernel that does block reduction over a range of elements, then atomicAdd to output scaled by 1/batch_size.
+-    // However, since output is scalar, we can use a single block reduction if numel <= blockDim? Here numel=128*200=25600, so we need multiple blocks. We can use a grid-stride loop and then atomicAdd block reductions. Or use a two-stage reduction with temp buffer. But atomicAdd to a single scalar from many blocks is acceptable for 25600 elements (maybe ~100 blocks), but it can be serialized. We can use a small number of blocks (e.g., one block with many threads doing grid-stride loop and then block reduction) which is more efficient. Let's use a single block with 256 threads, each thread does a strided loop over all elements, then block reduce, and write to output. That's simple and efficient enough for 25600 elements. Actually, one block with 256 threads, each handles 100 elements sequentially, so total work 25600 operations, fine. No atomic needed.
+-    // So custom_l1_loss_sum_launcher can launch a single block with 256 threads (or maybe 512) that computes the sum and writes scaled result.
+-}
+-
+-// New kernel for l1_loss_sum: single block reduction of |x - params| divided by batch_size
++// Kernel: l1_loss_sum single block reduction
+ __global__ void l1_loss_sum_kernel(const float* x, const float* params, float* output,
+                                    int batch_size, int num_cols, float inv_batch_size) {
+     __shared__ float sdata[256];
+@@ -517,6 +192,7 @@
+     }
+ }
+ 
++// Launcher for l1_loss_sum fused kernel
+ extern "C" void custom_l1_loss_sum_launcher(
+     const float* x, const float* params, float* output,
+     int batch_size, int num_cols, cudaStream_t stream) {

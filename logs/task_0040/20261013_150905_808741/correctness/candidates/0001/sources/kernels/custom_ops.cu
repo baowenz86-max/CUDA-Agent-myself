@@ -1,0 +1,301 @@
+// CUDA kernels and launchers for custom ops
+#include <cuda_runtime.h>
+#include <cudnn.h>
+#include <cublas_v2.h>
+#include <cstdint>
+#include <stdexcept>
+#include <iostream>
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err)); \
+    } \
+} while(0)
+
+#define CUDNN_CHECK(call) do { \
+    cudnnStatus_t status = call; \
+    if (status != CUDNN_STATUS_SUCCESS) { \
+        throw std::runtime_error(std::string("cuDNN error: ") + cudnnGetErrorString(status)); \
+    } \
+} while(0)
+
+#define CUBLAS_CHECK(call) do { \
+    cublasStatus_t status = call; \
+    if (status != CUBLAS_STATUS_SUCCESS) { \
+        throw std::runtime_error("cuBLAS error"); \
+    } \
+} while(0)
+
+// -----------------------------------------------------------------------------
+// Bias add kernel: y[b, c, i] = x[b, c, i] + bias[c]
+// input: [B, C, L], bias: [C] or [C,1] (we use bias_data as contiguous C values)
+// Output shape same as input.
+// Supports arbitrary strides for input/output by passing strides.
+// For simplicity, we assume contiguous, but we handle strides by computing index.
+__global__ void bias_add_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int B, int C, int L,
+    long long in_stride_b, long long in_stride_c, long long in_stride_l,
+    long long out_stride_b, long long out_stride_c, long long out_stride_l)
+{
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)B * C * L;
+    if (idx >= total) return;
+    // Compute b, c, l from linear index
+    int l = idx % L;
+    long long tmp = idx / L;
+    int c = tmp % C;
+    int b = tmp / C;
+    output[b * out_stride_b + c * out_stride_c + l * out_stride_l] =
+        input[b * in_stride_b + c * in_stride_c + l * in_stride_l] + bias[c];
+}
+
+// -----------------------------------------------------------------------------
+// Roll kernel: shifts=1, dims=2 (last dim) cyclic shift.
+// Output[b,c,l] = Input[b,c,(l - shift + L) % L] for shift=1
+__global__ void roll_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int B, int C, int L,
+    long long in_stride_b, long long in_stride_c, long long in_stride_l,
+    long long out_stride_b, long long out_stride_c, long long out_stride_l)
+{
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)B * C * L;
+    if (idx >= total) return;
+    int l = idx % L;
+    long long tmp = idx / L;
+    int c = tmp % C;
+    int b = tmp / C;
+    int src_l = (l - 1 + L) % L;  // shift=1 positive means right shift? Torch.roll with shifts=1 shifts to the right. Actually torch.roll(x, shifts=1) shifts elements to the right? Let's verify: roll([1,2,3], shifts=1) => [3,1,2]. So output[i] = input[(i - shift + n) % n]. So source index = (i - shift + n) % n. Yes.
+    output[b * out_stride_b + c * out_stride_c + l * out_stride_l] =
+        input[b * in_stride_b + c * in_stride_c + src_l * in_stride_l];
+}
+
+// -----------------------------------------------------------------------------
+// Launcher for conv_transpose1d using cuDNN
+// input: [B, C_in, L_in], weight: [C_in, C_out, K], bias: optional [C_out]
+// stride, padding, output_padding, dilation=1
+// Output: [B, C_out, L_out]
+extern "C" void conv_transpose1d_forward_launcher(
+    const float* input,   // [B, C_in, L_in]
+    const float* weight,  // [C_in, C_out, K]
+    const float* bias,    // [C_out] or nullptr
+    float* output,        // [B, C_out, L_out]
+    int B, int C_in, int L_in, int C_out, int K,
+    int stride, int padding, int output_padding,
+    cudaStream_t stream)
+{
+    // Compute output length
+    int L_out = (L_in - 1) * stride - 2 * padding + K + output_padding;
+
+    // Create cuDNN handle
+    cudnnHandle_t cudnn;
+    CUDNN_CHECK(cudnnCreate(&cudnn));
+    CUDNN_CHECK(cudnnSetStream(cudnn, stream));
+
+    // Define tensor descriptors for 1D convolution as 2D with height=1? cuDNN supports 1D convolution via CUDNN_TENSOR_NCHW with one dimension = 1.
+    // We'll treat as NCHW with H=1, W=L_in (spatial dimension).
+    cudnnTensorDescriptor_t x_desc, y_desc;
+    cudnnFilterDescriptor_t w_desc;
+    cudnnConvolutionDescriptor_t conv_desc;
+
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&x_desc));
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&y_desc));
+    CUDNN_CHECK(cudnnCreateFilterDescriptor(&w_desc));
+    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&conv_desc));
+
+    // Set input tensor: NCHW with N=B, C=C_in, H=1, W=L_in
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                           B, C_in, 1, L_in));
+    // Set output tensor: NCHW with N=B, C=C_out, H=1, W=L_out
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                           B, C_out, 1, L_out));
+    // Set filter descriptor: weight is [C_in, C_out, K] -> in cuDNN filter is [K, C_in, C_out]? Actually cuDNN filter for conv is [K, C_in, C_out] for depthwise? Standard NCHW filter is [C_out, C_in, H, W]. For 1D conv, filter shape is [C_out, C_in, 1, K].
+    // But PyTorch weight for ConvTranspose1d is [C_in, C_out, K]. We need to handle transposed convolution. cuDNN has cudnnConvolutionBackwardData which is the transposed convolution. We use that.
+    // For cudnnConvolutionBackwardData, the filter descriptor still describes the forward convolution filter (C_out, C_in, 1, K). So we set w_desc as [C_out, C_in, 1, K].
+    CUDNN_CHECK(cudnnSetFilter4dDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+                                           C_out, C_in, 1, K));
+
+    // Convolution descriptor for transposed convolution (backward data). Need padding, stride, dilation, output_padding.
+    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(conv_desc,
+                                                padding, padding, // vertical, horizontal padding (we use same)
+                                                stride, stride,   // vertical, horizontal stride
+                                                1, 1,             // dilation
+                                                CUDNN_CROSS_CORRELATION, // or CUDNN_CONVOLUTION? PyTorch uses cross-correlation.
+                                                CUDNN_DATA_FLOAT));
+    // For output_padding, we need to set something? output_padding is handled by adjusting the output size? In cuDNN backward data, output_padding is not directly supported; we may need to increase the output dimension by output_padding and then slice. But cuDNN's backward data computes output size based on formula without output_padding. We can compute output size as L_out_without = (L_in-1)*stride - 2*padding + K, then allocate temporary output with that size, then copy to the final output starting from index 0, and if output_padding > 0, the extra elements are zero? Actually PyTorch ConvTranspose1d with output_padding adds extra rows at the end of the output and they are filled with zeros (since no input contributes to them). So we can compute the backward data into a temporary buffer of size L_out_without, then copy it to the output with padding at the end zeroed.
+    // But easier: use cudnnConvolutionBackwardData with an output descriptor that includes output_padding by setting the filter stride? No. We'll do manual padding.
+    // Let's allocate temporary output for backward data (without output_padding) and then copy.
+    int L_out_no_extra = (L_in - 1) * stride - 2 * padding + K;
+    float* temp_output = nullptr;
+    if (L_out_no_extra > 0) {
+        CUDA_CHECK(cudaMalloc(&temp_output, (size_t)B * C_out * L_out_no_extra * sizeof(float)));
+        // Set temp tensor descriptor
+        cudnnTensorDescriptor_t temp_y_desc;
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&temp_y_desc));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(temp_y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                               B, C_out, 1, L_out_no_extra));
+        // Determine forward conv algorithm for backward data (or use default)
+        cudnnConvolutionFwdAlgo_t algo;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm(cudnn, w_desc, x_desc, conv_desc, temp_y_desc,
+                                                             CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST, 0, &algo));
+        // Allocate workspace
+        size_t workspace_size = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(cudnn, w_desc, x_desc, conv_desc, temp_y_desc, algo, &workspace_size));
+        void* workspace = nullptr;
+        if (workspace_size > 0) {
+            CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
+        }
+        float alpha = 1.0f, beta = 0.0f;
+        CUDNN_CHECK(cudnnConvolutionBackwardData(cudnn, &alpha, w_desc, weight,
+                                                 x_desc, input, conv_desc, algo,
+                                                 workspace, workspace_size, &beta, temp_y_desc, temp_output));
+        if (workspace) CUDA_CHECK(cudaFree(workspace));
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(temp_y_desc));
+        // Now copy temp_output to output with zero padding for output_padding extra length at the end.
+        // We need to copy B*C_out*L_out_no_extra elements.
+        if (L_out_no_extra > 0) {
+            cudaMemcpyAsync(output, temp_output, (size_t)B * C_out * L_out_no_extra * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            // Set extra elements (if any) to zero
+            int extra = L_out - L_out_no_extra; // equals output_padding
+            if (extra > 0) {
+                // fill the tail with zeros
+                cudaMemsetAsync(output + (size_t)B * C_out * L_out_no_extra, 0, (size_t)B * C_out * extra * sizeof(float), stream);
+            }
+        }
+        CUDA_CHECK(cudaFree(temp_output));
+    } else {
+        // If L_out_no_extra <= 0, backward data not possible; handle as all zero? But our case L_out_no_extra = 4095, L_out=4096, so >0.
+        // For safety, throw error.
+        throw std::runtime_error("Invalid output length for conv_transpose1d");
+    }
+
+    // Add bias if provided
+    if (bias != nullptr) {
+        // Launch bias add kernel on output (contiguous)
+        // We need a simple kernel: output[b,c,l] += bias[c]
+        int total = B * C_out * L_out;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        // Assume contiguous for output
+        bias_add_kernel<<<blocks, threads, 0, stream>>>(output, bias, output,
+                                                       B, C_out, L_out,
+                                                       (long long)C_out * L_out, L_out, 1,
+                                                       (long long)C_out * L_out, L_out, 1);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(x_desc));
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(y_desc));
+    CUDNN_CHECK(cudnnDestroyFilterDescriptor(w_desc));
+    CUDNN_CHECK(cudnnDestroyConvolutionDescriptor(conv_desc));
+    CUDNN_CHECK(cudnnDestroy(cudnn));
+}
+
+// -----------------------------------------------------------------------------
+// Launcher for bias_add_forward
+// input: [B, C, L], bias: [C, 1] or [C]
+// output: same shape as input
+// Supports non-contiguous? We handle strides.
+extern "C" void bias_add_forward_launcher(
+    const float* input,
+    const float* bias,
+    float* output,
+    int B, int C, int L,
+    long long in_stride_b, long long in_stride_c, long long in_stride_l,
+    long long out_stride_b, long long out_stride_c, long long out_stride_l,
+    cudaStream_t stream)
+{
+    long long total = (long long)B * C * L;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    bias_add_kernel<<<blocks, threads, 0, stream>>>(
+        input, bias, output, B, C, L,
+        in_stride_b, in_stride_c, in_stride_l,
+        out_stride_b, out_stride_c, out_stride_l);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// -----------------------------------------------------------------------------
+// Launcher for roll_forward
+// input: [B, C, L], output: same shape
+// shift=1, dim=2 (last)
+extern "C" void roll_forward_launcher(
+    const float* input,
+    float* output,
+    int B, int C, int L,
+    long long in_stride_b, long long in_stride_c, long long in_stride_l,
+    long long out_stride_b, long long out_stride_c, long long out_stride_l,
+    cudaStream_t stream)
+{
+    long long total = (long long)B * C * L;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    roll_kernel<<<blocks, threads, 0, stream>>>(
+        input, output, B, C, L,
+        in_stride_b, in_stride_c, in_stride_l,
+        out_stride_b, out_stride_c, out_stride_l);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// -----------------------------------------------------------------------------
+// Launcher for linear_forward using cuBLAS
+// input: [M, K] (M = batch, K = num_features)
+// weight: [N, K]
+// bias: [N] or nullptr
+// output: [M, N]
+// We compute output = input * weight^T + bias
+// Using cublasSgemm with opA=CUBLAS_OP_N, opB=CUBLAS_OP_T
+extern "C" void linear_forward_launcher(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int M, int K, int N,
+    cudaStream_t stream)
+{
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    // C = alpha * A * B + beta * C, with A = input (M x K), B = weight^T (K x N), C = output (M x N)
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                            M, N, K,
+                            &alpha,
+                            input, K,   // lda = K (row-major, but cublas assumes column-major; we can instead use transpose trick)
+                            weight, K,  // ldb = K, since weight is N x K stored row-major, but we want weight^T, so opB=OP_T with ldb=K works.
+                            &beta,
+                            output, N)); // ldc = N
+    // Note: cuBLAS expects column-major, but we pass row-major with transpose, which effectively computes correct.
+    // Add bias if provided
+    if (bias != nullptr) {
+        // Launch a simple kernel to add bias to each row of output
+        // We'll use a grid-stride loop over M*N elements, adding bias[col]
+        int total = M * N;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        // We can reuse bias_add_kernel with C=1 and L=N? Actually output shape [M, N], we want per element add bias[col].
+        // We'll create a simple inline kernel or just call a generic bias_row_kernel.
+        // For simplicity, we define a separate kernel or use a lambda? Use a small kernel defined below.
+        extern __global__ void add_bias_matrix_kernel(float* out, const float* bias, int M, int N);
+        // Actually define it at global scope earlier.
+        add_bias_matrix_kernel<<<blocks, threads, 0, stream>>>(output, bias, M, N);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUBLAS_CHECK(cublasDestroy(handle));
+}
+
+// Helper kernel to add bias to matrix rows (output[m,n] += bias[n])
+__global__ void add_bias_matrix_kernel(float* out, const float* bias, int M, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    int col = idx % N;
+    out[idx] += bias[col];
+}

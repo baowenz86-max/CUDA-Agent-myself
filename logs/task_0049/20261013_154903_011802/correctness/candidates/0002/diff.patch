@@ -1,0 +1,380 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -51,9 +51,62 @@
+     }
+ }
+ 
++// Custom CUDA kernel for 1D transposed convolution.
++// Input x: [batch, in_channels, length_in], with arbitrary strides.
++// Weight: [in_channels, out_channels, kernel_size], contiguous.
++// Output y: [batch, out_channels, length_out], contiguous.
++// Parameters: stride, padding, output_padding as in PyTorch.
++__global__ void conv_transpose1d_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int length_in,
++    int length_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    int in_batch_stride,
++    int in_channel_stride,
++    int in_inner_stride)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_elements = batch * out_channels * length_out;
++    if (idx >= total_elements) return;
++
++    // Decompose linear index into (b, oc, ol)
++    int b = idx / (out_channels * length_out);
++    int rem = idx - b * out_channels * length_out;
++    int oc = rem / length_out;
++    int ol = rem - oc * length_out;
++
++    float sum = 0.0f;
++
++    // Iterate over input channels and kernel positions
++    for (int ic = 0; ic < in_channels; ++ic) {
++        // Input pointer offset for (b, ic, 0)
++        const float* input_base = input + b * in_batch_stride + ic * in_channel_stride;
++        // Weight pointer offset for (ic, oc, 0)
++        const float* weight_base = weight + (ic * out_channels + oc) * kernel_size;
++
++        for (int k = 0; k < kernel_size; ++k) {
++            // Compute input index: il = (ol + padding - k) / stride, if divisible and in range
++            int numerator = ol + padding - k;
++            if (numerator < 0 || numerator % stride != 0) continue;
++            int il = numerator / stride;
++            if (il >= 0 && il < length_in) {
++                sum += input_base[il * in_inner_stride] * weight_base[k];
++            }
++        }
++    }
++
++    output[idx] = sum;
++}
++
+ // Launcher for bias_add_forward.
+-// Input tensor x: shape [batch, channels, length] with arbitrary strides.
+-// Output tensor out: contiguous same shape.
+ extern "C" void bias_add_forward_launcher(
+     float* out,
+     const float* in,
+@@ -81,8 +134,6 @@
+ }
+ 
+ // Launcher for round_elementwise_forward.
+-// Input tensor x: arbitrary shape and strides.
+-// Output tensor out: same shape, contiguous.
+ extern "C" void round_elementwise_forward_launcher(
+     float* out,
+     const float* in,
+@@ -102,3 +153,37 @@
+         // Handle as needed by binding layer.
+     }
+ }
++
++// Launcher for conv_transpose1d_forward.
++extern "C" void conv_transpose1d_forward_launcher(
++    const float* input,
++    const float* weight,
++    float* output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int length_in,
++    int length_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    int in_batch_stride,
++    int in_channel_stride,
++    int in_inner_stride,
++    cudaStream_t stream)
++{
++    int total_elements = batch * out_channels * length_out;
++    int block_size = 256;
++    int grid_size = (total_elements + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    conv_transpose1d_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, weight, output,
++        batch, in_channels, out_channels, length_in, length_out,
++        kernel_size, stride, padding, output_padding,
++        in_batch_stride, in_channel_stride, in_inner_stride);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Leave error checking to binding layer.
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -3,8 +3,6 @@
+ 
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+-#include <ATen/cuda/CUDAContext.h>
+ 
+ #include "../binding_registry.h"
+ 
+@@ -30,31 +28,23 @@
+     int total_elements,
+     cudaStream_t stream);
+ 
+-// Helper to check cuDNN status
+-#define CHECK_CUDNN(expr)                                                   \
+-  do {                                                                      \
+-    cudnnStatus_t status = (expr);                                          \
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS,                             \
+-                "cuDNN error at ", __FILE__, ":", __LINE__,                \
+-                ": ", cudnnGetErrorString(status));                         \
+-  } while (0)
+-
+-// Helper to check CUDA status
+-#define CHECK_CUDA(expr)                                                    \
+-  do {                                                                      \
+-    cudaError_t status = (expr);                                            \
+-    TORCH_CHECK(status == cudaSuccess,                                      \
+-                "CUDA error at ", __FILE__, ":", __LINE__,                  \
+-                ": ", cudaGetErrorString(status));                          \
+-  } while (0)
+-
+-static cudnnHandle_t getCudnnHandle() {
+-    static cudnnHandle_t handle = nullptr;
+-    if (handle == nullptr) {
+-        CHECK_CUDNN(cudnnCreate(&handle));
+-    }
+-    return handle;
+-}
++extern "C" void conv_transpose1d_forward_launcher(
++    const float* input,
++    const float* weight,
++    float* output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int length_in,
++    int length_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    int in_batch_stride,
++    int in_channel_stride,
++    int in_inner_stride,
++    cudaStream_t stream);
+ 
+ // ============ ConvTranspose1d forward ============
+ torch::Tensor conv_transpose1d_forward(
+@@ -91,159 +81,37 @@
+     // Allocate output tensor (contiguous, same device and dtype as input)
+     auto out = torch::empty({batch, out_channels, length_out}, x.options());
+ 
+-    // Ensure input and weight are contiguous for cuDNN
+-    auto x_contig = x.contiguous();
++    // Ensure weight is contiguous
+     auto weight_contig = weight.contiguous();
+ 
+-    cudnnHandle_t handle = getCudnnHandle();
++    // Get strides of x (may be non-contiguous)
++    int64_t in_batch_stride = x.stride(0);
++    int64_t in_channel_stride = x.stride(1);
++    int64_t in_inner_stride = x.stride(2);
++
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    CHECK_CUDNN(cudnnSetStream(handle, stream));
+-
+-    // Create tensor descriptors
+-    cudnnTensorDescriptor_t x_desc, y_desc;
+-    cudnnFilterDescriptor_t w_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&x_desc));
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&y_desc));
+-    CHECK_CUDNN(cudnnCreateFilterDescriptor(&w_desc));
+-    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+-
+-    // Set x descriptor: shape [batch, in_channels, length_in], contiguous
+-    int x_dims[3] = {(int)batch, (int)in_channels, (int)length_in};
+-    int x_strides[3] = {(int)(in_channels * length_in), (int)length_in, 1};
+-    CHECK_CUDNN(cudnnSetTensorNdDescriptor(x_desc, CUDNN_DATA_FLOAT, 3, x_dims, x_strides));
+-
+-    // Set y descriptor: shape [batch, out_channels, length_out], contiguous
+-    int y_dims[3] = {(int)batch, (int)out_channels, (int)length_out};
+-    int y_strides[3] = {(int)(out_channels * length_out), (int)length_out, 1};
+-    CHECK_CUDNN(cudnnSetTensorNdDescriptor(y_desc, CUDNN_DATA_FLOAT, 3, y_dims, y_strides));
+-
+-    // Set filter descriptor: shape [in_channels, out_channels, kernel_size]
+-    int w_dims[3] = {(int)in_channels, (int)out_channels, (int)kernel_size};
+-    CHECK_CUDNN(cudnnSetFilterNdDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 3, w_dims));
+-
+-    // Set convolution descriptor for transposed convolution
+-    // For cuDNN, transposed convolution is performed by swapping input/output and using convolution backward data
+-    // Here we use cudnnSetConvolutionNdDescriptor with forward mode but swap descriptors as per cuDNN docs.
+-    // Simpler: use cudnnConvolutionBackwardData with appropriate descriptor.
+-    int padA[3] = {(int)padding, 0, 0};
+-    int strideA[3] = {(int)stride, 1, 1};
+-    int dilationA[3] = {1, 1, 1};
+-    CHECK_CUDNN(cudnnSetConvolutionNdDescriptor(
+-        conv_desc,
+-        3,
+-        padA,
+-        strideA,
+-        dilationA,
+-        CUDNN_CONVOLUTION,
+-        CUDNN_DATA_FLOAT));
+-
+-    // Determine algorithm
+-    cudnnConvolutionBwdDataAlgo_t algo;
+-    CHECK_CUDNN(cudnnGetConvolutionBackwardDataAlgorithm(
+-        handle,
+-        w_desc,
+-        y_desc,
+-        conv_desc,
+-        x_desc,
+-        CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST,
+-        0,
+-        &algo));
+-
+-    // Allocate workspace
+-    size_t workspace_size = 0;
+-    CHECK_CUDNN(cudnnGetConvolutionBackwardDataWorkspaceSize(
+-        handle,
+-        w_desc,
+-        y_desc,
+-        conv_desc,
+-        x_desc,
+-        algo,
+-        &workspace_size));
+-
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        CHECK_CUDA(cudaMalloc(&workspace, workspace_size));
+-    }
+-
+-    float alpha = 1.0f, beta = 0.0f;
+-
+-    // Perform backward data convolution: output = conv_transpose(input)
+-    // In cuDNN, backward data takes dy as input and produce dx as output.
+-    // For transposed conv: input x is like dy (shape batch, out_channels, length_out) but actually we need mapping.
+-    // Standard method: use cudnnConvolutionBackwardData with descriptors:
+-    //   dx_desc = x_desc (input to transposed conv, shape [batch, in_channels, length_in])
+-    //   dy_desc = y_desc (output of transposed conv, shape [batch, out_channels, length_out])
+-    //   w_desc = weight, conv_desc with stride, padding
+-    // Then call cudnnConvolutionBackwardData(handle, alpha, w_desc, weight, dy_desc, dy, conv_desc, algo, workspace, size, beta, dx_desc, dx)
+-    CHECK_CUDNN(cudnnConvolutionBackwardData(
+-        handle,
+-        &alpha,
+-        w_desc,
++
++    conv_transpose1d_forward_launcher(
++        x.data_ptr<float>(),
+         weight_contig.data_ptr<float>(),
+-        y_desc,
+-        out.data_ptr<float>(), // dy (input to conv_transpose? no, output of conv_transpose)
+-        conv_desc,
+-        algo,
+-        workspace,
+-        workspace_size,
+-        &beta,
+-        x_desc,
+-        x_contig.data_ptr<float>(), // dx (output of transposed conv)
+-    ));
+-
+-    // Free workspace
+-    if (workspace_size > 0) {
+-        CHECK_CUDA(cudaFree(workspace));
+-    }
+-
+-    // Clean up descriptors
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(x_desc));
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(y_desc));
+-    CHECK_CUDNN(cudnnDestroyFilterDescriptor(w_desc));
+-    CHECK_CUDNN(cudnnDestroyConvolutionDescriptor(conv_desc));
+-
+-    // Handle output_padding: cuDNN does not directly support output_padding.
+-    // We need to manually add extra zeros at the end? Actually output_padding adds extra size at the end of the output.
+-    // We handled it by computing length_out with output_padding, but cuDNN's computed output length might be shorter.
+-    // Need to correct: compute without output_padding then pad, or adjust descriptors.
+-    // Better: compute output length without output_padding, then pad the tensor.
+-    // But we already allocated out with length_out (including output_padding) and passed y_desc with that size.
+-    // cuDNN might write only length_out_without_output_padding and leave rest undefined.
+-    // We'll zero out the extra part separately.
+-    int64_t length_out_no_pad = (length_in - 1) * stride - 2 * padding + kernel_size;
+-    if (output_padding > 0 && length_out > length_out_no_pad) {
+-        // Zero out the extra elements at the end of each sequence
+-        // Use CUDA memset or a simple kernel? For simplicity, we can use torch::zeros but that is a torch op.
+-        // But torch::zeros is just allocation, not computation? We can use cudaMemsetAsync on the extra region.
+-        // The extra region is non-contiguous per channel, so we need to zero per channel.
+-        // We'll later launch a small kernel or use cudaMemset2D? Since this is a binding file, no custom kernels allowed.
+-        // Better: allocate out with exact cuDNN output shape and then pad by concatenating zeros via torch.cat? Not allowed.
+-        // The simplest: allocate out with shape without output_padding, then create a larger tensor and copy the first part.
+-        // But that would require torch.cat or padding.
+-        // However, in the current design, we set length_out including output_padding and pass y_desc with that shape.
+-        // cuDNN likely expects dy to have same spatial dimensions as its computed output; passing larger may cause issues or crash.
+-        // So we should compute without output_padding and then handle output_padding separately.
+-        // Let's redo: allocate out_tmp of shape [batch, out_channels, length_out_without_padding], run cuDNN, then pad to length_out.
+-        // But padding requires a custom kernel or using cudaMemset on the extra region.
+-        // Since we cannot define kernels in .cpp, we can use cudaMemsetAsync for the extra region, but the extra region is not contiguous across channels.
+-        // We can loop over batch and channels and copy each channel's data and zero the extra elements using cudaMemcpyAsync and cudaMemsetAsync.
+-        // That is acceptable and not a torch op.
+-        // But maybe simpler: use torch::constant_pad_nd? But that might be considered a torch op and not allowed.
+-        // The rule says "NO torch operators in C++". So we must avoid torch:: functions that compute.
+-        // However, torch::empty and torch::zeros are allocation only, but torch::zeros may launch a kernel.
+-        // Better to use cudaMemsetAsync on the allocated tensor's memory.
+-        // We'll allocate out of the desired size (with output_padding) and then zero the extra region.
+-        // For cuDNN, we'll create a temporary output tensor without padding, then copy data and zero extra.
+-        // Actually, we can compute length_out_without_padding and allocate temp, run cuDNN, then allocate final out, copy the valid part, and zero the extra.
+-        // Let's implement that to be safe.
+-    }
+-
+-    // For simplicity, we assume output_padding is 0 for now because task has output_padding=1 but we need to support it.
+-    // We'll implement proper handling.
+-
+-    // Return output
++        out.data_ptr<float>(),
++        (int)batch,
++        (int)in_channels,
++        (int)out_channels,
++        (int)length_in,
++        (int)length_out,
++        (int)kernel_size,
++        (int)stride,
++        (int)padding,
++        (int)output_padding,
++        (int)in_batch_stride,
++        (int)in_channel_stride,
++        (int)in_inner_stride,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "conv_transpose1d_forward kernel launch failed: ", cudaGetErrorString(err));
++
+     return out;
+ }
+ 
+@@ -273,7 +141,6 @@
+     int64_t inner_stride = x.stride(2);
+ 
+     int total_elements = batch * channels * length;
+-    int ndims = 3; // for round kernel, not used here
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     bias_add_forward_launcher(
+@@ -319,8 +186,8 @@
+     int* strides_dev = nullptr;
+     cudaMalloc(&shape_dev, ndims * sizeof(int));
+     cudaMalloc(&strides_dev, ndims * sizeof(int));
+-    cudaMemcpyAsync(shape_dev, shape_cpu.data(), ndims * sizeof(int), cudaMemcpyHostToDevice, at::cuda::getCurrentCUDAStream());
+-    cudaMemcpyAsync(strides_dev, strides_cpu.data(), ndims * sizeof(int), cudaMemcpyHostToDevice, at::cuda::getCurrentCUDAStream());
++    cudaMemcpyAsync(shape_dev, shape_cpu.data(), ndims * sizeof(int), cudaMemcpyHostToDevice, c10::cuda::getCurrentCUDAStream());
++    cudaMemcpyAsync(strides_dev, strides_cpu.data(), ndims * sizeof(int), cudaMemcpyHostToDevice, c10::cuda::getCurrentCUDAStream());
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     round_elementwise_forward_launcher(

@@ -1,0 +1,217 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,181 +0,0 @@
+-#include <cuda_runtime.h>
+-#include <cstdint>
+-
+-// Kernel to perform view_as_real and permutation in one step.
+-// Input: complex64 tensor interpreted as float2 pairs.
+-// Output: float tensor with shape (B,H,W,C,2) and strides provided.
+-// The output is written to a contiguous memory block but with permuted strides.
+-__global__ void view_as_real_permute_kernel(
+-    const float2* __restrict__ input,
+-    float* __restrict__ output,
+-    int B, int C, int H, int W,
+-    long long in_stride_b, long long in_stride_c, long long in_stride_h, long long in_stride_w,
+-    long long out_stride_b, long long out_stride_h, long long out_stride_w, long long out_stride_c, long long out_stride_2)
+-{
+-    long long total = (long long)B * H * W * C * 2;
+-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-
+-    for (long long i = idx; i < total; i += stride) {
+-        // Decompose linear index i into (b, h, w, c, two)
+-        long long tmp = i;
+-        int two = tmp % 2;
+-        tmp /= 2;
+-        int c = tmp % C;
+-        tmp /= C;
+-        int w = tmp % W;
+-        tmp /= W;
+-        int h = tmp % H;
+-        tmp /= H;
+-        int b = tmp;
+-
+-        // Compute input offset (b,c,h,w) in complex64 elements
+-        long long in_idx = b * in_stride_b + c * in_stride_c + h * in_stride_h + w * in_stride_w;
+-        float2 val = input[in_idx];
+-        float real = val.x;
+-        float imag = val.y;
+-
+-        // Compute output offset based on permuted strides
+-        long long out_idx = b * out_stride_b + h * out_stride_h + w * out_stride_w + c * out_stride_c + two * out_stride_2;
+-        output[out_idx] = (two == 0) ? real : imag;
+-    }
+-}
+-
+-// Kernel for clipping a float tensor with arbitrary strides.
+-__global__ void clip_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    long long numel,
+-    float clip_min, float clip_max,
+-    const long long* __restrict__ strides,  // array of 5 strides
+-    const int* __restrict__ dims)           // array of 5 dimensions
+-{
+-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-
+-    for (long long i = idx; i < numel; i += stride) {
+-        // Compute multi-dimensional index from linear i using dims
+-        long long tmp = i;
+-        int ind[5];
+-        #pragma unroll
+-        for (int d = 4; d >= 0; --d) {
+-            ind[d] = tmp % dims[d];
+-            tmp /= dims[d];
+-        }
+-        // Compute offset using strides
+-        long long offset = 0;
+-        #pragma unroll
+-        for (int d = 0; d < 5; ++d) {
+-            offset += ind[d] * strides[d];
+-        }
+-        float val = input[offset];
+-        val = fminf(fmaxf(val, clip_min), clip_max);
+-        output[offset] = val;
+-    }
+-}
+-
+-// Host launcher for view_as_real + permute.
+-// Input: complex64 tensor pointer (as float2*).
+-// Output: float tensor pointer (contiguous allocation but viewed with permuted strides).
+-// Strides are provided by the binding layer.
+-extern "C" void view_as_real_permute_launcher(
+-    const float2* input,
+-    float* output,
+-    int B, int C, int H, int W,
+-    long long in_stride_b, long long in_stride_c, long long in_stride_h, long long in_stride_w,
+-    long long out_stride_b, long long out_stride_h, long long out_stride_w, long long out_stride_c, long long out_stride_2,
+-    cudaStream_t stream)
+-{
+-    long long total = (long long)B * H * W * C * 2;
+-    int threads = 256;
+-    int blocks = (int)((total + threads - 1) / threads);
+-    if (blocks > 65535) blocks = 65535; // grid-stride loop handles rest
+-    view_as_real_permute_kernel<<<blocks, threads, 0, stream>>>(
+-        input, output, B, C, H, W,
+-        in_stride_b, in_stride_c, in_stride_h, in_stride_w,
+-        out_stride_b, out_stride_h, out_stride_w, out_stride_c, out_stride_2);
+-}
+-
+-// Host launcher for clip with arbitrary strides.
+-// Input: float tensor with any strides.
+-// Output: float tensor with same shape and strides (maybe contiguous copy).
+-// We assume output has same strides as input.
+-extern "C" void clip_launcher(
+-    const float* input,
+-    float* output,
+-    long long numel,
+-    float clip_min, float clip_max,
+-    const long long* strides,  // device pointer to 5 strides? We pass host pointer to kernel? Actually kernel needs strides on device.
+-    const int* dims,
+-    cudaStream_t stream)
+-{
+-    int threads = 256;
+-    int blocks = (int)((numel + threads - 1) / threads);
+-    if (blocks > 65535) blocks = 65535;
+-    clip_kernel<<<blocks, threads, 0, stream>>>(
+-        input, output, numel, clip_min, clip_max, strides, dims);
+-}
+-
+-// Note: The clip_launcher as written expects device pointers for strides and dims,
+-// which is not ideal. We can instead hardcode the 5D structure of the problem
+-// in the launcher and kernel to avoid passing arrays. Since the contract is fixed
+-// for this task (5D tensor with shape (B,H,W,C,2)), we can simplify.
+-// However, to keep flexibility, we could pass strides and dims as kernel arguments
+-// by value if we know they are 5D. For this task, we know the strides:
+-// (8388608,2,1,4096) and dims (64,2048,2,2048). We can create specialized kernels.
+-// Let's provide specialized launchers with these known dimensions and strides to avoid
+-device-side arrays.
+-
+-// Simplified clip kernel for fixed 5D permuted layout (B,H,W,C,2).
+-__global__ void clip_permuted_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    int B, int H, int W, int C,
+-    long long stride_b, long long stride_h, long long stride_w, long long stride_c, long long stride_2,
+-    float clip_min, float clip_max)
+-{
+-    long long total = (long long)B * H * W * C * 2;
+-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-
+-    for (long long i = idx; i < total; i += stride) {
+-        long long tmp = i;
+-        int two = tmp % 2;
+-        tmp /= 2;
+-        int c = tmp % C;
+-        tmp /= C;
+-        int w = tmp % W;
+-        tmp /= W;
+-        int h = tmp % H;
+-        tmp /= H;
+-        int b = tmp;
+-
+-        long long offset = b * stride_b + h * stride_h + w * stride_w + c * stride_c + two * stride_2;
+-        float val = input[offset];
+-        val = fminf(fmaxf(val, clip_min), clip_max);
+-        output[offset] = val;
+-    }
+-}
+-
+-// Specialized launcher for clip with fixed 5D permuted layout.
+-extern "C" void clip_permuted_launcher(
+-    const float* input,
+-    float* output,
+-    int B, int H, int W, int C,
+-    long long stride_b, long long stride_h, long long stride_w, long long stride_c, long long stride_2,
+-    float clip_min, float clip_max,
+-    cudaStream_t stream)
+-{
+-    long long total = (long long)B * H * W * C * 2;
+-    int threads = 256;
+-    int blocks = (int)((total + threads - 1) / threads);
+-    if (blocks > 65535) blocks = 65535;
+-    clip_permuted_kernel<<<blocks, threads, 0, stream>>>(
+-        input, output, B, H, W, C,
+-        stride_b, stride_h, stride_w, stride_c, stride_2,
+-        clip_min, clip_max);
+-}
+-
+-// The above kernels and launchers are the final implementation.
+-// The binding layer will call view_as_real_permute_launcher to produce the intermediate
+-// tensor (with permuted strides) and then clip_permuted_launcher to clip it.
+--- before/model_new.py
++++ after/model_new.py
+@@ -1,6 +1,7 @@
+ import torch
+ import torch.nn as nn
+ import cuda_extension
++
+ 
+ class ModelNew(nn.Module):
+     def __init__(self, input_shape, einsum_equation, clip_min, clip_max):
+@@ -11,16 +12,16 @@
+         self.clip_max = clip_max
+ 
+     def forward(self, x):
+-        x = cuda_extension.view_as_real(x)
+-        x = cuda_extension.permute_bchw_to_bhwc(x)
+-        x = cuda_extension.clip(x, self.clip_min, self.clip_max)
++        x = cuda_extension.custom_view_as_real(x)
++        x = cuda_extension.custom_einsum_bchw_to_bhwc(x)
++        x = cuda_extension.custom_clip(x, min_val=self.clip_min, max_val=self.clip_max)
+         return x
+ 
+     def debug_forward(self, x):
+-        x = cuda_extension.view_as_real(x)
++        x = cuda_extension.custom_view_as_real(x)
+         yield 'step_001', x
+-        x = cuda_extension.permute_bchw_to_bhwc(x)
++        x = cuda_extension.custom_einsum_bchw_to_bhwc(x)
+         yield 'step_002', x
+-        x = cuda_extension.clip(x, self.clip_min, self.clip_max)
++        x = cuda_extension.custom_clip(x, min_val=self.clip_min, max_val=self.clip_max)
+         yield 'step_003', x
+         yield 'step_004', x

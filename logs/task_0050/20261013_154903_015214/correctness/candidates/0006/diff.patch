@@ -1,0 +1,465 @@
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,72 +1,227 @@
++// custom_ops_binding.cpp
++// Implementation of conv2d_forward using dynamic loading of cuDNN to avoid header dependency.
++// The compilation environment lacks cudnn.h, so we manually declare the necessary types and function pointers.
++// We assume the cuDNN shared library is available at runtime (libcudnn.so).
++
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
++#include <dlfcn.h>
+ #include <vector>
++#include <stdexcept>
++#include <string>
+ #include "../binding_registry.h"
+ 
+-// Forward declarations (none needed from .cu since conv is cuDNN)
+-
+-// Helper to check CUDA errors
+-#define CHECK_CUDA(call) { \
+-    cudaError_t err = call; \
+-    TORCH_CHECK(err == cudaSuccess, "CUDA error: ", cudaGetErrorString(err)); \
+-}
+-
+-#define CHECK_CUDNN(call) { \
+-    cudnnStatus_t err = call; \
+-    TORCH_CHECK(err == CUDNN_STATUS_SUCCESS, "cuDNN error: ", cudnnGetErrorString(err)); \
+-}
+-
+-// Temporary helper to create cuDNN tensor descriptor for NCHW float32 tensor with optional strides
+-static cudnnTensorDescriptor_t createTensorDesc(const torch::Tensor& tensor) {
++// Minimal cuDNN type definitions matching cuDNN v8 API (common across versions)
++// These are forward declarations; actual size not needed if we use pointers only.
++struct cudnnContext;
++typedef struct cudnnContext* cudnnHandle_t;
++
++struct cudnnTensorStruct;
++typedef struct cudnnTensorStruct* cudnnTensorDescriptor_t;
++
++struct cudnnFilterStruct;
++typedef struct cudnnFilterStruct* cudnnFilterDescriptor_t;
++
++struct cudnnConvolutionStruct;
++typedef struct cudnnConvolutionStruct* cudnnConvolutionDescriptor_t;
++
++typedef enum {
++    CUDNN_STATUS_SUCCESS = 0,
++    CUDNN_STATUS_NOT_INITIALIZED = 1,
++    CUDNN_STATUS_ALLOC_FAILED = 2,
++    CUDNN_STATUS_BAD_PARAM = 3,
++    CUDNN_STATUS_INTERNAL_ERROR = 4,
++    CUDNN_STATUS_INVALID_VALUE = 5,
++    CUDNN_STATUS_ARCH_MISMATCH = 6,
++    CUDNN_STATUS_MAPPING_ERROR = 7,
++    CUDNN_STATUS_EXECUTION_FAILED = 8,
++    CUDNN_STATUS_NOT_SUPPORTED = 9,
++    CUDNN_STATUS_LICENSE_ERROR = 10,
++    CUDNN_STATUS_RUNTIME_PREREQUISITE_MISSING = 11,
++    CUDNN_STATUS_RUNTIME_IN_PROGRESS = 12,
++    CUDNN_STATUS_RUNTIME_FP_OVERFLOW = 13,
++} cudnnStatus_t;
++
++typedef enum {
++    CUDNN_DATA_FLOAT = 0,
++    CUDNN_DATA_DOUBLE = 1,
++    CUDNN_DATA_HALF = 2,
++    CUDNN_DATA_INT8 = 3,
++    CUDNN_DATA_INT32 = 4,
++    CUDNN_DATA_INT8x4 = 5,
++    CUDNN_DATA_UINT8 = 6,
++    CUDNN_DATA_UINT8x4 = 7,
++    CUDNN_DATA_INT8x32 = 8,
++    CUDNN_DATA_BFLOAT16 = 9,
++    CUDNN_DATA_INT64 = 10,
++    CUDNN_DATA_BOOLEAN = 11,
++} cudnnDataType_t;
++
++typedef enum {
++    CUDNN_TENSOR_NCHW = 0,
++    CUDNN_TENSOR_NHWC = 1,
++    CUDNN_TENSOR_NCHW_VECT_C = 2,
++} cudnnTensorFormat_t;
++
++typedef enum {
++    CUDNN_CONVOLUTION = 0,
++    CUDNN_CROSS_CORRELATION = 1,
++} cudnnConvolutionMode_t;
++
++typedef enum {
++    CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM = 0,
++    CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM = 1,
++    CUDNN_CONVOLUTION_FWD_ALGO_GEMM = 2,
++    CUDNN_CONVOLUTION_FWD_ALGO_DIRECT = 3,
++    CUDNN_CONVOLUTION_FWD_ALGO_FFT = 4,
++    CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING = 5,
++    CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD = 6,
++    CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED = 7,
++    CUDNN_CONVOLUTION_FWD_ALGO_COUNT = 8
++} cudnnConvolutionFwdAlgo_t;
++
++typedef enum {
++    CUDNN_CONVOLUTION_FWD_PREFER_FASTEST = 0,
++    CUDNN_CONVOLUTION_FWD_PREFER_ACCURATE = 1,
++    CUDNN_CONVOLUTION_FWD_PREFER_VALID = 2,
++} cudnnConvolutionFwdPreference_t;
++
++// Function pointer types for the cuDNN functions we need
++typedef cudnnStatus_t (*cudnnCreate_t)(cudnnHandle_t*);
++typedef cudnnStatus_t (*cudnnDestroy_t)(cudnnHandle_t);
++typedef cudnnStatus_t (*cudnnSetStream_t)(cudnnHandle_t, cudaStream_t);
++typedef cudnnStatus_t (*cudnnCreateTensorDescriptor_t)(cudnnTensorDescriptor_t*);
++typedef cudnnStatus_t (*cudnnSetTensorNdDescriptor_t)(cudnnTensorDescriptor_t, cudnnDataType_t, int, const int*, const int*);
++typedef cudnnStatus_t (*cudnnDestroyTensorDescriptor_t)(cudnnTensorDescriptor_t);
++typedef cudnnStatus_t (*cudnnCreateFilterDescriptor_t)(cudnnFilterDescriptor_t*);
++typedef cudnnStatus_t (*cudnnSetFilterNdDescriptor_t)(cudnnFilterDescriptor_t, cudnnDataType_t, cudnnTensorFormat_t, int, const int*);
++typedef cudnnStatus_t (*cudnnDestroyFilterDescriptor_t)(cudnnFilterDescriptor_t);
++typedef cudnnStatus_t (*cudnnCreateConvolutionDescriptor_t)(cudnnConvolutionDescriptor_t*);
++typedef cudnnStatus_t (*cudnnSetConvolution2dDescriptor_t)(cudnnConvolutionDescriptor_t, int, int, int, int, int, int, cudnnConvolutionMode_t, cudnnDataType_t);
++typedef cudnnStatus_t (*cudnnSetConvolutionGroupCount_t)(cudnnConvolutionDescriptor_t, int);
++typedef cudnnStatus_t (*cudnnGetConvolutionForwardAlgorithm_t)(cudnnHandle_t, cudnnTensorDescriptor_t, cudnnFilterDescriptor_t, cudnnConvolutionDescriptor_t, cudnnTensorDescriptor_t, cudnnConvolutionFwdPreference_t, size_t, cudnnConvolutionFwdAlgo_t*);
++typedef cudnnStatus_t (*cudnnGetConvolutionForwardWorkspaceSize_t)(cudnnHandle_t, cudnnTensorDescriptor_t, cudnnFilterDescriptor_t, cudnnConvolutionDescriptor_t, cudnnTensorDescriptor_t, cudnnConvolutionFwdAlgo_t, size_t*);
++typedef cudnnStatus_t (*cudnnConvolutionForward_t)(cudnnHandle_t, const void*, cudnnTensorDescriptor_t, const void*, cudnnFilterDescriptor_t, const void*, cudnnConvolutionDescriptor_t, cudnnConvolutionFwdAlgo_t, void*, size_t, const void*, cudnnTensorDescriptor_t, void*);
++typedef cudnnStatus_t (*cudnnDestroyConvolutionDescriptor_t)(cudnnConvolutionDescriptor_t);
++typedef const char* (*cudnnGetErrorString_t)(cudnnStatus_t);
++
++// Global function pointers loaded on demand
++struct CudnnAPI {
++    void* handle = nullptr;
++    cudnnCreate_t cudnnCreate = nullptr;
++    cudnnDestroy_t cudnnDestroy = nullptr;
++    cudnnSetStream_t cudnnSetStream = nullptr;
++    cudnnCreateTensorDescriptor_t cudnnCreateTensorDescriptor = nullptr;
++    cudnnSetTensorNdDescriptor_t cudnnSetTensorNdDescriptor = nullptr;
++    cudnnDestroyTensorDescriptor_t cudnnDestroyTensorDescriptor = nullptr;
++    cudnnCreateFilterDescriptor_t cudnnCreateFilterDescriptor = nullptr;
++    cudnnSetFilterNdDescriptor_t cudnnSetFilterNdDescriptor = nullptr;
++    cudnnDestroyFilterDescriptor_t cudnnDestroyFilterDescriptor = nullptr;
++    cudnnCreateConvolutionDescriptor_t cudnnCreateConvolutionDescriptor = nullptr;
++    cudnnSetConvolution2dDescriptor_t cudnnSetConvolution2dDescriptor = nullptr;
++    cudnnSetConvolutionGroupCount_t cudnnSetConvolutionGroupCount = nullptr;
++    cudnnGetConvolutionForwardAlgorithm_t cudnnGetConvolutionForwardAlgorithm = nullptr;
++    cudnnGetConvolutionForwardWorkspaceSize_t cudnnGetConvolutionForwardWorkspaceSize = nullptr;
++    cudnnConvolutionForward_t cudnnConvolutionForward = nullptr;
++    cudnnDestroyConvolutionDescriptor_t cudnnDestroyConvolutionDescriptor = nullptr;
++    cudnnGetErrorString_t cudnnGetErrorString = nullptr;
++    bool loaded = false;
++    bool load_failed = false;
++};
++
++static CudnnAPI& get_cudnn_api() {
++    static CudnnAPI api;
++    return api;
++}
++
++static bool load_cudnn_library() {
++    CudnnAPI& api = get_cudnn_api();
++    if (api.loaded) return true;
++    if (api.load_failed) return false;
++    
++    // Try common library names
++    const char* libnames[] = {"libcudnn.so", "libcudnn.so.8", "libcudnn.so.7"};
++    for (const char* name : libnames) {
++        api.handle = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
++        if (api.handle) break;
++    }
++    if (!api.handle) {
++        api.load_failed = true;
++        return false;
++    }
++    
++    #define LOAD_SYMBOL(name) do { \
++        api.name = (decltype(api.name))dlsym(api.handle, #name); \
++        if (!api.name) { \
++            dlclose(api.handle); \
++            api.handle = nullptr; \
++            api.load_failed = true; \
++            return false; \
++        } \
++    } while(0)
++    
++    LOAD_SYMBOL(cudnnCreate);
++    LOAD_SYMBOL(cudnnDestroy);
++    LOAD_SYMBOL(cudnnSetStream);
++    LOAD_SYMBOL(cudnnCreateTensorDescriptor);
++    LOAD_SYMBOL(cudnnSetTensorNdDescriptor);
++    LOAD_SYMBOL(cudnnDestroyTensorDescriptor);
++    LOAD_SYMBOL(cudnnCreateFilterDescriptor);
++    LOAD_SYMBOL(cudnnSetFilterNdDescriptor);
++    LOAD_SYMBOL(cudnnDestroyFilterDescriptor);
++    LOAD_SYMBOL(cudnnCreateConvolutionDescriptor);
++    LOAD_SYMBOL(cudnnSetConvolution2dDescriptor);
++    LOAD_SYMBOL(cudnnSetConvolutionGroupCount);
++    LOAD_SYMBOL(cudnnGetConvolutionForwardAlgorithm);
++    LOAD_SYMBOL(cudnnGetConvolutionForwardWorkspaceSize);
++    LOAD_SYMBOL(cudnnConvolutionForward);
++    LOAD_SYMBOL(cudnnDestroyConvolutionDescriptor);
++    LOAD_SYMBOL(cudnnGetErrorString);
++    
++    #undef LOAD_SYMBOL
++    
++    api.loaded = true;
++    return true;
++}
++
++// Helper macro for checking cuDNN status using loaded function
++#define CHECK_CUDNN(expr) do { \
++    cudnnStatus_t status = (expr); \
++    if (status != CUDNN_STATUS_SUCCESS) { \
++        const char* err_str = get_cudnn_api().cudnnGetErrorString ? get_cudnn_api().cudnnGetErrorString(status) : "unknown error"; \
++        TORCH_CHECK(false, "cuDNN error: ", err_str); \
++    } \
++} while(0)
++
++// Helper to create tensor descriptor
++static cudnnTensorDescriptor_t create_tensor_desc(const torch::Tensor& tensor) {
++    CudnnAPI& api = get_cudnn_api();
+     cudnnTensorDescriptor_t desc;
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&desc));
++    CHECK_CUDNN(api.cudnnCreateTensorDescriptor(&desc));
+     
+     auto sizes = tensor.sizes();
+     auto strides = tensor.strides();
+-    int n = sizes[0], c = sizes[1], h = sizes[2], w = sizes[3];
+-    
+-    std::vector<int> dims = {n, c, h, w};
+-    std::vector<int> strides_arr = {
+-        (int)strides[0], (int)strides[1], (int)strides[2], (int)strides[3]
+-    };
+-    
+-    CHECK_CUDNN(cudnnSetTensorNdDescriptor(
+-        desc,
+-        CUDNN_DATA_FLOAT,
+-        4,
+-        dims.data(),
+-        strides_arr.data()
+-    ));
++    int dims[4] = {(int)sizes[0], (int)sizes[1], (int)sizes[2], (int)sizes[3]};
++    int stride_arr[4] = {(int)strides[0], (int)strides[1], (int)strides[2], (int)strides[3]};
++    
++    CHECK_CUDNN(api.cudnnSetTensorNdDescriptor(desc, CUDNN_DATA_FLOAT, 4, dims, stride_arr));
+     return desc;
+ }
+ 
+-// Creates a filter descriptor for NCHW layout, using strides if provided
+-static cudnnFilterDescriptor_t createFilterDesc(const torch::Tensor& weight) {
++static cudnnFilterDescriptor_t create_filter_desc(const torch::Tensor& weight) {
++    CudnnAPI& api = get_cudnn_api();
+     cudnnFilterDescriptor_t desc;
+-    CHECK_CUDNN(cudnnCreateFilterDescriptor(&desc));
++    CHECK_CUDNN(api.cudnnCreateFilterDescriptor(&desc));
+     
+     auto sizes = weight.sizes();
+-    auto strides = weight.strides();
+-    int out_c = sizes[0], in_c_per_group = sizes[1], k_h = sizes[2], k_w = sizes[3];
+-    std::vector<int> dims = {out_c, in_c_per_group, k_h, k_w};
+-    
+-    CHECK_CUDNN(cudnnSetFilterNdDescriptor(
+-        desc,
+-        CUDNN_DATA_FLOAT,
+-        CUDNN_TENSOR_NCHW,
+-        4,
+-        dims.data()
+-    ));
++    int dims[4] = {(int)sizes[0], (int)sizes[1], (int)sizes[2], (int)sizes[3]};
++    CHECK_CUDNN(api.cudnnSetFilterNdDescriptor(desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 4, dims));
+     return desc;
+ }
+ 
+-// Conv2d forward using cuDNN
+-// weight: [out_channels, in_channels/groups, kernel_h, kernel_w]
+-// input: [N, in_channels, H, W]
+-// Returns: [N, out_channels, H_out, W_out]
++// Main conv2d forward function
+ torch::Tensor conv2d_forward_cudnn(
+     const torch::Tensor& weight,
+     const torch::Tensor& input,
+@@ -78,17 +233,23 @@
+     int64_t dilation_w,
+     int64_t groups
+ ) {
+-    // Parameter validation
++    // Load cuDNN library if not already
++    if (!load_cudnn_library()) {
++        TORCH_CHECK(false, "Failed to load cuDNN library");
++    }
++    CudnnAPI& api = get_cudnn_api();
++    
++    // Validate tensors
+     TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
+     TORCH_CHECK(weight.is_cuda(), "weight must be CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+-    TORCH_CHECK(input.dim() == 4, "input must be 4D (N,C,H,W)");
+-    TORCH_CHECK(weight.dim() == 4, "weight must be 4D (out_c, in_c/groups, kH, kW)");
+-    TORCH_CHECK(stride_h > 0 && stride_w > 0, "stride must be positive");
+-    TORCH_CHECK(padding_h >= 0 && padding_w >= 0, "padding must be non-negative");
+-    TORCH_CHECK(dilation_h > 0 && dilation_w > 0, "dilation must be positive");
+-    TORCH_CHECK(groups > 0, "groups must be positive");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D");
++    TORCH_CHECK(weight.dim() == 4, "weight must be 4D");
++    TORCH_CHECK(stride_h > 0 && stride_w > 0, "stride positive");
++    TORCH_CHECK(padding_h >= 0 && padding_w >= 0, "padding non-negative");
++    TORCH_CHECK(dilation_h > 0 && dilation_w > 0, "dilation positive");
++    TORCH_CHECK(groups > 0, "groups positive");
+     
+     int64_t N = input.size(0);
+     int64_t C = input.size(1);
+@@ -99,81 +260,65 @@
+     int64_t kH = weight.size(2);
+     int64_t kW = weight.size(3);
+     
+-    TORCH_CHECK(C == in_c_per_group * groups, "input channels must equal in_c_per_group * groups");
+-    TORCH_CHECK(out_c % groups == 0, "out_channels must be divisible by groups");
++    TORCH_CHECK(C == in_c_per_group * groups, "input channels mismatch");
++    TORCH_CHECK(out_c % groups == 0, "out_channels divisible by groups");
+     
+     int64_t H_out = (H + 2 * padding_h - dilation_h * (kH - 1) - 1) / stride_h + 1;
+     int64_t W_out = (W + 2 * padding_w - dilation_w * (kW - 1) - 1) / stride_w + 1;
+-    TORCH_CHECK(H_out > 0 && W_out > 0, "output size must be positive");
+-    
+-    // Make input and weight contiguous if not already (cuDNN requires contiguous for these APIs)
++    TORCH_CHECK(H_out > 0 && W_out > 0, "output size positive");
++    
++    // Contiguous tensors
+     torch::Tensor input_contig = input.contiguous();
+     torch::Tensor weight_contig = weight.contiguous();
+-    
+-    // Allocate output tensor of shape [N, out_c, H_out, W_out]
+     auto output = torch::empty({N, out_c, H_out, W_out}, input.options());
+     
+-    // Get cuDNN handle and stream
+-    cudnnHandle_t cudnn_handle;
+-    CHECK_CUDNN(cudnnCreate(&cudnn_handle));
+-    
++    // Create handle and set stream
++    cudnnHandle_t handle;
++    CHECK_CUDNN(api.cudnnCreate(&handle));
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    CHECK_CUDNN(cudnnSetStream(cudnn_handle, stream));
+-    
+-    // Set up descriptors
+-    cudnnTensorDescriptor_t input_desc = createTensorDesc(input_contig);
+-    cudnnTensorDescriptor_t output_desc = createTensorDesc(output);
+-    cudnnFilterDescriptor_t filter_desc = createFilterDesc(weight_contig);
++    CHECK_CUDNN(api.cudnnSetStream(handle, stream));
++    
++    // Descriptors
++    cudnnTensorDescriptor_t input_desc = create_tensor_desc(input_contig);
++    cudnnTensorDescriptor_t output_desc = create_tensor_desc(output);
++    cudnnFilterDescriptor_t filter_desc = create_filter_desc(weight_contig);
+     
+     cudnnConvolutionDescriptor_t conv_desc;
+-    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+-    CHECK_CUDNN(cudnnSetConvolution2dDescriptor(
++    CHECK_CUDNN(api.cudnnCreateConvolutionDescriptor(&conv_desc));
++    CHECK_CUDNN(api.cudnnSetConvolution2dDescriptor(
+         conv_desc,
+-        padding_h, padding_w,
+-        stride_h, stride_w,
+-        dilation_h, dilation_w,
+-        CUDNN_CROSS_CORRELATION,  // PyTorch conv2d uses cross-correlation
++        (int)padding_h, (int)padding_w,
++        (int)stride_h, (int)stride_w,
++        (int)dilation_h, (int)dilation_w,
++        CUDNN_CROSS_CORRELATION,
+         CUDNN_DATA_FLOAT
+     ));
+     if (groups > 1) {
+-        CHECK_CUDNN(cudnnSetConvolutionGroupCount(conv_desc, groups));
+-    }
+-    
+-    // Determine algorithm (use deterministic algorithm, may be slower but correct)
++        CHECK_CUDNN(api.cudnnSetConvolutionGroupCount(conv_desc, (int)groups));
++    }
++    
++    // Algorithm selection
+     cudnnConvolutionFwdAlgo_t algo;
+-    CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm(
+-        cudnn_handle,
+-        input_desc,
+-        filter_desc,
+-        conv_desc,
+-        output_desc,
+-        CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
+-        0,
+-        &algo
++    CHECK_CUDNN(api.cudnnGetConvolutionForwardAlgorithm(
++        handle, input_desc, filter_desc, conv_desc, output_desc,
++        CUDNN_CONVOLUTION_FWD_PREFER_FASTEST, 0, &algo
+     ));
+     
+-    // Workspace size
++    // Workspace
+     size_t workspace_size = 0;
+-    CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(
+-        cudnn_handle,
+-        input_desc,
+-        filter_desc,
+-        conv_desc,
+-        output_desc,
+-        algo,
+-        &workspace_size
++    CHECK_CUDNN(api.cudnnGetConvolutionForwardWorkspaceSize(
++        handle, input_desc, filter_desc, conv_desc, output_desc, algo, &workspace_size
+     ));
+-    
+-    // Allocate workspace if needed
+     void* workspace = nullptr;
+     if (workspace_size > 0) {
+-        CHECK_CUDA(cudaMalloc(&workspace, workspace_size));
+-    }
+-    
+-    // Perform convolution
++        cudaError_t cuda_err = cudaMalloc(&workspace, workspace_size);
++        TORCH_CHECK(cuda_err == cudaSuccess, "cudaMalloc failed");
++    }
++    
++    // Execute
+     float alpha = 1.0f, beta = 0.0f;
+-    CHECK_CUDNN(cudnnConvolutionForward(
+-        cudnn_handle,
++    CHECK_CUDNN(api.cudnnConvolutionForward(
++        handle,
+         &alpha,
+         input_desc, input_contig.data_ptr<float>(),
+         filter_desc, weight_contig.data_ptr<float>(),
+@@ -185,13 +330,13 @@
+     
+     // Cleanup
+     if (workspace) {
+-        CHECK_CUDA(cudaFree(workspace));
+-    }
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(input_desc));
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(output_desc));
+-    CHECK_CUDNN(cudnnDestroyFilterDescriptor(filter_desc));
+-    CHECK_CUDNN(cudnnDestroyConvolutionDescriptor(conv_desc));
+-    CHECK_CUDNN(cudnnDestroy(cudnn_handle));
++        cudaFree(workspace);
++    }
++    api.cudnnDestroyTensorDescriptor(input_desc);
++    api.cudnnDestroyTensorDescriptor(output_desc);
++    api.cudnnDestroyFilterDescriptor(filter_desc);
++    api.cudnnDestroyConvolutionDescriptor(conv_desc);
++    api.cudnnDestroy(handle);
+     
+     return output;
+ }
+@@ -199,7 +344,7 @@
+ // Registration
+ void register_conv2d_forward(pybind11::module& m) {
+     m.def("conv2d_forward", &conv2d_forward_cudnn,
+-          "conv2d forward using cuDNN",
++          "conv2d forward using cuDNN (dynamic loading)",
+           py::arg("weight"),
+           py::arg("input"),
+           py::arg("stride_h"),
+@@ -211,4 +356,4 @@
+           py::arg("groups"));
+ }
+ 
+-REGISTER_BINDING(conv2d_forward, register_conv2d_forward);
++REGISTER_BINDING(conv2d_forward, register_conv2d_forward);

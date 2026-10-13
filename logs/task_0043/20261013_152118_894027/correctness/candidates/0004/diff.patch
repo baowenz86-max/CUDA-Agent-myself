@@ -1,0 +1,645 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,134 +1,165 @@
+ #include <cuda_runtime.h>
+-#include <cstdint>
+ 
+-// Helper to compute index from multi-dimensional strides
+-template <typename T>
+-__device__ __forceinline__ T get_strided_index(const T* strides, const T* shape, int ndim, const T* indices) {
+-    T idx = 0;
+-    for (int i = 0; i < ndim; ++i) {
+-        idx += indices[i] * strides[i];
+-    }
+-    return idx;
++// Helper to convert linear index to 4D coordinates (for input with 4 dims)
++__device__ __forceinline__ void index_to_4d(
++    long long idx,
++    long long d1, long long d2, long long d3, long long d4,
++    long long &i1, long long &i2, long long &i3, long long &i4)
++{
++    i4 = idx % d4;
++    idx /= d4;
++    i3 = idx % d3;
++    idx /= d3;
++    i2 = idx % d2;
++    i1 = idx / d2;
+ }
+ 
+-// Kernel for view_as_real: complex64 (float2) input to float32 output with last dim size 2.
+-// Input: complex64 tensor with shape [B, C, H, W] (or any dimensions) on CPU. We copy to CUDA memory.
+-// Output: float32 tensor with shape [..., 2].
+-// The launcher will allocate output on CUDA and call this kernel.
+-// We use a 1D grid: each thread handles one element of the original complex tensor (all except last dim).
+-// For each complex element at flat index i, we write output[2*i] = real, output[2*i+1] = imag.
+-// This assumes input is contiguous? But contract says supports strides. We need to handle general strides.
+-// However, the input is on CPU, and we need to copy data to GPU. The binding will likely use a contiguous copy or pass raw pointer with strides.
+-// For simplicity and performance, we assume the input is contiguous, but we can handle strides by using a kernel that iterates over logical linear index and computes multi-dimensional indices.
+-// Since input is complex64 on CPU, we must first copy to GPU. The binding will handle that; launcher expects a GPU pointer for complex input.
+-// We'll create a kernel that reads from GPU complex data with strides and writes to GPU output contiguous.
+-__global__ void view_as_real_kernel(const float2* __restrict__ input,
+-                                    float* __restrict__ output,
+-                                    const int64_t total_complex_elements,
+-                                    const int64_t* __restrict__ input_strides,
+-                                    const int64_t* __restrict__ input_shape,
+-                                    int ndim) {
+-    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+-    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+-    for (int64_t i = idx; i < total_complex_elements; i += stride) {
+-        // Compute multi-dimensional indices for this linear index over the non-last dimensions.
+-        int64_t remainder = i;
+-        int64_t flat_input_idx = 0;
+-        // ndim is the number of dimensions of the original complex tensor (e.g., B, C, H, W)
+-        for (int d = ndim - 1; d >= 0; --d) {
+-            int64_t dim_size = input_shape[d];
+-            int64_t coord = remainder % dim_size;
+-            remainder /= dim_size;
+-            flat_input_idx += coord * input_strides[d];
+-        }
+-        float2 val = input[flat_input_idx];
+-        output[2 * i] = val.x;
+-        output[2 * i + 1] = val.y;
++// Kernel: view_as_real for complex64 input
++// input: complex64 tensor (interpreted as float2 pairs)
++// output: float32 tensor with extra last dimension of size 2
++// input_shape: [d0,d1,d2] (complex elements)
++// input_strides: [s0,s1,s2] in complex elements
++// output_strides: [os0,os1,os2,os3] in float elements
++__global__ void view_as_real_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    long long d0, long long d1, long long d2,
++    long long s0, long long s1, long long s2,
++    long long os0, long long os1, long long os2, long long os3,
++    long long total)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = blockDim.x * gridDim.x;
++    for (; idx < total; idx += stride) {
++        // idx is linear over output elements: d0*d1*d2*2
++        long long out_linear = idx;
++        // decompose output linear index into (b,c,h,real_idx)
++        long long real_idx = out_linear & 1LL;  // 0 or 1
++        long long hw = out_linear >> 1;         // index into d1*d2 elements
++        long long c = hw % d2;
++        long long h = (hw / d2) % d1;
++        long long b = hw / (d2 * d1);
++        // input complex element offset (in float units, because input is float pointer to complex data)
++        long long in_offset = b * s0 * 2LL + h * s1 * 2LL + c * s2 * 2LL;
++        // output offset in float units
++        long long out_offset = b * os0 + h * os1 + c * os2 + real_idx * os3;
++        output[out_offset] = input[in_offset + real_idx];
+     }
+ }
+ 
+-// Kernel for einsum bchw->bhwc on a 5D tensor where last dim size is 2.
+-// Input shape: [B, C, H, W, 2], output shape: [B, H, W, C, 2].
+-// We treat the last dimension (size 2) as a unit and copy both elements.
+-// We'll use a 1D grid over total number of output elements excluding the last dim? Actually output total = B*H*W*C*2.
+-// We can have each thread handle one output element (flat index).
+-// General strides supported via input and output strides.
+-__global__ void einsum_permute_kernel(const float* __restrict__ input,
+-                                      float* __restrict__ output,
+-                                      const int64_t total_output_elements,
+-                                      const int64_t* __restrict__ input_strides, // 5 strides
+-                                      const int64_t* __restrict__ output_strides, // 5 strides
+-                                      const int64_t* __restrict__ output_shape, // 5 dims
+-                                      int ndim) {
+-    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+-    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+-    for (int64_t i = idx; i < total_output_elements; i += stride) {
+-        // Compute output multi-dimensional index from flat i.
+-        int64_t remainder = i;
+-        int64_t input_idx = 0;
+-        for (int d = ndim - 1; d >= 0; --d) {
+-            int64_t coord = remainder % output_shape[d];
+-            remainder /= output_shape[d];
+-            // Map output coord to input coord: b->b, h->c, w->h, c->w, 2->2
+-            int input_dim;
+-            if (d == 0) input_dim = 0; // b
+-            else if (d == 1) input_dim = 2; // output h -> input h (since input order: b,c,h,w)
+-            else if (d == 2) input_dim = 3; // output w -> input w
+-            else if (d == 3) input_dim = 1; // output c -> input c
+-            else input_dim = 4; // last 2
+-            input_idx += coord * input_strides[input_dim];
+-        }
+-        output[i] = input[input_idx];
++// Kernel: einsum bchw->bhwc, i.e., transpose last two dims
++// input: float32 tensor with shape [B,C,H,W] and strides [is0,is1,is2,is3]
++// output: float32 tensor with shape [B,H,W,C] and strides [os0,os1,os2,os3]
++__global__ void einsum_bchw_to_bhwc_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    long long B, long long C, long long H, long long W,
++    long long is0, long long is1, long long is2, long long is3,
++    long long os0, long long os1, long long os2, long long os3,
++    long long total)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = blockDim.x * gridDim.x;
++    for (; idx < total; idx += stride) {
++        // output linear index -> (b,h,w,c)
++        long long c = idx % C;
++        long long w = (idx / C) % W;
++        long long h = (idx / (C * W)) % H;
++        long long b = idx / (C * W * H);
++        long long in_offset = b * is0 + c * is1 + h * is2 + w * is3;
++        long long out_offset = b * os0 + h * os1 + w * os2 + c * os3;
++        output[out_offset] = input[in_offset];
+     }
+ }
+ 
+-// Kernel for clip
+-__global__ void clip_kernel(float* __restrict__ data,
+-                            int64_t total_elements,
+-                            float min_val,
+-                            float max_val) {
+-    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+-    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+-    for (int64_t i = idx; i < total_elements; i += stride) {
+-        float val = data[i];
++// Kernel: clip values to [min_val, max_val]
++// input: float32 tensor with arbitrary shape (numel = total) and strides
++// output: float32 tensor with same shape, may be arbitrary strides
++// We use a 1D linear index over input elements; for each element, compute its
++// multidimensional coordinates from the provided shape and strides.
++// However, to support arbitrary dim count, we pass shape and strides as arrays.
++// For simplicity and to avoid shared memory overhead, we pass the number of dims
++// and use dynamic parallelism? No, we can't easily pass variable-length arrays to
++// kernel without shared memory. Since this task has 4 dims only, we implement
++// specialized 4D version and a generic version? We'll do 4D only, as contract
++// specifies 4D.
++__global__ void clip_kernel_4d(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    long long d0, long long d1, long long d2, long long d3,
++    long long is0, long long is1, long long is2, long long is3,
++    long long os0, long long os1, long long os2, long long os3,
++    float min_val, float max_val,
++    long long total)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = blockDim.x * gridDim.x;
++    for (; idx < total; idx += stride) {
++        long long i3 = idx % d3;
++        long long rem = idx / d3;
++        long long i2 = rem % d2;
++        rem /= d2;
++        long long i1 = rem % d1;
++        long long i0 = rem / d1;
++        long long in_offset = i0 * is0 + i1 * is1 + i2 * is2 + i3 * is3;
++        long long out_offset = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3;
++        float val = input[in_offset];
+         val = fminf(fmaxf(val, min_val), max_val);
+-        data[i] = val;
++        output[out_offset] = val;
+     }
+ }
+ 
+-// Launchers (extern "C" for binding)
+-extern "C" void view_as_real_launcher(const float2* input, float* output,
+-                                      int64_t total_complex_elements,
+-                                      const int64_t* input_strides,
+-                                      const int64_t* input_shape,
+-                                      int ndim,
+-                                      cudaStream_t stream) {
+-    const int block_size = 256;
+-    int64_t grid_size = (total_complex_elements + block_size - 1) / block_size;
+-    if (grid_size > 2147483647) grid_size = 2147483647;
+-    view_as_real_kernel<<<(int)grid_size, block_size, 0, stream>>>(
+-        input, output, total_complex_elements, input_strides, input_shape, ndim);
++// Generic clip kernel for any number of dimensions (up to 8) using arrays passed via constant memory or kernel params.
++// But to keep it simple, we'll use the 4D version since the contract guarantees 4D.
++
++// Host launchers (extern "C" so binding.cpp can call them)
++
++extern "C" void view_as_real_launcher(
++    const float* input,
++    float* output,
++    long long d0, long long d1, long long d2,
++    long long s0, long long s1, long long s2,
++    long long os0, long long os1, long long os2, long long os3,
++    cudaStream_t stream)
++{
++    long long total = d0 * d1 * d2 * 2LL;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid-stride loop handles the rest
++    view_as_real_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, d0, d1, d2, s0, s1, s2, os0, os1, os2, os3, total);
+ }
+ 
+-extern "C" void einsum_permute_launcher(const float* input, float* output,
+-                                        int64_t total_output_elements,
+-                                        const int64_t* input_strides,
+-                                        const int64_t* output_strides,
+-                                        const int64_t* output_shape,
+-                                        int ndim,
+-                                        cudaStream_t stream) {
+-    const int block_size = 256;
+-    int64_t grid_size = (total_output_elements + block_size - 1) / block_size;
+-    if (grid_size > 2147483647) grid_size = 2147483647;
+-    einsum_permute_kernel<<<(int)grid_size, block_size, 0, stream>>>(
+-        input, output, total_output_elements, input_strides, output_strides, output_shape, ndim);
++extern "C" void einsum_bchw_to_bhwc_launcher(
++    const float* input,
++    float* output,
++    long long B, long long C, long long H, long long W,
++    long long is0, long long is1, long long is2, long long is3,
++    long long os0, long long os1, long long os2, long long os3,
++    cudaStream_t stream)
++{
++    long long total = B * C * H * W;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    einsum_bchw_to_bhwc_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, B, C, H, W, is0, is1, is2, is3, os0, os1, os2, os3, total);
+ }
+ 
+-extern "C" void clip_launcher(float* data, int64_t total_elements,
+-                              float min_val, float max_val,
+-                              cudaStream_t stream) {
+-    const int block_size = 256;
+-    int64_t grid_size = (total_elements + block_size - 1) / block_size;
+-    if (grid_size > 2147483647) grid_size = 2147483647;
+-    clip_kernel<<<(int)grid_size, block_size, 0, stream>>>(data, total_elements, min_val, max_val);
++extern "C" void clip_launcher(
++    const float* input,
++    float* output,
++    long long d0, long long d1, long long d2, long long d3,
++    long long is0, long long is1, long long is2, long long is3,
++    long long os0, long long os1, long long os2, long long os3,
++    float min_val, float max_val,
++    cudaStream_t stream)
++{
++    long long total = d0 * d1 * d2 * d3;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    clip_kernel_4d<<<blocks, threads, 0, stream>>>(
++        input, output, d0, d1, d2, d3, is0, is1, is2, is3, os0, os1, os2, os3,
++        min_val, max_val, total);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,195 +1,175 @@
+-// Binding for custom non-convolution kernels defined in custom_ops.cu
+ #include <torch/types.h>
+-#include <pybind11/pybind11.h>
++#include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+-namespace py = pybind11;
++// Declare launchers from custom_ops.cu
++extern "C" void view_as_real_launcher(
++    const float* input,
++    float* output,
++    long long d0, long long d1, long long d2,
++    long long s0, long long s1, long long s2,
++    long long os0, long long os1, long long os2, long long os3,
++    cudaStream_t stream);
+ 
+-// Declare launchers from custom_ops.cu
+-extern "C" void view_as_real_launcher(const float2* input, float* output,
+-                                      int64_t total_complex_elements,
+-                                      const int64_t* input_strides,
+-                                      const int64_t* input_shape,
+-                                      int ndim,
+-                                      cudaStream_t stream);
++extern "C" void einsum_bchw_to_bhwc_launcher(
++    const float* input,
++    float* output,
++    long long B, long long C, long long H, long long W,
++    long long is0, long long is1, long long is2, long long is3,
++    long long os0, long long os1, long long os2, long long os3,
++    cudaStream_t stream);
+ 
+-extern "C" void einsum_permute_launcher(const float* input, float* output,
+-                                        int64_t total_output_elements,
+-                                        const int64_t* input_strides,
+-                                        const int64_t* output_strides,
+-                                        const int64_t* output_shape,
+-                                        int ndim,
+-                                        cudaStream_t stream);
++extern "C" void clip_launcher(
++    const float* input,
++    float* output,
++    long long d0, long long d1, long long d2, long long d3,
++    long long is0, long long is1, long long is2, long long is3,
++    long long os0, long long os1, long long os2, long long os3,
++    float min_val, float max_val,
++    cudaStream_t stream);
+ 
+-extern "C" void clip_launcher(float* data, int64_t total_elements,
+-                              float min_val, float max_val,
+-                              cudaStream_t stream);
+-
+-// Helper to check CUDA errors after kernel launches
+-static void check_cuda_error(const char* name) {
+-    cudaError_t err = cudaGetLastError();
+-    TORCH_CHECK(err == cudaSuccess, name, " failed with error: ", cudaGetErrorString(err));
++// Helper to get current CUDA stream
++static inline cudaStream_t getCurrentStream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
+ }
+ 
+-// view_as_real_forward: CPU complex64 -> CUDA float32 with extra trailing dim of size 2
+-torch::Tensor view_as_real_forward(torch::Tensor x) {
+-    TORCH_CHECK(x.is_cpu(), "view_as_real_forward: input must be CPU tensor");
+-    TORCH_CHECK(x.scalar_type() == torch::kComplex64, "view_as_real_forward: input must be complex64");
+-    TORCH_CHECK(!x.is_complex(), "view_as_real_forward: input should be complex64 but got ", x.scalar_type());
++// 1. view_as_real: complex64 -> float32 with extra trailing dimension of size 2
++torch::Tensor view_as_real_kernel(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "view_as_real_kernel: input must be CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kComplex64, "view_as_real_kernel: input must be complex64");
++    TORCH_CHECK(x.dim() == 3, "view_as_real_kernel: input must be 3D");
+ 
+-    // Original shape
+-    auto sizes = x.sizes();
+-    int64_t ndim = x.dim();
+-    TORCH_CHECK(ndim > 0, "view_as_real_forward: input must have at least one dimension");
++    // Input is [B, C, H] in complex elements; we need contiguous in terms of complex elements
++    auto x_contig = x.contiguous(); // ensure strides are dense in complex elements
+ 
+-    // Output shape: input shape + [2]
+-    std::vector<int64_t> out_sizes(sizes.begin(), sizes.end());
+-    out_sizes.push_back(2);
++    long long B = x_contig.size(0);
++    long long C = x_contig.size(1);
++    long long H = x_contig.size(2);
+ 
+-    // Allocate contiguous CUDA output
+-    auto out = torch::empty(out_sizes, torch::dtype(torch::kFloat32).device(torch::kCUDA));
++    // Output shape: [B, C, H, 2]
++    auto output = torch::empty({B, C, H, 2}, x_contig.options().dtype(torch::kFloat32));
+ 
+-    // Ensure input is contiguous for easier copying to GPU; if not, make contiguous
+-    if (!x.is_contiguous()) {
+-        x = x.contiguous();
+-    }
++    // For contiguous complex input, strides in complex elements: [C*H, H, 1]
++    // Since data_ptr is float*, offsets must be in float units, so multiply by 2.
++    long long s0 = C * H * 2LL;
++    long long s1 = H * 2LL;
++    long long s2 = 2LL;
+ 
+-    // Copy complex tensor to GPU (as float2). Total number of complex elements = numel of input.
+-    int64_t total_complex_elements = x.numel();
+-    auto x_gpu = torch::empty_like(x, torch::dtype(torch::kComplex64).device(torch::kCUDA));
+-    x_gpu.copy_(x);
++    // Output strides from torch::empty: [C*H*2, H*2, 2, 1]
++    long long os0 = output.stride(0);
++    long long os1 = output.stride(1);
++    long long os2 = output.stride(2);
++    long long os3 = output.stride(3);
+ 
+-    // For input strides, we pass the strides of the complex tensor (in units of float2 elements)
+-    // Convert to int64_t array on host; kernel expects strides in terms of complex elements.
+-    auto stride_opt = x.strides();
+-    std::vector<int64_t> input_strides(stride_opt.begin(), stride_opt.end());
+-    auto shape_opt = x.sizes();
+-    std::vector<int64_t> input_shape(shape_opt.begin(), shape_opt.end());
++    cudaStream_t stream = getCurrentStream();
+ 
+-    // Move strides and shape to GPU? The launcher expects device pointers to int64 arrays.
+-    // In our .cu, the kernel takes const int64_t* __restrict__ input_strides and input_shape,
+-    // which are declared as device pointers (kernel memory space). So we need to copy them to GPU.
+-    // Alternatively, modify launcher to accept host pointers? But .cu cannot be modified in this stage.
+-    // We must allocate device memory for these arrays and copy them.
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    view_as_real_launcher(
++        reinterpret_cast<const float*>(x_contig.data_ptr<c10::complex<float>>()),
++        output.data_ptr<float>(),
++        B, C, H,
++        s0, s1, s2,
++        os0, os1, os2, os3,
++        stream);
+ 
+-    int64_t* d_input_strides = nullptr;
+-    int64_t* d_input_shape = nullptr;
+-    cudaMalloc(&d_input_strides, ndim * sizeof(int64_t));
+-    cudaMalloc(&d_input_shape, ndim * sizeof(int64_t));
+-    cudaMemcpyAsync(d_input_strides, input_strides.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+-    cudaMemcpyAsync(d_input_shape, input_shape.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "view_as_real_launcher failed: ", cudaGetErrorString(err));
+ 
+-    // Call launcher with GPU complex pointer
+-    view_as_real_launcher(
+-        reinterpret_cast<const float2*>(x_gpu.data_ptr<c10::complex<float>>()),
+-        out.data_ptr<float>(),
+-        total_complex_elements,
+-        d_input_strides,
+-        d_input_shape,
+-        static_cast<int>(ndim),
+-        stream
+-    );
+-    check_cuda_error("view_as_real_launcher");
+-
+-    // Free device arrays
+-    cudaFree(d_input_strides);
+-    cudaFree(d_input_shape);
+-
+-    return out;
++    return output;
+ }
+ 
+-// einsum_bchw_to_bhwc_forward: CUDA float32 [B,C,H,W,2] -> [B,H,W,C,2]
+-torch::Tensor einsum_bchw_to_bhwc_forward(torch::Tensor x) {
+-    TORCH_CHECK(x.is_cuda(), "einsum_bchw_to_bhwc_forward: input must be CUDA tensor");
+-    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "einsum_bchw_to_bhwc_forward: input must be float32");
++// 2. einsum bchw->bhwc: transpose last two dimensions
++torch::Tensor einsum_bchw_to_bhwc(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "einsum_bchw_to_bhwc: input must be CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "einsum_bchw_to_bhwc: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "einsum_bchw_to_bhwc: input must be 4D");
+ 
+-    auto sizes = x.sizes();
+-    TORCH_CHECK(sizes.size() == 5, "einsum_bchw_to_bhwc_forward: input must be 5D [B,C,H,W,2]");
+-    int64_t B = sizes[0];
+-    int64_t C = sizes[1];
+-    int64_t H = sizes[2];
+-    int64_t W = sizes[3];
+-    int64_t R = sizes[4]; // == 2
+-    TORCH_CHECK(R == 2, "einsum_bchw_to_bhwc_forward: last dim must be 2");
++    // Input shape: [B, C, H, W]
++    long long B = x.size(0);
++    long long C = x.size(1);
++    long long H = x.size(2);
++    long long W = x.size(3);
+ 
+-    // Output shape [B,H,W,C,2]
+-    std::vector<int64_t> out_sizes = {B, H, W, C, R};
+-    auto out = torch::empty(out_sizes, torch::dtype(torch::kFloat32).device(torch::kCUDA));
++    // Output shape: [B, H, W, C] with reference stride [H*W*C, W*C, C, 1]
++    auto output = torch::empty({B, H, W, C}, x.options());
+ 
+-    // Input and output strides
+-    auto in_strides = x.strides(); // 5 strides, may be non-contiguous
+-    auto out_strides = out.strides();
++    // Launcher supports arbitrary strides, but we must pass correct input strides.
++    // We'll use input strides as provided (x may be non-contiguous).
++    long long is0 = x.stride(0);
++    long long is1 = x.stride(1);
++    long long is2 = x.stride(2);
++    long long is3 = x.stride(3);
+ 
+-    // Total output elements = B*H*W*C*2
+-    int64_t total_out = out.numel();
++    long long os0 = output.stride(0);
++    long long os1 = output.stride(1);
++    long long os2 = output.stride(2);
++    long long os3 = output.stride(3);
+ 
+-    // Prepare strides and shape for launcher (device arrays)
+-    int ndim = 5;
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    cudaStream_t stream = getCurrentStream();
+ 
+-    int64_t* d_input_strides = nullptr;
+-    int64_t* d_output_strides = nullptr;
+-    int64_t* d_output_shape = nullptr;
+-    cudaMalloc(&d_input_strides, ndim * sizeof(int64_t));
+-    cudaMalloc(&d_output_strides, ndim * sizeof(int64_t));
+-    cudaMalloc(&d_output_shape, ndim * sizeof(int64_t));
++    einsum_bchw_to_bhwc_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B, C, H, W,
++        is0, is1, is2, is3,
++        os0, os1, os2, os3,
++        stream);
+ 
+-    std::vector<int64_t> input_strides(in_strides.begin(), in_strides.end());
+-    std::vector<int64_t> output_strides(out_strides.begin(), out_strides.end());
+-    std::vector<int64_t> output_shape(out_sizes.begin(), out_sizes.end());
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "einsum_bchw_to_bhwc_launcher failed: ", cudaGetErrorString(err));
+ 
+-    cudaMemcpyAsync(d_input_strides, input_strides.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+-    cudaMemcpyAsync(d_output_strides, output_strides.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+-    cudaMemcpyAsync(d_output_shape, output_shape.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+-
+-    einsum_permute_launcher(
+-        x.data_ptr<float>(),
+-        out.data_ptr<float>(),
+-        total_out,
+-        d_input_strides,
+-        d_output_strides,
+-        d_output_shape,
+-        ndim,
+-        stream
+-    );
+-    check_cuda_error("einsum_permute_launcher");
+-
+-    cudaFree(d_input_strides);
+-    cudaFree(d_output_strides);
+-    cudaFree(d_output_shape);
+-
+-    return out;
++    return output;
+ }
+ 
+-// clip_forward: in-place clamp on CUDA float32 tensor
+-torch::Tensor clip_forward(torch::Tensor x, float min = 0.0f, float max = 1.0f) {
+-    TORCH_CHECK(x.is_cuda(), "clip_forward: input must be CUDA tensor");
+-    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "clip_forward: input must be float32");
++// 3. clip: element-wise clamp with min_val and max_val
++torch::Tensor clip_kernel(torch::Tensor x, double min_val, double max_val) {
++    TORCH_CHECK(x.is_cuda(), "clip_kernel: input must be CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "clip_kernel: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "clip_kernel: input must be 4D");
+ 
+-    // We will modify in-place to preserve any strides and avoid extra memory.
+-    // The launcher modifies data in-place.
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    int64_t total_elements = x.numel();
++    // Input shape: [D0, D1, D2, D3]
++    long long d0 = x.size(0);
++    long long d1 = x.size(1);
++    long long d2 = x.size(2);
++    long long d3 = x.size(3);
+ 
+-    clip_launcher(x.data_ptr<float>(), total_elements, min, max, stream);
+-    check_cuda_error("clip_launcher");
++    // Output tensor with same shape and strides as input
++    auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
+ 
+-    return x;
++    long long is0 = x.stride(0);
++    long long is1 = x.stride(1);
++    long long is2 = x.stride(2);
++    long long is3 = x.stride(3);
++    long long os0 = output.stride(0); // should equal is0
++    long long os1 = output.stride(1);
++    long long os2 = output.stride(2);
++    long long os3 = output.stride(3);
++
++    cudaStream_t stream = getCurrentStream();
++
++    clip_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        d0, d1, d2, d3,
++        is0, is1, is2, is3,
++        os0, os1, os2, os3,
++        static_cast<float>(min_val),
++        static_cast<float>(max_val),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "clip_launcher failed: ", cudaGetErrorString(err));
++
++    return output;
+ }
+ 
++// Registration
+ void register_custom_ops(pybind11::module& m) {
+-    m.def("view_as_real_forward", &view_as_real_forward,
+-          "Convert CPU complex64 tensor to CUDA float32 tensor with extra trailing dim of 2",
+-          py::arg("x"));
+-    m.def("einsum_bchw_to_bhwc_forward", &einsum_bchw_to_bhwc_forward,
+-          "Permute bchw->bhwc for a 5D tensor where last dim is 2",
+-          py::arg("x"));
+-    m.def("clip_forward", &clip_forward,
+-          "Clamp tensor element-wise to [min, max]",
+-          py::arg("x"), py::arg("min") = 0.0f, py::arg("max") = 1.0f);
++    m.def("view_as_real_kernel", &view_as_real_kernel, "Convert complex64 tensor to float32 view with extra last dim of size 2", py::arg("x"));
++    m.def("einsum_bchw_to_bhwc", &einsum_bchw_to_bhwc, "Einsum bchw->bhwc (transpose last two dims)", py::arg("x"));
++    m.def("clip_kernel", &clip_kernel, "Clip tensor values to [min, max]", py::arg("x"), py::arg("min_val"), py::arg("max_val"));
+ }
+ 
+ REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -12,16 +12,16 @@
+         self.clip_max = clip_max
+ 
+     def forward(self, x):
+-        x = cuda_extension.view_as_real_forward(x)
+-        x = cuda_extension.einsum_bchw_to_bhwc_forward(x)
+-        x = cuda_extension.clip_forward(x, min=self.clip_min, max=self.clip_max)
++        x = cuda_extension.view_as_real_kernel(x)
++        x = cuda_extension.einsum_bchw_to_bhwc(x)
++        x = cuda_extension.clip_kernel(x, self.clip_min, self.clip_max)
+         return x
+ 
+     def debug_forward(self, x):
+-        x = cuda_extension.view_as_real_forward(x)
+-        yield 'step_001', x
+-        x = cuda_extension.einsum_bchw_to_bhwc_forward(x)
+-        yield 'step_002', x
+-        x = cuda_extension.clip_forward(x, min=self.clip_min, max=self.clip_max)
+-        yield 'step_003', x
+-        yield 'step_004', x
++        x = cuda_extension.view_as_real_kernel(x)
++        yield "step_001", x
++        x = cuda_extension.einsum_bchw_to_bhwc(x)
++        yield "step_002", x
++        x = cuda_extension.clip_kernel(x, self.clip_min, self.clip_max)
++        yield "step_003", x
++        yield "step_004", x

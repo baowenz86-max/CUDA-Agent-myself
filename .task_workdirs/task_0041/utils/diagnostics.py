@@ -161,6 +161,53 @@ def api_signatures(model):
     return signatures
 
 
+def reference_calls(model):
+    """Record exact call arguments, without inferring behavior from module state."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(type(model).forward)))
+    result = []
+    for call in (x for x in ast.walk(tree) if isinstance(x, ast.Call)):
+        name = ast.unparse(call.func)
+        row = {'function': name, 'args': [ast.unparse(x) for x in call.args],
+               'keywords': {x.arg or '**kwargs': ast.unparse(x.value) for x in call.keywords}}
+        if name.startswith(('F.conv', 'torch.nn.functional.conv')):
+            row['bias'] = row['keywords'].get('bias', row['args'][2] if len(row['args']) >= 3 else 'None (omitted)')
+        if any(x in name for x in ('masked_select', 'unbind', 'transpose', 'median', 'sign', 'softmax', 'rsqrt')):
+            row['semantic_warning'] = 'Preserve axes, strides, stable order, boundary behavior and exact return type'
+        result.append(row)
+    return result
+
+
+def boundary_context(value, indices=()):
+    """Small scalar/near-zero samples for diagnosing sensitive downstream ops."""
+    import torch
+    if not isinstance(value, torch.Tensor):
+        return {'structure': describe(value)}
+    result = {'structure': describe(value)}
+    if value.numel() == 1:
+        result['scalar'] = repr(value.item())
+    samples = []
+    for index in indices[:5]:
+        if len(index) == value.dim() and all(0 <= x < value.shape[i] for i, x in enumerate(index)):
+            samples.append({'index': index, 'value': repr(value[tuple(index)].item())})
+    result['failure_index_samples'] = samples
+    if value.is_floating_point() and value.is_contiguous():
+        flat = value.view(-1)
+        minimum, count, near = math.inf, 0, []
+        for start in range(0, flat.numel(), 1_048_576):
+            chunk = flat[start:start + 1_048_576]
+            finite = torch.isfinite(chunk)
+            if finite.any().item():
+                minimum = min(minimum, float(chunk[finite].abs().min().item()))
+            mask = finite & (chunk.abs() <= 1e-4)
+            count += int(mask.sum().item())
+            if len(near) < 5:
+                near.extend({'flat_index': start + i, 'value': repr(chunk[i].item())}
+                            for i in mask.nonzero().flatten()[:5 - len(near)].tolist())
+        result.update(min_absolute_value=_finite_json(minimum), near_zero_count=count,
+                      near_zero_threshold=1e-4, near_zero_samples=near)
+    return result
+
+
 class ComparisonFailure(AssertionError):
     def __init__(self, detail):
         self.detail = detail

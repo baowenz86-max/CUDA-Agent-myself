@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from .diagnostics import (
     ComparisonFailure, check_equal, reference_trace,
-    seed_all, transform_tree, write_json,
+    seed_all, transform_tree, write_json, boundary_context,
 )
 
 
@@ -122,6 +122,8 @@ def restore_rng(state):
 def diagnose(torch_model, cuda_model, fixture, inputs, input_seed, device):
     if not callable(getattr(cuda_model, 'debug_forward', None)):
         return {'status': 'unavailable', 'reason': 'ModelNew.debug_forward is missing'}
+    matched = 0
+    stage = None
     try:
         ref_fn, stages = reference_trace(torch_model)
         torch_model.load_state_dict(fixture['state_dict'], strict=True)
@@ -134,7 +136,9 @@ def diagnose(torch_model, cuda_model, fixture, inputs, input_seed, device):
         ref_rng = initial_rng
         actual_rng = rng_state()
         matched = 0
-        for stage in stages:
+        previous = []
+        sensitive = ('sign', 'median', 'ne(', 'rsqrt', 'softmax')
+        for stage_index, stage in enumerate(stages):
             restore_rng(ref_rng)
             expected_id, expected = next(reference)
             ref_rng = rng_state()
@@ -145,22 +149,34 @@ def diagnose(torch_model, cuda_model, fixture, inputs, input_seed, device):
             actual_rng = rng_state()
             if checkpoint != expected_id:
                 return {'status': 'failed', 'checkpoint': stage, 'kind': 'checkpoint_contract',
-                        'actual_id': str(checkpoint), 'matched_checkpoints': matched}
+                        'actual_id': str(checkpoint), 'matched_checkpoints': matched, 'input_seed': input_seed}
             try:
                 check_equal(value, expected, expected_id)
             except ComparisonFailure as exc:
-                return {'status': 'failed', 'checkpoint': stage, 'error': exc.detail,
-                        'matched_checkpoints': matched}
+                diagnostic = {'status': 'failed', 'checkpoint': stage, 'error': exc.detail,
+                              'matched_checkpoints': matched, 'input_seed': input_seed}
+                if any(token in stage['source'] for token in sensitive):
+                    diagnostic['boundary_context'] = previous
+                return diagnostic
             matched += 1
+            # Record small summaries before subsequent in-place operations can
+            # change the tensors. No whole-tensor clones or retained references.
+            upcoming = stages[stage_index + 1:stage_index + 3]
+            if any(token in item['source'] for item in upcoming for token in sensitive):
+                previous.append({'checkpoint': expected_id, 'actual': boundary_context(value),
+                                 'expected': boundary_context(expected)})
+            previous = previous[-2:]
             del expected, value
         sentinel = object()
         with block_torch_functional():
             if next(actual, sentinel) is not sentinel:
-                return {'status': 'failed', 'kind': 'extra_checkpoint', 'matched_checkpoints': matched}
-        return {'status': 'matched', 'matched_checkpoints': matched,
+                return {'status': 'failed', 'kind': 'extra_checkpoint', 'matched_checkpoints': matched,
+                        'input_seed': input_seed}
+        return {'status': 'matched', 'matched_checkpoints': matched, 'input_seed': input_seed,
                 'note': 'Debug checkpoints match; normal forward still failed and remains rejected'}
     except Exception as exc:
         return {'status': 'unavailable', 'reason': f'{type(exc).__name__}: {exc}',
+                'input_seed': input_seed, 'checkpoint': stage, 'matched_checkpoints': matched,
                 'traceback': traceback.format_exc()}
 
 
@@ -170,7 +186,11 @@ def main(argv=None):
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--replay', type=Path, help='Replay a trusted, locally saved failure_inputs.pt')
     parser.add_argument('--diagnose', action='store_true', help='Diagnose the saved failure in a fresh process')
+    parser.add_argument('--diagnostic-replay', type=Path,
+                        help='Diagnose an earlier candidate input, writing evidence to the current run only')
     args = parser.parse_args(argv)
+    if args.diagnostic_replay and (not args.diagnose or args.replay):
+        parser.error('--diagnostic-replay requires --diagnose and cannot be combined with --replay')
     directory = args.replay.resolve().parent if args.replay else fixture_directory()
     report_path = directory / 'verification.json'
     result = {'status': 'failed', 'seed': args.seed, 'num_checks': 5, 'checks': [],
@@ -180,7 +200,9 @@ def main(argv=None):
         torch_model, cuda_model, fixture = initialize_models(directory, args.seed, args.device)
         replay = torch.load(args.replay, map_location='cpu', weights_only=False) if args.replay else None
         if args.diagnose:
-            failure = replay or torch.load(directory / 'failure_inputs.pt', map_location='cpu', weights_only=False)
+            failure = (torch.load(args.diagnostic_replay, map_location='cpu', weights_only=False)
+                       if args.diagnostic_replay else replay or
+                       torch.load(directory / 'failure_inputs.pt', map_location='cpu', weights_only=False))
             with torch.no_grad():
                 diagnostic = diagnose(torch_model, cuda_model, fixture, failure['inputs'], failure['seed'], args.device)
             write_json(directory / 'diagnostic.json', diagnostic)

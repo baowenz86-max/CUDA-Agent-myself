@@ -1,0 +1,30 @@
+import torch
+import torch.nn as nn
+import cuda_extension
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, num_params):
+        super().__init__()
+        self.conv_transpose = nn.ConvTranspose1d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.params = nn.ParameterList([nn.Parameter(torch.randn(out_channels)) for _ in range(num_params)])
+
+    def forward(self, x):
+        # Call custom op that performs: conv_transpose1d without bias, add param biases, round
+        x = cuda_extension.convt1d_bias_round(
+            x,
+            self.conv_transpose.weight,
+            None,  # bias=None to match reference
+            self.conv_transpose.stride[0],
+            self.conv_transpose.padding[0],
+            self.conv_transpose.output_padding[0],
+            [p for p in self.params],  # list of param tensors
+        )
+        return x
+
+    def debug_forward(self, x):
+        # Since no official checkpoints, yield only final output with id 'final'
+        y = self.forward(x)
+        yield 'final', y

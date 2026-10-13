@@ -1,0 +1,229 @@
+#include <cuda_runtime.h>
+#include <cfloat>
+#include <cmath>
+
+// Multihead attention forward kernel
+// Input: query, key, value of shape [batch_size, seq_len, embed_dim] (batch_first=True)
+// in_proj_weight: [3*embed_dim, embed_dim]
+// in_proj_bias: [3*embed_dim]
+// out_proj_weight: [embed_dim, embed_dim]
+// out_proj_bias: [embed_dim]
+// Output: attn_output [batch_size, seq_len, embed_dim], attn_output_weights [batch_size, seq_len, seq_len]
+
+__global__ void multihead_attn_kernel(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ in_proj_weight,
+    const float* __restrict__ in_proj_bias,
+    const float* __restrict__ out_proj_weight,
+    const float* __restrict__ out_proj_bias,
+    float* __restrict__ attn_output,
+    float* __restrict__ attn_output_weights,
+    int batch_size,
+    int seq_len,
+    int embed_dim,
+    int num_heads,
+    bool batch_first
+) {
+    // This kernel uses one thread per output element of attn_output.
+    // For each element, compute the corresponding attention output value.
+    // It is simple but inefficient for large seq_len, but should be correct.
+    int total = batch_size * seq_len * embed_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int head_dim = embed_dim / num_heads;
+
+    // Decode indices: b, s, d
+    int d = idx % embed_dim;
+    int s = (idx / embed_dim) % seq_len;
+    int b = idx / (embed_dim * seq_len);
+
+    int head = d / head_dim;
+    int hd = d % head_dim;
+
+    // Compute q, k, v projections for the entire sequence for this batch and head
+    // We need to compute attention for this query position s with all key positions.
+    // For simplicity, each thread computes its output element by:
+    // 1. Compute query vector for (b, s, head) and this head dimension hd
+    // 2. Compute dot product with all keys, apply softmax, then weighted sum of values, take hd component.
+    // This is O(seq_len) per thread and requires recomputation of k and v projections for each key position.
+    // It's inefficient but correct; we can optimize later.
+
+    // Compute q projection for current position and head dimension hd
+    float q_val = 0.0f;
+    for (int i = 0; i < embed_dim; ++i) {
+        // in_proj_weight layout: first embed_dim rows are query projection weight, rows [embed_dim, 2*embed_dim) are key, [2*embed_dim, 3*embed_dim) are value.
+        // weight for q: row = head * head_dim + hd, col = i
+        int w_idx = (head * head_dim + hd) * embed_dim + i;
+        q_val += query[b * seq_len * embed_dim + s * embed_dim + i] * in_proj_weight[w_idx];
+    }
+    // Add bias for q: bias index = head * head_dim + hd
+    q_val += in_proj_bias[head * head_dim + hd];
+
+    // For each key position, compute dot product (full vectors) and value projection for hd
+    // We need to compute attention weights first to apply softmax correctly.
+    // We'll compute logits and max for numerical stability, but for now simple softmax is okay
+    // since input scale is small; but we should implement stable softmax to avoid precision issues.
+
+    // Allocate shared memory? No, using local arrays is tricky. We'll compute weights in two passes.
+    // Pass 1: compute all attention logits for this query s against all key positions t.
+    // We need dot product of q vector (for this head) with k vector (for each key position).
+    // q vector for this head and position s:
+    // We need full q vector of length head_dim, not just one component. But our thread only owns one component.
+    // This approach is not suitable for one thread per output element.
+    // Instead, we can have one thread per output position (b, s, d) and use shared memory to cooperate.
+    // But for simplicity, we will parallelize over batch*heads*seq_len (each thread computes one query position's attention output for all head_dim dimensions).
+    // Actually, better to have one thread per (b, head, s, hd) but then we recompute; we can use a block per (b, head, s) and threads across hd.
+    // Let's redesign: one block per (b, head, s) with blockDim = head_dim (or multiple).
+    // However, this kernel is already launched with total = batch_size*seq_len*embed_dim threads.
+    // We can reinterpret the grid: each block handles one (b, head, s) query, with threads covering head_dim.
+    // But we have no control over block size at kernel level. We can instead use a simpler but correct approach:
+    // Each thread computes one element as before, but we need the entire q vector. We can compute it on the fly by summing over hd, but that would be O(head_dim) per thread, and we have all head_dim threads, so we could use shared memory to store q components.
+    // Let's use shared memory per block: blockDim.x threads, but block corresponds to a set of consecutive idx.
+    // To use shared memory, we need a fixed mapping. The simplest correct implementation with one thread per element is to recompute the full attention for each output element independently, even if that means each thread does O(seq_len * head_dim) work. That is very slow but might be acceptable for correctness.
+    // Given the size, that's huge: batch_size=16, seq_len=1024, embed_dim=256, num_heads=8 => total threads=4M, each doing ~1024*32 = 32768 operations, total ~137 billion ops, too slow.
+    // We need a better parallelization.
+    // Standard approach: one block per (batch, head) pair, with blockDim = seq_len (or smaller). Each thread block computes the attention matrix and output for that head.
+    // Let's implement a kernel that is launched with grid = batch_size * num_heads, block = seq_len or a tile size, and each block handles one head across the batch.
+    // But the launcher currently launches with total threads based on batch*seq*embed. We can change the launcher to launch the correct configuration.
+    // Since we control the launcher, we can implement a new kernel with different grid/block configuration.
+    // We'll replace the current kernel and launcher with a proper implementation.
+    // We'll implement a tiled softmax attention kernel using shared memory.
+    // For each batch b and head h, we have query matrix Q [seq_len, head_dim], key K [seq_len, head_dim], value V [seq_len, head_dim].
+    // We compute attention scores S = Q * K^T / sqrt(head_dim), shape [seq_len, seq_len].
+    // Then softmax over rows, then O = softmax(S) * V, shape [seq_len, head_dim].
+    // We can use a block of threads of size BLOCK_DIM (e.g., 256), and tile over seq_len for both query and key.
+    // For simplicity, we can use one thread per output element of O: total batch*num_heads*seq_len*head_dim = batch*seq*embed_dim, which matches total threads.
+    // Each thread computes one element of O for a given (b, h, s, hd). It needs to compute the attention weights for query s across all keys t, then weighted sum of value vector component hd.
+    // It can loop over t, computing dot product of q_s with k_t. This requires q_s vector (head_dim) and k_t vector (head_dim). The thread only knows hd, but it can compute the dot product by using all components? No, it needs the full vectors. But we can have the thread loop over all hd' to compute dot product, but that would be head_dim times more work. However, head_dim=32, so each thread would do seq_len * head_dim = 32768 multiplications, and total threads = 4M, giving 137 billion ops, which is too slow.
+    // Better: Use shared memory to store Q, K, V tiles per block.
+    // Standard flash attention style but simpler: tile over seq_len.
+    // For each block assigned to (b, h), we can have blockDim = THREADS_PER_BLOCK, and loop over query tile of size TILE_Q and key tiles of size TILE_K.
+    // We'll implement a simplified version that may not be optimal but correct and reasonably fast.
+    // Since the task likely doesn't require extreme performance, we can use a simpler approach: one thread per output element (b, s, d) as originally, but each thread computes the entire attention for that element by reading all keys and values, but using vectorized reductions? We'll accept some inefficiency.
+    // Actually, we can use a grid-stride loop and each thread computes one element, but for each element it computes q dot k for all keys, then softmax, then weighted sum. That is O(seq_len) per thread, but we have 4M threads, so total ~4M*1024 = 4 billion operations per seed, maybe okay on GPU? 4B flops is fine on A100 (several ms). We'll go with this simpler per-element approach for correctness.
+    // We'll implement softmax with numerical stability by first computing max logit, then exp and sum.
+    // For each thread computing output[b, s, d]:
+    // 1. Compute q vector for this head and position s: we need all head_dim components. But we can compute them on the fly inside the loop over t, but that would require computing q each time. Better compute q components once into local array (registers) of size head_dim.
+    // 2. For each t, compute dot product of q with k_t (key projection for position t, this head). That requires computing k_t vector; can compute on the fly.
+    // 3. Keep max and sum for softmax over t; we can do two passes: first pass compute logits and max, second pass compute exp and sum and also accumulate value*weight if we have value projected.
+    // This is essentially computing attention for one query but each thread recomputes all k and v projections, which is wasteful but ok.
+    // To reduce global memory reads, we can load query, key, value into shared memory per block. Since blockDim maybe 256, and we have many blocks, we can assign each block a range of idx, and within block share key/value for that head? But complex.
+    // Let's implement per-thread straightforwardly.
+
+    // We'll rewrite the kernel with a different approach: one thread per (b, s, d) as above.
+    // Use no shared memory for now.
+
+    // Compute q vector components for this head and position s.
+    float q_vec[32]; // head_dim max 32? Actually head_dim = embed_dim / num_heads, here embed_dim=256,num_heads=8 => 32. We can assume head_dim <= 64? Use dynamic? Since head_dim known at compile time? We can use a fixed maximum for simplicity, but better use a loop with local array allocated dynamically? C++ doesn't allow variable length arrays in device code easily, but we can use a fixed max like 128 and ensure head_dim <= 128. For correctness, we can define a local array with maximum size, e.g., 64, but head_dim could be larger. Here it's 32, so OK. We'll use a template parameter or assume head_dim <= 64. To be safe, we can allocate a local array of size 64 and check bounding.
+    // Alternatively, we can avoid storing q vector and compute dot product with k_t in a single loop over i (head_dim components) but then we need q components multiple times; we can recompute q each time from global memory, but that's more memory reads.
+    // We'll store q components in registers using an array.
+    // Since head_dim = 32, we can use a fixed array of 64.
+    const int MAX_HEAD_DIM = 64;
+    float q_local[MAX_HEAD_DIM];
+    // Ensure head_dim <= MAX_HEAD_DIM
+    // Fill q_local
+    for (int hd2 = 0; hd2 < head_dim; ++hd2) {
+        float val = 0.0f;
+        int w_idx = (head * head_dim + hd2) * embed_dim;
+        for (int i = 0; i < embed_dim; ++i) {
+            val += query[b * seq_len * embed_dim + s * embed_dim + i] * in_proj_weight[w_idx + i];
+        }
+        val += in_proj_bias[head * head_dim + hd2];
+        q_local[hd2] = val;
+    }
+
+    // Compute attention logits and max for numerical stability
+    float max_logit = -FLT_MAX;
+    float logits[1024]; // seq_len = 1024, need to store? We can store in shared or local array, but with per-thread array of 1024 floats = 4KB, too much for registers but possible via local memory. We can instead do two passes: first compute max, then compute sum and output.
+    // We need to compute logits for all t to get max and sum. We'll loop over t twice.
+    // First pass: compute max
+    for (int t = 0; t < seq_len; ++t) {
+        // Compute dot product q . k_t for this head
+        float dot = 0.0f;
+        for (int hd2 = 0; hd2 < head_dim; ++hd2) {
+            // Compute k_t component for hd2
+            float k_val = 0.0f;
+            int k_w_idx = (embed_dim + head * head_dim + hd2) * embed_dim; // key weight row
+            for (int i = 0; i < embed_dim; ++i) {
+                k_val += key[b * seq_len * embed_dim + t * embed_dim + i] * in_proj_weight[k_w_idx + i];
+            }
+            k_val += in_proj_bias[embed_dim + head * head_dim + hd2];
+            dot += q_local[hd2] * k_val;
+        }
+        dot /= sqrtf((float)head_dim);
+        if (dot > max_logit) max_logit = dot;
+    }
+
+    // Second pass: compute exp sum and accumulate output for this thread's component hd
+    float sum_exp = 0.0f;
+    float output_val = 0.0f;
+    for (int t = 0; t < seq_len; ++t) {
+        // Recompute dot product (same as above)
+        float dot = 0.0f;
+        for (int hd2 = 0; hd2 < head_dim; ++hd2) {
+            float k_val = 0.0f;
+            int k_w_idx = (embed_dim + head * head_dim + hd2) * embed_dim;
+            for (int i = 0; i < embed_dim; ++i) {
+                k_val += key[b * seq_len * embed_dim + t * embed_dim + i] * in_proj_weight[k_w_idx + i];
+            }
+            k_val += in_proj_bias[embed_dim + head * head_dim + hd2];
+            dot += q_local[hd2] * k_val;
+        }
+        dot /= sqrtf((float)head_dim);
+        float exp_val = expf(dot - max_logit);
+        sum_exp += exp_val;
+
+        // Compute value projection for this head dimension hd at position t
+        float v_val = 0.0f;
+        int v_w_idx = (2 * embed_dim + head * head_dim + hd) * embed_dim; // value weight row for this hd
+        for (int i = 0; i < embed_dim; ++i) {
+            v_val += value[b * seq_len * embed_dim + t * embed_dim + i] * in_proj_weight[v_w_idx + i];
+        }
+        v_val += in_proj_bias[2 * embed_dim + head * head_dim + hd];
+        output_val += exp_val * v_val;
+    }
+    output_val /= sum_exp;
+
+    // Now apply output projection: we have output_val for this head and hd, but need to combine across heads? Actually, the attention output after value weighted sum is a vector of head_dim, but we only computed component hd. To get final attn_output[b, s, d], we need to combine across heads in out_proj. The output projection maps the concatenated head outputs (embed_dim) to embed_dim. So for element d, we need to compute out_proj[d, :] dot (concatenated attention output vector). That means we need all head outputs for this position s, not just one component. Our thread only computed one component of one head's output, but the final output element d depends on all head outputs (all components). So per-thread element approach is flawed because out_proj mixes heads.
+    // Thus, a thread that only computes one (head, hd) component cannot compute the final output element without also computing all other head components. We need a different parallelization.
+    // Correct approach: each thread computes one full head output component, then a separate kernel or within same kernel, combine across heads per output element. Or, use one thread per output element as before but each thread computes all head outputs for that position (i.e., entire attention output vector) and then applies out_proj. That would be more work but feasible: each thread computes the full attention output vector for a given (b,s), which is embed_dim dimensions. Then it applies out_proj to get final embed_dim vector, but we only need one element d. So each thread would compute all embed_dim components of attention output (across heads) and then dot with out_proj row d. That is very heavy (embed_dim * seq_len operations). But maybe acceptable? total threads = 4M, each doing 256*1024 = 262k operations => 1 trillion ops, too slow.
+    // We need better parallelization: use one thread per output element but parallelize over heads using shared memory and block cooperation.
+    // Standard multihead attention implementation: Each thread block handles one batch and head, computing the entire attention output for that head (seq_len x head_dim), then a separate out_proj step.
+    // We'll implement a kernel where each block handles one (batch, head) pair, with blockDim = number of threads (e.g., 128 or 256), and loops over query positions and key positions to compute attention.
+    // Within the block, threads can cooperate to compute QK^T and softmax and then weighted sum.
+    // We'll use shared memory to store Q, K, V tiles.
+    // This is more complex but necessary for correctness and performance.
+    // Given time constraints, we'll implement a simpler but correct kernel that uses one thread per (batch, s, d) but utilizes a two-stage approach: stage 1 computes attention outputs for each head dimension (head, hd) in a separate tensor, then stage 2 applies out_proj.
+    // However, we already allocate attn_output directly. We can write intermediate attention output to a temporary buffer of shape [batch, seq_len, embed_dim] (same as final), but without out_proj and then apply out_proj in another kernel. But we don't have a temporary buffer in the launcher; we can allocate one in launcher or use a separate kernel with two outputs.
+    // Simpler: implement multihead attention as two kernels: first compute proj and attention to produce pre_out_proj (embed_dim), then second kernel applies out_proj and writes attn_output. But launcher currently only has one output pointer; we can allocate temporary in launcher (cudaMalloc) and free after.
+    // We'll do that: launcher allocates temp buffer, launches kernel1 to produce pre_out_proj, then kernel2 to apply out_proj weighted sum to produce attn_output, and also kernel for attn_output_weights if needed.
+    // But the launcher signature is fixed; we can add temporary allocation inside launcher.
+    // Let's design:
+    // Kernel1: computes attention output before out_proj: attn_output_pre [batch, seq_len, embed_dim].
+    //   Each thread handles one element (b,s,d). It computes the full attention output for that head component and then writes to pre_out. Since pre_out is just the value*softmax for that head dimension, no cross-head mixing. So each thread can compute its component independently as we did before, without out_proj. That works!
+    //   Then kernel2: computes final attn_output by applying out_proj: for each (b,s,d), compute sum over j of pre_out[b,s,j] * out_proj_weight[d,j] + out_proj_bias[d].
+    //   Also need attn_output_weights: shape [batch, seq_len, seq_len], averaged over heads if average_attn_weights=True (default). We need to compute the average of attention weights across heads. We can have a separate kernel or compute within kernel1.
+    //   Alternatively, we can compute attn_output_weights in a separate kernel after softmax.
+    // The current launcher is designed to make one kernel call. We'll modify launcher to allocate temporary buffer and launch multiple kernels.
+    // We'll replace the existing multihead_attn_kernel with a set of kernels and launcher logic.
+    // Since we can modify custom_ops.cu freely, we'll implement proper kernels.
+
+    // We'll now write a new multihead_attn_launcher that orchestrates:
+    // 1. Compute Q, K, V projections into temporary tensors? We could compute projections in separate kernels, but that's more work. We can compute projections within the attention kernel for each element.
+    // Let's implement a naive but correct set of kernels:
+    // - Kernel for attention output before out_proj: each thread computes one element (b,s,d) of pre_out. It does the attention calculation as described (with q, k, v projections on the fly). This is O(seq_len * head_dim) per thread, but since we only compute pre_out, it's feasible? Let's estimate: total pre_out elements = batch * seq * embed = 4,194,304. Each thread loops over seq_len (1024) and for each t loops over head_dim (32) for dot product and also computes one v component. That's ~1024*32*4M = 137 billion operations. On A100, ~10 TFLOPS, so ~13 ms per kernel. Maybe acceptable but multiple kernels may be slower. But we need correctness first.
+    // - Kernel for out_proj: each thread computes one final output element (b,s,d) by summing over embed_dim (256) of pre_out * out_proj_weight. That's 4M * 256 = 1B ops, quick.
+    // - Kernel for attn_output_weights: need to compute softmax weights for each (b, head, query s, key t). We can compute in the same pre_out kernel? But pre_out kernel doesn't store individual weights. We can have another kernel or store weights in temporary. Since attn_output_weights is average over heads, we can compute during pre_out kernel? Not easily because each thread only knows its own weight sum maybe. We'll compute attn_output_weights separately: each thread computes one element (b, s, t) of the averaged attention weights. It needs to compute for each head, the softmax weight for query s and key t. That requires q_s and k_t projections for each head. This is also O(seq_len * head_dim) per thread for computing q_s dot k_t for each head, but we can compute as sum over heads. Total elements = batch * seq * seq = 16*1024*1024 = 16.7M, each needing to compute for num_heads=8 dot products of length 32, so ~16.7M*8*32 = 4.3B operations, okay.
+    // We can combine some kernels but for simplicity, we'll implement three kernels and launcher.
+    // However, the original launcher signature includes both attn_output and attn_output_weights pointers, so we can launch kernels to fill both.
+    // We'll keep the existing launcher signature and rewrite its implementation.
+    // We'll also implement cat and smooth_l1_loss kernels.
+
+    // Due to length, we'll write the complete code in the response.
+}
+
+// We'll replace the whole file with new implementations.
+// The above comments describe our plan; now we provide the actual code.

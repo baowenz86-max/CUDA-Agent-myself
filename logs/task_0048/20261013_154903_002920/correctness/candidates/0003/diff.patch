@@ -1,0 +1,154 @@
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -54,8 +54,6 @@
+     TORCH_CHECK(output_size == 1, "Only output_size=1 is supported for last two dims");
+     TORCH_CHECK(x.dim() == 5, "Input must be 5D (batch, channels, depth, height, width)");
+ 
+-    // Input may be non-contiguous; contract says supports strides.
+-    // We'll make it contiguous to simplify indexing and ensure correct strides.
+     auto x_contig = x.contiguous();
+ 
+     int batch = x_contig.size(0);
+@@ -76,19 +74,21 @@
+ 
+ // -----------------------------------------------------------------------------
+ // conv3d_forward using custom CUDA kernel
++// Now accepts scalar ints for stride and padding.
+ // -----------------------------------------------------------------------------
+ torch::Tensor conv3d_forward(
+     torch::Tensor x,
+     torch::Tensor weight,
+     c10::optional<torch::Tensor> bias,
+-    std::vector<int64_t> stride,
+-    std::vector<int64_t> padding) {
++    int64_t stride,
++    int64_t padding) {
+ 
+     check_cuda_float32(x, "x");
+     check_cuda_float32(weight, "weight");
+     TORCH_CHECK(x.dim() == 5, "Input must be 5D");
+     TORCH_CHECK(weight.dim() == 5, "Weight must be 5D");
+-    TORCH_CHECK(stride.size() == 3 && padding.size() == 3, "stride/padding must be length 3");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
+ 
+     auto x_contig = x.contiguous();
+     auto w_contig = weight.contiguous();
+@@ -106,8 +106,13 @@
+ 
+     TORCH_CHECK(in_channels == w_contig.size(1), "Input channels must match weight");
+ 
+-    int pad_d = padding[0], pad_h = padding[1], pad_w = padding[2];
+-    int stride_d = stride[0], stride_h = stride[1], stride_w = stride[2];
++    // Use same stride and padding for all three dimensions
++    int stride_d = static_cast<int>(stride);
++    int stride_h = static_cast<int>(stride);
++    int stride_w = static_cast<int>(stride);
++    int pad_d = static_cast<int>(padding);
++    int pad_h = static_cast<int>(padding);
++    int pad_w = static_cast<int>(padding);
+ 
+     int out_depth = (in_depth + 2 * pad_d - kernel_d) / stride_d + 1;
+     int out_height = (in_height + 2 * pad_h - kernel_h) / stride_h + 1;
+@@ -117,7 +122,6 @@
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // bias pointer: may be null
+     const float* bias_ptr = nullptr;
+     torch::Tensor b_contig;
+     if (bias.has_value() && bias.value().defined()) {
+@@ -144,21 +148,23 @@
+ 
+ // -----------------------------------------------------------------------------
+ // conv_transpose3d_forward using custom CUDA kernel
++// Now accepts scalar ints for stride, padding, output_padding.
+ // -----------------------------------------------------------------------------
+ torch::Tensor conv_transpose3d_forward(
+     torch::Tensor x,
+     torch::Tensor weight,
+     c10::optional<torch::Tensor> bias,
+-    std::vector<int64_t> stride,
+-    std::vector<int64_t> padding,
+-    std::vector<int64_t> output_padding) {
++    int64_t stride,
++    int64_t padding,
++    int64_t output_padding) {
+ 
+     check_cuda_float32(x, "x");
+     check_cuda_float32(weight, "weight");
+     TORCH_CHECK(x.dim() == 5, "Input must be 5D");
+     TORCH_CHECK(weight.dim() == 5, "Weight must be 5D");
+-    TORCH_CHECK(stride.size() == 3 && padding.size() == 3 && output_padding.size() == 3,
+-                "stride/padding/output_padding must be length 3");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++    TORCH_CHECK(output_padding >= 0, "output_padding must be non-negative");
+ 
+     auto x_contig = x.contiguous();
+     auto w_contig = weight.contiguous();
+@@ -175,9 +181,15 @@
+     int kernel_h = w_contig.size(3);
+     int kernel_w = w_contig.size(4);
+ 
+-    int stride_d = stride[0], stride_h = stride[1], stride_w = stride[2];
+-    int pad_d = padding[0], pad_h = padding[1], pad_w = padding[2];
+-    int opad_d = output_padding[0], opad_h = output_padding[1], opad_w = output_padding[2];
++    int stride_d = static_cast<int>(stride);
++    int stride_h = static_cast<int>(stride);
++    int stride_w = static_cast<int>(stride);
++    int pad_d = static_cast<int>(padding);
++    int pad_h = static_cast<int>(padding);
++    int pad_w = static_cast<int>(padding);
++    int opad_d = static_cast<int>(output_padding);
++    int opad_h = static_cast<int>(output_padding);
++    int opad_w = static_cast<int>(output_padding);
+ 
+     int out_depth = (in_depth - 1) * stride_d - 2 * pad_d + kernel_d + opad_d;
+     int out_height = (in_height - 1) * stride_h - 2 * pad_h + kernel_h + opad_h;
+--- before/model_new.py
++++ after/model_new.py
+@@ -15,21 +15,28 @@
+         self.bias = nn.Parameter(torch.randn(bias_shape))
+ 
+     def forward(self, x):
+-        x = cuda_extension.adaptive_avg_pool2d_5d(x, (1, 1))
+-        x = cuda_extension.conv3d_forward(x, self.conv3d.weight, self.conv3d.bias, self.conv3d.stride, self.conv3d.padding)
++        x = cuda_extension.adaptive_avg_pool2d_5d(x, 1)
++        x = cuda_extension.conv3d_forward(
++            x, self.conv3d.weight, self.conv3d.bias,
++            self.conv3d.stride[0], self.conv3d.padding[0]
++        )
+         x = cuda_extension.leaky_relu_forward(x, 0.01)
+         x = cuda_extension.add_bias(x, self.bias)
+         x = cuda_extension.clamp_forward(x, 0.0, 1.0)
+         x = cuda_extension.conv_transpose3d_forward(
+             x, self.conv_transpose3d.weight, self.conv_transpose3d.bias,
+-            self.conv_transpose3d.stride, self.conv_transpose3d.padding, self.conv_transpose3d.output_padding
++            self.conv_transpose3d.stride[0], self.conv_transpose3d.padding[0],
++            self.conv_transpose3d.output_padding[0]
+         )
+         return x
+ 
+     def debug_forward(self, x):
+-        x = cuda_extension.adaptive_avg_pool2d_5d(x, (1, 1))
++        x = cuda_extension.adaptive_avg_pool2d_5d(x, 1)
+         yield ("step_001", x)
+-        x = cuda_extension.conv3d_forward(x, self.conv3d.weight, self.conv3d.bias, self.conv3d.stride, self.conv3d.padding)
++        x = cuda_extension.conv3d_forward(
++            x, self.conv3d.weight, self.conv3d.bias,
++            self.conv3d.stride[0], self.conv3d.padding[0]
++        )
+         yield ("step_002", x)
+         x = cuda_extension.leaky_relu_forward(x, 0.01)
+         yield ("step_003", x)
+@@ -39,7 +46,8 @@
+         yield ("step_005", x)
+         x = cuda_extension.conv_transpose3d_forward(
+             x, self.conv_transpose3d.weight, self.conv_transpose3d.bias,
+-            self.conv_transpose3d.stride, self.conv_transpose3d.padding, self.conv_transpose3d.output_padding
++            self.conv_transpose3d.stride[0], self.conv_transpose3d.padding[0],
++            self.conv_transpose3d.output_padding[0]
+         )
+         yield ("step_006", x)
+         yield ("step_007", x)

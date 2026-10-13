@@ -10,8 +10,9 @@ import traceback
 
 import torch
 
-from .diagnostics import api_signatures, describe, reference_trace, seed_all, write_json
+from .diagnostics import api_signatures, describe, reference_calls, reference_trace, seed_all, write_json
 from .verification import build_inputs, device_inputs, fixture_directory, initialize_models, make_reference_fixture, synchronize
+from .operator_contract import binding_contract_errors, validate_contract
 
 
 def main(argv=None):
@@ -47,6 +48,14 @@ def main(argv=None):
                         raise ValueError(f'Compiled cuda_extension.{func.attr} is missing or not callable')
                     exports.add(func.attr)
             report['compiled_exports'] = sorted(exports)
+            operator_path = directory / 'custom_ops_contract.json'
+            if operator_path.exists():
+                operators = validate_contract(json.loads(operator_path.read_text()), contract)
+                report['compiled_signatures'] = {op['name']: (getattr(extension, op['name']).__doc__ or '')[:4000]
+                                                 for op in operators['operators'] if hasattr(extension, op['name'])}
+                errors = binding_contract_errors(extension, operators)
+                if errors:
+                    raise ValueError('\n'.join(errors))
             report.update(status='passed', state_dict_keys=list(fixture['state_dict']))
         else:
             reference = importlib.import_module('model')
@@ -60,6 +69,7 @@ def main(argv=None):
                           init_inputs=describe(fixture['init_inputs']), inputs=describe(inputs), execution_device=args.device,
                           state_dict={k: describe(v) for k, v in fixture['state_dict'].items()},
                           api_signatures=api_signatures(model),
+                          reference_calls=reference_calls(model),
                           modules={name: {'type': type(module).__name__, 'configuration': module.extra_repr(), 'training': module.training}
                                    for name, module in model.named_modules()}, input_seeds=[args.seed + 1 + i for i in range(5)])
             with torch.no_grad():
