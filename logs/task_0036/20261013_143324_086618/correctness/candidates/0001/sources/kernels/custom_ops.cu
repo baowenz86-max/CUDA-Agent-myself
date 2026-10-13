@@ -1,0 +1,292 @@
+#include <cuda_runtime.h>
+#include <cufft.h>
+#include <cstdint>
+#include <cstdio>
+
+// -----------------------------------------------------------------------------
+// custom_add: element-wise addition of two float32 tensors
+// -----------------------------------------------------------------------------
+__global__ void add_kernel(const float* __restrict__ x,
+                           const float* __restrict__ y,
+                           float* __restrict__ out,
+                           int64_t n) {
+    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    for (; idx < n; idx += stride) {
+        out[idx] = x[idx] + y[idx];
+    }
+}
+
+extern "C" void custom_add_launcher(const float* x,
+                                     const float* y,
+                                     float* out,
+                                     int64_t n,
+                                     cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (int)((n + threads - 1) / threads);
+    if (blocks > 65535) blocks = 65535;
+    add_kernel<<<blocks, threads, 0, stream>>>(x, y, out, n);
+}
+
+// -----------------------------------------------------------------------------
+// custom_argmin: argmin along last dim (rows), output [rows, 1] int64
+// Each block handles one row. Block size 256, grid rows.
+// -----------------------------------------------------------------------------
+__global__ void argmin_kernel(const float* __restrict__ x,
+                              int64_t* __restrict__ out,
+                              int64_t row_len,
+                              int64_t rows) {
+    __shared__ float smem_val[256];
+    __shared__ int64_t smem_idx[256];
+
+    int64_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    int tid = threadIdx.x;
+    const float* x_row = x + row * row_len;
+
+    float local_val = 3.402823466e+38F; // FLT_MAX
+    int64_t local_idx = -1;
+
+    // grid-stride loop over row_len with blockDim.x threads (256)
+    for (int64_t i = tid; i < row_len; i += blockDim.x) {
+        float v = x_row[i];
+        if (v < local_val) {
+            local_val = v;
+            local_idx = i;
+        }
+    }
+
+    smem_val[tid] = local_val;
+    smem_idx[tid] = local_idx;
+    __syncthreads();
+
+    // reduction in shared memory
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float other_val = smem_val[tid + stride];
+            int64_t other_idx = smem_idx[tid + stride];
+            if (other_val < smem_val[tid]) {
+                smem_val[tid] = other_val;
+                smem_idx[tid] = other_idx;
+            } else if (other_val == smem_val[tid] && other_idx < smem_idx[tid]) {
+                // tie-breaking: choose smaller index to match torch.argmin
+                smem_idx[tid] = other_idx;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[row] = smem_idx[0];
+    }
+}
+
+extern "C" void custom_argmin_launcher(const float* x,
+                                        int64_t* out,
+                                        int64_t rows,
+                                        int64_t row_len,
+                                        cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (int)rows;
+    argmin_kernel<<<blocks, threads, 0, stream>>>(x, out, row_len, rows);
+}
+
+// -----------------------------------------------------------------------------
+// custom_stft: torch.stft with default parameters
+//   center=True, pad_mode='reflect', normalized=False, onesided=True, window=None
+//   n_fft=1024, hop_length=256, win_length=1024, return_complex=True
+// Input: [batch, audio_len] contiguous float32
+// Output: [batch, n_fft/2+1, num_frames] complex64 (interleaved real/imag)
+// num_frames = 1 + floor(audio_len / hop_length) when center=True and audio_len % hop_length == 0? 
+// actually floor((audio_len + n_fft/2*2)/hop_length) = floor((200000+1024)/256)= floor(201024/256)=785??
+// Let's compute precisely using PyTorch formula: if center=True, input is padded with n_fft//2 on both sides, length = 200000+1024=201024.
+// number of frames = 1 + floor((padded_len - n_fft) / hop_length) = 1 + floor((201024-1024)/256) = 1 + floor(200000/256) = 1 + 781 = 782. Correct.
+// -----------------------------------------------------------------------------
+
+// Kernel to create windowed frames from input with reflect padding, then perform in-place R2C FFT.
+// We organize as: each block handles one frame? That would be many blocks (batch * frames = 128*782=100096) and each frame length 1024.
+// Better: Each thread computes one time point in the padded/windowed frame, then we perform FFT per frame using cuFFT batched plan.
+// cuFFT supports batch of many FFTs. We can create a work buffer of size [batch*n_frames, n_fft] real, then call cufftExecR2C on batch*num_frames, then reorganize to output.
+
+// Step 1: compute frame start index and windowing (rectangular window since win_length==n_fft and window=None)
+__global__ void stft_prepare_kernel(const float* __restrict__ input,
+                                    float* __restrict__ work,
+                                    int64_t batch,
+                                    int64_t audio_len,
+                                    int64_t n_fft,
+                                    int64_t hop_length,
+                                    int64_t win_length,
+                                    int64_t num_frames) {
+    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t total_frames = batch * num_frames;
+    int64_t total = total_frames * n_fft;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+
+    int64_t pad = n_fft / 2;
+    int64_t padded_len = audio_len + 2 * pad;
+
+    for (; idx < total; idx += stride) {
+        int64_t frame = idx / n_fft;
+        int64_t t = idx % n_fft;
+        int64_t b = frame / num_frames;
+        int64_t f = frame % num_frames;
+
+        int64_t input_idx = f * hop_length + t - pad;
+        // reflect padding around [0, audio_len-1]
+        // PyTorch reflect pad formula: reflect index i -> if i<0, i = -i; if i>=len, i = 2*len-2-i
+        if (input_idx < 0) {
+            input_idx = -input_idx;
+        } else if (input_idx >= audio_len) {
+            input_idx = 2 * audio_len - 2 - input_idx;
+        }
+        // If after reflection still out of bounds (shouldn't for pad <= len-1), clamp
+        if (input_idx < 0) input_idx = 0;
+        if (input_idx >= audio_len) input_idx = audio_len - 1;
+
+        work[idx] = input[b * audio_len + input_idx];
+    }
+}
+
+// Step 2: apply window if necessary (here rectangular, so skip). But allow general win_length maybe? 
+// Since win_length=n_fft, no padding or truncation; window=None means rectangular, so no-op.
+
+// Step 3: cuFFT batched R2C
+// For each batch element, we have num_frames real FFTs of length n_fft. We can create a cuFFT plan for 1D R2C, batch = batch*num_frames, with idist=n_fft, odist=(n_fft/2+1).
+// Input work buffer layout: [batch*num_frames, n_fft] contiguous real.
+// Output cuFFT complex buffer layout: [batch*num_frames, n_fft/2+1] with interleaved real/imag.
+// Then we need to copy/transpose to output [batch, n_fft/2+1, num_frames] complex64.
+// We'll use a kernel to rearrange.
+
+__global__ void stft_rearrange_kernel(const cufftComplex* __restrict__ fft_out,
+                                      float* __restrict__ output_real,
+                                      float* __restrict__ output_imag,
+                                      int64_t batch,
+                                      int64_t num_frames,
+                                      int64_t n_freqs) {
+    // output is complex64 with shape [batch, n_freqs, num_frames], stride [n_freqs*num_frames, 1, n_freqs]
+    // We pass separate real and imag pointers because complex tensor in C++ can be managed by binding, we write to two float arrays or one interleaved? 
+    // Typically PyTorch complex64 tensor is stored as interleaved real/imag, but we can output into a float pointer and cast to complex64 via binding. We'll write into the raw memory assuming interleaved.
+    // For simplicity, launcher receives a void* output (complex64) and we write using float2? Better use cufftComplex and reinterpret output as cufftComplex*.
+    // We'll define output as cufftComplex* directly.
+}
+
+// Alternative better approach: Use cuFFT with batching over batch dimension only, and for each batch element run multiple FFTs with stride. That may be more efficient.
+// Actually we can set up a plan for batch = batch, with each element having nfft and idist=n_fft, odist=n_fft/2+1, and n[0]=num_frames? No cuFFT batch is not 2D. We can use advanced data layout: plan with rank=1, n=n_fft, and batch=num_frames*batch, with input stride is n_fft, output stride is n_fft/2+1. That works.
+
+// Let's implement launcher that:
+// 1. Allocate work buffer for input frames (batch*num_frames*n_fft floats)
+// 2. Launch stft_prepare_kernel to fill work
+// 3. Allocate fft_out buffer (batch*num_frames*(n_fft/2+1) cufftComplex)
+// 4. Create cufft plan (compute once, maybe cached static)
+// 5. Execute cufftExecR2C(plan, work, fft_out)
+// 6. Launch rearrange kernel to write output as [batch][freq][frame] with complex interleaved
+// 7. Free work and fft_out
+
+// Since binding.cpp will allocate output tensor with shape [batch, n_fft/2+1, num_frames] and dtype complex64, we can pass pointers.
+
+// Launcher signature: custom_stft_launcher(const float* x, float* out_real, float* out_imag? We'll pass void* output as cufftComplex* or float*). 
+// Better define as: extern "C" void custom_stft_launcher(const float* input, cufftComplex* output, int64_t batch, int64_t audio_len, int64_t n_fft, int64_t hop_length, int64_t win_length, cudaStream_t stream);
+// The binding will cast output to cufftComplex*.
+
+// But to avoid leaking cufftComplex type, could use float2. Use float2* output.
+// We'll use float2* output.
+
+// Helper to get current cuFFT plan, cached by n_fft, batch, num_frames, and stream? For simplicity create and destroy each call, but that is slow. 
+// Better: use static plan cache with mutex, but .cu can't include mutex easily. We can assume single-threaded calls and use static variables. Since our custom op invoked from Python sequentially, okay.
+
+static cufftHandle stft_plan = 0;
+static int64_t plan_batch = -1;
+static int64_t plan_n_fft = -1;
+static int64_t plan_num_frames = -1;
+
+// Kernel to rearrange fft output from [batch*num_frames, n_freqs] interleaved to [batch, n_freqs, num_frames] interleaved
+__global__ void stft_rearrange_kernel(const float2* __restrict__ fft_out,
+                                      float2* __restrict__ output,
+                                      int64_t batch,
+                                      int64_t num_frames,
+                                      int64_t n_freqs) {
+    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t total = batch * num_frames * n_freqs;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    for (; idx < total; idx += stride) {
+        // idx corresponds to fft_out linear index (frame_major)
+        int64_t frame = idx / n_freqs;
+        int64_t freq = idx % n_freqs;
+        int64_t b = frame / num_frames;
+        int64_t f = frame % num_frames;
+        // output index: ((b * n_freqs) + freq) * num_frames + f
+        int64_t out_idx = (b * n_freqs + freq) * num_frames + f;
+        output[out_idx] = fft_out[idx];
+    }
+}
+
+extern "C" void custom_stft_launcher(const float* input,
+                                     float2* output,
+                                     int64_t batch,
+                                     int64_t audio_len,
+                                     int64_t n_fft,
+                                     int64_t hop_length,
+                                     int64_t win_length,
+                                     cudaStream_t stream) {
+    // Compute num_frames as PyTorch does with center=True
+    int64_t pad = n_fft / 2;
+    int64_t padded_len = audio_len + 2 * pad;
+    int64_t num_frames = 1 + (padded_len - n_fft) / hop_length;
+
+    int64_t total_frames = batch * num_frames;
+    int64_t work_size = total_frames * n_fft;
+    int64_t fft_size = total_frames * (n_fft / 2 + 1);
+
+    // Allocate temporary work buffers on current stream
+    float* work = nullptr;
+    float2* fft_out = nullptr;
+    cudaMallocAsync(&work, sizeof(float) * work_size, stream);
+    cudaMallocAsync(&fft_out, sizeof(float2) * fft_size, stream);
+
+    // Fill work buffer
+    int threads = 256;
+    int blocks = (int)std::min<int64_t>((work_size + threads - 1) / threads, 65535);
+    if (blocks == 0) blocks = 1;
+    stft_prepare_kernel<<<blocks, threads, 0, stream>>>(
+        input, work, batch, audio_len, n_fft, hop_length, win_length, num_frames);
+
+    // Ensure plan is valid for this configuration (we don't use mutex, assume single-thread)
+    if (stft_plan == 0 || plan_batch != batch || plan_n_fft != n_fft || plan_num_frames != num_frames) {
+        if (stft_plan != 0) {
+            cufftDestroy(stft_plan);
+        }
+        cufftResult res = cufftPlan1d(&stft_plan, (int)n_fft, CUFFT_R2C, (int)total_frames);
+        if (res != CUFFT_SUCCESS) {
+            // Handle error, maybe print and return
+            return;
+        }
+        // Set stream
+        cufftSetStream(stft_plan, stream);
+        plan_batch = batch;
+        plan_n_fft = n_fft;
+        plan_num_frames = num_frames;
+    } else {
+        cufftSetStream(stft_plan, stream); // ensure stream updated
+    }
+
+    // Execute FFT
+    cufftResult res = cufftExecR2C(stft_plan, work, (cufftComplex*)fft_out);
+    if (res != CUFFT_SUCCESS) {
+        cudaFreeAsync(work, stream);
+        cudaFreeAsync(fft_out, stream);
+        return;
+    }
+
+    // Rearrange to output layout
+    int64_t n_freqs = n_fft / 2 + 1;
+    int64_t total_out = batch * n_freqs * num_frames;
+    blocks = (int)std::min<int64_t>((total_out + threads - 1) / threads, 65535);
+    if (blocks == 0) blocks = 1;
+    stft_rearrange_kernel<<<blocks, threads, 0, stream>>>(
+        fft_out, output, batch, num_frames, n_freqs);
+
+    // Free temporary buffers
+    cudaFreeAsync(work, stream);
+    cudaFreeAsync(fft_out, stream);
+}

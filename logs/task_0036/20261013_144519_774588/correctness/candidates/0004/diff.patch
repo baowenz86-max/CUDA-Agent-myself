@@ -1,0 +1,717 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,231 +1,255 @@
+-// custom_ops.cu - CUDA kernels and launchers for add, argmin, STFT
++// custom_ops.cu - CUDA kernels and launchers for custom_add, custom_argmin, custom_stft
++// No torch/ATen/c10/pybind dependencies. Pure CUDA and cuFFT.
++
+ #include <cuda_runtime.h>
+ #include <cufft.h>
+-#include <cmath>
+-
+-// -----------------------------------------------------------------------------
+-// Add: output = x + y elementwise
+-// -----------------------------------------------------------------------------
+-template <typename T>
+-__global__ void add_kernel(const T* __restrict__ x,
+-                           const T* __restrict__ y,
+-                           T* __restrict__ out,
+-                           long long n) {
+-    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-    for (; idx < n; idx += stride) {
+-        out[idx] = x[idx] + y[idx];
+-    }
+-}
+-
+-extern "C" cudaError_t add_forward_launcher(const float* x,
+-                                            const float* y,
+-                                            float* out,
+-                                            long long n,
+-                                            cudaStream_t stream) {
+-    if (n == 0) return cudaSuccess;
++#include <cstdint>
++#include <algorithm>
++
++// Helper macro for CUDA error checking
++#define CUDA_CHECK(call) \
++    do { \
++        cudaError_t err = call; \
++        if (err != cudaSuccess) { \
++            fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
++            abort(); \
++        } \
++    } while (0)
++
++#define CUFFT_CHECK(call) \
++    do { \
++        cufftResult err = call; \
++        if (err != CUFFT_SUCCESS) { \
++            fprintf(stderr, "cuFFT error %s:%d: %d\n", __FILE__, __LINE__, (int)err); \
++            abort(); \
++        } \
++    } while (0)
++
++// ---------------------------------------------------------------------
++// 1. custom_add: element-wise addition
++// ---------------------------------------------------------------------
++
++__global__ void elementwise_add_kernel(const float* __restrict__ x,
++                                       const float* __restrict__ y,
++                                       float* __restrict__ out,
++                                       int64_t n) {
++    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (; i < n; i += stride) {
++        out[i] = x[i] + y[i];
++    }
++}
++
++extern "C" void custom_add_launcher(const float* x,
++                                    const float* y,
++                                    float* out,
++                                    int64_t n,
++                                    cudaStream_t stream) {
+     const int threads = 256;
+-    int blocks = (int)std::min<long long>((n + threads - 1) / threads, 1048576);
+-    add_kernel<float><<<blocks, threads, 0, stream>>>(x, y, out, n);
+-    cudaError_t err = cudaGetLastError();
+-    return err;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Argmin over last dimension, keepdim=True. Input [B, N] -> output [B, 1] int64.
+-// -----------------------------------------------------------------------------
+-template <typename T>
+-__global__ void argmin_lastdim_kernel(const T* __restrict__ x,
+-                                      long long* __restrict__ out,
+-                                      int N,
+-                                      long long B) {
+-    long long b = blockIdx.x;
+-    if (b >= B) return;
+-    const T* row = x + b * (long long)N;
++    int blocks = (int)std::min<int64_t>((n + threads - 1) / threads, 65535);
++    if (blocks <= 0) blocks = 1;
++    elementwise_add_kernel<<<blocks, threads, 0, stream>>>(x, y, out, n);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// ---------------------------------------------------------------------
++// 2. custom_argmin: argmin along last dimension, keepdim=True
++// ---------------------------------------------------------------------
++
++__global__ void argmin_kernel(const float* __restrict__ x,
++                              int64_t* __restrict__ out,
++                              int64_t rows,
++                              int64_t cols) {
++    // Each block handles one row, returns global index of minimum
++    extern __shared__ float sdata[];
++    extern __shared__ int64_t sidx[];
++    // We need both sdata and sidx; actually can use one shared array of struct, but here we use separate extern pointers.
++    // CUDA requires dynamic shared memory to be declared as one array. So we'll use a single char array and cast in kernel.
++    // Actually extern __shared__ float sdata[]; and then sidx[] would share same memory incorrectly.
++    // So we need to do union approach: use a struct or simply allocate shared memory of size 2 * blockDim.x * (sizeof(float)+sizeof(int64_t)).
++    // But easier: we'll not use shared memory reduction; each thread linearly scans a portion and then a single warp reduces? 
++    // For simplicity and correctness (though slower), each block does reduction using shared memory for both value and index.
++    // We'll use a struct Pair { float val; int64_t idx; } in shared memory.
++    struct Pair { float val; int64_t idx; };
++    __shared__ Pair spair[1024]; // max threads 1024 (we use 256)
+     int tid = threadIdx.x;
+-    int stride = blockDim.x;
+-    int best_idx = 0;
+-    T best_val = row[0];
+-    for (int i = tid; i < N; i += stride) {
+-        T val = row[i];
+-        if (val < best_val) {
+-            best_val = val;
+-            best_idx = i;
++    int64_t row = blockIdx.x;
++    const float* row_ptr = x + row * cols;
++    float min_val = FLT_MAX;
++    int64_t min_idx = -1;
++    for (int64_t col = tid; col < cols; col += blockDim.x) {
++        float v = row_ptr[col];
++        if (v < min_val) {
++            min_val = v;
++            min_idx = col;
+         }
+     }
+-    // Reduce within block using shared memory
+-    extern __shared__ int s_indices[];
+-    extern __shared__ float s_values[];
+-    s_indices[tid] = best_idx;
+-    s_values[tid] = (float)best_val;
++    spair[tid].val = min_val;
++    spair[tid].idx = min_idx;
+     __syncthreads();
+     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+-            if (s_values[tid + s] < s_values[tid]) {
+-                s_values[tid] = s_values[tid + s];
+-                s_indices[tid] = s_indices[tid + s];
++            if (spair[tid + s].val < spair[tid].val) {
++                spair[tid] = spair[tid + s];
+             }
+         }
+         __syncthreads();
+     }
+-    if (tid == 0) out[b] = (long long)s_indices[0];
+-}
+-
+-extern "C" cudaError_t argmin_launcher(const float* x,
+-                                       long long* out,
+-                                       int N,
+-                                       long long B,
++    if (tid == 0) {
++        out[row] = spair[0].idx;
++    }
++}
++
++extern "C" void custom_argmin_launcher(const float* x,
++                                       int64_t* out,
++                                       int64_t rows,
++                                       int64_t cols,
+                                        cudaStream_t stream) {
+-    if (B == 0 || N == 0) return cudaSuccess;
+-    int threads = std::min(1024, N);
+-    int shared_bytes = threads * (sizeof(int) + sizeof(float));
+-    dim3 grid((unsigned int)std::min<long long>(B, 1048576));
+-    argmin_lastdim_kernel<float><<<grid, threads, shared_bytes, stream>>>(x, out, N, B);
+-    cudaError_t err = cudaGetLastError();
+-    return err;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// STFT with cuFFT, center=True, reflect padding, Hann window, onesided output.
+-// Input: [B, N] float32, output: [B, F, T] complex64 (interleaved float2).
+-// F = n_fft/2 + 1, T = 1 + floor(N / hop_length).
+-// -----------------------------------------------------------------------------
+-__global__ void stft_build_frames_kernel(const float* __restrict__ x,
+-                                         int B,
+-                                         int N,
+-                                         int n_fft,
+-                                         int hop_length,
+-                                         int win_length,
+-                                         const float* __restrict__ window,
+-                                         cufftComplex* __restrict__ frames,
+-                                         int T) {
+-    int t = blockIdx.x;
+-    int b = blockIdx.y;
+-    if (t >= T || b >= B) return;
+-    int L = n_fft;
+-    int start = t * hop_length - n_fft / 2;
+-    for (int i = threadIdx.x; i < L; i += blockDim.x) {
+-        int idx = start + i;
+-        float val = 0.0f;
+-        if (idx >= 0 && idx < N) {
+-            val = x[b * N + idx];
+-        } else {
+-            int reflected = idx;
+-            if (reflected < 0) reflected = -reflected - 1;
+-            else if (reflected >= N) reflected = 2 * N - 1 - reflected;
+-            if (reflected >= 0 && reflected < N) {
+-                val = x[b * N + reflected];
+-            }
+-        }
+-        frames[(b * T + t) * L + i].x = val * window[i];
+-        frames[(b * T + t) * L + i].y = 0.0f;
+-    }
+-}
+-
+-__global__ void stft_extract_onesided_kernel(const cufftComplex* __restrict__ frames,
+-                                             cufftComplex* __restrict__ out,
+-                                             int B,
+-                                             int T,
+-                                             int L,
+-                                             int F) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int b = blockIdx.y;
+-    if (b >= B) return;
+-    int total = F * T;
++    int threads = 256;
++    if (cols < 256) threads = (int)cols;
++    int shared_bytes = threads * sizeof(float) + threads * sizeof(int64_t);
++    // We asssume threads <= 1024, shared memory fits.
++    argmin_kernel<<<rows, threads, shared_bytes, stream>>>(x, out, rows, cols);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// ---------------------------------------------------------------------
++// 3. custom_stft: STFT using cuFFT R2C
++// ---------------------------------------------------------------------
++
++// Device function: reflect padding index beyond boundaries
++__device__ int reflect_index(int idx, int len) {
++    if (idx < 0) idx = -idx;
++    if (idx >= len) {
++        int period = 2 * (len - 1);
++        idx = idx % period;
++        if (idx >= len) idx = period - idx;
++    }
++    return idx;
++}
++
++extern "C" void custom_stft_launcher(const float* x,
++                                     int n_fft,
++                                     int hop_length,
++                                     int win_length,
++                                     bool return_complex,
++                                     float* out_real,
++                                     float* out_imag,
++                                     int64_t B,
++                                     int64_t L,
++                                     cudaStream_t stream) {
++    // Compute number of frames: center=True with reflect pad adds n_fft//2 on both sides.
++    int n_frames = 1 + (L + n_fft / 2 + n_fft / 2 - n_fft) / hop_length;
++    // Simplify: n_frames = 1 + (L + n_fft - n_fft) / hop_length = 1 + L / hop_length, but careful with integer.
++    n_frames = 1 + (L + n_fft - n_fft) / hop_length; // center=True with reflect pad effectively adds n_fft/2 each side.
++    // Actually formula: n_frames = 1 + (L + n_fft/2 + n_fft/2 - n_fft) / hop_length = 1 + L / hop_length.
++    // Given L=200000, hop=256 => 1 + 781 = 782, matches.
++    int freq = n_fft / 2 + 1; // 513
++
++    // Allocate temporary device buffers for padded input and frames
++    int64_t padded_len = L + n_fft; // reflect pad adds n_fft/2 each side => total L + n_fft
++    float* d_padded = nullptr;
++    CUDA_CHECK(cudaMalloc(&d_padded, padded_len * B * sizeof(float)));
++    // Allocate buffer for the windowed frames: each frame of length n_fft, total frames = n_frames per batch
++    float* d_frames = nullptr;
++    CUDA_CHECK(cudaMalloc(&d_frames, B * n_frames * n_fft * sizeof(float)));
++    // Allocate complex output buffer for FFT: B * n_frames * freq complex floats
++    cufftComplex* d_fft_out = nullptr;
++    CUDA_CHECK(cudaMalloc(&d_fft_out, B * n_frames * freq * sizeof(cufftComplex)));
++
++    // Kernel to perform reflect padding and copy to d_padded
++    // We can combine padding and frame construction into one kernel that writes windowed frames directly,
++    // but for simplicity we first pad, then run cuFFT on frames created by a kernel from padded.
++    // We'll create a kernel to pad reflect.
++    dim3 pad_block(256);
++    dim3 pad_grid((padded_len * B + pad_block.x - 1) / pad_block.x);
++    // We'll use a custom kernel: reflect_pad_kernel
++    auto reflect_pad_kernel = [](const float* __restrict__ x, float* __restrict__ padded,
++                                 int64_t L, int n_fft, int64_t padded_len) __global__ {
++        int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++        int64_t total = padded_len * gridDim.x; // wrong, need B separate but we treat padded as B*padded_len contiguous
++        // Actually we launched with grid covering total elements, so each thread handles one element.
++        if (idx >= total) return;
++        int64_t b = idx / padded_len;
++        int64_t pos = idx % padded_len;
++        int64_t orig_pos = pos - n_fft / 2;
++        int orig_idx = reflect_index((int)orig_pos, (int)L);
++        padded[idx] = x[b * L + orig_idx];
++    };
++    // We cannot define lambda as __global__, so we define a separate kernel below.
++    // We'll instead write a separate __global__ function outside.
++
++    // Launch padding kernel
++    reflect_pad_kernel<<<pad_grid, pad_block, 0, stream>>>(x, d_padded, L, n_fft, padded_len);
++    CUDA_CHECK(cudaGetLastError());
++
++    // Now create frames by selecting windows from padded data and multiply by rectangular window (all ones).
++    // We can write a kernel that from padded data copies each frame into d_frames.
++    // But we can also use cuFFT with custom strides? cuFFT can handle batch with different strides using advanced data layout.
++    // Simpler: create contiguous frames of length n_fft.
++    dim3 frame_block(256);
++    int total_frames = B * n_frames;
++    dim3 frame_grid((total_frames + frame_block.x - 1) / frame_block.x);
++    // Kernel: each thread handles one frame and copies n_fft elements? That would be inefficient.
++    // Better: each thread copies multiple elements per frame? We'll just launch one thread per frame and loop n_fft inside (slow but okay for now).
++    // Or use a kernel with one thread per element: for each frame, copy n_fft elements.
++    // We'll define a kernel frame_copy_kernel that uses grid-stride over total elements = total_frames * n_fft.
++    // We'll implement later.
++
++    // For cuFFT: set up plan for many 1D R2C transforms of size n_fft, batch = B*n_frames.
++    cufftHandle plan;
++    CUFFT_CHECK(cufftPlan1d(&plan, n_fft, CUFFT_R2C, B * n_frames));
++    // Execute FFT on d_frames -> d_fft_out
++    CUFFT_CHECK(cufftExecR2C(plan, d_frames, d_fft_out));
++    // Synchronize stream for cufft (cuFFT uses stream from plan, need to set stream)
++    CUFFT_CHECK(cufftSetStream(plan, stream));
++
++    // After FFT, copy results to output complex array with correct strides.
++    // Output array in torch is complex64 with shape [B, freq, n_frames], strides [freq*n_frames, 1, freq].
++    // We are given separate real and imag pointers, but torch complex tensor is interleaved real/imag.
++    // In binding we'll allocate a complex tensor and pass its data_ptr as float2? Actually torch complex64 is float2 (real, imag contiguous).
++    // We will pass output as float2* to launcher, but we declared out_real and out_imag separately. We can combine into a custom struct or use float2*.
++    // To avoid confusion, we'll change launcher signature to accept float2* output_complex and we can cast to cufftComplex (which is float2).
++    // In the final code, we'll set output as float2*, or use cufftComplex*. We'll adjust.
++
++    // Cleanup
++    CUFFT_CHECK(cufftDestroy(plan));
++    CUDA_CHECK(cudaFree(d_padded));
++    CUDA_CHECK(cudaFree(d_frames));
++    CUDA_CHECK(cudaFree(d_fft_out));
++}
++
++// Define the actual global kernels for padding and frame copying
++__global__ void reflect_pad_kernel(const float* __restrict__ x,
++                                   float* __restrict__ padded,
++                                   int64_t L,
++                                   int n_fft,
++                                   int64_t padded_len,
++                                   int64_t total) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx >= total) return;
+-    int f = idx % F;
+-    int t = idx / F;
+-    out[(b * F + f) * T + t] = frames[(b * T + t) * L + f];
+-}
+-
+-extern "C" cudaError_t stft_forward_launcher(const float* x,
+-                                            int B,
+-                                            int N,
+-                                            int n_fft,
+-                                            int hop_length,
+-                                            int win_length,
+-                                            cufftComplex* out,
+-                                            cudaStream_t stream) {
+-    if (B == 0 || N == 0) return cudaSuccess;
+-    const int F = n_fft / 2 + 1;
+-    const int T = 1 + N / hop_length;
+-    const int L = n_fft;
+-
+-    cufftHandle plan;
+-    cufftResult result = cufftCreate(&plan);
+-    if (result != CUFFT_SUCCESS) return cudaErrorUnknown;
+-    result = cufftSetStream(plan, stream);
+-    if (result != CUFFT_SUCCESS) { cufftDestroy(plan); return cudaErrorUnknown; }
+-    // We will perform C2C transforms of size n_fft for each frame.
+-    result = cufftPlan1d(&plan, n_fft, CUFFT_C2C, B * T);
+-    if (result != CUFFT_SUCCESS) { cufftDestroy(plan); return cudaErrorUnknown; }
+-
+-    // Allocate workspace for windowed frames: complex input to C2C.
+-    cufftComplex* d_frames;
+-    cudaError_t err = cudaMallocAsync(&d_frames, (size_t)B * T * L * sizeof(cufftComplex), stream);
+-    if (err != cudaSuccess) { cufftDestroy(plan); return err; }
+-
+-    // We need a Hann window of length win_length, centered, with zeros padding to n_fft.
+-    // For simplicity, we compute the window on CPU and copy to device in a small buffer.
+-    // This is a one-time per-call setup (could be cached, but bound by launcher simplicity).
+-    float* h_window = new float[n_fft]();
+-    int left = (n_fft - win_length) / 2;
+-    for (int i = 0; i < win_length; ++i) {
+-        h_window[left + i] = 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (win_length - 1)));
+-    }
+-    float* d_window;
+-    err = cudaMallocAsync(&d_window, n_fft * sizeof(float), stream);
+-    if (err != cudaSuccess) { delete[] h_window; cudaFreeAsync(d_frames, stream); cufftDestroy(plan); return err; }
+-    err = cudaMemcpyAsync(d_window, h_window, n_fft * sizeof(float), cudaMemcpyHostToDevice, stream);
+-    if (err != cudaSuccess) {
+-        delete[] h_window;
+-        cudaFreeAsync(d_window, stream);
+-        cudaFreeAsync(d_frames, stream);
+-        cufftDestroy(plan);
+-        return err;
+-    }
+-    delete[] h_window;
+-
+-    // Launch frame building kernel
+-    dim3 blockBuild(256);
+-    dim3 gridBuild(T, B);
+-    stft_build_frames_kernel<<<gridBuild, blockBuild, 0, stream>>>(
+-        x, B, N, n_fft, hop_length, win_length, d_window, d_frames, T);
+-    err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        cudaFreeAsync(d_window, stream);
+-        cudaFreeAsync(d_frames, stream);
+-        cufftDestroy(plan);
+-        return err;
+-    }
+-
+-    // Perform batched C2C FFT.
+-    result = cufftExecC2C(plan, d_frames, d_frames, CUFFT_FORWARD);
+-    if (result != CUFFT_SUCCESS) {
+-        cudaFreeAsync(d_window, stream);
+-        cudaFreeAsync(d_frames, stream);
+-        cufftDestroy(plan);
+-        return cudaErrorUnknown;
+-    }
+-
+-    // Now output only positive frequencies (onesided) into out as interleaved complex.
+-    // Out shape: [B, F, T], with F = n_fft/2 + 1.
+-    dim3 blockExtract(256);
+-    dim3 gridExtract((F * T + blockExtract.x - 1) / blockExtract.x, B);
+-    stft_extract_onesided_kernel<<<gridExtract, blockExtract, 0, stream>>>(
+-        d_frames, out, B, T, L, F);
+-    err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        cudaFreeAsync(d_window, stream);
+-        cudaFreeAsync(d_frames, stream);
+-        cufftDestroy(plan);
+-        return err;
+-    }
+-
+-    // Free temporary buffers and destroy plan.
+-    cudaFreeAsync(d_window, stream);
+-    cudaFreeAsync(d_frames, stream);
+-    cufftDestroy(plan);
+-
+-    return cudaSuccess;
+-}+    int64_t b = idx / padded_len;
++    int64_t pos = idx % padded_len;
++    int64_t orig_pos = pos - n_fft / 2;
++    int orig_idx = reflect_index((int)orig_pos, (int)L);
++    padded[idx] = x[b * L + orig_idx];
++}
++
++__global__ void frame_copy_kernel(const float* __restrict__ padded,
++                                  float* __restrict__ frames,
++                                  int64_t padded_len,
++                                  int n_fft,
++                                  int hop_length,
++                                  int n_frames,
++                                  int64_t total_frames,
++                                  int64_t total) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total) return;
++    int64_t frame_idx = idx / n_fft; // which frame
++    int64_t offset = idx % n_fft;
++    int64_t b = frame_idx / n_frames;
++    int64_t f = frame_idx % n_frames;
++    int64_t start = f * hop_length; // start in padded coordinates (padding already added n_fft/2)
++    padded_idx = b * padded_len + start + offset;
++    frames[idx] = padded[padded_idx];
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,135 +1,114 @@
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
++#include <cufft.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cufft.h>
+-#include <c10/util/complex.h>
++#include <cstdint>
++#include <stdexcept>
+ #include "../binding_registry.h"
+ 
+-// Declare launchers from custom_ops.cu
+-extern "C" cudaError_t add_forward_launcher(const float* x,
+-                                            const float* y,
+-                                            float* out,
+-                                            long long n,
+-                                            cudaStream_t stream);
++// Launcher declarations from custom_ops.cu
++extern "C" void custom_add_launcher(const float* x, const float* y, float* out, int64_t n, cudaStream_t stream);
++extern "C" void custom_argmin_launcher(const float* x, int64_t* out, int64_t rows, int64_t cols, cudaStream_t stream);
++extern "C" void custom_stft_launcher(const float* x, int64_t B, int64_t L, int n_fft, int hop_length, int win_length,
++                                    cufftComplex* out, cudaStream_t stream);
+ 
+-extern "C" cudaError_t argmin_launcher(const float* x,
+-                                       long long* out,
+-                                       int N,
+-                                       long long B,
+-                                       cudaStream_t stream);
++// Helper to check CUDA errors
++static void check_cuda_error(const char* func_name) {
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        throw std::runtime_error(std::string("CUDA error after ") + func_name + ": " + cudaGetErrorString(err));
++    }
++}
+ 
+-extern "C" cudaError_t stft_forward_launcher(const float* x,
+-                                            int B,
+-                                            int N,
+-                                            int n_fft,
+-                                            int hop_length,
+-                                            int win_length,
+-                                            cufftComplex* out,
+-                                            cudaStream_t stream);
+-
+-// -----------------------------------------------------------------------------
+-// add_forward: elementwise x + y
+-// -----------------------------------------------------------------------------
+-torch::Tensor add_forward(torch::Tensor x, torch::Tensor y) {
++// ---------------- custom_add ----------------
++torch::Tensor custom_add(torch::Tensor x, torch::Tensor y) {
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(y.is_cuda(), "y must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(y.dtype() == torch::kFloat32, "y must be float32");
+     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+     TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
+-    TORCH_CHECK(x.sizes() == y.sizes(), "x and y must have the same shape");
++    TORCH_CHECK(x.sizes() == y.sizes(), "x and y must have same shape");
+ 
+-    auto output = torch::empty_like(x);
+-    long long n = x.numel();
+-    if (n == 0) return output;
+-
++    auto out = torch::empty_like(x);
++    int64_t n = x.numel();
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    cudaError_t err = add_forward_launcher(
+-        x.data_ptr<float>(),
+-        y.data_ptr<float>(),
+-        output.data_ptr<float>(),
+-        n,
+-        stream
+-    );
+-    TORCH_CHECK(err == cudaSuccess, "add_forward_launcher failed with error: ", cudaGetErrorString(err));
+-    return output;
++    custom_add_launcher(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), n, stream);
++    check_cuda_error("custom_add_launcher");
++    return out;
+ }
+ 
+-// -----------------------------------------------------------------------------
+-// argmin_lastdim_keepdim: argmin over last dim, keepdim=True
+-// -----------------------------------------------------------------------------
+-torch::Tensor argmin_lastdim_keepdim(torch::Tensor x) {
++// ---------------- custom_argmin ----------------
++torch::Tensor custom_argmin(torch::Tensor x) {
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+     TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dimension");
+ 
+-    int64_t N = x.size(-1);
+-    TORCH_CHECK(N > 0, "last dimension size must be positive");
+-    int64_t B = x.numel() / N;
+-
+-    auto options = torch::TensorOptions().dtype(torch::kInt64).device(x.device());
+-    auto output = torch::empty({B, 1}, options);
+-    if (B == 0) return output;
++    int64_t rows = x.dim() == 1 ? 1 : x.size(0);
++    int64_t cols = x.dim() == 1 ? x.size(0) : x.size(-1);
++    auto out = torch::empty({rows, 1}, x.options().dtype(torch::kInt64));
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    cudaError_t err = argmin_launcher(
+-        x.data_ptr<float>(),
+-        reinterpret_cast<long long*>(output.data_ptr<int64_t>()),
+-        static_cast<int>(N),
+-        static_cast<long long>(B),
+-        stream
+-    );
+-    TORCH_CHECK(err == cudaSuccess, "argmin_launcher failed with error: ", cudaGetErrorString(err));
+-    return output;
++    custom_argmin_launcher(x.data_ptr<float>(), out.data_ptr<int64_t>(), rows, cols, stream);
++    check_cuda_error("custom_argmin_launcher");
++
++    if (x.dim() == 1) {
++        // keepdim=True should return shape [1, 1] to match torch.argmin on 1D with keepdim
++        return out;
++    } else {
++        return out;
++    }
+ }
+ 
+-// -----------------------------------------------------------------------------
+-// stft_forward: STFT with default center=True, pad_mode='reflect', onesided=True
+-// -----------------------------------------------------------------------------
+-torch::Tensor stft_forward(torch::Tensor x, int64_t n_fft, int64_t hop_length, int64_t win_length) {
++// ---------------- custom_stft ----------------
++torch::Tensor custom_stft(torch::Tensor x, int64_t n_fft, int64_t hop_length, int64_t win_length, bool return_complex) {
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+-    TORCH_CHECK(x.dim() == 2, "x must be 2D [B, N]");
+-    TORCH_CHECK(n_fft > 0 && hop_length > 0 && win_length > 0, "n_fft, hop_length, win_length must be positive");
++    TORCH_CHECK(x.dim() == 2, "x must be 2D [batch, length]");
++    TORCH_CHECK(n_fft > 0, "n_fft must be positive");
++    TORCH_CHECK(hop_length > 0, "hop_length must be positive");
++    TORCH_CHECK(win_length > 0, "win_length must be positive");
+     TORCH_CHECK(win_length <= n_fft, "win_length must be <= n_fft");
++    TORCH_CHECK(return_complex, "only return_complex=True is supported");
+ 
+     int64_t B = x.size(0);
+-    int64_t N = x.size(1);
+-    int64_t F = n_fft / 2 + 1;
+-    int64_t T = 1 + N / hop_length;
++    int64_t L = x.size(1);
++    int64_t n_freq = n_fft / 2 + 1;
++    // Compute number of frames: center=True, reflect pad n_fft//2 on each side
++    int64_t padded_len = L + n_fft;
++    int64_t n_frames = 1 + (padded_len - n_fft) / hop_length; // equals 1 + L / hop_length when win_length == n_fft
++    // For general win_length, torch.stft uses center=True with reflect pad n_fft//2, win_length window, but here window is rectangular of length win_length.
++    // Actually torch.stft with default window=None creates a rectangular window of length win_length if provided, else n_fft.
++    // The frame length is win_length, zero-padded to n_fft if win_length < n_fft. In our case win_length=n_fft.
++    // So the formula holds.
+ 
++    // Output complex tensor with shape [B, n_freq, n_frames]
+     auto options = torch::TensorOptions().dtype(torch::kComplexFloat).device(x.device());
+-    auto output = torch::empty({B, F, T}, options);
+-    if (B == 0 || N == 0) return output;
++    auto stft_out = torch::empty({B, n_freq, n_frames}, options);
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    cudaError_t err = stft_forward_launcher(
+-        x.data_ptr<float>(),
+-        static_cast<int>(B),
+-        static_cast<int>(N),
+-        static_cast<int>(n_fft),
+-        static_cast<int>(hop_length),
+-        static_cast<int>(win_length),
+-        reinterpret_cast<cufftComplex*>(output.data_ptr<c10::complex<float>>()),
+-        stream
+-    );
+-    TORCH_CHECK(err == cudaSuccess, "stft_forward_launcher failed with error: ", cudaGetErrorString(err));
+-    return output;
++    // Convert complex64 tensor data pointer to cufftComplex* (which is float2)
++    cufftComplex* out_ptr = reinterpret_cast<cufftComplex*>(stft_out.data_ptr<c10::complex<float>>());
++
++    // Call launcher with B, L, n_fft, hop_length, win_length, output pointer
++    custom_stft_launcher(x.data_ptr<float>(), B, L, (int)n_fft, (int)hop_length, (int)win_length, out_ptr, stream);
++    check_cuda_error("custom_stft_launcher");
++
++    return stft_out;
+ }
+ 
+-// -----------------------------------------------------------------------------
+-// Registration
+-// -----------------------------------------------------------------------------
++// ---------------- Registration ----------------
+ void register_custom_ops(pybind11::module& m) {
+-    m.def("add_forward", &add_forward, "Elementwise addition (x + y)",
++    m.def("custom_add", &custom_add, "Add two tensors element-wise",
+           py::arg("x"), py::arg("y"));
+-    m.def("argmin_lastdim_keepdim", &argmin_lastdim_keepdim, "Argmin over last dimension with keepdim",
++    m.def("custom_argmin", &custom_argmin, "Argmin along last dim with keepdim",
+           py::arg("x"));
+-    m.def("stft_forward", &stft_forward, "STFT with Hann window, center=True, reflect padding, onesided",
+-          py::arg("x"), py::arg("n_fft") = 1024, py::arg("hop_length") = 256, py::arg("win_length") = 1024);
++    m.def("custom_stft", &custom_stft, "STFT using cuFFT",
++          py::arg("x"), py::arg("n_fft"), py::arg("hop_length"), py::arg("win_length"),
++          py::arg("return_complex") = true);
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);+REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -11,16 +11,28 @@
+         self.win_length = win_length
+ 
+     def forward(self, x, y):
+-        x = cuda_extension.add_forward(x, y)
+-        argmin = cuda_extension.argmin_lastdim_keepdim(x)
+-        stft = cuda_extension.stft_forward(x, self.n_fft, self.hop_length, self.win_length)
++        x = cuda_extension.custom_add(x, y)
++        argmin = cuda_extension.custom_argmin(x)
++        stft = cuda_extension.custom_stft(
++            x,
++            n_fft=self.n_fft,
++            hop_length=self.hop_length,
++            win_length=self.win_length,
++            return_complex=True
++        )
+         return x, argmin, stft
+ 
+     def debug_forward(self, x, y):
+-        x = cuda_extension.add_forward(x, y)
++        x = cuda_extension.custom_add(x, y)
+         yield 'step_001', x
+-        argmin = cuda_extension.argmin_lastdim_keepdim(x)
++        argmin = cuda_extension.custom_argmin(x)
+         yield 'step_002', argmin
+-        stft = cuda_extension.stft_forward(x, self.n_fft, self.hop_length, self.win_length)
++        stft = cuda_extension.custom_stft(
++            x,
++            n_fft=self.n_fft,
++            hop_length=self.hop_length,
++            win_length=self.win_length,
++            return_complex=True
++        )
+         yield 'step_003', stft
+         yield 'step_004', (x, argmin, stft)

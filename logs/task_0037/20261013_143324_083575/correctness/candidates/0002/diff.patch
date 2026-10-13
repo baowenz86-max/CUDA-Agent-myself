@@ -1,0 +1,386 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -2,15 +2,13 @@
+ #include <cstdint>
+ 
+ // Kernel to convert int64 labels to one-hot float32 on CUDA.
+-// x: input int64 labels on device, output: float one-hot tensor.
+-// total: total number of elements in output.
++// Input: int64 labels on device, output: float one-hot tensor.
+ __global__ void one_hot_float_kernel(const int64_t* __restrict__ input,
+                                      float* __restrict__ output,
+                                      int64_t total_elements,
+                                      int num_classes) {
+     int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+     if (idx >= total_elements) return;
+-    // Indexing: input index = idx / num_classes, class = idx % num_classes
+     int64_t label = input[idx / num_classes];
+     int64_t cls = idx % num_classes;
+     output[idx] = (label == cls) ? 1.0f : 0.0f;
+@@ -38,10 +36,6 @@
+ }
+ 
+ // Kernel for constant padding on height and width dims.
+-// Input: [N, H_in, W_in, C] contiguous float tensor.
+-// Output: [N, H_out, W_out, C] contiguous, H_out = H_in + pad_top + pad_bottom,
+-//         W_out = W_in + pad_left + pad_right.
+-// Strategy: one thread per output element; compute corresponding input index if interior, else fill value.
+ __global__ void pad_constant_kernel(const float* __restrict__ input,
+                                     float* __restrict__ output,
+                                     int64_t total_output,
+@@ -54,7 +48,6 @@
+ 
+     int H_out = H_in + pad_top + pad_bottom;
+     int W_out = W_in + pad_left + pad_right;
+-    // Decompose output index
+     int64_t tmp = idx;
+     int c = tmp % C;
+     tmp /= C;
+@@ -62,13 +55,11 @@
+     tmp /= W_out;
+     int h_out = tmp % H_out;
+     tmp /= H_out;
+-    int n = tmp;  // batch index
+-
+-    // Check if within interior (taking into account padding)
++    int n = tmp;
++
+     int h_in = h_out - pad_top;
+     int w_in = w_out - pad_left;
+     if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+-        // Compute input index: ((n*H_in + h_in)*W_in + w_in)*C + c
+         int64_t in_idx = (((int64_t)n * H_in + h_in) * W_in + w_in) * C + c;
+         output[idx] = input[in_idx];
+     } else {
+@@ -76,10 +67,7 @@
+     }
+ }
+ 
+-// Kernel for softmax along last dimension (axis = -1, i.e., C dimension).
+-// Input: [N, H, W, C] contiguous float tensor. Output same shape.
+-// One block per row? We use one thread per row for simplicity, but with large C maybe more efficient.
+-// Here C=9 in this task, so one thread per row is fine.
++// Kernel for softmax along last dimension (C).
+ __global__ void softmax_last_dim_kernel(const float* __restrict__ input,
+                                         float* __restrict__ output,
+                                         int64_t rows,
+@@ -89,19 +77,16 @@
+     const float* in_row = input + row * C;
+     float* out_row = output + row * C;
+ 
+-    // Find max for numerical stability
+     float max_val = in_row[0];
+     for (int i = 1; i < C; ++i) {
+         if (in_row[i] > max_val) max_val = in_row[i];
+     }
+-    // Compute exp and sum
+     float sum = 0.0f;
+     for (int i = 0; i < C; ++i) {
+         float e = expf(in_row[i] - max_val);
+         out_row[i] = e;
+         sum += e;
+     }
+-    // Normalize
+     for (int i = 0; i < C; ++i) {
+         out_row[i] /= sum;
+     }
+@@ -109,17 +94,17 @@
+ 
+ // Launchers with C linkage.
+ 
++// Host-to-device launcher for CPU input (original)
+ extern "C" void one_hot_float_launcher(const int64_t* input_cpu,
+                                         int64_t N,
+                                         int64_t H,
+                                         int64_t W,
+                                         int num_classes,
+-                                        float* output_cuda,   // preallocated float tensor on device
++                                        float* output_cuda,
+                                         cudaStream_t stream) {
+     int64_t total = N * H * W * num_classes;
+     if (total == 0) return;
+ 
+-    // Allocate device buffer for input labels
+     int64_t* input_dev;
+     cudaMalloc(&input_dev, N * H * W * sizeof(int64_t));
+     cudaMemcpyAsync(input_dev, input_cpu, N * H * W * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+@@ -128,17 +113,26 @@
+     int64_t blocks = (total + threads - 1) / threads;
+     one_hot_float_kernel<<<blocks, threads, 0, stream>>>(input_dev, output_cuda, total, num_classes);
+ 
+-    cudaFree(input_dev); // careful: free after kernel? The kernel uses the buffer, so need to ensure completion before free.
+-    // Usually we can schedule free after kernel by using cudaStreamAddCallback or just leak? Better to use cudaFree after stream sync? 
+-    // Since function returns immediately, we can't free safely. Instead, allocate using cudaMallocAsync or use temporary maybe with cudaFree after stream sync inside launcher.
+-    // To keep simple, we can use cudaMallocManaged or just allocate on device and then free without waiting? That is unsafe.
+-    // We will use cudaMalloc and then not free, causing memory leak, but for short inference it's acceptable? Not good.
+-    // Alternative: use cudaMallocAsync with pool.
+-    // For simplicity, use cudaMalloc and then cudaFree after kernel launch but without synchronization: cudaFree may wait until all prior work completes? The cudaFree docs say it may return immediately but the memory is not reused until work completes, so it's safe but may block? Actually cudaFree is synchronous with respect to the device? It may block until all previous operations complete. That is acceptable.
+-    // So we can do: launch kernel, then cudaFree(input_dev); // blocks until kernel done, maybe okay.
+     cudaFree(input_dev);
+ }
+ 
++// Device-to-device launcher for CUDA input
++extern "C" void one_hot_float_cuda_launcher(const int64_t* input_dev,
++                                             int64_t N,
++                                             int64_t H,
++                                             int64_t W,
++                                             int num_classes,
++                                             float* output_cuda,
++                                             cudaStream_t stream) {
++    int64_t total = N * H * W * num_classes;
++    if (total == 0) return;
++
++    int threads = 256;
++    int64_t blocks = (total + threads - 1) / threads;
++    one_hot_float_kernel<<<blocks, threads, 0, stream>>>(input_dev, output_cuda, total, num_classes);
++}
++
++// Host-to-device launcher for int64 one-hot (debug)
+ extern "C" void one_hot_int64_launcher(const int64_t* input_cpu,
+                                         int64_t N,
+                                         int64_t H,
+@@ -158,6 +152,22 @@
+     one_hot_int64_kernel<<<blocks, threads, 0, stream>>>(input_dev, output_cuda, total, num_classes);
+ 
+     cudaFree(input_dev);
++}
++
++// Device-to-device launcher for int64 one-hot (debug)
++extern "C" void one_hot_int64_cuda_launcher(const int64_t* input_dev,
++                                             int64_t N,
++                                             int64_t H,
++                                             int64_t W,
++                                             int num_classes,
++                                             int64_t* output_cuda,
++                                             cudaStream_t stream) {
++    int64_t total = N * H * W * num_classes;
++    if (total == 0) return;
++
++    int threads = 256;
++    int64_t blocks = (total + threads - 1) / threads;
++    one_hot_int64_kernel<<<blocks, threads, 0, stream>>>(input_dev, output_cuda, total, num_classes);
+ }
+ 
+ extern "C" void cast_float32_launcher(const int64_t* input_cuda,
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,32 +1,34 @@
+-// Binding for custom ops declared in custom_ops.cu
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cuda_runtime.h>
+ #include "../binding_registry.h"
+ 
+-// Extern C launcher declarations matching custom_ops.cu
++// Launcher declarations
+ extern "C" void one_hot_float_launcher(const int64_t* input_cpu,
+-                                        int64_t N,
+-                                        int64_t H,
+-                                        int64_t W,
++                                        int64_t N, int64_t H, int64_t W,
+                                         int num_classes,
+                                         float* output_cuda,
+                                         cudaStream_t stream);
+-
++extern "C" void one_hot_float_cuda_launcher(const int64_t* input_dev,
++                                             int64_t N, int64_t H, int64_t W,
++                                             int num_classes,
++                                             float* output_cuda,
++                                             cudaStream_t stream);
+ extern "C" void one_hot_int64_launcher(const int64_t* input_cpu,
+-                                        int64_t N,
+-                                        int64_t H,
+-                                        int64_t W,
++                                        int64_t N, int64_t H, int64_t W,
+                                         int num_classes,
+                                         int64_t* output_cuda,
+                                         cudaStream_t stream);
+-
++extern "C" void one_hot_int64_cuda_launcher(const int64_t* input_dev,
++                                             int64_t N, int64_t H, int64_t W,
++                                             int num_classes,
++                                             int64_t* output_cuda,
++                                             cudaStream_t stream);
+ extern "C" void cast_float32_launcher(const int64_t* input_cuda,
+                                        float* output_cuda,
+                                        int64_t total_elements,
+                                        cudaStream_t stream);
+-
+ extern "C" void pad_constant_launcher(const float* input_cuda,
+                                       float* output_cuda,
+                                       int64_t total_output,
+@@ -35,16 +37,14 @@
+                                       int pad_top, int pad_bottom,
+                                       float value,
+                                       cudaStream_t stream);
+-
+ extern "C" void softmax_dim_launcher(const float* input_cuda,
+                                      float* output_cuda,
+                                      int64_t rows,
+                                      int C,
+                                      cudaStream_t stream);
+ 
+-// Wrapper for one_hot_float
++// Helper to get contiguous input and possibly move to CPU if needed
+ torch::Tensor one_hot_float(torch::Tensor x, int64_t num_classes) {
+-    TORCH_CHECK(x.is_cpu(), "Input x must be a CPU tensor");
+     TORCH_CHECK(x.dtype() == torch::kInt64, "Input x must be int64");
+     TORCH_CHECK(x.dim() == 3, "Input x must be 3D [batch, height, width]");
+     TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
+@@ -54,7 +54,6 @@
+     int64_t H = x.size(1);
+     int64_t W = x.size(2);
+ 
+-    // Allocate output on CUDA: [N, H, W, num_classes]
+     auto options = torch::TensorOptions()
+                        .dtype(torch::kFloat32)
+                        .device(torch::kCUDA);
+@@ -62,19 +61,24 @@
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    one_hot_float_launcher(
+-        x.data_ptr<int64_t>(),
+-        N, H, W,
+-        static_cast<int>(num_classes),
+-        output.data_ptr<float>(),
+-        stream);
+-
+-    return output;
+-}
+-
+-// Wrapper for one_hot_int64
++    if (x.is_cuda()) {
++        one_hot_float_cuda_launcher(
++            x.data_ptr<int64_t>(),
++            N, H, W, static_cast<int>(num_classes),
++            output.data_ptr<float>(),
++            stream);
++    } else {
++        one_hot_float_launcher(
++            x.data_ptr<int64_t>(),
++            N, H, W, static_cast<int>(num_classes),
++            output.data_ptr<float>(),
++            stream);
++    }
++
++    return output;
++}
++
+ torch::Tensor one_hot_int64(torch::Tensor x, int64_t num_classes) {
+-    TORCH_CHECK(x.is_cpu(), "Input x must be a CPU tensor");
+     TORCH_CHECK(x.dtype() == torch::kInt64, "Input x must be int64");
+     TORCH_CHECK(x.dim() == 3, "Input x must be 3D [batch, height, width]");
+     TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
+@@ -91,17 +95,23 @@
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    one_hot_int64_launcher(
+-        x.data_ptr<int64_t>(),
+-        N, H, W,
+-        static_cast<int>(num_classes),
+-        output.data_ptr<int64_t>(),
+-        stream);
+-
+-    return output;
+-}
+-
+-// Wrapper for cast_float32
++    if (x.is_cuda()) {
++        one_hot_int64_cuda_launcher(
++            x.data_ptr<int64_t>(),
++            N, H, W, static_cast<int>(num_classes),
++            output.data_ptr<int64_t>(),
++            stream);
++    } else {
++        one_hot_int64_launcher(
++            x.data_ptr<int64_t>(),
++            N, H, W, static_cast<int>(num_classes),
++            output.data_ptr<int64_t>(),
++            stream);
++    }
++
++    return output;
++}
++
+ torch::Tensor cast_float32(torch::Tensor x) {
+     TORCH_CHECK(x.is_cuda(), "Input x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kInt64, "Input x must be int64");
+@@ -124,7 +134,6 @@
+     return output;
+ }
+ 
+-// Wrapper for pad_constant
+ torch::Tensor pad_constant(torch::Tensor x,
+                            int64_t pad_left,
+                            int64_t pad_right,
+@@ -168,17 +177,12 @@
+     return output;
+ }
+ 
+-// Wrapper for softmax_dim
+ torch::Tensor softmax_dim(torch::Tensor x, int64_t dim) {
+     TORCH_CHECK(x.is_cuda(), "Input x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input x must be float32");
+     TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
+     TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim must be a valid dimension");
+ 
+-    // For this task, dim is 1 which corresponds to last dimension after permutation.
+-    // The custom kernel handles softmax along the last dimension (C).
+-    // If dim is not the last dimension, we would need a different kernel,
+-    // but according to contract it is always last dim in this task.
+     TORCH_CHECK(dim == x.dim() - 1, "Only softmax over last dimension is supported by this binding");
+ 
+     int64_t rows = x.numel() / x.size(-1);
+@@ -199,7 +203,7 @@
+ 
+ void register_custom_ops(pybind11::module& m) {
+     m.def("one_hot_float", &one_hot_float,
+-          "One-hot encode int64 CPU tensor to float32 CUDA tensor",
++          "One-hot encode int64 tensor to float32 CUDA tensor",
+           py::arg("x"), py::arg("num_classes"));
+     m.def("pad_constant", &pad_constant,
+           "Constant pad height and width dimensions",
+@@ -209,7 +213,7 @@
+           "Softmax along specified dimension",
+           py::arg("x"), py::arg("dim"));
+     m.def("one_hot_int64", &one_hot_int64,
+-          "One-hot encode int64 CPU tensor to int64 CUDA tensor (debug)",
++          "One-hot encode int64 tensor to int64 CUDA tensor (debug)",
+           py::arg("x"), py::arg("num_classes"));
+     m.def("cast_float32", &cast_float32,
+           "Cast int64 tensor to float32 (debug)",
+--- before/model_new.py
++++ after/model_new.py
+@@ -12,28 +12,19 @@
+         self.padding_value = padding_value
+ 
+     def forward(self, x):
+-        # Step 1: one_hot + float cast in one custom op
+-        # Input x is int64 CPU, but custom op will move to CUDA and produce float32.
++        # one_hot_float now accepts CPU or CUDA input, handling device accordingly.
+         x = cuda_extension.one_hot_float(x, self.num_classes)
+-        # Step 2: constant padding on height and width dims
+         x = cuda_extension.pad_constant(x, self.padding_size, self.padding_size, self.padding_size, self.padding_size, self.padding_value)
+-        # Step 3: softmax over depth dimension (last dimension)
+         x = cuda_extension.softmax_dim(x, self.depth)
+         return x
+ 
+     def debug_forward(self, x):
+-        # Must yield checkpoint IDs and values in exact order as reference_steps
+-        # step_001: one_hot result (int64 tensor on cuda)
+         onehot = cuda_extension.one_hot_int64(x, self.num_classes)
+         yield 'step_001', onehot
+-        # step_002: float cast
+         x_f = cuda_extension.cast_float32(onehot)
+         yield 'step_002', x_f
+-        # step_003: pad
+         padded = cuda_extension.pad_constant(x_f, self.padding_size, self.padding_size, self.padding_size, self.padding_size, self.padding_value)
+         yield 'step_003', padded
+-        # step_004: softmax
+         result = cuda_extension.softmax_dim(padded, self.depth)
+         yield 'step_004', result
+-        # step_005: return result (same as step_004)
+         yield 'step_005', result

@@ -1,0 +1,224 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,6 +1,123 @@
+ #include <cuda_runtime.h>
+ 
+-// This file intentionally contains no CUDA kernels.
+-// All required operations are implemented in C++ binding files using cuDNN for ConvTranspose
+-// and straightforward elementwise/normalization logic for LayerNorm and addcmul.
+-// Since no non-convolution CUDA computation is required, this file only includes the CUDA runtime header.+// LayerNorm kernel: input shape [batch, channels, length]
++// weight and bias have shape [channels, length] (same as normalized_shape)
++__global__ void layer_norm_kernel(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int batch_size,
++    int channels,
++    int length,
++    float eps)
++{
++    int batch = blockIdx.x;
++    int channel = blockIdx.y;
++    int idx = threadIdx.x;
++
++    // Each block handles one (batch, channel) pair.
++    __shared__ float mean;
++    __shared__ float var;
++    __shared__ float inv_std;
++
++    float thread_sum = 0.0f;
++    for (int i = idx; i < length; i += blockDim.x) {
++        float val = input[(batch * channels + channel) * length + i];
++        thread_sum += val;
++    }
++
++    // Block reduction for sum
++    __shared__ float sum_shared[256];
++    sum_shared[idx] = thread_sum;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (idx < stride) {
++            sum_shared[idx] += sum_shared[idx + stride];
++        }
++        __syncthreads();
++    }
++    if (idx == 0) {
++        mean = sum_shared[0] / length;
++    }
++    __syncthreads();
++
++    // Compute variance
++    float thread_var_sum = 0.0f;
++    for (int i = idx; i < length; i += blockDim.x) {
++        float diff = input[(batch * channels + channel) * length + i] - mean;
++        thread_var_sum += diff * diff;
++    }
++    __shared__ float var_shared[256];
++    var_shared[idx] = thread_var_sum;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (idx < stride) {
++            var_shared[idx] += var_shared[idx + stride];
++        }
++        __syncthreads();
++    }
++    if (idx == 0) {
++        var = var_shared[0] / length;
++        inv_std = rsqrtf(var + eps);
++    }
++    __syncthreads();
++
++    // Normalize and apply affine
++    for (int i = idx; i < length; i += blockDim.x) {
++        float val = input[(batch * channels + channel) * length + i];
++        float norm = (val - mean) * inv_std;
++        // weight and bias are per (channel, i)
++        float w = weight[channel * length + i];
++        float b = bias[channel * length + i];
++        output[(batch * channels + channel) * length + i] = norm * w + b;
++    }
++}
++
++// Addcmul kernel: output = input + tensor1 * tensor2
++template <typename scalar_t>
++__global__ void addcmul_kernel(
++    scalar_t* output,
++    const scalar_t* input,
++    const scalar_t* tensor1,
++    const scalar_t* tensor2,
++    int numel)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < numel) {
++        output[idx] = input[idx] + tensor1[idx] * tensor2[idx];
++    }
++}
++
++// Launcher for layer_norm
++extern "C" void layer_norm_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int batch_size,
++    int channels,
++    int length,
++    float eps,
++    cudaStream_t stream)
++{
++    dim3 grid(batch_size, channels);
++    dim3 block(256);
++    layer_norm_kernel<<<grid, block, 0, stream>>>(
++        output, input, weight, bias, batch_size, channels, length, eps);
++}
++
++// Launcher for addcmul
++extern "C" void addcmul_launcher(
++    float* output,
++    const float* input,
++    const float* tensor1,
++    const float* tensor2,
++    int numel,
++    cudaStream_t stream)
++{
++    const int block_size = 256;
++    const int grid_size = (numel + block_size - 1) / block_size;
++    addcmul_kernel<float><<<grid_size, block_size, 0, stream>>>(
++        output, input, tensor1, tensor2, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,4 +1,3 @@
+-// Include necessary headers
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <c10/cuda/CUDAStream.h>
+@@ -6,7 +5,7 @@
+ #include <cudnn.h>
+ #include "../binding_registry.h"
+ 
+-// Declare non-convolution launchers from custom_ops.cu
++// Declare launchers from custom_ops.cu
+ extern "C" void layer_norm_launcher(
+     float* output,
+     const float* input,
+@@ -87,7 +86,6 @@
+     CHECK_CUDNN(cudnnSetStream(cudnn_handle, stream));
+ 
+     // For ConvTranspose1d, cuDNN uses 2D convolution with height=1.
+-    // We need to set up tensor descriptors for input, output, and filter.
+     cudnnTensorDescriptor_t input_desc, output_desc;
+     cudnnFilterDescriptor_t filter_desc;
+     cudnnConvolutionDescriptor_t conv_desc;
+@@ -97,9 +95,6 @@
+     CHECK_CUDNN(cudnnCreateFilterDescriptor(&filter_desc));
+     CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+ 
+-    // For cuDNN, ConvTranspose is called "convolution backward data".
+-    // We need to use cudnnConvolutionBackwardData.
+-    // Set tensor descriptors: N, C, H, W (with W=1 for 1D)
+     // Input shape: [batch, in_channels, in_length, 1]
+     CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+         input_desc,
+@@ -134,13 +129,10 @@
+     ));
+ 
+     // Convolution descriptor for backward data
+-    // padA: top/left pad, padB: bottom/right pad, stride, dilation
+-    // For ConvTranspose1d: padding is applied to the input of the forward conv,
+-    // i.e., in backward data, the padding is as given.
+     CHECK_CUDNN(cudnnSetConvolution2dDescriptor(
+         conv_desc,
+         padding,      // padA
+-        padding,      // padB (symmetric)
++        padding,      // padB
+         stride,       // stride height
+         1,            // stride width
+         1,            // dilation height
+@@ -149,7 +141,7 @@
+         CUDNN_DATA_FLOAT
+     ));
+ 
+-    // Choose algorithm (use deterministic algorithm)
++    // Choose algorithm
+     cudnnConvolutionBwdDataAlgo_t algo;
+     CHECK_CUDNN(cudnnGetConvolutionBackwardDataAlgorithm(
+         cudnn_handle,
+@@ -199,19 +191,6 @@
+ 
+     // Add bias if present
+     if (bias.defined()) {
+-        // Bias is per output channel, we can use a simple elementwise add via a kernel or cuBLAS?
+-        // Simplest: allocate a temp of shape [1, out_channels, 1, 1] and use cuDNN add tensor?
+-        // Or we can implement a small CUDA kernel in the .cu file, but we don't have one here.
+-        // However, we have to add bias. We can use the addcmul launcher? No, better to have a separate bias add kernel.
+-        // Since the .cu currently has no kernels, we must declare another launcher, or implement bias add within conv_transpose_forward using a simple CUDA kernel? But .cpp cannot contain CUDA kernels.
+-        // Option: use cublas? Not straightforward. We'll need to declare an extern launcher for bias addition, but that would require modifying .cu.
+-        // But the task says non-convolution launchers are in .cu, but we are only allowed to create .cpp in this phase.
+-        // We may assume that the .cu will be updated in a later phase to include necessary kernels. For now, we declare the launcher as extern and assume it will exist.
+-        // We'll add a declaration for a bias_add_launcher and call it if bias present.
+-        // However, the instruction says "不要生成或修改 .cu". So we cannot add it to .cu. But we need bias addition.
+-        // Alternative: use cuDNN's cudnnAddTensor to add bias.
+-        // cudnnAddTensor can add a bias tensor with shape [1, out_channels, 1, 1] to the output.
+-        // Let's use cudnnAddTensor.
+         cudnnTensorDescriptor_t bias_desc;
+         CHECK_CUDNN(cudnnCreateTensorDescriptor(&bias_desc));
+         CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+@@ -229,7 +208,7 @@
+             &alpha_bias,
+             bias_desc,
+             bias_contig.data_ptr<float>(),
+-            &alpha, // alpha for output? Actually cudnnAddTensor adds scaled bias to output: output = alpha * output + bias.
++            &alpha,
+             output_desc,
+             output.data_ptr<float>()
+         ));
+@@ -289,7 +268,6 @@
+         stream
+     );
+ 
+-    // Check for errors
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "CUDA kernel error: ", cudaGetErrorString(err));
+ 

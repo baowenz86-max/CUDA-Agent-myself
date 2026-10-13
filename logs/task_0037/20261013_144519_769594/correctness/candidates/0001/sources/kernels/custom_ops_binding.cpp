@@ -1,0 +1,146 @@
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include "../binding_registry.h"
+
+// Declare launchers from custom_ops.cu
+extern "C" void one_hot_launcher(const int64_t* input,
+                                 int64_t* output,
+                                 int N, int H, int W, int C,
+                                 cudaStream_t stream);
+
+extern "C" void float_launcher(const int64_t* input,
+                               float* output,
+                               int64_t numel,
+                               cudaStream_t stream);
+
+extern "C" void pad_launcher(const float* input,
+                             float* output,
+                             int N, int H, int W, int C,
+                             int pad,
+                             float pad_value,
+                             cudaStream_t stream);
+
+extern "C" void softmax_launcher(const float* input,
+                                 float* output,
+                                 int N, int H, int W, int C,
+                                 cudaStream_t stream);
+
+torch::Tensor one_hot_forward(torch::Tensor x, int64_t num_classes) {
+    TORCH_CHECK(x.dtype() == torch::kInt64, "one_hot_forward: input must be int64");
+    TORCH_CHECK(x.dim() == 3, "one_hot_forward: input must be 3D [N,H,W]");
+
+    // Move to CUDA if necessary
+    if (!x.is_cuda()) {
+        x = x.to(torch::kCUDA);
+    }
+    TORCH_CHECK(x.is_cuda(), "one_hot_forward: input must be on CUDA");
+    TORCH_CHECK(x.is_contiguous(), "one_hot_forward: input must be contiguous");
+
+    auto sizes = x.sizes();
+    int N = static_cast<int>(sizes[0]);
+    int H = static_cast<int>(sizes[1]);
+    int W = static_cast<int>(sizes[2]);
+
+    auto output = torch::empty({N, H, W, num_classes}, x.options().dtype(torch::kInt64));
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    one_hot_launcher(x.data_ptr<int64_t>(),
+                     output.data_ptr<int64_t>(),
+                     N, H, W, static_cast<int>(num_classes),
+                     stream);
+
+    return output;
+}
+
+torch::Tensor float_forward(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda(), "float_forward: input must be CUDA tensor");
+    TORCH_CHECK(x.dtype() == torch::kInt64, "float_forward: input must be int64");
+    TORCH_CHECK(x.is_contiguous(), "float_forward: input must be contiguous");
+
+    int64_t numel = x.numel();
+    auto output = torch::empty(x.sizes(), x.options().dtype(torch::kFloat32));
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    float_launcher(x.data_ptr<int64_t>(),
+                   output.data_ptr<float>(),
+                   numel,
+                   stream);
+
+    return output;
+}
+
+torch::Tensor pad_forward(torch::Tensor x, int64_t padding_size, double padding_value) {
+    TORCH_CHECK(x.is_cuda(), "pad_forward: input must be CUDA tensor");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "pad_forward: input must be float32");
+    TORCH_CHECK(x.dim() == 4, "pad_forward: input must be 4D [N,H,W,C]");
+    TORCH_CHECK(x.is_contiguous(), "pad_forward: input must be contiguous");
+
+    auto sizes = x.sizes();
+    int N = static_cast<int>(sizes[0]);
+    int H = static_cast<int>(sizes[1]);
+    int W = static_cast<int>(sizes[2]);
+    int C = static_cast<int>(sizes[3]);
+    int pad = static_cast<int>(padding_size);
+
+    int out_H = H + 2 * pad;
+    int out_W = W + 2 * pad;
+    int out_C = C + 2 * pad;
+
+    auto output = torch::empty({N, out_H, out_W, out_C}, x.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    pad_launcher(x.data_ptr<float>(),
+                 output.data_ptr<float>(),
+                 N, H, W, C,
+                 pad,
+                 static_cast<float>(padding_value),
+                 stream);
+
+    return output;
+}
+
+torch::Tensor softmax_forward(torch::Tensor x, int64_t dim) {
+    TORCH_CHECK(x.is_cuda(), "softmax_forward: input must be CUDA tensor");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "softmax_forward: input must be float32");
+    TORCH_CHECK(x.dim() == 4, "softmax_forward: input must be 4D [N,H,W,C]");
+    TORCH_CHECK(x.is_contiguous(), "softmax_forward: input must be contiguous");
+    TORCH_CHECK(dim >= 0 && dim < x.dim(), "softmax_forward: dim out of range");
+
+    // The launcher only supports softmax along dimension 1 (H)
+    TORCH_CHECK(dim == 1, "softmax_forward: only dim=1 is supported by this launcher");
+
+    auto sizes = x.sizes();
+    int N = static_cast<int>(sizes[0]);
+    int H = static_cast<int>(sizes[1]);
+    int W = static_cast<int>(sizes[2]);
+    int C = static_cast<int>(sizes[3]);
+
+    auto output = torch::empty_like(x);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    softmax_launcher(x.data_ptr<float>(),
+                     output.data_ptr<float>(),
+                     N, H, W, C,
+                     stream);
+
+    return output;
+}
+
+void register_custom_ops(pybind11::module& m) {
+    m.def("one_hot_forward", &one_hot_forward,
+          "One-hot encode int64 input into int64 output",
+          pybind11::arg("x"), pybind11::arg("num_classes"));
+    m.def("float_forward", &float_forward,
+          "Cast int64 tensor to float32",
+          pybind11::arg("x"));
+    m.def("pad_forward", &pad_forward,
+          "Pad last three dimensions symmetrically",
+          pybind11::arg("x"), pybind11::arg("padding_size"), pybind11::arg("padding_value"));
+    m.def("softmax_forward", &softmax_forward,
+          "Softmax along dimension dim",
+          pybind11::arg("x"), pybind11::arg("dim"));
+}
+
+REGISTER_BINDING(custom_ops, register_custom_ops);

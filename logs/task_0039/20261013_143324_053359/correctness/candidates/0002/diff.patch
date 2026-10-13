@@ -1,0 +1,375 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -2,15 +2,89 @@
+ 
+ // -----------------------------------------------------------------------------
+ // Non-convolution CUDA kernels and launchers for the custom extension.
+-// Conv2d is handled via cuDNN in binding.cpp (not this file).
++// Conv2d is implemented as a custom direct convolution kernel here (no cuDNN).
+ // All tensors are float32, dimensions are int, pointers are raw device pointers.
+ // Launchers use cudaStream_t and check for errors after launch.
+ // -----------------------------------------------------------------------------
+ 
+ // -----------------------------------------------------------------------------
++// conv2d: direct convolution, output[n,oc,oh,ow] = sum_{ic,kh,kw}
++//          input[n,ic,oh*stride - padding + kh, ow*stride - padding + kw] * weight[oc,ic,kh,kw]
++//          + bias[oc] (if bias provided)
++// -----------------------------------------------------------------------------
++__global__ void conv2d_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int N, int C_in, int H, int W,
++    int C_out, int R, int S,
++    int stride, int padding,
++    int H_out, int W_out)
++{
++    int64_t total = (int64_t)N * C_out * H_out * W_out;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride_total = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride_total) {
++        int ow = i % W_out;
++        int64_t tmp = i / W_out;
++        int oh = tmp % H_out;
++        tmp /= H_out;
++        int oc = tmp % C_out;
++        int n = tmp / C_out;
++
++        float sum = 0.0f;
++        for (int ic = 0; ic < C_in; ++ic) {
++            for (int kh = 0; kh < R; ++kh) {
++                int ih = oh * stride - padding + kh;
++                if (ih < 0 || ih >= H) continue;
++                for (int kw = 0; kw < S; ++kw) {
++                    int iw = ow * stride - padding + kw;
++                    if (iw < 0 || iw >= W) continue;
++                    int64_t in_idx = ((int64_t)n * C_in + ic) * H * W + (int64_t)ih * W + iw;
++                    int64_t w_idx = (((int64_t)oc * C_in + ic) * R + kh) * S + kw;
++                    sum += input[in_idx] * weight[w_idx];
++                }
++            }
++        }
++        if (bias != nullptr) {
++            sum += bias[oc];
++        }
++        output[i] = sum;
++    }
++}
++
++extern "C" void conv2d_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int H, int W,
++    int C_out, int R, int S,
++    int stride, int padding,
++    cudaStream_t stream)
++{
++    if (N <= 0 || C_in <= 0 || C_out <= 0 || H <= 0 || W <= 0 || R <= 0 || S <= 0) return;
++    int H_out = (H + 2 * padding - R) / stride + 1;
++    int W_out = (W + 2 * padding - S) / stride + 1;
++    if (H_out <= 0 || W_out <= 0) return;
++
++    int64_t total = (int64_t)N * C_out * H_out * W_out;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 65535) grid = 65535;
++
++    conv2d_kernel<<<grid, block, 0, stream>>>(
++        input, weight, bias, output,
++        N, C_in, H, W, C_out, R, S, stride, padding, H_out, W_out);
++
++    cudaError_t err = cudaGetLastError();
++    // caller checks
++}
++
++// -----------------------------------------------------------------------------
+ // add_bias: input shape [N,C,H,W], bias shape [C,1,1] broadcast over channels.
+-//   output[n,c,h,w] = input[n,c,h,w] + bias[c]
+-// Handles non-contiguous input/output via strides.
+ // -----------------------------------------------------------------------------
+ __global__ void add_bias_kernel(
+     const float* __restrict__ input,
+@@ -55,7 +129,7 @@
+     int64_t total = (int64_t)N * C * H * W;
+     int block = 256;
+     int grid = (int)((total + block - 1) / block);
+-    if (grid > 65535) grid = 65535; // grid-stride loop handles rest
++    if (grid > 65535) grid = 65535;
+ 
+     add_bias_kernel<<<grid, block, 0, stream>>>(
+         input, bias, output,
+@@ -64,19 +138,10 @@
+         out_N_stride, out_C_stride, out_H_stride, out_W_stride);
+ 
+     cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // Error can be retrieved by host after launch; nothing to return.
+-        // In binding.cpp, check this error via cudaGetLastError after launcher call.
+-        // We record it in a static thread_local variable? Better: use a simple printf for debug,
+-        // but production should not print. The launcher is void, so we rely on caller to check.
+-        // To keep simple, we do nothing here; binding.cpp will call cudaGetLastError.
+-    }
+ }
+ 
+ // -----------------------------------------------------------------------------
+ // batch_norm: input [N,C,H,W], running_mean/running_var/weight/bias [C].
+-//   y = (x - running_mean[c]) / sqrt(running_var[c] + eps) * weight[c] + bias[c]
+-// Handles non-contiguous input/output via strides.
+ // -----------------------------------------------------------------------------
+ __global__ void batch_norm_kernel(
+     const float* __restrict__ input,
+@@ -141,17 +206,10 @@
+         out_N_stride, out_C_stride, out_H_stride, out_W_stride);
+ 
+     cudaError_t err = cudaGetLastError();
+-    // same as above, caller checks
+ }
+ 
+ // -----------------------------------------------------------------------------
+ // avg_pool2d: input [N,C,H,W], kernel_size, stride, padding, count_include_pad=True.
+-//   Output size: H_out = floor((H + 2*padding - kernel_size)/stride) + 1, similarly W_out.
+-//   For each output element, average over window (kernel_size x kernel_size), including
+-//   padding positions as zeros (count_include_pad=True).
+-// This kernel assumes input and output are contiguous (as they will be); but to be safe,
+-// we can handle arbitrary strides similar to above. However, for pooling, we typically
+-// need to compute from input coordinates, so we use input strides.
+ // -----------------------------------------------------------------------------
+ __global__ void avg_pool2d_kernel(
+     const float* __restrict__ input,
+@@ -174,7 +232,6 @@
+         int c = tmp % C;
+         int n = tmp / C;
+ 
+-        // Compute input window start (including padding offset)
+         int h_start = h_out * stride - padding;
+         int w_start = w_out * stride - padding;
+ 
+@@ -193,7 +250,6 @@
+             }
+         }
+ 
+-        // count_include_pad=True: divide by kernel_size^2 regardless of padding
+         float avg = sum / (float)(kernel_size * kernel_size);
+ 
+         int64_t out_idx = (int64_t)n * out_N_stride + (int64_t)c * out_C_stride +
+@@ -228,7 +284,6 @@
+         out_N_stride, out_C_stride, out_H_stride, out_W_stride);
+ 
+     cudaError_t err = cudaGetLastError();
+-    // caller checks
+ }
+ 
+ // -----------------------------------------------------------------------------
+@@ -238,7 +293,7 @@
+     const float* __restrict__ input,
+     float* __restrict__ output,
+     int64_t total,
+-    int64_t in_stride,  // assuming input is contiguous for now, but we can pass strides as needed
++    int64_t in_stride,
+     int64_t out_stride)
+ {
+     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+@@ -248,10 +303,6 @@
+         output[i * out_stride] = 1.0f / (1.0f + expf(-input[i * in_stride]));
+     }
+ }
+-
+-// We need a more general sigmoid that supports arbitrary strides; for simplicity,
+-// we assume input/output are contiguous in the launcher (they should be after previous ops).
+-// We'll implement a general version using N,C,H,W and strides similar to above.
+ 
+ extern "C" void sigmoid_launcher(
+     const float* input,
+@@ -270,11 +321,4 @@
+         input, output, total, in_stride, out_stride);
+ 
+     cudaError_t err = cudaGetLastError();
+-    // caller checks
+-}
+-
+-// Note: The actual binding.cpp will call the appropriate launcher. For the generic
+-// sigmoid, if input is not contiguous, it should be made contiguous before calling
+-// (or pass actual strides). Here we provide simple contiguous version as contract
+-// tensors are contiguous. For safety, binding can call a launcher that accepts general
+-// strides; but given contract, contiguous is fine.
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,13 +1,22 @@
+-// PyTorch binding for custom ops using cuDNN for Conv2d and CUDA kernels for others
++// PyTorch binding for custom ops using CUDA kernels only (no cuDNN)
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
++extern "C" void conv2d_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int H, int W,
++    int C_out, int R, int S,
++    int stride, int padding,
++    cudaStream_t stream);
++
+ extern "C" void add_bias_launcher(
+     const float* input,
+     const float* bias,
+@@ -53,7 +62,10 @@
+     return c10::cuda::getCurrentCUDAStream().stream();
+ }
+ 
+-// Conv2d using cuDNN
++// Conv2d forward using custom CUDA kernel
++// Note: No cuDNN dependency; this is a simple direct convolution.
++// It assumes stride and padding are symmetric (no dilation).
++// Bias is optional.
+ torch::Tensor conv2d_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+                              int64_t stride, int64_t padding) {
+     TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+@@ -62,12 +74,14 @@
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
+     TORCH_CHECK(input.dim() == 4, "Input must be 4D");
+     TORCH_CHECK(weight.dim() == 4, "Weight must be 4D");
+-
+-    // Convert stride/padding to tuple if needed (they are ints)
+-    int stride_h = stride;
+-    int stride_w = stride;
+-    int padding_h = padding;
+-    int padding_w = padding;
++    TORCH_CHECK(stride >= 1, "stride must be >= 1");
++    TORCH_CHECK(padding >= 0, "padding must be >= 0");
++
++    // Convert stride/padding to int for kernel
++    int stride_h = static_cast<int>(stride);
++    int stride_w = static_cast<int>(stride);
++    int padding_h = static_cast<int>(padding);
++    int padding_w = static_cast<int>(padding);
+ 
+     // Ensure contiguous
+     auto input_contig = input.contiguous();
+@@ -83,8 +97,7 @@
+     int C_in = input_contig.size(1);
+     int H = input_contig.size(2);
+     int W = input_contig.size(3);
+-    int K = weight_contig.size(0);
+-    int C_out = K;
++    int C_out = weight_contig.size(0);
+     int R = weight_contig.size(2);
+     int S = weight_contig.size(3);
+ 
+@@ -92,48 +105,20 @@
+ 
+     int H_out = (H + 2 * padding_h - R) / stride_h + 1;
+     int W_out = (W + 2 * padding_w - S) / stride_w + 1;
++    TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid output dimensions");
+ 
+     auto output = torch::empty({N, C_out, H_out, W_out}, input.options());
+ 
+-    cudnnHandle_t cudnn_handle;
+-    cudnnCreate(&cudnn_handle);
+-    cudnnSetStream(cudnn_handle, getCurrentStream());
+-
+-    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    cudnnCreateTensorDescriptor(&input_desc);
+-    cudnnCreateTensorDescriptor(&output_desc);
+-    cudnnCreateTensorDescriptor(&bias_desc);
+-    cudnnCreateFilterDescriptor(&filter_desc);
+-    cudnnCreateConvolutionDescriptor(&conv_desc);
+-
+-    cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C_in, H, W);
+-    cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C_out, H_out, W_out);
+-    cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, C_out, 1, 1);
+-    cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, K, C_in, R, S);
+-    cudnnSetConvolution2dDescriptor(conv_desc, padding_h, padding_w, stride_h, stride_w, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
+-
+-    float alpha = 1.0f, beta = 0.0f;
+-    cudnnConvolutionForward(cudnn_handle, &alpha, input_desc, input_contig.data_ptr<float>(),
+-                            filter_desc, weight_contig.data_ptr<float>(), conv_desc,
+-                            CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM, nullptr, 0, &beta,
+-                            output_desc, output.data_ptr<float>());
+-
+-    if (bias_contig.defined()) {
+-        float alpha_bias = 1.0f, beta_bias = 1.0f;
+-        cudnnAddTensor(cudnn_handle, &alpha_bias, bias_desc, bias_contig.data_ptr<float>(),
+-                       &beta_bias, output_desc, output.data_ptr<float>());
+-    }
+-
+-    cudnnDestroyTensorDescriptor(input_desc);
+-    cudnnDestroyTensorDescriptor(output_desc);
+-    cudnnDestroyTensorDescriptor(bias_desc);
+-    cudnnDestroyFilterDescriptor(filter_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn_handle);
+-
++    conv2d_launcher(
++        input_contig.data_ptr<float>(),
++        weight_contig.data_ptr<float>(),
++        bias_contig.defined() ? bias_contig.data_ptr<float>() : nullptr,
++        output.data_ptr<float>(),
++        N, C_in, H, W,
++        C_out, R, S,
++        stride_h, padding_h,
++        getCurrentStream());
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "conv2d_launcher failed");
+     return output;
+ }
+ 
+@@ -148,6 +133,7 @@
+     TORCH_CHECK(bias.size(0) == input.size(1), "Bias channel mismatch");
+ 
+     auto input_contig = input.contiguous();
++    auto bias_contig = bias.contiguous();
+     auto output = torch::empty_like(input_contig);
+ 
+     int N = input_contig.size(0);
+@@ -155,7 +141,6 @@
+     int H = input_contig.size(2);
+     int W = input_contig.size(3);
+ 
+-    // Since both contiguous, strides can be computed but pass as is
+     int in_N_stride = input_contig.stride(0);
+     int in_C_stride = input_contig.stride(1);
+     int in_H_stride = input_contig.stride(2);
+@@ -165,7 +150,7 @@
+     int out_H_stride = output.stride(2);
+     int out_W_stride = output.stride(3);
+ 
+-    add_bias_launcher(input_contig.data_ptr<float>(), bias.data_ptr<float>(),
++    add_bias_launcher(input_contig.data_ptr<float>(), bias_contig.data_ptr<float>(),
+                       output.data_ptr<float>(), N, C, H, W,
+                       in_N_stride, in_C_stride, in_H_stride, in_W_stride,
+                       out_N_stride, out_C_stride, out_H_stride, out_W_stride,
+@@ -228,9 +213,8 @@
+     int H = input_contig.size(2);
+     int W = input_contig.size(3);
+ 
+-    int H_out = (H + 2 * padding - kernel_size) / stride + 1;
+-    int W_out = (W + 2 * padding - kernel_size) / stride + 1;
+-
++    int H_out = (H + 2 * static_cast<int>(padding) - static_cast<int>(kernel_size)) / static_cast<int>(stride) + 1;
++    int W_out = (W + 2 * static_cast<int>(padding) - static_cast<int>(kernel_size)) / static_cast<int>(stride) + 1;
+     TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid pooling parameters");
+ 
+     auto output = torch::empty({N, C, H_out, W_out}, input_contig.options());
+@@ -272,7 +256,7 @@
+ 
+ // Registration
+ void register_custom_ops(pybind11::module& m) {
+-    m.def("conv2d_forward", &conv2d_forward, "Conv2d forward using cuDNN",
++    m.def("conv2d_forward", &conv2d_forward, "Conv2d forward using custom CUDA kernel",
+           py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("stride"), py::arg("padding"));
+     m.def("add_bias_forward", &add_bias_forward, "Add bias forward",
+           py::arg("input"), py::arg("bias"));

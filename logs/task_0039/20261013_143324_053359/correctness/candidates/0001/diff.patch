@@ -1,0 +1,618 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,280 @@
++#include <cuda_runtime.h>
++
++// -----------------------------------------------------------------------------
++// Non-convolution CUDA kernels and launchers for the custom extension.
++// Conv2d is handled via cuDNN in binding.cpp (not this file).
++// All tensors are float32, dimensions are int, pointers are raw device pointers.
++// Launchers use cudaStream_t and check for errors after launch.
++// -----------------------------------------------------------------------------
++
++// -----------------------------------------------------------------------------
++// add_bias: input shape [N,C,H,W], bias shape [C,1,1] broadcast over channels.
++//   output[n,c,h,w] = input[n,c,h,w] + bias[c]
++// Handles non-contiguous input/output via strides.
++// -----------------------------------------------------------------------------
++__global__ void add_bias_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride)
++{
++    int64_t total = (int64_t)N * C * H * W;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int w = i % W;
++        int64_t tmp = i / W;
++        int h = tmp % H;
++        tmp /= H;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        int64_t in_idx = (int64_t)n * in_N_stride + (int64_t)c * in_C_stride +
++                         (int64_t)h * in_H_stride + (int64_t)w * in_W_stride;
++        int64_t out_idx = (int64_t)n * out_N_stride + (int64_t)c * out_C_stride +
++                          (int64_t)h * out_H_stride + (int64_t)w * out_W_stride;
++
++        output[out_idx] = input[in_idx] + bias[c];
++    }
++}
++
++extern "C" void add_bias_launcher(
++    const float* input,
++    const float* bias,
++    float* output,
++    int N, int C, int H, int W,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride,
++    cudaStream_t stream)
++{
++    if (N <= 0 || C <= 0 || H <= 0 || W <= 0) return;
++
++    int64_t total = (int64_t)N * C * H * W;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 65535) grid = 65535; // grid-stride loop handles rest
++
++    add_bias_kernel<<<grid, block, 0, stream>>>(
++        input, bias, output,
++        N, C, H, W,
++        in_N_stride, in_C_stride, in_H_stride, in_W_stride,
++        out_N_stride, out_C_stride, out_H_stride, out_W_stride);
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Error can be retrieved by host after launch; nothing to return.
++        // In binding.cpp, check this error via cudaGetLastError after launcher call.
++        // We record it in a static thread_local variable? Better: use a simple printf for debug,
++        // but production should not print. The launcher is void, so we rely on caller to check.
++        // To keep simple, we do nothing here; binding.cpp will call cudaGetLastError.
++    }
++}
++
++// -----------------------------------------------------------------------------
++// batch_norm: input [N,C,H,W], running_mean/running_var/weight/bias [C].
++//   y = (x - running_mean[c]) / sqrt(running_var[c] + eps) * weight[c] + bias[c]
++// Handles non-contiguous input/output via strides.
++// -----------------------------------------------------------------------------
++__global__ void batch_norm_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    float eps,
++    int N, int C, int H, int W,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride)
++{
++    int64_t total = (int64_t)N * C * H * W;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int w = i % W;
++        int64_t tmp = i / W;
++        int h = tmp % H;
++        tmp /= H;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        int64_t in_idx = (int64_t)n * in_N_stride + (int64_t)c * in_C_stride +
++                         (int64_t)h * in_H_stride + (int64_t)w * in_W_stride;
++        int64_t out_idx = (int64_t)n * out_N_stride + (int64_t)c * out_C_stride +
++                          (int64_t)h * out_H_stride + (int64_t)w * out_W_stride;
++
++        float val = input[in_idx];
++        float inv_std = rsqrtf(running_var[c] + eps);
++        val = (val - running_mean[c]) * inv_std * weight[c] + bias[c];
++        output[out_idx] = val;
++    }
++}
++
++extern "C" void batch_norm_launcher(
++    const float* input,
++    const float* running_mean,
++    const float* running_var,
++    const float* weight,
++    const float* bias,
++    float* output,
++    float eps,
++    int N, int C, int H, int W,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride,
++    cudaStream_t stream)
++{
++    if (N <= 0 || C <= 0 || H <= 0 || W <= 0) return;
++
++    int64_t total = (int64_t)N * C * H * W;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 65535) grid = 65535;
++
++    batch_norm_kernel<<<grid, block, 0, stream>>>(
++        input, running_mean, running_var, weight, bias, output,
++        eps, N, C, H, W,
++        in_N_stride, in_C_stride, in_H_stride, in_W_stride,
++        out_N_stride, out_C_stride, out_H_stride, out_W_stride);
++
++    cudaError_t err = cudaGetLastError();
++    // same as above, caller checks
++}
++
++// -----------------------------------------------------------------------------
++// avg_pool2d: input [N,C,H,W], kernel_size, stride, padding, count_include_pad=True.
++//   Output size: H_out = floor((H + 2*padding - kernel_size)/stride) + 1, similarly W_out.
++//   For each output element, average over window (kernel_size x kernel_size), including
++//   padding positions as zeros (count_include_pad=True).
++// This kernel assumes input and output are contiguous (as they will be); but to be safe,
++// we can handle arbitrary strides similar to above. However, for pooling, we typically
++// need to compute from input coordinates, so we use input strides.
++// -----------------------------------------------------------------------------
++__global__ void avg_pool2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int H_out, int W_out,
++    int kernel_size, int stride, int padding,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride)
++{
++    int64_t total = (int64_t)N * C * H_out * W_out;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride_total = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride_total) {
++        int w_out = i % W_out;
++        int64_t tmp = i / W_out;
++        int h_out = tmp % H_out;
++        tmp /= H_out;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        // Compute input window start (including padding offset)
++        int h_start = h_out * stride - padding;
++        int w_start = w_out * stride - padding;
++
++        float sum = 0.0f;
++        for (int kh = 0; kh < kernel_size; ++kh) {
++            int h_in = h_start + kh;
++            bool h_valid = (h_in >= 0 && h_in < H);
++            for (int kw = 0; kw < kernel_size; ++kw) {
++                int w_in = w_start + kw;
++                bool w_valid = (w_in >= 0 && w_in < W);
++                if (h_valid && w_valid) {
++                    int64_t in_idx = (int64_t)n * in_N_stride + (int64_t)c * in_C_stride +
++                                     (int64_t)h_in * in_H_stride + (int64_t)w_in * in_W_stride;
++                    sum += input[in_idx];
++                }
++            }
++        }
++
++        // count_include_pad=True: divide by kernel_size^2 regardless of padding
++        float avg = sum / (float)(kernel_size * kernel_size);
++
++        int64_t out_idx = (int64_t)n * out_N_stride + (int64_t)c * out_C_stride +
++                          (int64_t)h_out * out_H_stride + (int64_t)w_out * out_W_stride;
++        output[out_idx] = avg;
++    }
++}
++
++extern "C" void avg_pool2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int H_out, int W_out,
++    int kernel_size, int stride, int padding,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride,
++    cudaStream_t stream)
++{
++    if (N <= 0 || C <= 0 || H_out <= 0 || W_out <= 0) return;
++
++    int64_t total = (int64_t)N * C * H_out * W_out;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 65535) grid = 65535;
++
++    avg_pool2d_kernel<<<grid, block, 0, stream>>>(
++        input, output,
++        N, C, H, W,
++        H_out, W_out,
++        kernel_size, stride, padding,
++        in_N_stride, in_C_stride, in_H_stride, in_W_stride,
++        out_N_stride, out_C_stride, out_H_stride, out_W_stride);
++
++    cudaError_t err = cudaGetLastError();
++    // caller checks
++}
++
++// -----------------------------------------------------------------------------
++// sigmoid: elementwise, handles non-contiguous via strides.
++// -----------------------------------------------------------------------------
++__global__ void sigmoid_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t total,
++    int64_t in_stride,  // assuming input is contiguous for now, but we can pass strides as needed
++    int64_t out_stride)
++{
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        output[i * out_stride] = 1.0f / (1.0f + expf(-input[i * in_stride]));
++    }
++}
++
++// We need a more general sigmoid that supports arbitrary strides; for simplicity,
++// we assume input/output are contiguous in the launcher (they should be after previous ops).
++// We'll implement a general version using N,C,H,W and strides similar to above.
++
++extern "C" void sigmoid_launcher(
++    const float* input,
++    float* output,
++    int64_t total,
++    int64_t in_stride,
++    int64_t out_stride,
++    cudaStream_t stream)
++{
++    if (total <= 0) return;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 65535) grid = 65535;
++
++    sigmoid_kernel<<<grid, block, 0, stream>>>(
++        input, output, total, in_stride, out_stride);
++
++    cudaError_t err = cudaGetLastError();
++    // caller checks
++}
++
++// Note: The actual binding.cpp will call the appropriate launcher. For the generic
++// sigmoid, if input is not contiguous, it should be made contiguous before calling
++// (or pass actual strides). Here we provide simple contiguous version as contract
++// tensors are contiguous. For safety, binding can call a launcher that accepts general
++// strides; but given contract, contiguous is fine.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,288 @@
++// PyTorch binding for custom ops using cuDNN for Conv2d and CUDA kernels for others
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cudnn.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void add_bias_launcher(
++    const float* input,
++    const float* bias,
++    float* output,
++    int N, int C, int H, int W,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride,
++    cudaStream_t stream);
++
++extern "C" void batch_norm_launcher(
++    const float* input,
++    const float* running_mean,
++    const float* running_var,
++    const float* weight,
++    const float* bias,
++    float* output,
++    float eps,
++    int N, int C, int H, int W,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride,
++    cudaStream_t stream);
++
++extern "C" void avg_pool2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int H_out, int W_out,
++    int kernel_size, int stride, int padding,
++    int in_N_stride, int in_C_stride, int in_H_stride, int in_W_stride,
++    int out_N_stride, int out_C_stride, int out_H_stride, int out_W_stride,
++    cudaStream_t stream);
++
++extern "C" void sigmoid_launcher(
++    const float* input,
++    float* output,
++    int64_t total,
++    int64_t in_stride,
++    int64_t out_stride,
++    cudaStream_t stream);
++
++// Helper to get current CUDA stream
++static cudaStream_t getCurrentStream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// Conv2d using cuDNN
++torch::Tensor conv2d_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
++                             int64_t stride, int64_t padding) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D");
++    TORCH_CHECK(weight.dim() == 4, "Weight must be 4D");
++
++    // Convert stride/padding to tuple if needed (they are ints)
++    int stride_h = stride;
++    int stride_w = stride;
++    int padding_h = padding;
++    int padding_w = padding;
++
++    // Ensure contiguous
++    auto input_contig = input.contiguous();
++    auto weight_contig = weight.contiguous();
++    torch::Tensor bias_contig;
++    if (bias.defined()) {
++        TORCH_CHECK(bias.is_cuda() && bias.dtype() == torch::kFloat32 && bias.dim() == 1,
++                    "Bias must be 1D float32 CUDA tensor");
++        bias_contig = bias.contiguous();
++    }
++
++    int N = input_contig.size(0);
++    int C_in = input_contig.size(1);
++    int H = input_contig.size(2);
++    int W = input_contig.size(3);
++    int K = weight_contig.size(0);
++    int C_out = K;
++    int R = weight_contig.size(2);
++    int S = weight_contig.size(3);
++
++    TORCH_CHECK(weight_contig.size(1) == C_in, "Weight channel mismatch");
++
++    int H_out = (H + 2 * padding_h - R) / stride_h + 1;
++    int W_out = (W + 2 * padding_w - S) / stride_w + 1;
++
++    auto output = torch::empty({N, C_out, H_out, W_out}, input.options());
++
++    cudnnHandle_t cudnn_handle;
++    cudnnCreate(&cudnn_handle);
++    cudnnSetStream(cudnn_handle, getCurrentStream());
++
++    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
++    cudnnFilterDescriptor_t filter_desc;
++    cudnnConvolutionDescriptor_t conv_desc;
++
++    cudnnCreateTensorDescriptor(&input_desc);
++    cudnnCreateTensorDescriptor(&output_desc);
++    cudnnCreateTensorDescriptor(&bias_desc);
++    cudnnCreateFilterDescriptor(&filter_desc);
++    cudnnCreateConvolutionDescriptor(&conv_desc);
++
++    cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C_in, H, W);
++    cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C_out, H_out, W_out);
++    cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, C_out, 1, 1);
++    cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, K, C_in, R, S);
++    cudnnSetConvolution2dDescriptor(conv_desc, padding_h, padding_w, stride_h, stride_w, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
++
++    float alpha = 1.0f, beta = 0.0f;
++    cudnnConvolutionForward(cudnn_handle, &alpha, input_desc, input_contig.data_ptr<float>(),
++                            filter_desc, weight_contig.data_ptr<float>(), conv_desc,
++                            CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM, nullptr, 0, &beta,
++                            output_desc, output.data_ptr<float>());
++
++    if (bias_contig.defined()) {
++        float alpha_bias = 1.0f, beta_bias = 1.0f;
++        cudnnAddTensor(cudnn_handle, &alpha_bias, bias_desc, bias_contig.data_ptr<float>(),
++                       &beta_bias, output_desc, output.data_ptr<float>());
++    }
++
++    cudnnDestroyTensorDescriptor(input_desc);
++    cudnnDestroyTensorDescriptor(output_desc);
++    cudnnDestroyTensorDescriptor(bias_desc);
++    cudnnDestroyFilterDescriptor(filter_desc);
++    cudnnDestroyConvolutionDescriptor(conv_desc);
++    cudnnDestroy(cudnn_handle);
++
++    return output;
++}
++
++// Add bias forward
++torch::Tensor add_bias_forward(torch::Tensor input, torch::Tensor bias) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D");
++    TORCH_CHECK(bias.dim() == 3 && bias.size(1) == 1 && bias.size(2) == 1, "Bias shape must be [C,1,1]");
++    TORCH_CHECK(bias.size(0) == input.size(1), "Bias channel mismatch");
++
++    auto input_contig = input.contiguous();
++    auto output = torch::empty_like(input_contig);
++
++    int N = input_contig.size(0);
++    int C = input_contig.size(1);
++    int H = input_contig.size(2);
++    int W = input_contig.size(3);
++
++    // Since both contiguous, strides can be computed but pass as is
++    int in_N_stride = input_contig.stride(0);
++    int in_C_stride = input_contig.stride(1);
++    int in_H_stride = input_contig.stride(2);
++    int in_W_stride = input_contig.stride(3);
++    int out_N_stride = output.stride(0);
++    int out_C_stride = output.stride(1);
++    int out_H_stride = output.stride(2);
++    int out_W_stride = output.stride(3);
++
++    add_bias_launcher(input_contig.data_ptr<float>(), bias.data_ptr<float>(),
++                      output.data_ptr<float>(), N, C, H, W,
++                      in_N_stride, in_C_stride, in_H_stride, in_W_stride,
++                      out_N_stride, out_C_stride, out_H_stride, out_W_stride,
++                      getCurrentStream());
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "add_bias_launcher failed");
++    return output;
++}
++
++// BatchNorm forward
++torch::Tensor batch_norm_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
++                                 torch::Tensor running_mean, torch::Tensor running_var, double eps) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
++    TORCH_CHECK(running_mean.is_cuda(), "running_mean must be a CUDA tensor");
++    TORCH_CHECK(running_var.is_cuda(), "running_var must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
++    TORCH_CHECK(running_mean.dtype() == torch::kFloat32, "running_mean must be float32");
++    TORCH_CHECK(running_var.dtype() == torch::kFloat32, "running_var must be float32");
++
++    auto input_contig = input.contiguous();
++    auto output = torch::empty_like(input_contig);
++
++    int N = input_contig.size(0);
++    int C = input_contig.size(1);
++    int H = input_contig.size(2);
++    int W = input_contig.size(3);
++
++    int in_N_stride = input_contig.stride(0);
++    int in_C_stride = input_contig.stride(1);
++    int in_H_stride = input_contig.stride(2);
++    int in_W_stride = input_contig.stride(3);
++    int out_N_stride = output.stride(0);
++    int out_C_stride = output.stride(1);
++    int out_H_stride = output.stride(2);
++    int out_W_stride = output.stride(3);
++
++    batch_norm_launcher(input_contig.data_ptr<float>(), running_mean.data_ptr<float>(),
++                        running_var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
++                        output.data_ptr<float>(), static_cast<float>(eps), N, C, H, W,
++                        in_N_stride, in_C_stride, in_H_stride, in_W_stride,
++                        out_N_stride, out_C_stride, out_H_stride, out_W_stride,
++                        getCurrentStream());
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "batch_norm_launcher failed");
++    return output;
++}
++
++// AvgPool2d forward
++torch::Tensor avg_pool2d_forward(torch::Tensor input, int64_t kernel_size, int64_t stride, int64_t padding) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D");
++
++    auto input_contig = input.contiguous();
++
++    int N = input_contig.size(0);
++    int C = input_contig.size(1);
++    int H = input_contig.size(2);
++    int W = input_contig.size(3);
++
++    int H_out = (H + 2 * padding - kernel_size) / stride + 1;
++    int W_out = (W + 2 * padding - kernel_size) / stride + 1;
++
++    TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid pooling parameters");
++
++    auto output = torch::empty({N, C, H_out, W_out}, input_contig.options());
++
++    int in_N_stride = input_contig.stride(0);
++    int in_C_stride = input_contig.stride(1);
++    int in_H_stride = input_contig.stride(2);
++    int in_W_stride = input_contig.stride(3);
++    int out_N_stride = output.stride(0);
++    int out_C_stride = output.stride(1);
++    int out_H_stride = output.stride(2);
++    int out_W_stride = output.stride(3);
++
++    avg_pool2d_launcher(input_contig.data_ptr<float>(), output.data_ptr<float>(),
++                        N, C, H, W, H_out, W_out,
++                        static_cast<int>(kernel_size), static_cast<int>(stride), static_cast<int>(padding),
++                        in_N_stride, in_C_stride, in_H_stride, in_W_stride,
++                        out_N_stride, out_C_stride, out_H_stride, out_W_stride,
++                        getCurrentStream());
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "avg_pool2d_launcher failed");
++    return output;
++}
++
++// Sigmoid forward
++torch::Tensor sigmoid_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto input_contig = input.contiguous();
++    auto output = torch::empty_like(input_contig);
++
++    int64_t total = input_contig.numel();
++    if (total == 0) return output;
++
++    sigmoid_launcher(input_contig.data_ptr<float>(), output.data_ptr<float>(), total, 1, 1, getCurrentStream());
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "sigmoid_launcher failed");
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("conv2d_forward", &conv2d_forward, "Conv2d forward using cuDNN",
++          py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("stride"), py::arg("padding"));
++    m.def("add_bias_forward", &add_bias_forward, "Add bias forward",
++          py::arg("input"), py::arg("bias"));
++    m.def("batch_norm_forward", &batch_norm_forward, "BatchNorm forward",
++          py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("running_mean"),
++          py::arg("running_var"), py::arg("eps"));
++    m.def("avg_pool2d_forward", &avg_pool2d_forward, "AvgPool2d forward",
++          py::arg("input"), py::arg("kernel_size"), py::arg("stride"), py::arg("padding"));
++    m.def("sigmoid_forward", &sigmoid_forward, "Sigmoid forward",
++          py::arg("input"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,41 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, bias_shape, kernel_size, stride, padding):
++        super().__init__()
++        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
++        self.bn = nn.BatchNorm2d(out_channels)
++        self.pool = nn.AvgPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
++        self.bias = nn.Parameter(torch.randn(bias_shape))
++
++    def forward(self, x):
++        x = cuda_extension.conv2d_forward(x, self.conv.weight, self.conv.bias,
++                                          self.conv.stride, self.conv.padding)
++        x = cuda_extension.add_bias_forward(x, self.bias)
++        x = cuda_extension.batch_norm_forward(x, self.bn.weight, self.bn.bias,
++                                               self.bn.running_mean, self.bn.running_var,
++                                               self.bn.eps)
++        x = cuda_extension.avg_pool2d_forward(x, self.pool.kernel_size,
++                                              self.pool.stride, self.pool.padding)
++        x = cuda_extension.sigmoid_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.conv2d_forward(x, self.conv.weight, self.conv.bias,
++                                          self.conv.stride, self.conv.padding)
++        yield 'step_001', x
++        x = cuda_extension.add_bias_forward(x, self.bias)
++        yield 'step_002', x
++        x = cuda_extension.batch_norm_forward(x, self.bn.weight, self.bn.bias,
++                                               self.bn.running_mean, self.bn.running_var,
++                                               self.bn.eps)
++        yield 'step_003', x
++        x = cuda_extension.avg_pool2d_forward(x, self.pool.kernel_size,
++                                              self.pool.stride, self.pool.padding)
++        yield 'step_004', x
++        x = cuda_extension.sigmoid_forward(x)
++        yield 'step_005', x
++        yield 'step_006', x

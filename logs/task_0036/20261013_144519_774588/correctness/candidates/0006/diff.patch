@@ -1,0 +1,136 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -33,10 +33,7 @@
+ 
+ // -----------------------------------------------------------------------------
+ // Argmin over last dimension, keepdim=True. Input [B, N] -> output [B, 1] int64.
+-// Redesigned to avoid shared memory corruption.
+-// Each block processes one row (B blocks). Within a block, each thread handles a
+-// subset of N elements and computes a local min. Then a reduction in shared memory
+-// with correct offsets and synchronization yields the global index.
++// Uses shared memory reduction with separate arrays to avoid overlap.
+ // -----------------------------------------------------------------------------
+ __global__ void argmin_lastdim_kernel(const float* __restrict__ x,
+                                       long long* __restrict__ out,
+@@ -48,15 +45,13 @@
+     int tid = threadIdx.x;
+     int stride = blockDim.x;
+ 
+-    // Shared memory: use a union to ensure proper alignment and avoid overlap.
+-    // We'll store pairs of (int index, float value).
++    // Shared memory: use extern shared char array and cast to aligned types
+     extern __shared__ char smem[];
+     int* s_indices = reinterpret_cast<int*>(smem);
+     float* s_values = reinterpret_cast<float*>(smem + blockDim.x * sizeof(int));
+ 
+     int best_idx = 0;
+-    float best_val = row[0]; // Initialize with first element for each thread; but we want each thread to start with its own first element, not row[0] for all.
+-    // Actually, each thread should initialize with its first assigned element to avoid bias.
++    float best_val = row[0]; // each thread starts with first element, will be overwritten by local min
+     if (tid < N) {
+         best_idx = tid;
+         best_val = row[tid];
+@@ -65,7 +60,6 @@
+         best_idx = -1;
+     }
+ 
+-    // Stride over elements assigned to this thread
+     for (int i = tid + stride; i < N; i += stride) {
+         float val = row[i];
+         if (val < best_val) {
+@@ -74,17 +68,14 @@
+         }
+     }
+ 
+-    // Store local results in shared memory
+     s_indices[tid] = best_idx;
+     s_values[tid] = best_val;
+     __syncthreads();
+ 
+-    // Reduction over blockDim.x elements (which may be > N if N < blockDim.x, but we handle with -1 sentinel)
+     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+             float other_val = s_values[tid + s];
+             int other_idx = s_indices[tid + s];
+-            // If either is invalid (-1 sentinel for idx), treat as +inf
+             float my_val = s_values[tid];
+             int my_idx = s_indices[tid];
+             if (other_idx != -1 && (my_idx == -1 || other_val < my_val)) {
+@@ -99,7 +90,6 @@
+         if (s_indices[0] != -1) {
+             out[b] = (long long)s_indices[0];
+         } else {
+-            // This should not happen as N>0, but set 0 to avoid garbage.
+             out[b] = 0;
+         }
+     }
+@@ -111,19 +101,11 @@
+                                        long long B,
+                                        cudaStream_t stream) {
+     if (B == 0 || N == 0) return cudaSuccess;
+-    int threads = std::min(1024, N);
+-    // Ensure threads is power of two for reduction (up to 1024)
+-    // If N not power of two, we still use max threads 1024, reduction works for any power-of-2 <= blockDim.
+-    // Actually, if N < threads, some threads have no elements and best_idx=-1, which we handle.
+-    // But we still need blockDim power-of-2 for tree reduction. We'll use 1024 always if N>1024 else next power of two? For simplicity, use 1024 if N>=1024 else N (which may not be power of two causing reduction issue).
+-    // Better: use threads = min(1024, next_power_of_two(N)). But N may be 200000 > 1024, so threads=1024. If N smaller, we can use threads = N if N is power of two else next power of two > N, capped at 1024.
+-    // For correctness with any N, we can use threads = 256 or 512 etc. Let's compute next power of two for N <=1024.
+-    if (N < 1024) {
++    int threads = 1024;
++    if (N < threads) {
+         int power = 1;
+         while (power < N) power <<= 1;
+         threads = power;
+-    } else {
+-        threads = 1024;
+     }
+     int shared_bytes = threads * sizeof(int) + threads * sizeof(float);
+     dim3 grid((unsigned int)std::min<long long>(B, 1048576));
+@@ -134,7 +116,7 @@
+ 
+ // -----------------------------------------------------------------------------
+ // STFT with cuFFT, center=True, reflect padding, Hann window, onesided output.
+-// Input: [B, N] float32, output: [B, F, T] complex64 (interleaved float2).
++// Input: [B, N] float32, output: [B, F, T] complex64 (non-contiguous stride [F*T, 1, F]).
+ // F = n_fft/2 + 1, T = 1 + floor(N / hop_length).
+ // -----------------------------------------------------------------------------
+ __global__ void stft_build_frames_kernel(const float* __restrict__ x,
+@@ -182,7 +164,11 @@
+     if (idx >= total) return;
+     int f = idx % F;
+     int t = idx / F;
+-    out[(b * F + f) * T + t] = frames[(b * T + t) * L + f];
++    // Output stride: [F*T, 1, F] for shape [B, F, T]
++    // offset = b * (F*T) + f * 1 + t * F
++    long long out_offset = (long long)b * F * T + f + (long long)t * F;
++    long long frame_offset = (long long)(b * T + t) * L + f;
++    out[out_offset] = frames[frame_offset];
+ }
+ 
+ extern "C" cudaError_t stft_forward_launcher(const float* x,
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -87,6 +87,8 @@
+ 
+ // -----------------------------------------------------------------------------
+ // stft_forward: STFT with default center=True, pad_mode='reflect', onesided=True
++// Allocate output with the non-contiguous stride expected by torch.stft:
++// shape [B, n_fft/2+1, T] with stride [F*T, 1, F]
+ // -----------------------------------------------------------------------------
+ torch::Tensor stft_forward(torch::Tensor x, int64_t n_fft, int64_t hop_length, int64_t win_length) {
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+@@ -102,7 +104,8 @@
+     int64_t T = 1 + N / hop_length;
+ 
+     auto options = torch::TensorOptions().dtype(torch::kComplexFloat).device(x.device());
+-    auto output = torch::empty({B, F, T}, options);
++    // Expected stride: [F*T, 1, F]
++    auto output = torch::empty_strided({B, F, T}, {F * T, 1, F}, options);
+     if (B == 0 || N == 0) return output;
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+@@ -132,4 +135,4 @@
+           py::arg("x"), py::arg("n_fft") = 1024, py::arg("hop_length") = 256, py::arg("win_length") = 1024);
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);+REGISTER_BINDING(custom_ops, register_custom_ops);

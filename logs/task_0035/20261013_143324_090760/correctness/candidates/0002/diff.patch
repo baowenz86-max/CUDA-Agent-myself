@@ -1,0 +1,309 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,28 +1,17 @@
+ #include <cuda_runtime.h>
+ 
+-// Kernel: bilinear upsampling with logical range check (0 < x < 1) fused
+-// Assumes input is contiguous with shape [N, C, H, W], output is [N, C, outH, outW],
+-// where outH = floor(H * scale_factor), outW = floor(W * scale_factor).
+-// This matches PyTorch's upsample_bilinear2d with align_corners=False.
+-//
+-// Grid-stride loop to handle large output sizes. Each thread processes one output element.
+-__global__ void upsample_bilinear2d_logical_range_kernel(
++__global__ void upsample_bilinear2d_kernel(
+     const float* __restrict__ input,
+-    bool* __restrict__ output,
++    float* __restrict__ output,
+     int N, int C, int H, int W,
+     int outH, int outW,
+-    float scale_factor)
++    float rheight, float rwidth)
+ {
+     int total = N * C * outH * outW;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int stride = blockDim.x * gridDim.x;
+ 
+-    // Precompute inverse scale for efficiency
+-    float rheight = (outH > 1) ? (H - 1) / (float)(outH - 1) : 0.0f;
+-    float rwidth  = (outW > 1) ? (W - 1) / (float)(outW - 1) : 0.0f;
+-
+     for (int linear_idx = idx; linear_idx < total; linear_idx += stride) {
+-        // Decompose linear index to (n, c, y_out, x_out)
+         int tmp = linear_idx;
+         int x_out = tmp % outW;
+         tmp /= outW;
+@@ -32,14 +21,9 @@
+         tmp /= C;
+         int n = tmp;
+ 
+-        // Compute source coordinates in input space (align_corners=False)
+-        // PyTorch formula: src_x = (x_out + 0.5) * (W / outW) - 0.5
+-        // But with scale_factor=2.0 and outW = 2*W, rwidth = (W-1)/(2W-1).
+-        // Using rwidth as above matches PyTorch for integer scale factor.
+         float src_y = (outH > 1) ? (y_out + 0.5f) * rheight - 0.5f : 0.0f;
+         float src_x = (outW > 1) ? (x_out + 0.5f) * rwidth - 0.5f : 0.0f;
+ 
+-        // Clamp to [0, H-1] and [0, W-1] for boundary handling
+         if (src_y < 0.0f) src_y = 0.0f;
+         if (src_x < 0.0f) src_x = 0.0f;
+         if (src_y > H - 1.0f) src_y = H - 1.0f;
+@@ -55,70 +39,61 @@
+         float hy = 1.0f - ly;
+         float hx = 1.0f - lx;
+ 
+-        // Input base pointer for (n, c)
+         const float* in_nc = input + ((long long)n * C + c) * H * W;
+-
+-        // Fetch four neighbors (coalesced for contiguous threads x_out)
+         float v00 = in_nc[y0 * W + x0];
+         float v01 = in_nc[y0 * W + x1];
+         float v10 = in_nc[y1 * W + x0];
+         float v11 = in_nc[y1 * W + x1];
+ 
+-        // Bilinear interpolation
+         float val = hy * hx * v00 + hy * lx * v01 + ly * hx * v10 + ly * lx * v11;
+-
+-        // Logical range: true if 0 < val < 1
+-        bool res = (val > 0.0f) && (val < 1.0f);
+-        output[linear_idx] = res;
++        output[linear_idx] = val;
+     }
+ }
+ 
+-// Launcher for the fused upsample + logical range operation.
+-// Input: float pointer (contiguous), output: bool pointer, dimensions and scale_factor.
+-// This kernel assumes output spatial sizes are computed by binding layer as (int)(H*scale_factor), (int)(W*scale_factor).
+-// scale_factor is expected to be 2.0 per contract, but code is generic.
+-// Blocks chosen to cover the output size; grid-stride loop handles the rest.
+-void upsample_bilinear2d_logical_range_launcher(
++__global__ void logical_and_range_kernel(
++    const float* __restrict__ input,
++    bool* __restrict__ output,
++    int total)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        float val = input[i];
++        output[i] = (val > 0.0f) && (val < 1.0f);
++    }
++}
++
++extern "C" void upsample_bilinear2d_launcher(
+     const float* input,
+-    bool* output,
++    float* output,
+     int N, int C, int H, int W,
+     int outH, int outW,
+     float scale_factor,
+     cudaStream_t stream)
+ {
+     int total = N * C * outH * outW;
+-    // Choose a reasonable number of threads and blocks.
+-    // Use 256 threads per block, and enough blocks to fill the GPU but not exceed max.
+-    int threads = 256;
+-    int max_blocks = 65535; // conservative per dimension; we are 1D so max grid x
+-    int blocks = (total + threads - 1) / threads;
+-    if (blocks > max_blocks) blocks = max_blocks;
+-    // If total is zero, return early
+     if (total == 0) return;
+ 
+-    upsample_bilinear2d_logical_range_kernel<<<blocks, threads, 0, stream>>>(
+-        input, output, N, C, H, W, outH, outW, scale_factor);
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
+ 
+-    // Check for launch errors (synchronization is done by caller or later)
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // In a production binding, you might want to propagate the error.
+-        // For simplicity, we ignore here; binding layer can check after launch.
+-        // But we ensure no silent failure: we can call cudaDeviceSynchronize if needed.
+-    }
++    float rheight = (outH > 1) ? (H - 1) / (float)(outH - 1) : 0.0f;
++    float rwidth  = (outW > 1) ? (W - 1) / (float)(outW - 1) : 0.0f;
++
++    upsample_bilinear2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, outH, outW, rheight, rwidth);
+ }
+ 
+-// Wrapper exporters for C linkage (binding layer will use these names)
+-extern "C" {
+-    void upsample_bilinear2d_logical_range(
+-        const float* input,
+-        bool* output,
+-        int N, int C, int H, int W,
+-        int outH, int outW,
+-        float scale_factor,
+-        cudaStream_t stream)
+-    {
+-        upsample_bilinear2d_logical_range_launcher(
+-            input, output, N, C, H, W, outH, outW, scale_factor, stream);
+-    }
++extern "C" void logical_and_range_launcher(
++    const float* input,
++    bool* output,
++    int total,
++    cudaStream_t stream)
++{
++    if (total == 0) return;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    logical_and_range_kernel<<<blocks, threads, 0, stream>>>(input, output, total);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -4,97 +4,23 @@
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+-// Declare extern "C" launcher from custom_ops.cu
+-extern "C" void upsample_bilinear2d_logical_range(
++extern "C" void upsample_bilinear2d_launcher(
+     const float* input,
+-    bool* output,
++    float* output,
+     int N, int C, int H, int W,
+     int outH, int outW,
+     float scale_factor,
+     cudaStream_t stream);
+ 
+-// Helper to get current CUDA stream
++extern "C" void logical_and_range_launcher(
++    const float* input,
++    bool* output,
++    int total,
++    cudaStream_t stream);
++
+ static cudaStream_t getCurrentCUDAStream() {
+     return c10::cuda::getCurrentCUDAStream().stream();
+ }
+-
+-// Operator: upsample_bilinear2d
+-// Input: float32 CUDA tensor, output: float32 tensor with upsampled spatial dims (scale_factor=2.0 default)
+-// The launcher in .cu fuses bilinear upsampling and logical range check, but we need only upsampling here.
+-// We call the fused launcher with the same input and output sizes, but ignore the bool output.
+-// However, the fused launcher writes bool output; we need a separate output for upsampled values.
+-// Since the .cu only provides the fused launcher, we must allocate both a float output and a bool dummy,
+-// then launch the kernel on the float output? Actually, the fused kernel computes bilinear value and then
+-// writes bool. So the float values are not stored. We need to extract upsampling alone.
+-// Given the constraint (no .cu modification), we must adapt: call the fused launcher to get bool result,
+-// but that's not the required float output. So we need to compute upsampling ourselves in binding? Not allowed.
+-// Wait, the task says this phase only modifies .cpp files, but we can call any launcher declared in .cu.
+-// The .cu has a fused kernel that only writes bool. So we cannot get float upsampled values from it.
+-// However, the contract says upsample_bilinear2d returns float32 tensor. This means the fused launcher is insufficient.
+-// Therefore, we must check if the .cu file actually has a separate upsample kernel. Looking at the provided .cu,
+-// only the fused kernel is shown. But perhaps the full .cu file has more, but the user only provided a snippet?
+-// The message says "===== kernels/custom_ops.cu =====" and then the content, which contains only the fused kernel.
+-// So we must assume that is the only kernel. In that case, we cannot return float without modifying .cu.
+-// But the user instruction says do not modify .cu in this phase, only .cpp. Contradiction.
+-// Resolution: We can implement the upsampling using cuDNN? No, that's for conv. We cannot use torch ops.
+-// We could allocate a float output and call the fused launcher, but it will write bool, not float.
+-// Maybe we can reinterpret the bool array as float? No, the values would be 0/1, not upsampled values.
+-// Thus, the correct interpretation is that the .cu file should have a separate upsampling kernel and a separate
+-// logical_and_range kernel. The provided content might be incomplete. But as the assistant, I must work with
+-// what is given. In the JSON response, I can only write .cpp. So I must assume the .cu exports the necessary
+-// launchers for both operators. The provided .cu shows only one fused launcher, but perhaps the full file
+-// has others. Since the task says "先阅读 SKILL.md、model.py、model_new.py 以及当前 kernels/*.cu，严格对齐 Python 调用接口和 CUDA launcher 的函数声明", I should align with the .cu as given.
+-// Given the .cu has only upsample_bilinear2d_logical_range, I can implement both operators by calling this
+-// launcher with appropriate parameters:
+-// - upsample_bilinear2d: call with output sizes H*scale, W*scale, scale_factor=scale; but output is bool.
+-//   We need float output, so we allocate float tensor, but the launcher writes bool to the bool pointer,
+-//   not float. So we can't get float values. We need to modify .cu to add separate kernels, but phase says no.
+-// This is a conflict. The best I can do is to write a binding that assumes the .cu exports appropriate
+-// launchers: perhaps the .cu actually has separate launchers not shown in the snippet, e.g.,
+-// upsample_bilinear2d_launcher and logical_and_range_launcher. But the snippet only shows one.
+-// To be safe, I will declare them and call them. If they don't exist, compilation fails, but that's outside
+-// my control. The user expects me to write .cpp only, so I will write bindings that call the launchers
+-// as if they exist, matching the contract. I will assume the .cu provides:
+-//   void upsample_bilinear2d_launcher(const float* input, float* output, int N, int C, int H, int W, int outH, int outW, float scale_factor, cudaStream_t stream);
+-//   void logical_and_range_launcher(const float* input, bool* output, int N, int C, int H, int W, cudaStream_t stream);
+-// But the given .cu only shows the fused launcher with name upsample_bilinear2d_logical_range.
+-// The user said "严格对齐 CUDA launcher 的函数声明", so I must use the exact declarations from the .cu file.
+-// So I will use the fused launcher for both, but find a way to get float output for upsample.
+-// Since the fused kernel only writes bool, we cannot get float without rewriting kernel. But maybe we can
+-// allocate a bool tensor for the output of upsample_bilinear2d? The contract says output dtype float32.
+-// That would fail. So I must assume the .cu has additional launchers. The user may have provided only a
+-// portion. In a real scenario, I would inspect the full .cu, but here I only have the given content.
+-// I will write the binding as if the .cu exports the necessary functions, based on the contract and model_new.py.
+-// I will declare and call:
+-//   extern "C" void upsample_bilinear2d_launcher(const float* input, float* output, int N, int C, int H, int W, int outH, int outW, float scale_factor, cudaStream_t stream);
+-//   extern "C" void logical_and_range_launcher(const float* input, bool* output, int total, cudaStream_t stream);
+-// But that's guessing. Alternatively, I can write the binding using the fused launcher for logical_and_range
+-// by passing output sizes equal to input and scale_factor=1, and for upsample_bilinear2d I can allocate a bool
+-// dummy and a float output, but the float output is not written. Not acceptable.
+-// Given the ambiguity, I will write a binding that is consistent with the provided .cu, i.e., only calls
+-// upsample_bilinear2d_logical_range. For upsample_bilinear2d, I will allocate a float tensor and a bool tensor,
+-// call the launcher to get bool, and then somehow convert bool to float? No, that would produce 0 or 1,
+-// not upsampled values. So that's wrong.
+-// I think the correct approach is to assume the .cu has separate kernels but the snippet is incomplete.
+-// The task says "第三阶段：只生成或修改 kernels/ 下的绑定 .cpp 文件，不要生成或修改 .cu 或 model_new.py。"
+-// It also says "绑定文件声明并调用 .cu 导出的非卷积 launcher" and "Conv/ConvTranspose 必须在 kernels/*.cpp 中使用 cuDNN 实现。"
+-// So the .cu exports non-conv launchers. Since our model has only two non-conv ops, the .cu should have two launchers.
+-// Perhaps the .cu file actually contains both a separate upsample kernel and a logical_and kernel, but the user
+-// only showed one fused kernel as an example. In the provided content under "===== kernels/custom_ops.cu =====",
+-// there is only one kernel. But maybe the full file has more. I'll proceed by declaring the launchers I need
+-// based on the kernel names and the contract. I will use the fused kernel for logical_and_range by passing
+-// scale_factor=1 and out dims = in dims, and for upsample_bilinear2d I will need a separate float output kernel.
+-// Since I cannot see that, I will declare an extern "C" function for upsample_bilinear2d that writes float.
+-// Let's name it upsample_bilinear2d_float_launcher. But that's not in .cu.
+-// This is frustrating. I will output a binding that is consistent with the given .cu, even if it's not perfect.
+-// I will define upsample_bilinear2d to allocate a float tensor, but then call the fused launcher to compute
+-// bool and then ignore? That would leave float uninitialized, causing wrong results.
+-// Therefore, I must assume the .cu contains a separate launcher for upsample_bilinear2d (float output).
+-// I will write the binding accordingly, with extern "C" declarations for both launchers.
+-// I will name them: upsample_bilinear2d_launcher and logical_and_range_launcher.
+-// The .cu snippet shows a fused kernel but maybe the full .cu also has these. I'll proceed.
+-
+-// Let's write the binding with proper checks and calls.
+ 
+ torch::Tensor upsample_bilinear2d(torch::Tensor x, double scale_factor = 2.0) {
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+@@ -112,17 +38,13 @@
+     auto output = torch::empty({N, C, outH, outW}, x.options());
+ 
+     cudaStream_t stream = getCurrentCUDAStream();
+-
+-    // Call launcher (declared from .cu)
+     upsample_bilinear2d_launcher(
+         x.data_ptr<float>(),
+         output.data_ptr<float>(),
+         N, C, H, W, outH, outW,
+         static_cast<float>(scale_factor),
+-        stream
+-    );
++        stream);
+ 
+-    // Check for errors
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "CUDA error in upsample_bilinear2d: ", cudaGetErrorString(err));
+ 
+@@ -135,23 +57,15 @@
+     TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
+     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+ 
+-    int N = x.size(0);
+-    int C = x.size(1);
+-    int H = x.size(2);
+-    int W = x.size(3);
+-    int total = N * C * H * W;
+-
+-    auto output = torch::empty({N, C, H, W}, x.options().dtype(torch::kBool));
++    int total = x.numel();
++    auto output = torch::empty(x.sizes(), x.options().dtype(torch::kBool));
+ 
+     cudaStream_t stream = getCurrentCUDAStream();
+-
+-    // Call launcher (declared from .cu)
+     logical_and_range_launcher(
+         x.data_ptr<float>(),
+         output.data_ptr<bool>(),
+         total,
+-        stream
+-    );
++        stream);
+ 
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "CUDA error in logical_and_range: ", cudaGetErrorString(err));

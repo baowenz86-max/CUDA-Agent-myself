@@ -1,0 +1,432 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,140 +1,128 @@
+ #include <cuda_runtime.h>
+-#include <cstdint>
+ 
+-// Bilinear upsampling kernel, align_corners = false
+-// Input: NCHW float32 tensor, contiguous or with strides given by input strides
+-// Output: NCHW float32 tensor, contiguous
+-// scale_factor: float (can be non-integer)
+-// H_in, W_in: input spatial dims
+-// H_out, W_out: output spatial dims
+-__global__ void bilinear_upsample_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
++// 双线性上采样 kernel：支持任意 stride，输出连续
++// 对齐 corners=False: src = (dst + 0.5) / scale - 0.5
++template <typename scalar_t>
++__global__ void upsample_bilinear2d_cuda_kernel(
++    const scalar_t* __restrict__ input,
++    scalar_t* __restrict__ output,
+     int N, int C, int H_in, int W_in,
+     int H_out, int W_out,
+-    float scale_factor,
+-    long long input_stride_n,  // use long long to avoid overflow for large tensors
+-    long long input_stride_c,
+-    long long input_stride_h,
+-    long long input_stride_w)
++    float scale_h, float scale_w,
++    int64_t in_N_stride, int64_t in_C_stride,
++    int64_t in_H_stride, int64_t in_W_stride)
+ {
+-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    int total = N * C * H_out * W_out;
+-
+-    for (int idx = tid; idx < total; idx += stride) {
+-        // Decompose linear index to n,c,oy,ox
+-        int ox = idx % W_out;
+-        int tmp = idx / W_out;
+-        int oy = tmp % H_out;
++    int64_t total = (int64_t)N * C * H_out * W_out;
++    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++         idx < total;
++         idx += (int64_t)gridDim.x * blockDim.x)
++    {
++        int w_out = idx % W_out;
++        int64_t tmp = idx / W_out;
++        int h_out = tmp % H_out;
+         tmp /= H_out;
+         int c = tmp % C;
+         int n = tmp / C;
+ 
+-        // Compute source coordinates (align_corners=False)
+-        float src_x = (ox + 0.5f) / scale_factor - 0.5f;
+-        float src_y = (oy + 0.5f) / scale_factor - 0.5f;
++        // 计算源坐标（align_corners=False）
++        float src_h_f = (h_out + 0.5f) / scale_h - 0.5f;
++        float src_w_f = (w_out + 0.5f) / scale_w - 0.5f;
+ 
+-        // Clamp to valid interpolation range: [-0.5, H_in-1+0.5] or [-0.5, W_in-1+0.5]
+-        src_x = fmaxf(-0.5f, fminf(src_x, W_in - 1 + 0.5f));
+-        src_y = fmaxf(-0.5f, fminf(src_y, H_in - 1 + 0.5f));
++        // clamp 到有效范围
++        if (src_h_f < 0.0f) src_h_f = 0.0f;
++        if (src_w_f < 0.0f) src_w_f = 0.0f;
++        if (src_h_f > H_in - 1.0f) src_h_f = (float)(H_in - 1);
++        if (src_w_f > W_in - 1.0f) src_w_f = (float)(W_in - 1);
+ 
+-        // Determine integer and fractional parts
+-        int x1 = (int)floorf(src_x);
+-        int y1 = (int)floorf(src_y);
+-        float x_frac = src_x - x1;
+-        float y_frac = src_y - y1;
++        int h0 = (int)src_h_f;
++        int w0 = (int)src_w_f;
++        int h1 = (h0 < H_in - 1) ? (h0 + 1) : h0;
++        int w1 = (w0 < W_in - 1) ? (w0 + 1) : w0;
+ 
+-        // Clamp indices to [0, W_in-1] and [0, H_in-1] for actual reads
+-        int x0 = max(0, x1);
+-        int x2 = min(x1 + 1, W_in - 1);
+-        int y0 = max(0, y1);
+-        int y2 = min(y1 + 1, H_in - 1);
++        float h_lambda = src_h_f - h0;
++        float w_lambda = src_w_f - w0;
+ 
+-        // Compute base pointer for this (n,c) plane using input strides
+-        const float* in_nc = input + n * input_stride_n + c * input_stride_c;
++        // 输入基地址（考虑 batch 和 channel 的 stride）
++        const scalar_t* in_ptr = input + (int64_t)n * in_N_stride + (int64_t)c * in_C_stride;
+ 
+-        // Read four neighbors using input strides for h,w
+-        float p00 = in_nc[y0 * input_stride_h + x0 * input_stride_w];
+-        float p01 = in_nc[y0 * input_stride_h + x2 * input_stride_w];
+-        float p10 = in_nc[y2 * input_stride_h + x0 * input_stride_w];
+-        float p11 = in_nc[y2 * input_stride_h + x2 * input_stride_w];
++        // 四个邻居值（使用给定 H,W stride）
++        scalar_t v00 = in_ptr[(int64_t)h0 * in_H_stride + (int64_t)w0 * in_W_stride];
++        scalar_t v01 = in_ptr[(int64_t)h0 * in_H_stride + (int64_t)w1 * in_W_stride];
++        scalar_t v10 = in_ptr[(int64_t)h1 * in_H_stride + (int64_t)w0 * in_W_stride];
++        scalar_t v11 = in_ptr[(int64_t)h1 * in_H_stride + (int64_t)w1 * in_W_stride];
+ 
+-        // Bilinear interpolation
+-        float value = p00 * (1 - x_frac) * (1 - y_frac) +
+-                      p01 * x_frac * (1 - y_frac) +
+-                      p10 * (1 - x_frac) * y_frac +
+-                      p11 * x_frac * y_frac;
++        // 双线性插值
++        float top = v00 * (1.0f - w_lambda) + v01 * w_lambda;
++        float bottom = v10 * (1.0f - w_lambda) + v11 * w_lambda;
++        float result = top * (1.0f - h_lambda) + bottom * h_lambda;
+ 
+-        output[idx] = value;
++        output[idx] = (scalar_t)result;
+     }
+ }
+ 
+-// Logical AND threshold kernel: output bool = (x > 0) && (x < 1)
+-__global__ void logical_and_threshold_kernel(
++// 逻辑与 kernel: 输出 bool (uint8_t)
++__global__ void logical_and_positive_less_than_one_kernel(
+     const float* __restrict__ input,
+     bool* __restrict__ output,
+-    int total)
++    int64_t total)
+ {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int i = idx; i < total; i += stride) {
+-        float val = input[i];
+-        output[i] = (val > 0.0f) && (val < 1.0f);
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = gridDim.x * blockDim.x;
++    for (; idx < total; idx += stride) {
++        float val = input[idx];
++        output[idx] = (val > 0.0f) && (val < 1.0f);
+     }
+ }
+ 
+-// Launcher for bilinear upsampling
+-// Parameters: input pointer, output pointer, N, C, H_in, W_in, H_out, W_out, scale_factor, strides, stream
+-extern "C" void bilinear_upsample_launcher(
++// Launchers (C interface, no torch dependencies)
++
++extern "C" void upsample_bilinear2d_launcher(
+     const float* input,
+     float* output,
+     int N, int C, int H_in, int W_in,
+     int H_out, int W_out,
+     float scale_factor,
+-    long long input_stride_n,
+-    long long input_stride_c,
+-    long long input_stride_h,
+-    long long input_stride_w,
++    int64_t in_N_stride, int64_t in_C_stride,
++    int64_t in_H_stride, int64_t in_W_stride,
+     cudaStream_t stream)
+ {
+-    int total = N * C * H_out * W_out;
+-    if (total == 0) return;
++    int64_t total = (int64_t)N * C * H_out * W_out;
++    if (total <= 0) return;
+ 
+     int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    // Cap blocks to reasonable maximum for grid-stride loop
+-    if (blocks > 65535) blocks = 65535;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid cap, kernel uses grid-stride loop
+ 
+-    bilinear_upsample_kernel<<<blocks, threads, 0, stream>>>(
+-        input, output, N, C, H_in, W_in, H_out, W_out, scale_factor,
+-        input_stride_n, input_stride_c, input_stride_h, input_stride_w);
++    upsample_bilinear2d_cuda_kernel<float><<<blocks, threads, 0, stream>>>(
++        input, output,
++        N, C, H_in, W_in, H_out, W_out,
++        scale_factor, scale_factor,
++        in_N_stride, in_C_stride, in_H_stride, in_W_stride);
+ 
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+-        // In a binding we would throw, here we just ignore or can set a flag.
+-        // But launcher cannot throw; it's up to the binding to check errors,
+-        // but we can perform a quick check to aid debugging.
+-        // We'll leave this as a no-op; the binding should call cudaGetLastError after launch.
++        // 错误处理：可以打印或忽略，但不能抛出异常（无 torch 头文件）
++        // 这里简单记录，binding 层可通过返回检查
+     }
+ }
+ 
+-// Launcher for logical_and_threshold
+-// Parameters: input pointer, output bool pointer, total elements, stream
+-extern "C" void logical_and_threshold_launcher(
++extern "C" void logical_and_positive_less_than_one_launcher(
+     const float* input,
+     bool* output,
+-    int total,
++    int64_t total,
+     cudaStream_t stream)
+ {
+-    if (total == 0) return;
++    if (total <= 0) return;
+ 
+     int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
++    int blocks = (int)((total + threads - 1) / threads);
+     if (blocks > 65535) blocks = 65535;
+ 
+-    logical_and_threshold_kernel<<<blocks, threads, 0, stream>>>(input, output, total);
++    logical_and_positive_less_than_one_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, total);
+ 
+     cudaError_t err = cudaGetLastError();
+-    // Same: no throw, but binding can check after launch
++    if (err != cudaSuccess) {
++        // 错误处理同上
++    }
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,127 +1,108 @@
+-// Binding for bilinear upsampling and logical_and_threshold
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+-// Declare launchers from custom_ops.cu
+-extern "C" void bilinear_upsample_launcher(
++// 声明来自 custom_ops.cu 的 launcher
++extern "C" void upsample_bilinear2d_launcher(
+     const float* input,
+     float* output,
+     int N, int C, int H_in, int W_in,
+     int H_out, int W_out,
+     float scale_factor,
+-    long long input_stride_n,
+-    long long input_stride_c,
+-    long long input_stride_h,
+-    long long input_stride_w,
++    int64_t in_N_stride, int64_t in_C_stride,
++    int64_t in_H_stride, int64_t in_W_stride,
+     cudaStream_t stream);
+ 
+-extern "C" void logical_and_threshold_launcher(
++extern "C" void logical_and_positive_less_than_one_launcher(
+     const float* input,
+     bool* output,
+-    int total,
++    int64_t total,
+     cudaStream_t stream);
+ 
+-// Wrapper for bilinear upsample
+-static torch::Tensor bilinear_upsample_forward(torch::Tensor x, double scale_factor) {
+-    // Input checks
++// 包装函数：双线性上采样
++torch::Tensor upsample_bilinear2d(torch::Tensor x, double scale_factor) {
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
+-    // Allow non-contiguous; we pass strides to launcher
+-    // But ensure it is contiguous for best performance? The launcher supports strides, so allow non-contiguous.
+-    // However, our kernel uses input_stride_* which should be valid.
+-    // For safety, we may require contiguous? PyTorch upsample accepts non-contiguous as well,
+-    // but our launcher supports strides. We'll allow non-contiguous by using strides.
+-    auto sizes = x.sizes();
+-    int N = sizes[0];
+-    int C = sizes[1];
+-    int H_in = sizes[2];
+-    int W_in = sizes[3];
+-    if (H_in == 0 || W_in == 0) {
+-        // If input spatial dims are zero, output also zero in those dims.
+-        int H_out = static_cast<int>(std::floor(H_in * scale_factor));
+-        int W_out = static_cast<int>(std::floor(W_in * scale_factor));
+-        auto output = torch::empty({N, C, H_out, W_out}, x.options());
+-        return output;
+-    }
+-    // Compute output spatial dims: floor(H_in * scale_factor), floor(W_in * scale_factor)
++
++    // 确保输入连续，简化 stride 处理（launcher 已支持任意 stride，但为了性能，我们传递原始 stride）
++    // 如果输入非连续，launcher 会根据 stride 正确读取；此处不解包为连续，保留原始 stride。
++    // 但为了安全，我们可以先连续化，避免复杂 stride 处理
++    auto x_contig = x.contiguous();
++
++    int N = x_contig.size(0);
++    int C = x_contig.size(1);
++    int H_in = x_contig.size(2);
++    int W_in = x_contig.size(3);
++
++    // 计算输出尺寸：PyTorch 的 nn.Upsample 使用 floor(scale_factor * size)
+     int H_out = static_cast<int>(std::floor(H_in * scale_factor));
+     int W_out = static_cast<int>(std::floor(W_in * scale_factor));
+-    TORCH_CHECK(H_out > 0 && W_out > 0, "Output spatial dimensions must be positive");
+ 
+-    // Allocate output tensor (contiguous)
+-    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++    // 分配输出张量（连续）
++    auto output = torch::empty({N, C, H_out, W_out}, x_contig.options());
+ 
+-    // Get contiguous version of input if not already, but we can use original strides.
+-    // The launcher expects input pointer and strides. We'll make x contiguous to simplify? 
+-    // But that would copy data and lose performance. Since the input from model_new is typical contiguous,
+-    // we can check contiguity and use original if contiguous, else make contiguous.
+-    // For best performance, we assume input contiguous as produced by previous ops.
+-    // If not contiguous, we can make it contiguous inside (no error).
+-    torch::Tensor input_contig = x.is_contiguous() ? x : x.contiguous();
+-
++    // 获取当前 CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Get strides of continuous input
+-    long long stride_n = input_contig.stride(0);
+-    long long stride_c = input_contig.stride(1);
+-    long long stride_h = input_contig.stride(2);
+-    long long stride_w = input_contig.stride(3);
+-
+-    bilinear_upsample_launcher(
+-        input_contig.data_ptr<float>(),
++    // 调用 launcher
++    upsample_bilinear2d_launcher(
++        x_contig.data_ptr<float>(),
+         output.data_ptr<float>(),
+         N, C, H_in, W_in,
+         H_out, W_out,
+         static_cast<float>(scale_factor),
+-        stride_n, stride_c, stride_h, stride_w,
++        x_contig.stride(0), x_contig.stride(1),
++        x_contig.stride(2), x_contig.stride(3),
+         stream
+     );
+ 
++    // 检查 CUDA 错误
+     cudaError_t err = cudaGetLastError();
+-    TORCH_CHECK(err == cudaSuccess, "CUDA error in bilinear_upsample: ", cudaGetErrorString(err));
++    TORCH_CHECK(err == cudaSuccess, "CUDA error in upsample_bilinear2d: ", cudaGetErrorString(err));
+ 
+     return output;
+ }
+ 
+-// Wrapper for logical_and_threshold
+-static torch::Tensor logical_and_threshold_forward(torch::Tensor x) {
+-    // Input checks
++// 包装函数：logical_and (x > 0) & (x < 1)
++torch::Tensor logical_and_positive_less_than_one(torch::Tensor x) {
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+-    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
+ 
+-    auto output = torch::empty(x.sizes(), x.options().dtype(torch::kBool));
+-    int total = x.numel();
++    // 确保输入连续
++    auto x_contig = x.contiguous();
++    int64_t total = x_contig.numel();
+ 
+-    // Ensure input is contiguous; kernel reads linearly
+-    torch::Tensor input_contig = x.is_contiguous() ? x : x.contiguous();
++    // 分配输出 bool 张量（连续）
++    auto output = torch::empty(x_contig.sizes(), x_contig.options().dtype(torch::kBool));
+ 
++    // 获取当前 CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    logical_and_threshold_launcher(
+-        input_contig.data_ptr<float>(),
++    // 调用 launcher
++    logical_and_positive_less_than_one_launcher(
++        x_contig.data_ptr<float>(),
+         output.data_ptr<bool>(),
+         total,
+         stream
+     );
+ 
++    // 检查 CUDA 错误
+     cudaError_t err = cudaGetLastError();
+-    TORCH_CHECK(err == cudaSuccess, "CUDA error in logical_and_threshold: ", cudaGetErrorString(err));
++    TORCH_CHECK(err == cudaSuccess, "CUDA error in logical_and_positive_less_than_one: ", cudaGetErrorString(err));
+ 
+     return output;
+ }
+ 
+-// Register bindings
++// 注册函数
+ void register_custom_ops(pybind11::module& m) {
+-    m.def("bilinear_upsample", &bilinear_upsample_forward,
+-          "Bilinear upsampling (align_corners=False)",
++    m.def("upsample_bilinear2d", &upsample_bilinear2d,
++          "Bilinear upsample with scale_factor (align_corners=False)",
+           pybind11::arg("x"), pybind11::arg("scale_factor"));
+-    m.def("logical_and_threshold", &logical_and_threshold_forward,
+-          "Elementwise logical AND of (x > 0) and (x < 1)",
++    m.def("logical_and_positive_less_than_one", &logical_and_positive_less_than_one,
++          "Logical AND of (x > 0) and (x < 1)",
+           pybind11::arg("x"));
+ }
+ 
+--- before/model_new.py
++++ after/model_new.py
+@@ -1,6 +1,5 @@
+ import torch
+ import torch.nn as nn
+-import cuda_extension
+ 
+ 
+ class ModelNew(nn.Module):
+@@ -11,17 +10,15 @@
+         self.mode = mode
+         self.upsample_kernel_size = upsample_kernel_size
+         self.upsample_padding = upsample_padding
+-        # Keep upsample module for state_dict compatibility, but do not call it
+-        self.upsample = nn.Upsample(scale_factor=scale_factor, mode=mode)
+ 
+     def forward(self, x):
+-        upsampled = cuda_extension.bilinear_upsample(x, self.scale_factor)
+-        out = cuda_extension.logical_and_threshold(upsampled)
+-        return out
++        x = cuda_extension.upsample_bilinear2d(x, self.scale_factor)
++        x = cuda_extension.logical_and_positive_less_than_one(x)
++        return x
+ 
+     def debug_forward(self, x):
+-        upsampled = cuda_extension.bilinear_upsample(x, self.scale_factor)
+-        yield 'step_001', upsampled
+-        out = cuda_extension.logical_and_threshold(upsampled)
+-        yield 'step_002', out
+-        yield 'step_003', out
++        x = cuda_extension.upsample_bilinear2d(x, self.scale_factor)
++        yield 'step_001', x
++        x = cuda_extension.logical_and_positive_less_than_one(x)
++        yield 'step_002', x
++        yield 'step_003', x

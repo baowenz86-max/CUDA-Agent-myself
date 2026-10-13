@@ -1,0 +1,948 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,224 +1,137 @@
++// CUDA kernels and launchers for non-convolution custom ops.
++// ConvTranspose1d and Linear will be implemented in C++ using cuDNN/cuBLAS.
++// This file only contains raw CUDA kernels and launchers with C linkage.
+ #include <cuda_runtime.h>
+ 
+ // -----------------------------------------------------------------------------
+-// add_bias kernel: broadcast bias of shape [out_channels, 1] over last dimension
+-// input: [batch, channels, length], bias: [channels, 1]
+-// output: same shape as input
++// add_bias_forward: out = input + bias broadcast over last dimension
++// input: [B, C, L], bias: [C, 1] (contiguous)
+ // -----------------------------------------------------------------------------
+-__global__ void add_bias_kernel(float* __restrict__ output,
+-                                const float* __restrict__ input,
++__global__ void add_bias_kernel(const float* __restrict__ input,
+                                 const float* __restrict__ bias,
+-                                int channels,
+-                                int length,
+-                                long long total_elements) {
+-    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-    for (; idx < total_elements; idx += stride) {
+-        int c = (idx / length) % channels;
+-        output[idx] = input[idx] + bias[c];
+-    }
++                                float* __restrict__ output,
++                                int B, int C, int L) {
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long total = (long long)B * C * L;
++    if (idx >= total) return;
++    int l = idx % L;
++    long long bc = idx / L;
++    int c = bc % C;
++    output[idx] = input[idx] + bias[c];
+ }
+ 
+-extern "C" void add_bias_launcher(float* output,
+-                                  const float* input,
++extern "C" void add_bias_launcher(const float* input,
+                                   const float* bias,
+-                                  int channels,
+-                                  int length,
+-                                  long long total_elements,
++                                  float* output,
++                                  int B, int C, int L,
+                                   cudaStream_t stream) {
+-    int threads = 256;
+-    long long blocks_ll = (total_elements + threads - 1) / threads;
+-    int blocks = (blocks_ll > 1048576) ? 1048576 : (int)blocks_ll;
+-    add_bias_kernel<<<blocks, threads, 0, stream>>>(output, input, bias,
+-                                                    channels, length, total_elements);
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // ignore
++    long long total = (long long)B * C * L;
++    const int block_size = 256;
++    long long grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 0) {
++        add_bias_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
++            input, bias, output, B, C, L);
+     }
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// roll kernel along dimension 2 (the last dimension)
+-// input shape: [batch, channels, length], shifts can be positive/negative
+-// output same shape. Here we assume shifts=1 (as used in model), but keep generic.
++// roll_forward: out = roll(input, shifts, dim) specialized for dim=2, shifts=1
++// input: [B, C, L], output same shape
++// Equivalent to: output[:, :, 0] = input[:, :, L-1], output[:, :, i] = input[:, :, i-1]
+ // -----------------------------------------------------------------------------
+-__global__ void roll_kernel(float* __restrict__ output,
+-                            const float* __restrict__ input,
+-                            int length,
+-                            int shifts,
+-                            long long total_elements) {
+-    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-    for (; idx < total_elements; idx += stride) {
+-        long long base = idx / length;
+-        int pos = idx % length;
+-        int src_pos = (pos - shifts) % length;
+-        if (src_pos < 0) src_pos += length;
+-        output[base * length + pos] = input[base * length + src_pos];
++__global__ void roll_last_dim_kernel(const float* __restrict__ input,
++                                     float* __restrict__ output,
++                                     int B, int C, int L) {
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long total = (long long)B * C * L;
++    if (idx >= total) return;
++    int l = idx % L;
++    long long bc = idx / L;
++    long long src_idx;
++    if (l == 0) {
++        src_idx = bc * L + (L - 1);
++    } else {
++        src_idx = bc * L + (l - 1);
+     }
++    output[idx] = input[src_idx];
+ }
+ 
+-extern "C" void roll_launcher(float* output,
+-                              const float* input,
+-                              int length,
+-                              int shifts,
+-                              long long total_elements,
++extern "C" void roll_launcher(const float* input,
++                              float* output,
++                              int B, int C, int L,
++                              int shifts, int dim,
+                               cudaStream_t stream) {
+-    int threads = 256;
+-    long long blocks_ll = (total_elements + threads - 1) / threads;
+-    int blocks = (blocks_ll > 1048576) ? 1048576 : (int)blocks_ll;
+-    roll_kernel<<<blocks, threads, 0, stream>>>(output, input, length, shifts, total_elements);
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // ignore
++    // Only supports dim=2 (last dim), shifts=1 for this contract.
++    if (dim != 2 || shifts != 1) {
++        // Invalid configuration: copy input to output as fallback? The contract
++        // guarantees these values, so we can ignore or assert.
++        // We'll do nothing here; binding should ensure correct args.
++        return;
++    }
++    long long total = (long long)B * C * L;
++    const int block_size = 256;
++    long long grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 0) {
++        roll_last_dim_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
++            input, output, B, C, L);
+     }
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// view kernel: actually just copies data (view does not change data layout,
+-// but for completeness we provide a kernel that copies contiguous elements,
+-// assuming input is contiguous after previous ops; the binding will pass contiguous
+-// tensors. input and output have same number of elements.
++// flatten_forward: output = input.reshape(B, C*L)  (contiguous copy)
++// input: [B, C, L] contiguous, output: [B, C*L]
+ // -----------------------------------------------------------------------------
+-__global__ void view_kernel(float* __restrict__ output,
+-                            const float* __restrict__ input,
+-                            long long total_elements) {
+-    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-    for (; idx < total_elements; idx += stride) {
++__global__ void flatten_kernel(const float* __restrict__ input,
++                               float* __restrict__ output,
++                               long long total_elements) {
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < total_elements) {
+         output[idx] = input[idx];
+     }
+ }
+ 
+-extern "C" void view_launcher(float* output,
+-                              const float* input,
+-                              long long total_elements,
+-                              cudaStream_t stream) {
+-    int threads = 256;
+-    long long blocks_ll = (total_elements + threads - 1) / threads;
+-    int blocks = (blocks_ll > 1048576) ? 1048576 : (int)blocks_ll;
+-    view_kernel<<<blocks, threads, 0, stream>>>(output, input, total_elements);
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // ignore
++extern "C" void flatten_launcher(const float* input,
++                                 float* output,
++                                 int B, int C, int L,
++                                 int start_dim,
++                                 cudaStream_t stream) {
++    // Only supports start_dim=1, which flattens all dimensions after batch.
++    if (start_dim != 1) return;
++    long long total = (long long)B * C * L;
++    const int block_size = 256;
++    long long grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 0) {
++        flatten_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
++            input, output, total);
+     }
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// linear kernel: output = input @ weight.T + bias
+-// input shape: [batch, num_features], weight shape: [out_features, num_features],
+-// bias shape: [out_features]
+-// output shape: [batch, out_features]
+-// We use coalesced access: each thread computes one output element.
++// Declarations for launchers implemented in C++ (cuDNN/cuBLAS) future stage.
++// These declarations allow binding.cpp to reference them; no definitions here.
+ // -----------------------------------------------------------------------------
+-__global__ void linear_kernel(float* __restrict__ output,
+-                              const float* __restrict__ input,
+-                              const float* __restrict__ weight,
+-                              const float* __restrict__ bias,
+-                              int batch_size,
+-                              int num_features,
+-                              int out_features) {
+-    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (out_idx >= out_features) return;
+-    for (int b = 0; b < batch_size; ++b) {
+-        float sum = 0.0f;
+-        const float* inp = input + (long long)b * num_features;
+-        const float* w = weight + (long long)out_idx * num_features;
+-        for (int j = 0; j < num_features; ++j) {
+-            sum += inp[j] * w[j];
+-        }
+-        output[(long long)b * out_features + out_idx] = sum + bias[out_idx];
+-    }
+-}
++extern "C" void conv_transpose1d_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int in_length,
++    int out_length,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    cudaStream_t stream);
+ 
+-extern "C" void linear_launcher(float* output,
+-                                const float* input,
+-                                const float* weight,
+-                                const float* bias,
+-                                int batch_size,
+-                                int num_features,
+-                                int out_features,
+-                                cudaStream_t stream) {
+-    int threads = 256;
+-    int blocks = (out_features + threads - 1) / threads;
+-    linear_kernel<<<blocks, threads, 0, stream>>>(output, input, weight, bias,
+-                                                  batch_size, num_features, out_features);
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // ignore
+-    }
+-}
+-
+-// -----------------------------------------------------------------------------
+-// New: conv_transpose1d kernel.
+-// Input: [batch, in_channels, in_length], weight: [in_channels, out_channels, kernel_size],
+-// bias: [out_channels]. Output: [batch, out_channels, out_length].
+-// out_length = (in_length - 1) * stride - 2 * padding + kernel_size + output_padding.
+-// We compute each output element by accumulating contributions from corresponding input positions.
+-// For each output position (b, oc, ol), the value is sum over ic and k such that:
+-//   ol + padding - k = in_pos * stride, and 0 <= in_pos < in_length, 0 <= k < kernel_size.
+-// This yields the transposed convolution formula.
+-// -----------------------------------------------------------------------------
+-__global__ void conv_transpose1d_kernel(float* __restrict__ output,
+-                                        const float* __restrict__ input,
+-                                        const float* __restrict__ weight,
+-                                        const float* __restrict__ bias,
+-                                        int batch_size,
+-                                        int in_channels,
+-                                        int out_channels,
+-                                        int in_length,
+-                                        int out_length,
+-                                        int kernel_size,
+-                                        int stride,
+-                                        int padding) {
+-    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    long long total = (long long)batch_size * out_channels * out_length;
+-    long long stride_grid = (long long)gridDim.x * blockDim.x;
+-    for (; idx < total; idx += stride_grid) {
+-        int b = idx / (out_channels * out_length);
+-        int oc = (idx / out_length) % out_channels;
+-        int ol = idx % out_length;
+-        float sum = 0.0f;
+-        for (int ic = 0; ic < in_channels; ++ic) {
+-            for (int k = 0; k < kernel_size; ++k) {
+-                int numerator = ol + padding - k;
+-                if (numerator < 0) continue;
+-                if (numerator % stride != 0) continue;
+-                int in_pos = numerator / stride;
+-                if (in_pos >= 0 && in_pos < in_length) {
+-                    // weight layout: [in_channels][out_channels][kernel_size]
+-                    float w_val = weight[(ic * out_channels + oc) * kernel_size + k];
+-                    sum += input[(b * in_channels + ic) * in_length + in_pos] * w_val;
+-                }
+-            }
+-        }
+-        output[idx] = sum + bias[oc];
+-    }
+-}
+-
+-extern "C" void conv_transpose1d_launcher(float* output,
+-                                          const float* input,
+-                                          const float* weight,
+-                                          const float* bias,
+-                                          int batch_size,
+-                                          int in_channels,
+-                                          int out_channels,
+-                                          int in_length,
+-                                          int out_length,
+-                                          int kernel_size,
+-                                          int stride,
+-                                          int padding,
+-                                          cudaStream_t stream) {
+-    long long total = (long long)batch_size * out_channels * out_length;
+-    int threads = 256;
+-    long long blocks_ll = (total + threads - 1) / threads;
+-    int blocks = (blocks_ll > 1048576) ? 1048576 : (int)blocks_ll;
+-    conv_transpose1d_kernel<<<blocks, threads, 0, stream>>>(
+-        output, input, weight, bias,
+-        batch_size, in_channels, out_channels, in_length, out_length,
+-        kernel_size, stride, padding);
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // ignore
+-    }
+-}
++extern "C" void linear_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch,
++    int in_features,
++    int out_features,
++    cudaStream_t stream);
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,250 +1,289 @@
++// PyTorch binding for custom CUDA kernels
++// All tensor validation, allocation, and launcher calls.
++// ConvTranspose1d and Linear are implemented using cuDNN/cuBLAS in separate C++ files,
++// but their launchers are declared here and called.
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cuda_runtime.h>
+-#include <vector>
+ #include "../binding_registry.h"
+ 
+-// -----------------------------------------------------------------------------
+-// Declarations of launchers from custom_ops.cu
+-// -----------------------------------------------------------------------------
+-extern "C" void add_bias_launcher(float* output,
+-                                  const float* input,
++// Declare launchers from custom_ops.cu
++extern "C" void add_bias_launcher(const float* input,
+                                   const float* bias,
+-                                  int channels,
+-                                  int length,
+-                                  long long total_elements,
++                                  float* output,
++                                  int B, int C, int L,
+                                   cudaStream_t stream);
+ 
+-extern "C" void roll_launcher(float* output,
+-                              const float* input,
+-                              int length,
+-                              int shifts,
+-                              long long total_elements,
++extern "C" void roll_launcher(const float* input,
++                              float* output,
++                              int B, int C, int L,
++                              int shifts, int dim,
+                               cudaStream_t stream);
+ 
+-extern "C" void view_launcher(float* output,
+-                              const float* input,
+-                              long long total_elements,
+-                              cudaStream_t stream);
+-
+-extern "C" void linear_launcher(float* output,
+-                                const float* input,
+-                                const float* weight,
+-                                const float* bias,
+-                                int batch_size,
+-                                int num_features,
+-                                int out_features,
+-                                cudaStream_t stream);
+-
+-extern "C" void conv_transpose1d_launcher(float* output,
+-                                          const float* input,
+-                                          const float* weight,
+-                                          const float* bias,
+-                                          int batch_size,
+-                                          int in_channels,
+-                                          int out_channels,
+-                                          int in_length,
+-                                          int out_length,
+-                                          int kernel_size,
+-                                          int stride,
+-                                          int padding,
+-                                          cudaStream_t stream);
+-
+-// -----------------------------------------------------------------------------
+-// Helper: check CUDA tensor and dtype
+-// -----------------------------------------------------------------------------
+-static void check_cuda_float(const torch::Tensor& t, const char* name) {
++extern "C" void flatten_launcher(const float* input,
++                                 float* output,
++                                 int B, int C, int L,
++                                 int start_dim,
++                                 cudaStream_t stream);
++
++// Forward declarations for cuDNN/cuBLAS launchers (implemented in .cu or .cpp later)
++extern "C" void conv_transpose1d_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int in_length,
++    int out_length,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    cudaStream_t stream);
++
++extern "C" void linear_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch,
++    int in_features,
++    int out_features,
++    cudaStream_t stream);
++
++// Helper to check tensor requirements
++static void check_cuda_float32_contiguous(const torch::Tensor& t, const char* name) {
+     TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+     TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
+-}
+-
+-// -----------------------------------------------------------------------------
+-// 1. ConvTranspose1d forward using custom CUDA kernel
+-// -----------------------------------------------------------------------------
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++
++// ----------------------------------------------------------------------------
++// conv_transpose1d_forward
++// ----------------------------------------------------------------------------
+ torch::Tensor conv_transpose1d_forward(torch::Tensor input,
+                                        torch::Tensor weight,
+                                        torch::Tensor bias,
+                                        int64_t stride,
+                                        int64_t padding,
+                                        int64_t output_padding) {
+-    check_cuda_float(input, "input");
+-    check_cuda_float(weight, "weight");
+-    check_cuda_float(bias, "bias");
+-
+-    TORCH_CHECK(input.dim() == 3, "input must be 3D (batch, channels, length)");
+-    TORCH_CHECK(weight.dim() == 3, "weight must be 3D (in_channels, out_channels, kernel_size)");
+-    TORCH_CHECK(bias.dim() == 1, "bias must be 1D (out_channels)");
+-
+-    int batch_size = input.size(0);
+-    int in_channels = input.size(1);
+-    int input_length = input.size(2);
+-    int out_channels = weight.size(1);
+-    int kernel_size = weight.size(2);
+-
+-    TORCH_CHECK(weight.size(0) == in_channels, "weight in_channels mismatch");
+-    TORCH_CHECK(bias.size(0) == out_channels, "bias out_channels mismatch");
+-    TORCH_CHECK(padding >= 0, "padding must be non-negative");
+-    TORCH_CHECK(stride > 0, "stride must be positive");
+-    TORCH_CHECK(output_padding >= 0, "output_padding must be non-negative");
+-
+-    int output_length = (input_length - 1) * stride - 2 * padding + kernel_size + output_padding;
+-    TORCH_CHECK(output_length > 0, "computed output length must be positive");
+-
+-    auto input_contig = input.contiguous();
+-    auto weight_contig = weight.contiguous();
+-    auto bias_contig = bias.contiguous();
+-
+-    auto output = torch::empty({batch_size, out_channels, output_length}, input.options());
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    check_cuda_float32_contiguous(input, "input");
++    check_cuda_float32_contiguous(weight, "weight");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D [batch, in_channels, length]");
++    TORCH_CHECK(weight.dim() == 3, "weight must be 3D [in_channels, out_channels, kernel_size]");
++    TORCH_CHECK(input.size(1) == weight.size(0), "input channels must match weight in_channels");
++
++    int64_t batch = input.size(0);
++    int64_t in_channels = input.size(1);
++    int64_t in_length = input.size(2);
++    int64_t out_channels = weight.size(1);
++    int64_t kernel_size = weight.size(2);
++
++    // bias optional
++    if (bias.defined()) {
++        check_cuda_float32_contiguous(bias, "bias");
++        TORCH_CHECK(bias.dim() == 1 && bias.size(0) == out_channels,
++                    "bias must be 1D with size out_channels");
++    }
++
++    // Compute output length
++    int64_t out_length = (in_length - 1) * stride - 2 * padding + kernel_size + output_padding;
++    TORCH_CHECK(out_length > 0, "output length must be positive");
++
++    auto output = torch::empty({batch, out_channels, out_length}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    const float* bias_ptr = bias.defined() ? bias.data_ptr<float>() : nullptr;
++
+     conv_transpose1d_launcher(
+-        output.data_ptr<float>(),
+-        input_contig.data_ptr<float>(),
+-        weight_contig.data_ptr<float>(),
+-        bias_contig.data_ptr<float>(),
+-        batch_size,
+-        in_channels,
+-        out_channels,
+-        input_length,
+-        output_length,
+-        kernel_size,
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias_ptr,
++        output.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(in_channels),
++        static_cast<int>(out_channels),
++        static_cast<int>(in_length),
++        static_cast<int>(out_length),
++        static_cast<int>(kernel_size),
+         static_cast<int>(stride),
+         static_cast<int>(padding),
+-        stream);
+-    return output;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// 2. Add bias forward
+-// -----------------------------------------------------------------------------
++        static_cast<int>(output_padding),
++        stream
++    );
++
++    return output;
++}
++
++// ----------------------------------------------------------------------------
++// add_bias_forward
++// ----------------------------------------------------------------------------
+ torch::Tensor add_bias_forward(torch::Tensor input, torch::Tensor bias) {
+-    check_cuda_float(input, "input");
+-    check_cuda_float(bias, "bias");
+-    TORCH_CHECK(input.dim() == 3, "input must be 3D");
++    check_cuda_float32_contiguous(input, "input");
++    check_cuda_float32_contiguous(bias, "bias");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D [batch, channels, length]");
+     TORCH_CHECK(bias.dim() == 2 && bias.size(1) == 1, "bias must be [channels, 1]");
+-
+-    int channels = input.size(1);
+-    TORCH_CHECK(bias.size(0) == channels, "bias first dim must match channels");
++    TORCH_CHECK(input.size(1) == bias.size(0), "bias channel dimension must match input");
++
++    int64_t B = input.size(0);
++    int64_t C = input.size(1);
++    int64_t L = input.size(2);
+ 
+     auto output = torch::empty_like(input);
+-    long long total_elements = input.numel();
+-
+-    auto input_contig = input.contiguous();
+-    auto bias_contig = bias.contiguous();
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    add_bias_launcher(output.data_ptr<float>(),
+-                      input_contig.data_ptr<float>(),
+-                      bias_contig.data_ptr<float>(),
+-                      channels,
+-                      input.size(2),
+-                      total_elements,
+-                      stream);
+-    return output;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// 3. Roll forward
+-// -----------------------------------------------------------------------------
+-torch::Tensor roll_forward(torch::Tensor input, int64_t shifts, int64_t dims) {
+-    check_cuda_float(input, "input");
+-    TORCH_CHECK(input.dim() == 3, "input must be 3D");
+-    TORCH_CHECK(dims == 2, "only dims=2 supported");
+-    TORCH_CHECK(shifts >= -input.size(2) && shifts <= input.size(2), "shifts out of range");
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    add_bias_launcher(
++        input.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(B),
++        static_cast<int>(C),
++        static_cast<int>(L),
++        stream
++    );
++
++    return output;
++}
++
++// ----------------------------------------------------------------------------
++// roll_forward
++// ----------------------------------------------------------------------------
++torch::Tensor roll_forward(torch::Tensor input, int64_t shifts, int64_t dim) {
++    check_cuda_float32_contiguous(input, "input");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D [batch, channels, length]");
++    TORCH_CHECK(dim == 2, "only dim=2 is supported");
++    TORCH_CHECK(shifts == 1, "only shifts=1 is supported");
++
++    int64_t B = input.size(0);
++    int64_t C = input.size(1);
++    int64_t L = input.size(2);
+ 
+     auto output = torch::empty_like(input);
+-    long long total_elements = input.numel();
+-
+-    auto input_contig = input.contiguous();
+-    int length = input.size(2);
+-    int shift_int = static_cast<int>(shifts);
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    roll_launcher(output.data_ptr<float>(),
+-                  input_contig.data_ptr<float>(),
+-                  length,
+-                  shift_int,
+-                  total_elements,
+-                  stream);
+-    return output;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// 4. View forward (copy)
+-// -----------------------------------------------------------------------------
+-torch::Tensor view_forward(torch::Tensor input, int64_t out_features, int64_t num_features) {
+-    check_cuda_float(input, "input");
+-    TORCH_CHECK(input.dim() == 3, "input must be 3D");
+-    TORCH_CHECK(input.size(0) * input.size(1) * input.size(2) == out_features * num_features,
+-                "view shape mismatch");
+-
+-    auto output = torch::empty({input.size(0), num_features}, input.options());
+-    long long total_elements = input.numel();
+-
+-    auto input_contig = input.contiguous();
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    view_launcher(output.data_ptr<float>(),
+-                  input_contig.data_ptr<float>(),
+-                  total_elements,
+-                  stream);
+-    return output;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// 5. Linear forward
+-// -----------------------------------------------------------------------------
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    roll_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(B),
++        static_cast<int>(C),
++        static_cast<int>(L),
++        static_cast<int>(shifts),
++        static_cast<int>(dim),
++        stream
++    );
++
++    return output;
++}
++
++// ----------------------------------------------------------------------------
++// flatten_forward
++// ----------------------------------------------------------------------------
++torch::Tensor flatten_forward(torch::Tensor input, int64_t start_dim) {
++    check_cuda_float32_contiguous(input, "input");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D [batch, channels, length]");
++    TORCH_CHECK(start_dim == 1, "only start_dim=1 is supported");
++
++    int64_t B = input.size(0);
++    int64_t C = input.size(1);
++    int64_t L = input.size(2);
++
++    auto output = torch::empty({B, C * L}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    flatten_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(B),
++        static_cast<int>(C),
++        static_cast<int>(L),
++        static_cast<int>(start_dim),
++        stream
++    );
++
++    return output;
++}
++
++// ----------------------------------------------------------------------------
++// linear_forward
++// ----------------------------------------------------------------------------
+ torch::Tensor linear_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
+-    check_cuda_float(input, "input");
+-    check_cuda_float(weight, "weight");
+-    check_cuda_float(bias, "bias");
+-
+-    TORCH_CHECK(input.dim() == 2, "input must be 2D");
+-    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+-    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+-
+-    int batch_size = input.size(0);
+-    int num_features = input.size(1);
+-    int out_features = weight.size(0);
+-
+-    TORCH_CHECK(weight.size(1) == num_features, "weight width must match input features");
+-    TORCH_CHECK(bias.size(0) == out_features, "bias length must match output features");
+-
+-    auto output = torch::empty({batch_size, out_features}, input.options());
+-
+-    auto input_contig = input.contiguous();
+-    auto weight_contig = weight.contiguous();
+-    auto bias_contig = bias.contiguous();
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    linear_launcher(output.data_ptr<float>(),
+-                    input_contig.data_ptr<float>(),
+-                    weight_contig.data_ptr<float>(),
+-                    bias_contig.data_ptr<float>(),
+-                    batch_size,
+-                    num_features,
+-                    out_features,
+-                    stream);
+-    return output;
+-}
+-
+-// -----------------------------------------------------------------------------
++    check_cuda_float32_contiguous(input, "input");
++    check_cuda_float32_contiguous(weight, "weight");
++    TORCH_CHECK(input.dim() == 2, "input must be 2D [batch, in_features]");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [out_features, in_features]");
++    TORCH_CHECK(input.size(1) == weight.size(1), "input in_features must match weight in_features");
++
++    int64_t batch = input.size(0);
++    int64_t in_features = input.size(1);
++    int64_t out_features = weight.size(0);
++
++    if (bias.defined()) {
++        check_cuda_float32_contiguous(bias, "bias");
++        TORCH_CHECK(bias.dim() == 1 && bias.size(0) == out_features,
++                    "bias must be 1D with size out_features");
++    }
++
++    auto output = torch::empty({batch, out_features}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    const float* bias_ptr = bias.defined() ? bias.data_ptr<float>() : nullptr;
++
++    linear_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias_ptr,
++        output.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(in_features),
++        static_cast<int>(out_features),
++        stream
++    );
++
++    return output;
++}
++
++// ----------------------------------------------------------------------------
+ // Registration
+-// -----------------------------------------------------------------------------
++// ----------------------------------------------------------------------------
+ void register_custom_ops(pybind11::module& m) {
+     m.def("conv_transpose1d_forward", &conv_transpose1d_forward,
+-          "ConvTranspose1d forward",
+-          py::arg("input"), py::arg("weight"), py::arg("bias"),
+-          py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
++          "ConvTranspose1d forward (cuDNN)",
++          pybind11::arg("input"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"),
++          pybind11::arg("stride"),
++          pybind11::arg("padding"),
++          pybind11::arg("output_padding"));
++
+     m.def("add_bias_forward", &add_bias_forward,
+-          "Add bias forward", py::arg("input"), py::arg("bias"));
++          "Add bias broadcast over last dimension",
++          pybind11::arg("input"),
++          pybind11::arg("bias"));
++
+     m.def("roll_forward", &roll_forward,
+-          "Roll forward", py::arg("input"), py::arg("shifts"), py::arg("dims"));
+-    m.def("view_forward", &view_forward,
+-          "View forward", py::arg("input"), py::arg("out_features"), py::arg("num_features"));
++          "Roll along last dimension by shifts",
++          pybind11::arg("input"),
++          pybind11::arg("shifts"),
++          pybind11::arg("dim"));
++
++    m.def("flatten_forward", &flatten_forward,
++          "Flatten from start_dim to end",
++          pybind11::arg("input"),
++          pybind11::arg("start_dim"));
++
+     m.def("linear_forward", &linear_forward,
+-          "Linear forward", py::arg("input"), py::arg("weight"), py::arg("bias"));
++          "Linear transformation (cuBLAS)",
++          pybind11::arg("input"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"));
+ }
+ 
+ REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -17,82 +17,44 @@
+         out_features,
+     ):
+         super().__init__()
+-        # 初始化 ConvTranspose1d 参数（权重和偏置），保持 state_dict 键
+-        self.conv_transpose1d_weight = nn.Parameter(
+-            torch.empty(in_channels, out_channels, kernel_size)
++        self.conv_transpose1d = nn.ConvTranspose1d(
++            in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding
+         )
+-        self.conv_transpose1d_bias = nn.Parameter(torch.empty(out_channels))
+-        # 初始化额外的 bias 参数，形状为 bias_shape
+-        self.bias = nn.Parameter(torch.empty(bias_shape))
+-        # 初始化线性层参数
+-        self.linear_weight = nn.Parameter(torch.empty(out_features, num_features))
+-        self.linear_bias = nn.Parameter(torch.empty(out_features))
+-
+-        # 保存构造参数以便在 forward 中使用
+-        self.stride = stride
+-        self.padding = padding
+-        self.output_padding = output_padding
+-        self.in_channels = in_channels
+-        self.out_channels = out_channels
+-        self.kernel_size = kernel_size
+-        self.num_features = num_features
+-        self.out_features = out_features
+-
+-        # 参考模型中 nn.ConvTranspose1d 和 nn.Linear 的默认初始化
+-        # 这里手动复制相同的初始化逻辑，确保初始权重分布一致
+-        import math
+-        import torch.nn.init as init
+-
+-        init.kaiming_uniform_(self.conv_transpose1d_weight, a=math.sqrt(5))
+-        fan_in, _ = init._calculate_fan_in_and_fan_out(self.conv_transpose1d_weight)
+-        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+-        init.uniform_(self.conv_transpose1d_bias, -bound, bound)
+-        init.kaiming_uniform_(self.linear_weight, a=math.sqrt(5))
+-        bound = 1 / math.sqrt(self.linear_weight.size(1)) if self.linear_weight.size(1) > 0 else 0
+-        init.uniform_(self.linear_bias, -bound, bound)
++        self.bias = nn.Parameter(torch.randn(bias_shape))
++        self.linear = nn.Linear(num_features, out_features)
+ 
+     def forward(self, x):
+-        # 步骤 1：ConvTranspose1d
+         x = cuda_extension.conv_transpose1d_forward(
+             x,
+-            self.conv_transpose1d_weight,
+-            self.conv_transpose1d_bias,
+-            self.stride,
+-            self.padding,
+-            self.output_padding,
++            self.conv_transpose1d.weight,
++            self.conv_transpose1d.bias,
++            self.conv_transpose1d.stride[0],
++            self.conv_transpose1d.padding[0],
++            self.conv_transpose1d.output_padding[0],
+         )
+-        # 步骤 2：添加 bias
+         x = cuda_extension.add_bias_forward(x, self.bias)
+-        # 步骤 3：roll
+-        x = cuda_extension.roll_forward(x, shifts=1, dims=2)
+-        # 步骤 4：view
+-        x = cuda_extension.view_forward(x, self.out_features, self.num_features)
+-        # 步骤 5：线性层
+-        x = cuda_extension.linear_forward(x, self.linear_weight, self.linear_bias)
++        x = cuda_extension.roll_forward(x, shifts=1, dim=2)
++        x = cuda_extension.flatten_forward(x, start_dim=1)
++        x = cuda_extension.linear_forward(x, self.linear.weight, self.linear.bias)
+         return x
+ 
+     def debug_forward(self, x):
+-        # 按检查点顺序 yield (id, value)
+         x = cuda_extension.conv_transpose1d_forward(
+             x,
+-            self.conv_transpose1d_weight,
+-            self.conv_transpose1d_bias,
+-            self.stride,
+-            self.padding,
+-            self.output_padding,
++            self.conv_transpose1d.weight,
++            self.conv_transpose1d.bias,
++            self.conv_transpose1d.stride[0],
++            self.conv_transpose1d.padding[0],
++            self.conv_transpose1d.output_padding[0],
+         )
+-        yield "step_001", x
+-
++        yield 'step_001', x
+         x = cuda_extension.add_bias_forward(x, self.bias)
+-        yield "step_002", x
+-
+-        x = cuda_extension.roll_forward(x, shifts=1, dims=2)
+-        yield "step_003", x
+-
+-        x = cuda_extension.view_forward(x, self.out_features, self.num_features)
+-        yield "step_004", x
+-
+-        x = cuda_extension.linear_forward(x, self.linear_weight, self.linear_bias)
+-        yield "step_005", x
+-
+-        yield "step_006", x
++        yield 'step_002', x
++        x = cuda_extension.roll_forward(x, shifts=1, dim=2)
++        yield 'step_003', x
++        x = cuda_extension.flatten_forward(x, start_dim=1)
++        yield 'step_004', x
++        x = cuda_extension.linear_forward(x, self.linear.weight, self.linear.bias)
++        yield 'step_005', x
++        yield 'step_006', x
++        return

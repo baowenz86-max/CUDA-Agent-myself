@@ -1,0 +1,328 @@
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+#include <cudnn.h>
+#include "../binding_registry.h"
+
+// Declare launchers from custom_ops.cu
+extern "C" void layer_norm_launcher(
+    float* output,
+    const float* input,
+    const float* weight,
+    const float* bias,
+    int batch_size,
+    int channels,
+    int length,
+    float eps,
+    cudaStream_t stream
+);
+
+extern "C" void addcmul_launcher(
+    float* output,
+    const float* input,
+    const float* tensor1,
+    const float* tensor2,
+    int numel,
+    cudaStream_t stream
+);
+
+// Helper function to check cuDNN status
+#define CHECK_CUDNN(expr) \
+    do { \
+        cudnnStatus_t status = (expr); \
+        TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, \
+            "cuDNN error: ", cudnnGetErrorString(status)); \
+    } while (0)
+
+// ConvTranspose1d forward using cuDNN
+torch::Tensor conv_transpose_forward(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int64_t stride,
+    int64_t padding,
+    int64_t output_padding
+) {
+    // Validate inputs
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    if (bias.defined()) {
+        TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    }
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
+    if (bias.defined()) {
+        TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+    }
+    TORCH_CHECK(input.dim() == 3, "Input must be 3D (batch, channels, length)");
+    TORCH_CHECK(weight.dim() == 3, "Weight must be 3D (in_channels, out_channels, kernel_size)");
+
+    // Ensure contiguity
+    auto input_contig = input.contiguous();
+    auto weight_contig = weight.contiguous();
+    auto bias_contig = bias.defined() ? bias.contiguous() : torch::Tensor();
+
+    int batch_size = input_contig.size(0);
+    int in_channels = input_contig.size(1);
+    int in_length = input_contig.size(2);
+    int out_channels = weight_contig.size(1);
+    int kernel_size = weight_contig.size(2);
+
+    int out_length = (in_length - 1) * stride - 2 * padding + kernel_size + output_padding;
+
+    TORCH_CHECK(weight_contig.size(0) == in_channels, "Weight in_channels mismatch");
+    TORCH_CHECK(bias_contig.numel() == out_channels, "Bias size must match out_channels");
+
+    // Allocate output tensor
+    auto output = torch::empty({batch_size, out_channels, out_length}, input.options());
+
+    // Get current CUDA stream
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    // cuDNN handle
+    cudnnHandle_t cudnn_handle;
+    CHECK_CUDNN(cudnnCreate(&cudnn_handle));
+    CHECK_CUDNN(cudnnSetStream(cudnn_handle, stream));
+
+    // For ConvTranspose1d, cuDNN uses 2D convolution with height=1.
+    cudnnTensorDescriptor_t input_desc, output_desc;
+    cudnnFilterDescriptor_t filter_desc;
+    cudnnConvolutionDescriptor_t conv_desc;
+
+    CHECK_CUDNN(cudnnCreateTensorDescriptor(&input_desc));
+    CHECK_CUDNN(cudnnCreateTensorDescriptor(&output_desc));
+    CHECK_CUDNN(cudnnCreateFilterDescriptor(&filter_desc));
+    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+
+    // Input shape: [batch, in_channels, in_length, 1]
+    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+        input_desc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        batch_size,
+        in_channels,
+        in_length,
+        1
+    ));
+
+    // Output shape: [batch, out_channels, out_length, 1]
+    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+        output_desc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        batch_size,
+        out_channels,
+        out_length,
+        1
+    ));
+
+    // Filter shape: [in_channels, out_channels, kernel_size, 1]
+    CHECK_CUDNN(cudnnSetFilter4dDescriptor(
+        filter_desc,
+        CUDNN_DATA_FLOAT,
+        CUDNN_TENSOR_NCHW,
+        in_channels,
+        out_channels,
+        kernel_size,
+        1
+    ));
+
+    // Convolution descriptor for backward data
+    CHECK_CUDNN(cudnnSetConvolution2dDescriptor(
+        conv_desc,
+        padding,      // padA
+        padding,      // padB
+        stride,       // stride height
+        1,            // stride width
+        1,            // dilation height
+        1,            // dilation width
+        CUDNN_CROSS_CORRELATION,
+        CUDNN_DATA_FLOAT
+    ));
+
+    // Choose algorithm
+    cudnnConvolutionBwdDataAlgo_t algo;
+    CHECK_CUDNN(cudnnGetConvolutionBackwardDataAlgorithm(
+        cudnn_handle,
+        filter_desc,
+        input_desc,
+        conv_desc,
+        output_desc,
+        CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST,
+        0,
+        &algo
+    ));
+
+    // Workspace size
+    size_t workspace_size = 0;
+    CHECK_CUDNN(cudnnGetConvolutionBackwardDataWorkspaceSize(
+        cudnn_handle,
+        filter_desc,
+        input_desc,
+        conv_desc,
+        output_desc,
+        algo,
+        &workspace_size
+    ));
+
+    // Allocate workspace
+    void* workspace = nullptr;
+    if (workspace_size > 0) {
+        cudaMalloc(&workspace, workspace_size);
+    }
+
+    float alpha = 1.0f, beta = 0.0f;
+    CHECK_CUDNN(cudnnConvolutionBackwardData(
+        cudnn_handle,
+        &alpha,
+        filter_desc,
+        weight_contig.data_ptr<float>(),
+        input_desc,
+        input_contig.data_ptr<float>(),
+        conv_desc,
+        algo,
+        workspace,
+        workspace_size,
+        &beta,
+        output_desc,
+        output.data_ptr<float>()
+    ));
+
+    // Add bias if present
+    if (bias.defined()) {
+        cudnnTensorDescriptor_t bias_desc;
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&bias_desc));
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+            bias_desc,
+            CUDNN_TENSOR_NCHW,
+            CUDNN_DATA_FLOAT,
+            1,
+            out_channels,
+            1,
+            1
+        ));
+        float alpha_bias = 1.0f;
+        CHECK_CUDNN(cudnnAddTensor(
+            cudnn_handle,
+            &alpha_bias,
+            bias_desc,
+            bias_contig.data_ptr<float>(),
+            &alpha,
+            output_desc,
+            output.data_ptr<float>()
+        ));
+        CHECK_CUDNN(cudnnDestroyTensorDescriptor(bias_desc));
+    }
+
+    // Cleanup
+    if (workspace) cudaFree(workspace);
+    CHECK_CUDNN(cudnnDestroyTensorDescriptor(input_desc));
+    CHECK_CUDNN(cudnnDestroyTensorDescriptor(output_desc));
+    CHECK_CUDNN(cudnnDestroyFilterDescriptor(filter_desc));
+    CHECK_CUDNN(cudnnDestroyConvolutionDescriptor(conv_desc));
+    CHECK_CUDNN(cudnnDestroy(cudnn_handle));
+
+    return output;
+}
+
+// LayerNorm forward wrapper
+torch::Tensor layer_norm_forward(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    double eps
+) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+    TORCH_CHECK(input.dim() == 3, "Input must be 3D");
+
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    int length = input.size(2);
+
+    TORCH_CHECK(weight.numel() == channels * length, "Weight shape mismatch");
+    TORCH_CHECK(bias.numel() == channels * length, "Bias shape mismatch");
+
+    auto input_contig = input.contiguous();
+    auto weight_contig = weight.contiguous();
+    auto bias_contig = bias.contiguous();
+
+    auto output = torch::empty_like(input_contig);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    layer_norm_launcher(
+        output.data_ptr<float>(),
+        input_contig.data_ptr<float>(),
+        weight_contig.data_ptr<float>(),
+        bias_contig.data_ptr<float>(),
+        batch_size,
+        channels,
+        length,
+        static_cast<float>(eps),
+        stream
+    );
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel error: ", cudaGetErrorString(err));
+
+    return output;
+}
+
+// Addcmul forward wrapper
+torch::Tensor addcmul_forward(
+    torch::Tensor input,
+    torch::Tensor tensor1,
+    torch::Tensor tensor2
+) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(tensor1.is_cuda(), "Tensor1 must be a CUDA tensor");
+    TORCH_CHECK(tensor2.is_cuda(), "Tensor2 must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(tensor1.dtype() == torch::kFloat32, "Tensor1 must be float32");
+    TORCH_CHECK(tensor2.dtype() == torch::kFloat32, "Tensor2 must be float32");
+    TORCH_CHECK(input.sizes() == tensor1.sizes() && input.sizes() == tensor2.sizes(), "All tensors must have the same shape");
+
+    auto input_contig = input.contiguous();
+    auto tensor1_contig = tensor1.contiguous();
+    auto tensor2_contig = tensor2.contiguous();
+
+    auto output = torch::empty_like(input_contig);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    addcmul_launcher(
+        output.data_ptr<float>(),
+        input_contig.data_ptr<float>(),
+        tensor1_contig.data_ptr<float>(),
+        tensor2_contig.data_ptr<float>(),
+        input.numel(),
+        stream
+    );
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel error: ", cudaGetErrorString(err));
+
+    return output;
+}
+
+// Registration
+void register_custom_ops(pybind11::module& m) {
+    m.def("conv_transpose_forward", &conv_transpose_forward,
+          "ConvTranspose1d forward (cuDNN)",
+          py::arg("input"), py::arg("weight"), py::arg("bias"),
+          py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
+    m.def("layer_norm_forward", &layer_norm_forward,
+          "LayerNorm forward",
+          py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("eps"));
+    m.def("addcmul_forward", &addcmul_forward,
+          "Addcmul forward (value=1.0)",
+          py::arg("input"), py::arg("tensor1"), py::arg("tensor2"));
+}
+
+REGISTER_BINDING(custom_ops, register_custom_ops);

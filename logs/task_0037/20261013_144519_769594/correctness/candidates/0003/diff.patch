@@ -1,0 +1,92 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -30,7 +30,7 @@
+ 
+ // -----------------------------------------------------------------------------
+ // Pad kernel: input float32 [N,H,W,C], output [N,H,W+2*pad, C+2*pad]
+-// Pad last two dimensions symmetrically with given value.
++// Pad only W and C dimensions symmetrically with given value, H unchanged.
+ // -----------------------------------------------------------------------------
+ __global__ void pad_kernel(const float* __restrict__ input,
+                            float* __restrict__ output,
+@@ -70,37 +70,42 @@
+ // Softmax kernel along dimension 1 (H dimension)
+ // Input/output: float32 [N, H, W, C]
+ // Each (n, :, w, c) column is normalized.
++// Uses grid-stride loop over columns; each thread processes one or more columns.
+ // -----------------------------------------------------------------------------
+ __global__ void softmax_dim1_kernel(const float* __restrict__ input,
+                                     float* __restrict__ output,
+                                     int N, int H, int W, int C) {
+-    // One block per (n, w, c), threads iterate over H dimension
+-    int64_t col_idx = blockIdx.x;
+     int64_t total_cols = (int64_t)N * W * C;
+-    if (col_idx >= total_cols) return;
++    for (int64_t col_idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++         col_idx < total_cols;
++         col_idx += (int64_t)blockDim.x * gridDim.x) {
+ 
+-    int c = (int)(col_idx % C);
+-    int64_t tmp = col_idx / C;
+-    int w = (int)(tmp % W);
+-    int n = (int)(tmp / W);
++        int c = (int)(col_idx % C);
++        int64_t tmp = col_idx / C;
++        int w = (int)(tmp % W);
++        int n = (int)(tmp / W);
+ 
+-    float max_val = -1e30f;
+-    for (int h = 0; h < H; ++h) {
+-        int64_t idx = (((int64_t)n * H + h) * W + w) * C + c;
+-        float v = input[idx];
+-        if (v > max_val) max_val = v;
+-    }
++        // Find max over H
++        float max_val = -1e30f;
++        for (int h = 0; h < H; ++h) {
++            int64_t idx = (((int64_t)n * H + h) * W + w) * C + c;
++            float v = input[idx];
++            if (v > max_val) max_val = v;
++        }
+ 
+-    float sum_exp = 0.0f;
+-    for (int h = 0; h < H; ++h) {
+-        int64_t idx = (((int64_t)n * H + h) * W + w) * C + c;
+-        sum_exp += __expf(input[idx] - max_val);
+-    }
+-    float inv_sum = 1.0f / sum_exp;
++        // Compute sum of exp
++        float sum_exp = 0.0f;
++        for (int h = 0; h < H; ++h) {
++            int64_t idx = (((int64_t)n * H + h) * W + w) * C + c;
++            sum_exp += __expf(input[idx] - max_val);
++        }
++        float inv_sum = 1.0f / sum_exp;
+ 
+-    for (int h = 0; h < H; ++h) {
+-        int64_t idx = (((int64_t)n * H + h) * W + w) * C + c;
+-        output[idx] = __expf(input[idx] - max_val) * inv_sum;
++        // Write normalized values
++        for (int h = 0; h < H; ++h) {
++            int64_t idx = (((int64_t)n * H + h) * W + w) * C + c;
++            output[idx] = __expf(input[idx] - max_val) * inv_sum;
++        }
+     }
+ }
+ 
+@@ -146,6 +151,15 @@
+                                  cudaStream_t stream) {
+     int64_t total_cols = (int64_t)N * W * C;
+     int threads = 256;
++    // Calculate number of blocks needed to cover all columns with grid-stride loop.
++    // Each thread handles one column initially, so we can use a large grid.
++    // To keep block count reasonable, compute blocks as ceil(total_cols / threads),
++    // but the kernel will loop if gridDim.x*blockDim.x < total_cols.
+     int64_t blocks = (total_cols + threads - 1) / threads;
++    if (blocks > 65535) {
++        // Grid dimension limit for x is 2^31-1, but we cap to avoid huge launch;
++        // grid-stride loop handles remaining columns.
++        blocks = 65535;
++    }
+     softmax_dim1_kernel<<<(int)blocks, threads, 0, stream>>>(input, output, N, H, W, C);
+ }

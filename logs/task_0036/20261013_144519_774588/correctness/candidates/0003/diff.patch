@@ -1,0 +1,299 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -89,157 +89,6 @@
+ // STFT with cuFFT, center=True, reflect padding, Hann window, onesided output.
+ // Input: [B, N] float32, output: [B, F, T] complex64 (interleaved float2).
+ // F = n_fft/2 + 1, T = 1 + floor(N / hop_length).
+-// -----------------------------------------------------------------------------
+-extern "C" cudaError_t stft_forward_launcher(const float* x,
+-                                            int B,
+-                                            int N,
+-                                            int n_fft,
+-                                            int hop_length,
+-                                            int win_length,
+-                                            cufftComplex* out,
+-                                            cudaStream_t stream) {
+-    if (B == 0 || N == 0) return cudaSuccess;
+-    const int F = n_fft / 2 + 1;
+-    const int T = 1 + N / hop_length;
+-    const int L = n_fft;
+-
+-    cufftHandle plan;
+-    cufftResult result = cufftCreate(&plan);
+-    if (result != CUFFT_SUCCESS) return cudaErrorUnknown;
+-    result = cufftSetStream(plan, stream);
+-    if (result != CUFFT_SUCCESS) { cufftDestroy(plan); return cudaErrorUnknown; }
+-    // We will perform C2C transforms of size n_fft for each frame.
+-    result = cufftPlan1d(&plan, n_fft, CUFFT_C2C, B * T);
+-    if (result != CUFFT_SUCCESS) { cufftDestroy(plan); return cudaErrorUnknown; }
+-
+-    // Allocate workspace for windowed frames: complex input to C2C.
+-    cufftComplex* d_frames;
+-    cudaError_t err = cudaMallocAsync(&d_frames, (size_t)B * T * L * sizeof(cufftComplex), stream);
+-    if (err != cudaSuccess) { cufftDestroy(plan); return err; }
+-
+-    // We need a Hann window of length win_length, centered, with zeros padding to n_fft.
+-    // For simplicity, we compute the window on CPU and copy to device in a small buffer.
+-    // This is a one-time per-call setup (could be cached, but bound by launcher simplicity).
+-    float* h_window = new float[n_fft]();
+-    int left = (n_fft - win_length) / 2;
+-    for (int i = 0; i < win_length; ++i) {
+-        h_window[left + i] = 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (win_length - 1)));
+-    }
+-    float* d_window;
+-    err = cudaMallocAsync(&d_window, n_fft * sizeof(float), stream);
+-    if (err != cudaSuccess) { delete[] h_window; cudaFreeAsync(d_frames, stream); cufftDestroy(plan); return err; }
+-    err = cudaMemcpyAsync(d_window, h_window, n_fft * sizeof(float), cudaMemcpyHostToDevice, stream);
+-    if (err != cudaSuccess) {
+-        delete[] h_window;
+-        cudaFreeAsync(d_window, stream);
+-        cudaFreeAsync(d_frames, stream);
+-        cufftDestroy(plan);
+-        return err;
+-    }
+-    delete[] h_window;
+-
+-    // Kernel to build frames: for each (b,t), extract a windowed segment with reflection padding.
+-    // We launch a 2D grid: blockIdx.x for t, blockIdx.y for b.
+-    {
+-        dim3 block(256);
+-        dim3 grid(T, B);
+-        // Shared memory not needed; each thread handles one element of one frame.
+-        auto build_frames = [] __device__ (int b, int t, const float* x, int N, int n_fft,
+-                                          int hop_length, int win_length, const float* window,
+-                                          cufftComplex* frames) {
+-            int L = n_fft;
+-            int start = t * hop_length - n_fft / 2;
+-            for (int i = threadIdx.x; i < L; i += blockDim.x) {
+-                int src_idx = b * N + start + i;
+-                float val = 0.0f;
+-                bool valid = (start + i >= 0) && (start + i < N);
+-                if (!valid) {
+-                    // reflect padding
+-                    int idx = start + i;
+-                    if (idx < 0) idx = -idx - 1;
+-                    else if (idx >= N) idx = 2 * N - 1 - idx;
+-                    if (idx >= 0 && idx < N) {
+-                        idx = b * N + idx;
+-                        val = x[idx];
+-                    }
+-                } else {
+-                    val = x[src_idx];
+-                }
+-                frames[(b * T + t) * L + i].x = val * window[i];
+-                frames[(b * T + t) * L + i].y = 0.0f;
+-            }
+-        };
+-        // We can't use lambdas with __device__ in a kernel easily; create a proper kernel.
+-        // Define a separate kernel below.
+-    }
+-
+-    // Define the frame building kernel at file scope.
+-    // For now, we'll define a global function below and call it here.
+-    // (see stft_build_frames_kernel)
+-    // Launch the kernel:
+-    extern __global__ void stft_build_frames_kernel(const float* __restrict__ x,
+-                                                   int B,
+-                                                   int N,
+-                                                   int n_fft,
+-                                                   int hop_length,
+-                                                   int win_length,
+-                                                   const float* __restrict__ window,
+-                                                   cufftComplex* __restrict__ frames,
+-                                                   int T);
+-
+-    dim3 blockBuild(256);
+-    dim3 gridBuild(T, B);
+-    stft_build_frames_kernel<<<gridBuild, blockBuild, 0, stream>>>(
+-        x, B, N, n_fft, hop_length, win_length, d_window, d_frames, T);
+-    err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        cudaFreeAsync(d_window, stream);
+-        cudaFreeAsync(d_frames, stream);
+-        cufftDestroy(plan);
+-        return err;
+-    }
+-
+-    // Perform batched C2C FFT.
+-    result = cufftExecC2C(plan, d_frames, d_frames, CUFFT_FORWARD);
+-    if (result != CUFFT_SUCCESS) {
+-        cudaFreeAsync(d_window, stream);
+-        cudaFreeAsync(d_frames, stream);
+-        cufftDestroy(plan);
+-        return cudaErrorUnknown;
+-    }
+-
+-    // Now output only positive frequencies (onesided) into out as interleaved complex.
+-    // Out shape: [B, F, T], with F = n_fft/2 + 1. We need to copy from d_frames.
+-    // d_frames layout: (b*T + t) * L + f for complex index f=0..n_fft-1 (only f=0..F-1 needed).
+-    // We launch a kernel to extract and arrange.
+-    extern __global__ void stft_extract_onesided_kernel(const cufftComplex* __restrict__ frames,
+-                                                        cufftComplex* __restrict__ out,
+-                                                        int B,
+-                                                        int T,
+-                                                        int L,
+-                                                        int F);
+-    dim3 blockExtract(256);
+-    dim3 gridExtract((F * T + blockExtract.x - 1) / blockExtract.x, B);
+-    stft_extract_onesided_kernel<<<gridExtract, blockExtract, 0, stream>>>(
+-        d_frames, out, B, T, L, F);
+-    err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        cudaFreeAsync(d_window, stream);
+-        cudaFreeAsync(d_frames, stream);
+-        cufftDestroy(plan);
+-        return err;
+-    }
+-
+-    // Free temporary buffers and destroy plan.
+-    cudaFreeAsync(d_window, stream);
+-    cudaFreeAsync(d_frames, stream);
+-    cufftDestroy(plan);
+-
+-    return cudaSuccess;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Frame building kernel for STFT.
+ // -----------------------------------------------------------------------------
+ __global__ void stft_build_frames_kernel(const float* __restrict__ x,
+                                          int B,
+@@ -273,9 +122,6 @@
+     }
+ }
+ 
+-// -----------------------------------------------------------------------------
+-// Extraction kernel: copy F positive frequencies for each (b,t) to output.
+-// -----------------------------------------------------------------------------
+ __global__ void stft_extract_onesided_kernel(const cufftComplex* __restrict__ frames,
+                                              cufftComplex* __restrict__ out,
+                                              int B,
+@@ -291,3 +137,95 @@
+     int t = idx / F;
+     out[(b * F + f) * T + t] = frames[(b * T + t) * L + f];
+ }
++
++extern "C" cudaError_t stft_forward_launcher(const float* x,
++                                            int B,
++                                            int N,
++                                            int n_fft,
++                                            int hop_length,
++                                            int win_length,
++                                            cufftComplex* out,
++                                            cudaStream_t stream) {
++    if (B == 0 || N == 0) return cudaSuccess;
++    const int F = n_fft / 2 + 1;
++    const int T = 1 + N / hop_length;
++    const int L = n_fft;
++
++    cufftHandle plan;
++    cufftResult result = cufftCreate(&plan);
++    if (result != CUFFT_SUCCESS) return cudaErrorUnknown;
++    result = cufftSetStream(plan, stream);
++    if (result != CUFFT_SUCCESS) { cufftDestroy(plan); return cudaErrorUnknown; }
++    // We will perform C2C transforms of size n_fft for each frame.
++    result = cufftPlan1d(&plan, n_fft, CUFFT_C2C, B * T);
++    if (result != CUFFT_SUCCESS) { cufftDestroy(plan); return cudaErrorUnknown; }
++
++    // Allocate workspace for windowed frames: complex input to C2C.
++    cufftComplex* d_frames;
++    cudaError_t err = cudaMallocAsync(&d_frames, (size_t)B * T * L * sizeof(cufftComplex), stream);
++    if (err != cudaSuccess) { cufftDestroy(plan); return err; }
++
++    // We need a Hann window of length win_length, centered, with zeros padding to n_fft.
++    // For simplicity, we compute the window on CPU and copy to device in a small buffer.
++    // This is a one-time per-call setup (could be cached, but bound by launcher simplicity).
++    float* h_window = new float[n_fft]();
++    int left = (n_fft - win_length) / 2;
++    for (int i = 0; i < win_length; ++i) {
++        h_window[left + i] = 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (win_length - 1)));
++    }
++    float* d_window;
++    err = cudaMallocAsync(&d_window, n_fft * sizeof(float), stream);
++    if (err != cudaSuccess) { delete[] h_window; cudaFreeAsync(d_frames, stream); cufftDestroy(plan); return err; }
++    err = cudaMemcpyAsync(d_window, h_window, n_fft * sizeof(float), cudaMemcpyHostToDevice, stream);
++    if (err != cudaSuccess) {
++        delete[] h_window;
++        cudaFreeAsync(d_window, stream);
++        cudaFreeAsync(d_frames, stream);
++        cufftDestroy(plan);
++        return err;
++    }
++    delete[] h_window;
++
++    // Launch frame building kernel
++    dim3 blockBuild(256);
++    dim3 gridBuild(T, B);
++    stft_build_frames_kernel<<<gridBuild, blockBuild, 0, stream>>>(
++        x, B, N, n_fft, hop_length, win_length, d_window, d_frames, T);
++    err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        cudaFreeAsync(d_window, stream);
++        cudaFreeAsync(d_frames, stream);
++        cufftDestroy(plan);
++        return err;
++    }
++
++    // Perform batched C2C FFT.
++    result = cufftExecC2C(plan, d_frames, d_frames, CUFFT_FORWARD);
++    if (result != CUFFT_SUCCESS) {
++        cudaFreeAsync(d_window, stream);
++        cudaFreeAsync(d_frames, stream);
++        cufftDestroy(plan);
++        return cudaErrorUnknown;
++    }
++
++    // Now output only positive frequencies (onesided) into out as interleaved complex.
++    // Out shape: [B, F, T], with F = n_fft/2 + 1.
++    dim3 blockExtract(256);
++    dim3 gridExtract((F * T + blockExtract.x - 1) / blockExtract.x, B);
++    stft_extract_onesided_kernel<<<gridExtract, blockExtract, 0, stream>>>(
++        d_frames, out, B, T, L, F);
++    err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        cudaFreeAsync(d_window, stream);
++        cudaFreeAsync(d_frames, stream);
++        cufftDestroy(plan);
++        return err;
++    }
++
++    // Free temporary buffers and destroy plan.
++    cudaFreeAsync(d_window, stream);
++    cudaFreeAsync(d_frames, stream);
++    cufftDestroy(plan);
++
++    return cudaSuccess;
++}--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -3,6 +3,7 @@
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cufft.h>
++#include <c10/util/complex.h>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+@@ -75,7 +76,7 @@
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     cudaError_t err = argmin_launcher(
+         x.data_ptr<float>(),
+-        output.data_ptr<int64_t>(),
++        reinterpret_cast<long long*>(output.data_ptr<int64_t>()),
+         static_cast<int>(N),
+         static_cast<long long>(B),
+         stream
+@@ -100,7 +101,7 @@
+     int64_t F = n_fft / 2 + 1;
+     int64_t T = 1 + N / hop_length;
+ 
+-    auto options = torch::TensorOptions().dtype(torch::kComplex64).device(x.device());
++    auto options = torch::TensorOptions().dtype(torch::kComplexFloat).device(x.device());
+     auto output = torch::empty({B, F, T}, options);
+     if (B == 0 || N == 0) return output;
+ 
+@@ -131,4 +132,4 @@
+           py::arg("x"), py::arg("n_fft") = 1024, py::arg("hop_length") = 256, py::arg("win_length") = 1024);
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);
++REGISTER_BINDING(custom_ops, register_custom_ops);

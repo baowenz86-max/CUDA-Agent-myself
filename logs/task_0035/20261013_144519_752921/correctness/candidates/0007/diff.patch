@@ -1,0 +1,496 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,140 +1,163 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
+ 
+-// Bilinear upsampling kernel, align_corners = false
+-// Input: NCHW float32 tensor, contiguous or with strides given by input strides
+-// Output: NCHW float32 tensor, contiguous
+-// scale_factor: float (can be non-integer)
+-// H_in, W_in: input spatial dims
+-// H_out, W_out: output spatial dims
+-__global__ void bilinear_upsample_kernel(
++// Upsample bilinear2d kernel.
++// Each thread computes one output element.
++// Input can have arbitrary stride; output is assumed contiguous.
++// align_corners is passed as bool.
++__global__ void upsample_bilinear2d_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+     int N, int C, int H_in, int W_in,
+     int H_out, int W_out,
+     float scale_factor,
+-    long long input_stride_n,  // use long long to avoid overflow for large tensors
++    bool align_corners,
++    long long input_stride_n,
+     long long input_stride_c,
+     long long input_stride_h,
+     long long input_stride_w)
+ {
+-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    int total = N * C * H_out * W_out;
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long total = (long long)N * C * H_out * W_out;
++    if (idx >= total) return;
+ 
+-    for (int idx = tid; idx < total; idx += stride) {
+-        // Decompose linear index to n,c,oy,ox
+-        int ox = idx % W_out;
+-        int tmp = idx / W_out;
+-        int oy = tmp % H_out;
+-        tmp /= H_out;
+-        int c = tmp % C;
+-        int n = tmp / C;
++    // Decode output coordinates
++    int w_out = idx % W_out;
++    long long tmp = idx / W_out;
++    int h_out = tmp % H_out;
++    tmp /= H_out;
++    int c = tmp % C;
++    int n = tmp / C;
+ 
+-        // Compute source coordinates (align_corners=False)
+-        float src_x = (ox + 0.5f) / scale_factor - 0.5f;
+-        float src_y = (oy + 0.5f) / scale_factor - 0.5f;
++    // Compute source coordinates
++    float src_h, src_w;
++    if (align_corners) {
++        src_h = (float)h_out * (H_in - 1) / (float)(H_out - 1);
++        src_w = (float)w_out * (W_in - 1) / (float)(W_out - 1);
++    } else {
++        src_h = ((float)h_out + 0.5f) / scale_factor - 0.5f;
++        src_w = ((float)w_out + 0.5f) / scale_factor - 0.5f;
++    }
+ 
+-        // Clamp to valid interpolation range: [-0.5, H_in-1+0.5] or [-0.5, W_in-1+0.5]
+-        src_x = fmaxf(-0.5f, fminf(src_x, W_in - 1 + 0.5f));
+-        src_y = fmaxf(-0.5f, fminf(src_y, H_in - 1 + 0.5f));
++    // Clamp to [0, H_in-1] and [0, W_in-1]
++    src_h = fmaxf(0.0f, fminf(src_h, (float)(H_in - 1)));
++    src_w = fmaxf(0.0f, fminf(src_w, (float)(W_in - 1)));
+ 
+-        // Determine integer and fractional parts
+-        int x1 = (int)floorf(src_x);
+-        int y1 = (int)floorf(src_y);
+-        float x_frac = src_x - x1;
+-        float y_frac = src_y - y1;
++    int h0 = (int)floorf(src_h);
++    int w0 = (int)floorf(src_w);
++    int h1 = min(h0 + 1, H_in - 1);
++    int w1 = min(w0 + 1, W_in - 1);
+ 
+-        // Clamp indices to [0, W_in-1] and [0, H_in-1] for actual reads
+-        int x0 = max(0, x1);
+-        int x2 = min(x1 + 1, W_in - 1);
+-        int y0 = max(0, y1);
+-        int y2 = min(y1 + 1, H_in - 1);
++    float h_lambda = src_h - (float)h0;
++    float w_lambda = src_w - (float)w0;
+ 
+-        // Compute base pointer for this (n,c) plane using input strides
+-        const float* in_nc = input + n * input_stride_n + c * input_stride_c;
++    // Base pointer for this n,c
++    const float* in_base = input + n * input_stride_n + c * input_stride_c;
+ 
+-        // Read four neighbors using input strides for h,w
+-        float p00 = in_nc[y0 * input_stride_h + x0 * input_stride_w];
+-        float p01 = in_nc[y0 * input_stride_h + x2 * input_stride_w];
+-        float p10 = in_nc[y2 * input_stride_h + x0 * input_stride_w];
+-        float p11 = in_nc[y2 * input_stride_h + x2 * input_stride_w];
++    // Read four neighbors
++    float v00 = in_base[h0 * input_stride_h + w0 * input_stride_w];
++    float v01 = in_base[h0 * input_stride_h + w1 * input_stride_w];
++    float v10 = in_base[h1 * input_stride_h + w0 * input_stride_w];
++    float v11 = in_base[h1 * input_stride_h + w1 * input_stride_w];
+ 
+-        // Bilinear interpolation
+-        float value = p00 * (1 - x_frac) * (1 - y_frac) +
+-                      p01 * x_frac * (1 - y_frac) +
+-                      p10 * (1 - x_frac) * y_frac +
+-                      p11 * x_frac * y_frac;
++    // Bilinear interpolation
++    float val = (1.0f - h_lambda) * (1.0f - w_lambda) * v00 +
++                h_lambda * (1.0f - w_lambda) * v10 +
++                (1.0f - h_lambda) * w_lambda * v01 +
++                h_lambda * w_lambda * v11;
+ 
+-        output[idx] = value;
+-    }
++    // Output index is contiguous: ((n*C + c)*H_out + h_out)*W_out + w_out
++    long long out_idx = (((long long)n * C + c) * H_out + h_out) * W_out + w_out;
++    output[out_idx] = val;
+ }
+ 
+-// Logical AND threshold kernel: output bool = (x > 0) && (x < 1)
+-__global__ void logical_and_threshold_kernel(
++// Logical AND kernel for (x > lower) && (x < upper)
++// Input arbitrary stride, output bool contiguous.
++__global__ void logical_and_gt_lt_kernel(
+     const float* __restrict__ input,
+     bool* __restrict__ output,
+-    int total)
++    long long numel,
++    long long input_stride_n,
++    long long input_stride_c,
++    long long input_stride_h,
++    long long input_stride_w,
++    int ndims,
++    long long* input_strides,  // device array of strides (length ndims)
++    long long* input_sizes,    // device array of sizes (length ndims)
++    float lower,
++    float upper)
+ {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
+-    for (int i = idx; i < total; i += stride) {
+-        float val = input[i];
+-        output[i] = (val > 0.0f) && (val < 1.0f);
+-    }
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    if (idx >= numel) return;
++
++    // For 4D only, decode coordinates and use strides directly.
++    // We assume ndims == 4 as per contract.
++    // To be safe, we provide a generic version but assume 4D.
++    int w = idx % input_sizes[3];
++    long long tmp = idx / input_sizes[3];
++    int h = tmp % input_sizes[2];
++    tmp /= input_sizes[2];
++    int c = tmp % input_sizes[1];
++    int n = tmp / input_sizes[1];
++
++    long long offset = n * input_strides[0] + c * input_strides[1] + h * input_strides[2] + w * input_strides[3];
++    float val = input[offset];
++    bool cond = (val > lower) && (val < upper);
++    output[idx] = cond;
+ }
+ 
+-// Launcher for bilinear upsampling
+-// Parameters: input pointer, output pointer, N, C, H_in, W_in, H_out, W_out, scale_factor, strides, stream
+-extern "C" void bilinear_upsample_launcher(
++// Launcher for upsample_bilinear2d
++// Input/output are raw pointers. Strides passed as int64.
++extern "C" void upsample_bilinear2d_launcher(
+     const float* input,
+     float* output,
+     int N, int C, int H_in, int W_in,
+     int H_out, int W_out,
+     float scale_factor,
++    bool align_corners,
+     long long input_stride_n,
+     long long input_stride_c,
+     long long input_stride_h,
+     long long input_stride_w,
+     cudaStream_t stream)
+ {
+-    int total = N * C * H_out * W_out;
+-    if (total == 0) return;
+-
++    long long total = (long long)N * C * H_out * W_out;
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+-    // Cap blocks to reasonable maximum for grid-stride loop
+-    if (blocks > 65535) blocks = 65535;
+-
+-    bilinear_upsample_kernel<<<blocks, threads, 0, stream>>>(
+-        input, output, N, C, H_in, W_in, H_out, W_out, scale_factor,
++    upsample_bilinear2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H_in, W_in, H_out, W_out,
++        scale_factor, align_corners,
+         input_stride_n, input_stride_c, input_stride_h, input_stride_w);
+-
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+-        // In a binding we would throw, here we just ignore or can set a flag.
+-        // But launcher cannot throw; it's up to the binding to check errors,
+-        // but we can perform a quick check to aid debugging.
+-        // We'll leave this as a no-op; the binding should call cudaGetLastError after launch.
++        // Cannot use printf in release, but launcher can ignore or handle later.
++        // We assume binding will check.
+     }
+ }
+ 
+-// Launcher for logical_and_threshold
+-// Parameters: input pointer, output bool pointer, total elements, stream
+-extern "C" void logical_and_threshold_launcher(
++// Launcher for logical_and_gt_lt
++// Input is expected 4D contiguous or with strides provided.
++extern "C" void logical_and_gt_lt_launcher(
+     const float* input,
+     bool* output,
+-    int total,
++    long long numel,
++    long long input_stride_n,
++    long long input_stride_c,
++    long long input_stride_h,
++    long long input_stride_w,
++    float lower,
++    float upper,
+     cudaStream_t stream)
+ {
+-    if (total == 0) return;
+-
+     int threads = 256;
+-    int blocks = (total + threads - 1) / threads;
+-    if (blocks > 65535) blocks = 65535;
+-
+-    logical_and_threshold_kernel<<<blocks, threads, 0, stream>>>(input, output, total);
+-
++    int blocks = (numel + threads - 1) / threads;
++    logical_and_gt_lt_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, numel,
++        input_stride_n, input_stride_c, input_stride_h, input_stride_w,
++        4, nullptr, nullptr,  // not used
++        lower, upper);
+     cudaError_t err = cudaGetLastError();
+-    // Same: no throw, but binding can check after launch
++    if (err != cudaSuccess) {
++        // ignore for now
++    }
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,128 +1,128 @@
+-// Binding for bilinear upsampling and logical_and_threshold
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
+ #include <cuda_runtime.h>
+-#include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+-extern "C" void bilinear_upsample_launcher(
++extern "C" void upsample_bilinear2d_launcher(
+     const float* input,
+     float* output,
+     int N, int C, int H_in, int W_in,
+     int H_out, int W_out,
+     float scale_factor,
++    bool align_corners,
+     long long input_stride_n,
+     long long input_stride_c,
+     long long input_stride_h,
+     long long input_stride_w,
+     cudaStream_t stream);
+ 
+-extern "C" void logical_and_threshold_launcher(
++extern "C" void logical_and_gt_lt_launcher(
+     const float* input,
+     bool* output,
+-    int total,
++    long long numel,
++    long long input_stride_n,
++    long long input_stride_c,
++    long long input_stride_h,
++    long long input_stride_w,
++    float lower,
++    float upper,
+     cudaStream_t stream);
+ 
+-// Wrapper for bilinear upsample
+-static torch::Tensor bilinear_upsample_forward(torch::Tensor x, double scale_factor) {
+-    // Input checks
++// Wrapper for upsample_bilinear2d
++static torch::Tensor custom_upsample_bilinear2d(
++    torch::Tensor x,
++    double scale_factor,
++    bool align_corners) {
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
+-    // Allow non-contiguous; we pass strides to launcher
+-    // But ensure it is contiguous for best performance? The launcher supports strides, so allow non-contiguous.
+-    // However, our kernel uses input_stride_* which should be valid.
+-    // For safety, we may require contiguous? PyTorch upsample accepts non-contiguous as well,
+-    // but our launcher supports strides. We'll allow non-contiguous by using strides.
+-    auto sizes = x.sizes();
+-    int N = sizes[0];
+-    int C = sizes[1];
+-    int H_in = sizes[2];
+-    int W_in = sizes[3];
+-    if (H_in == 0 || W_in == 0) {
+-        // If input spatial dims are zero, output also zero in those dims.
+-        int H_out = static_cast<int>(std::floor(H_in * scale_factor));
+-        int W_out = static_cast<int>(std::floor(W_in * scale_factor));
+-        auto output = torch::empty({N, C, H_out, W_out}, x.options());
+-        return output;
+-    }
+-    // Compute output spatial dims: floor(H_in * scale_factor), floor(W_in * scale_factor)
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H_in = x.size(2);
++    int W_in = x.size(3);
++
++    // Compute output dimensions: floor(H_in * scale_factor), floor(W_in * scale_factor)
+     int H_out = static_cast<int>(std::floor(H_in * scale_factor));
+     int W_out = static_cast<int>(std::floor(W_in * scale_factor));
+-    TORCH_CHECK(H_out > 0 && W_out > 0, "Output spatial dimensions must be positive");
+ 
+-    // Allocate output tensor (contiguous)
++    // Output is contiguous, same dtype/device
+     auto output = torch::empty({N, C, H_out, W_out}, x.options());
+ 
+-    // Get contiguous version of input if not already, but we can use original strides.
+-    // The launcher expects input pointer and strides. We'll make x contiguous to simplify? 
+-    // But that would copy data and lose performance. Since the input from model_new is typical contiguous,
+-    // we can check contiguity and use original if contiguous, else make contiguous.
+-    // For best performance, we assume input contiguous as produced by previous ops.
+-    // If not contiguous, we can make it contiguous inside (no error).
+-    torch::Tensor input_contig = x.is_contiguous() ? x : x.contiguous();
+-
++    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Get strides of continuous input
+-    long long stride_n = input_contig.stride(0);
+-    long long stride_c = input_contig.stride(1);
+-    long long stride_h = input_contig.stride(2);
+-    long long stride_w = input_contig.stride(3);
++    // Pass input strides as long long (they are positive for any layout)
++    long long input_stride_n = x.stride(0);
++    long long input_stride_c = x.stride(1);
++    long long input_stride_h = x.stride(2);
++    long long input_stride_w = x.stride(3);
+ 
+-    bilinear_upsample_launcher(
+-        input_contig.data_ptr<float>(),
++    upsample_bilinear2d_launcher(
++        x.data_ptr<float>(),
+         output.data_ptr<float>(),
+         N, C, H_in, W_in,
+         H_out, W_out,
+         static_cast<float>(scale_factor),
+-        stride_n, stride_c, stride_h, stride_w,
+-        stream
+-    );
++        align_corners,
++        input_stride_n, input_stride_c, input_stride_h, input_stride_w,
++        stream);
+ 
++    // Check for kernel launch errors
+     cudaError_t err = cudaGetLastError();
+-    TORCH_CHECK(err == cudaSuccess, "CUDA error in bilinear_upsample: ", cudaGetErrorString(err));
++    TORCH_CHECK(err == cudaSuccess, "upsample_bilinear2d kernel launch failed: ", cudaGetErrorString(err));
+ 
+     return output;
+ }
+ 
+-// Wrapper for logical_and_threshold
+-static torch::Tensor logical_and_threshold_forward(torch::Tensor x) {
+-    // Input checks
++// Wrapper for logical_and_gt_lt
++static torch::Tensor custom_logical_and_gt_lt(
++    torch::Tensor x,
++    double lower,
++    double upper) {
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+-    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D as per current contract");
+ 
+     auto output = torch::empty(x.sizes(), x.options().dtype(torch::kBool));
+-    int total = x.numel();
+-
+-    // Ensure input is contiguous; kernel reads linearly
+-    torch::Tensor input_contig = x.is_contiguous() ? x : x.contiguous();
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    logical_and_threshold_launcher(
+-        input_contig.data_ptr<float>(),
++    long long numel = x.numel();
++    long long input_stride_n = x.stride(0);
++    long long input_stride_c = x.stride(1);
++    long long input_stride_h = x.stride(2);
++    long long input_stride_w = x.stride(3);
++
++    logical_and_gt_lt_launcher(
++        x.data_ptr<float>(),
+         output.data_ptr<bool>(),
+-        total,
+-        stream
+-    );
++        numel,
++        input_stride_n, input_stride_c, input_stride_h, input_stride_w,
++        static_cast<float>(lower),
++        static_cast<float>(upper),
++        stream);
+ 
+     cudaError_t err = cudaGetLastError();
+-    TORCH_CHECK(err == cudaSuccess, "CUDA error in logical_and_threshold: ", cudaGetErrorString(err));
++    TORCH_CHECK(err == cudaSuccess, "logical_and_gt_lt kernel launch failed: ", cudaGetErrorString(err));
+ 
+     return output;
+ }
+ 
+-// Register bindings
+-void register_custom_ops(pybind11::module& m) {
+-    m.def("bilinear_upsample", &bilinear_upsample_forward,
+-          "Bilinear upsampling (align_corners=False)",
+-          pybind11::arg("x"), pybind11::arg("scale_factor"));
+-    m.def("logical_and_threshold", &logical_and_threshold_forward,
+-          "Elementwise logical AND of (x > 0) and (x < 1)",
+-          pybind11::arg("x"));
++// Registration function
++static void register_custom_ops(pybind11::module& m) {
++    m.def("custom_upsample_bilinear2d", &custom_upsample_bilinear2d,
++          "Upsample bilinear2d custom op",
++          pybind11::arg("x"),
++          pybind11::arg("scale_factor"),
++          pybind11::arg("align_corners"));
++    m.def("custom_logical_and_gt_lt", &custom_logical_and_gt_lt,
++          "Logical AND of x > lower and x < upper",
++          pybind11::arg("x"),
++          pybind11::arg("lower"),
++          pybind11::arg("upper"));
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);+REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -1,27 +1,28 @@
+ import torch
+ import torch.nn as nn
+ import cuda_extension
+-
+ 
+ class ModelNew(nn.Module):
+     def __init__(self, parameter_dict_size, scale_factor, mode, upsample_kernel_size, upsample_padding):
+         super().__init__()
+         self.parameter_dict = nn.ParameterDict(parameter_dict_size)
++        # Store other arguments to match reference attributes
++        self.upsample_kernel_size = upsample_kernel_size
++        self.upsample_padding = upsample_padding
++        # Note: scale_factor and mode are not stored as attributes in reference, but might be needed;
++        # we keep them as instance variables without nn.Module to avoid state_dict changes.
+         self.scale_factor = scale_factor
+         self.mode = mode
+-        self.upsample_kernel_size = upsample_kernel_size
+-        self.upsample_padding = upsample_padding
+-        # Keep upsample module for state_dict compatibility, but do not call it
+-        self.upsample = nn.Upsample(scale_factor=scale_factor, mode=mode)
+ 
+     def forward(self, x):
+-        upsampled = cuda_extension.bilinear_upsample(x, self.scale_factor)
+-        out = cuda_extension.logical_and_threshold(upsampled)
+-        return out
++        x = cuda_extension.custom_upsample_bilinear2d(x, self.scale_factor, False)
++        x = cuda_extension.custom_logical_and_gt_lt(x, 0.0, 1.0)
++        return x
+ 
+     def debug_forward(self, x):
+-        upsampled = cuda_extension.bilinear_upsample(x, self.scale_factor)
+-        yield 'step_001', upsampled
+-        out = cuda_extension.logical_and_threshold(upsampled)
+-        yield 'step_002', out
+-        yield 'step_003', out
++        x = cuda_extension.custom_upsample_bilinear2d(x, self.scale_factor, False)
++        yield 'step_001', x
++        x = cuda_extension.custom_logical_and_gt_lt(x, 0.0, 1.0)
++        yield 'step_002', x
++        yield 'step_003', x
++        return x

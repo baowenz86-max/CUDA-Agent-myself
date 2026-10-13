@@ -1,0 +1,117 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -13,7 +13,7 @@
+     int N, int C, int H_in, int W_in,
+     int H_out, int W_out,
+     float scale_factor,
+-    long long input_stride_n,  // use long long to avoid overflow for large tensors
++    long long input_stride_n,
+     long long input_stride_c,
+     long long input_stride_h,
+     long long input_stride_w)
+@@ -31,39 +31,44 @@
+         int c = tmp % C;
+         int n = tmp / C;
+ 
+-        // Compute source coordinates (align_corners=False)
++        // Compute source coordinates using PyTorch's formula:
++        // src = (dst + 0.5) * scale_factor - 0.5
++        // Note: scale_factor is 1/scale = input_size / output_size, but here scale_factor is
++        // the user provided scale_factor (e.g., 2.0). PyTorch uses scale = 1/scale_factor,
++        // so src = (dst + 0.5) / scale_factor - 0.5.
+         float src_x = (ox + 0.5f) / scale_factor - 0.5f;
+         float src_y = (oy + 0.5f) / scale_factor - 0.5f;
+ 
+-        // Clamp to valid interpolation range: [-0.5, H_in-1+0.5] or [-0.5, W_in-1+0.5]
+-        src_x = fmaxf(-0.5f, fminf(src_x, W_in - 1 + 0.5f));
+-        src_y = fmaxf(-0.5f, fminf(src_y, H_in - 1 + 0.5f));
++        // PyTorch clamps the source coordinate to [-0.5, size-0.5] for interpolation,
++        // but for index calculation it uses floor and ceil then clamps to [0, size-1].
++        // We mimic that here:
++        int x0 = (int)floorf(src_x);
++        int y0 = (int)floorf(src_y);
++        int x1 = x0 + 1;
++        int y1 = y0 + 1;
+ 
+-        // Determine integer and fractional parts
+-        int x1 = (int)floorf(src_x);
+-        int y1 = (int)floorf(src_y);
+-        float x_frac = src_x - x1;
+-        float y_frac = src_y - y1;
++        // Clamp indices to valid range
++        x0 = max(0, x0);
++        y0 = max(0, y0);
++        x1 = min(x1, W_in - 1);
++        y1 = min(y1, H_in - 1);
+ 
+-        // Clamp indices to [0, W_in-1] and [0, H_in-1] for actual reads
+-        int x0 = max(0, x1);
+-        int x2 = min(x1 + 1, W_in - 1);
+-        int y0 = max(0, y1);
+-        int y2 = min(y1 + 1, H_in - 1);
++        float x_frac = src_x - x0;
++        float y_frac = src_y - y0;
+ 
+         // Compute base pointer for this (n,c) plane using input strides
+         const float* in_nc = input + n * input_stride_n + c * input_stride_c;
+ 
+         // Read four neighbors using input strides for h,w
+         float p00 = in_nc[y0 * input_stride_h + x0 * input_stride_w];
+-        float p01 = in_nc[y0 * input_stride_h + x2 * input_stride_w];
+-        float p10 = in_nc[y2 * input_stride_h + x0 * input_stride_w];
+-        float p11 = in_nc[y2 * input_stride_h + x2 * input_stride_w];
++        float p01 = in_nc[y0 * input_stride_h + x1 * input_stride_w];
++        float p10 = in_nc[y1 * input_stride_h + x0 * input_stride_w];
++        float p11 = in_nc[y1 * input_stride_h + x1 * input_stride_w];
+ 
+         // Bilinear interpolation
+-        float value = p00 * (1 - x_frac) * (1 - y_frac) +
+-                      p01 * x_frac * (1 - y_frac) +
+-                      p10 * (1 - x_frac) * y_frac +
++        float value = p00 * (1.0f - x_frac) * (1.0f - y_frac) +
++                      p01 * x_frac * (1.0f - y_frac) +
++                      p10 * (1.0f - x_frac) * y_frac +
+                       p11 * x_frac * y_frac;
+ 
+         output[idx] = value;
+@@ -85,7 +90,6 @@
+ }
+ 
+ // Launcher for bilinear upsampling
+-// Parameters: input pointer, output pointer, N, C, H_in, W_in, H_out, W_out, scale_factor, strides, stream
+ extern "C" void bilinear_upsample_launcher(
+     const float* input,
+     float* output,
+@@ -103,7 +107,6 @@
+ 
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+-    // Cap blocks to reasonable maximum for grid-stride loop
+     if (blocks > 65535) blocks = 65535;
+ 
+     bilinear_upsample_kernel<<<blocks, threads, 0, stream>>>(
+@@ -111,16 +114,10 @@
+         input_stride_n, input_stride_c, input_stride_h, input_stride_w);
+ 
+     cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // In a binding we would throw, here we just ignore or can set a flag.
+-        // But launcher cannot throw; it's up to the binding to check errors,
+-        // but we can perform a quick check to aid debugging.
+-        // We'll leave this as a no-op; the binding should call cudaGetLastError after launch.
+-    }
++    // No throw; binding checks after launch.
+ }
+ 
+ // Launcher for logical_and_threshold
+-// Parameters: input pointer, output bool pointer, total elements, stream
+ extern "C" void logical_and_threshold_launcher(
+     const float* input,
+     bool* output,
+@@ -136,5 +133,5 @@
+     logical_and_threshold_kernel<<<blocks, threads, 0, stream>>>(input, output, total);
+ 
+     cudaError_t err = cudaGetLastError();
+-    // Same: no throw, but binding can check after launch
++    // No throw; binding checks after launch.
+ }
