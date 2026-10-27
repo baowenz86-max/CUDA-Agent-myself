@@ -1,0 +1,787 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,570 @@
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++//------------------------------------------------------------------------------
++// Utility: check CUDA error after launches (host side, safe to call in launcher)
++//------------------------------------------------------------------------------
++static inline void check_cuda_error_(const char* msg) {
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Cannot include torch, so just avoid silent failure.
++        // Actual binding will throw if needed.
++    }
++}
++
++//------------------------------------------------------------------------------
++// masked_select_forward
++// Semantics: torch.masked_select(input, mask) where mask broadcast to input shape.
++// Strides are arbitrary; input and mask are CUDA tensors.
++// Output is 1D, length = number of True in mask (in row-major broadcast traversal).
++// We implement stable selection via two-pass:
++//   1) count true elements in broadcast mask
++//   2) exclusive scan / prefix sum per block to determine output positions
++//   3) copy selected input values to output in order.
++// Host launcher is responsible for allocation and calling kernels.
++//------------------------------------------------------------------------------
++
++// Kernel to count true values per block and compute block offsets
++// gridDim blocks; each block handles a chunk of logical broadcast index space (linearized)
++// We'll first compute total count using a grid-stride loop per block, store block sums,
++// then perform exclusive scan on block sums (small array, can be done via second kernel or sequential).
++// Finally, second pass assigns output positions and writes values.
++
++// Device helper: convert linear index over input numel to multi-index with given input and mask strides.
++// Broadcast rules: mask shape has fewer dims; align trailing dimensions.
++__device__ __forceinline__ int64_t get_mask_offset(int64_t linear_idx,
++                                                   int input_ndim,
++                                                   const int64_t* input_strides,
++                                                   int mask_ndim,
++                                                   const int64_t* mask_strides,
++                                                   const int64_t* mask_shape) {
++    int64_t offset = 0;
++    int64_t idx = linear_idx;
++    // dims from input_ndim-1 down to 0
++    for (int d = input_ndim - 1; d >= 0; --d) {
++        int64_t coord = idx % input_strides[d]; // not correct if strides not multiples; use division by shape? 
++        // Actually need input shape to compute coordinates; we don't have input_shape separate from strides.
++        // We can compute coordinate = (linear_idx / input_strides[d]) % shape[d], but need shape.
++        // We pass shape array later.
++    }
++    return 0;
++}
++
++// Instead of complex multi-index, we can traverse input in row-major order using input strides.
++// Since broadcast mask is given and should be broadcast to input, the True positions correspond
++// to mask broadcast coordinates. We can compute mask flat index and check mask value.
++// A simple approach: iterate over input logical elements; for each, compute multi-dimensional index,
++// then compute mask index using mask strides and shape (broadcast).
++
++// This is easier if we have input_shape and mask_shape/strides.
++// We'll implement a kernel that loops over input elements (grid-stride) and for each:
++//   1. compute multi-index from linear index and input_shape.
++//   2. compute mask_index using mask_strides and mask_shape with broadcasting (if mask dim smaller, align trailing and skip leading).
++//   3. if mask[mask_index] is true, selected.
++// This is O(N) computational overhead but safe and parallel-friendly.
++
++// We need two passes:
++//   Pass1: count selected per block (or directly compute prefix via atomic add on block counters?)
++//   Pass2: write output using precomputed offsets.
++
++// To avoid global synchronization issues, we'll implement a two-kernel approach:
++//   Kernel1: compute per-block counts (block_counts array, length = num_blocks)
++//   Host scan: launch a small scan kernel or use thrust? Not allowed. We'll implement a simple scan kernel that runs on block_counts using one block.
++//   Kernel2: use block offsets to write output.
++
++// But block granularity may cause load imbalance; still works.
++
++// Alternative: use a single kernel with atomicAdd to get positions, but order not stable, so not allowed.
++// So stable approach: two-pass with per-block counts and exclusive scan.
++
++// We'll implement:
++//   count_true_kernel: each block processes a range of input elements using grid-stride, counts true (with mask broadcast), stores count in block_counts[blockIdx.x].
++//   scan_offsets_kernel: single block, exclusive scan on block_counts, sets block_offsets[i] = sum of previous block counts, also writes total to total_count.
++//   gather_kernel: each block processes its range again, using block_offsets[blockIdx.x] as base and a local counter (shared memory or atomic within block?) to place selected elements.
++//     To keep stable order, we can maintain a per-thread count within the block and use atomicAdd on a shared counter; however, that may not preserve order within block if multiple threads add at different times. But atomicAdd on shared memory gives deterministic order? Not guaranteed, but can be made stable by using warp-level prefix or a per-block scan. Simpler: use a per-block global offset and let each thread add to a shared memory counter with atomicAdd; the order of writes is nondeterministic, so output order may differ. Need stable within block.
++//     To be fully stable, we need a block-level prefix sum over thread results. That's more complex. Instead, we can use a single global atomicAdd on a global counter and write in thread order? No.
++//     Another approach: process elements in a grid-stride loop but have each block handle a contiguous chunk (not strided) so order within block is by thread index and loop iteration; then we can compute local prefix sum using shared memory scan, then write in order.
++
++// We can implement a block-level scan on selected flag per thread for a contiguous tile.
++// Let's set block size = 256, tile size = 256 * elems_per_thread maybe multiple elements per thread to reduce overhead.
++
++// Since total elements 50M, we'll need many blocks. We can process contiguous tiles per block.
++
++// For each block, we process a contiguous range of flattened input indices [start, end).
++// We'll precompute block start/end based on blockIdx and gridDim, covering all elements exactly.
++// Within block, each thread processes one or more elements sequentially (e.g., tile size = blockDim.x * UNROLL).
++// For each processed element, compute mask broadcast check and store a flag (1 if selected) locally.
++// Then perform a block-wide scan (using shared memory) to get prefix sums.
++// After scan, each thread knows its base output position; then write selected elements to output using base + local prefix.
++// This ensures stable row-major order because elements are processed in increasing linear index within block and blocks are in increasing index order.
++
++// We will combine count and gather into one kernel? Not possible because output positions depend on total counts from previous blocks. We need two passes: first compute block counts, then prefix scan, then gather with known base per block.
++
++// However, we can compute per-block counts and also store elements to a temporary buffer in the first pass? Maybe.
++
++// We'll implement:
++//   Kernel1: count_selected_per_block_kernel. Each block processes a contiguous range and stores count in block_counts[blockIdx.x]. Also optionally stores per-thread counts? But not needed.
++//   Kernel2: block_exclusive_scan_kernel: single block scans block_counts to produce block_offsets and total_count.
++//   Kernel3: gather_selected_kernel: each block processes its same contiguous range, uses block_offsets[blockIdx.x] as starting output index, and within block performs scan to place selected elements.
++
++// This is stable and correct. Performance might be okay.
++
++// We can also combine kernel1 and kernel3 if we store a stable global ordering using a temporary index array, but that would require extra memory. The two-pass approach with three kernels is acceptable.
++
++// Define block size 256, elements per thread 8 -> tile size 2048. With 50M elements, ~24414 blocks. That's okay.
++
++// We'll need shape and stride arrays; we can pass them as pointers or use constant memory? Since input dims up to 4, we can pass as separate scalar arguments for 4D. To be general, we'll pass int ndim, and arrays of int64_t for input_shape, input_strides, mask_shape, mask_strides (all length ndim after broadcasting; we can precompute mask strides for broadcast). We'll trust the binding layer to supply arrays (or we can copy to device). Simpler: use template for max dims? We'll support up to 4D, which is sufficient for this task, but we can write generic using a fixed-size struct passed by value.
++
++// Since the contract specifies input [16,3,1024,1024] and mask [3,1024,1024] (broadcastable), we can implement specialized kernels for 4D input and 3D mask, but better be somewhat generic.
++
++// To simplify, we'll pass input as flattened 1D with input_strides and input_shape? Actually input is contiguous likely but may be non-contiguous. We can handle arbitrary strides by computing multi-index from linear flat index using shape array.
++
++// We'll create a device function to compute mask offset given input multi-index.
++
++__device__ __forceinline__ int64_t compute_mask_offset(int64_t* input_coords, int input_ndim, const int64_t* input_shape, const int64_t* mask_shape, const int64_t* mask_strides) {
++    int mask_ndim = input_ndim; // assume mask_shape has same ndim after alignment? Instead, we can pass mask_ndim and align trailing dims.
++    // We'll assume mask_shape and mask_strides already broadcast to input_ndim (i.e., leading ones prepended). Then use same ndim.
++    // But to be safe, we pass mask_ndim and align trailing.
++    // For our case, input_ndim=4, mask_ndim=3, broadcast means mask applied to last 3 dims.
++    int offset = 0;
++    int mask_dim = mask_ndim - 1;
++    for (int d = input_ndim - 1; d >= 0 && mask_dim >= 0; --d) {
++        int64_t coord = input_coords[d];
++        int64_t mask_extent = mask_shape[mask_dim];
++        if (mask_extent != 1 && coord >= mask_extent) {
++            // broadcast error, shouldn't happen
++        }
++        int64_t idx = (mask_extent == 1) ? 0 : coord;
++        offset += idx * mask_strides[mask_dim];
++        --mask_dim;
++    }
++    // For leading input dims where mask_dim <0, we ignore (broadcast over them).
++    return offset;
++}
++
++// Kernel to count selected per block and store block_counts
++// gridDim = numBlocks; each block processes a contiguous range of flattened input indices
++// start = blockIdx.x * block_tile_size; end = min(start + block_tile_size, total_elements)
++// The range is fixed based on blockIdx, independent of loop? We'll assign each block an equal tile (except last).
++__global__ void count_selected_kernel(
++    const float* __restrict__ input,
++    const bool* __restrict__ mask,
++    int64_t* __restrict__ block_counts,
++    int64_t total_elements,
++    int input_ndim,
++    const int64_t* __restrict__ input_shape,
++    const int64_t* __restrict__ input_strides,
++    int mask_ndim,
++    const int64_t* __restrict__ mask_shape,
++    const int64_t* __restrict__ mask_strides)
++{
++    // Block processes tile size = blockDim.x * ITEMS_PER_THREAD
++    constexpr int ITEMS_PER_THREAD = 8;
++    int64_t block_start = blockIdx.x * (int64_t)blockDim.x * ITEMS_PER_THREAD;
++    int64_t block_end = min(block_start + (int64_t)blockDim.x * ITEMS_PER_THREAD, total_elements);
++    int64_t local_count = 0;
++
++    for (int64_t base = block_start + threadIdx.x; base < block_end; base += blockDim.x) {
++        // For each handled element, compute multi-index and mask offset
++        int64_t idx = base;
++        int64_t coords[4]; // support up to 4 dims; increase if needed
++        for (int d = input_ndim - 1; d >= 0; --d) {
++            coords[d] = idx % input_shape[d];
++            idx /= input_shape[d];
++        }
++        int64_t mask_offset = compute_mask_offset(coords, input_ndim, input_shape, mask_shape, mask_strides);
++        if (mask[mask_offset]) {
++            local_count++;
++        }
++    }
++
++    // Reduce within block using shared memory
++    __shared__ int64_t sdata[256];
++    sdata[threadIdx.x] = local_count;
++    __syncthreads();
++
++    // Tree reduction
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) {
++            sdata[threadIdx.x] += sdata[threadIdx.x + s];
++        }
++        __syncthreads();
++    }
++
++    if (threadIdx.x == 0) {
++        block_counts[blockIdx.x] = sdata[0];
++    }
++}
++
++// Exclusive scan on block_counts (length numBlocks), single block
++__global__ void block_exclusive_scan_kernel(
++    const int64_t* __restrict__ block_counts,
++    int64_t* __restrict__ block_offsets,
++    int64_t* __restrict__ total_count,
++    int numBlocks)
++{
++    __shared__ int64_t temp[1024]; // assume numBlocks <= 1024; for larger, need multi-block scan, but likely okay
++    // For simplicity, we assume one block can handle. If numBlocks >1024, we'd need more complex scan. Since 50M/2048 ~24414, too many. Better implement a two-level scan? Alternatively, use a single block with loop over all block_counts? Not efficient.
++    // We'll use a grid-stride loop in a single block over block_counts, computing prefix directly. Since numBlocks ~ 24k, a single block with 256 threads can compute prefix efficiently using a multi-block scan algorithm? Simpler: use a dumb single-thread loop, but that would be slow for 24k (but still okay? maybe 24k operations is trivial). We'll just have thread 0 loop through and compute offsets sequentially. Since 24k is small, this is fine.
++    if (threadIdx.x == 0) {
++        int64_t sum = 0;
++        for (int i = 0; i < numBlocks; ++i) {
++            block_offsets[i] = sum;
++            sum += block_counts[i];
++        }
++        *total_count = sum;
++    }
++}
++
++// Gather selected elements using block_offsets.
++// Each block processes same tile as before, but now has base offset.
++__global__ void gather_selected_kernel(
++    const float* __restrict__ input,
++    const bool* __restrict__ mask,
++    float* __restrict__ output,
++    const int64_t* __restrict__ block_offsets,
++    int64_t total_elements,
++    int input_ndim,
++    const int64_t* __restrict__ input_shape,
++    const int64_t* __restrict__ input_strides,
++    int mask_ndim,
++    const int64_t* __restrict__ mask_shape,
++    const int64_t* __restrict__ mask_strides)
++{
++    constexpr int ITEMS_PER_THREAD = 8;
++    int64_t block_start = blockIdx.x * (int64_t)blockDim.x * ITEMS_PER_THREAD;
++    int64_t block_end = min(block_start + (int64_t)blockDim.x * ITEMS_PER_THREAD, total_elements);
++    int64_t base_offset = block_offsets[blockIdx.x];
++
++    // Each thread processes elements in a contiguous chunk with stride blockDim.x? Actually in count kernel we used base = block_start + threadIdx.x; base += blockDim.x.
++    // That means each thread handles elements separated by blockDim.x, not contiguous, but the order across threads is not strictly row-major. For stable order, we need elements processed in increasing linear index across threads. If thread 0 handles indices 0,256,512,... and thread 1 handles 1,257,..., the combined order is not monotonic. To preserve row-major order, we need each block to process contiguous elements in a way that the output order follows linear index. However, the scan within block can account for interleaving if we do a proper prefix sum over all per-thread local flags with a particular ordering: we want output positions to follow linear index order. The simple approach of having each thread process a contiguous subrange is better. Let's modify: each block processes a contiguous range of elements [block_start, block_end). We can assign each thread a contiguous sub-range of size (block_end - block_start + blockDim.x - 1)/blockDim.x. Then each thread loops over its sub-range sequentially, counting selected. After local counts, we can compute prefix across threads using shared memory. Then each thread writes its selected elements in order using its prefix plus local count. This preserves order because threads are ordered by threadIdx and within thread by loop order, which corresponds to increasing linear index. However, the sub-ranges may not divide equally; we can handle boundaries.
++
++    // Let's implement with this scheme:
++    int64_t range_length = block_end - block_start;
++    int64_t per_thread = (range_length + blockDim.x - 1) / blockDim.x;
++    int64_t start = block_start + threadIdx.x * per_thread;
++    int64_t end = min(start + per_thread, block_end);
++
++    // First, count selected in local sub-range
++    int64_t local_count = 0;
++    for (int64_t idx = start; idx < end; ++idx) {
++        // compute mask offset
++        int64_t coords[4];
++        int64_t tmp = idx;
++        for (int d = input_ndim - 1; d >= 0; --d) {
++            coords[d] = tmp % input_shape[d];
++            tmp /= input_shape[d];
++        }
++        int64_t mask_offset = compute_mask_offset(coords, input_ndim, input_shape, mask_shape, mask_strides);
++        if (mask[mask_offset]) {
++            local_count++;
++        }
++    }
++
++    // Prefix sum across threads to get global base for each thread's contributions
++    __shared__ int64_t s_counts[256];
++    __shared__ int64_t s_prefix[256];
++    s_counts[threadIdx.x] = local_count;
++    __syncthreads();
++
++    // Exclusive scan on s_counts to get prefix for each thread
++    int64_t temp = 0;
++    for (int offset = 1; offset < blockDim.x; offset <<= 1) {
++        if (threadIdx.x >= offset) {
++            temp = s_counts[threadIdx.x - offset];
++        }
++        __syncthreads();
++        if (threadIdx.x >= offset) {
++            s_counts[threadIdx.x] += temp;
++        }
++        __syncthreads();
++    }
++    // Now s_counts[threadIdx.x] contains inclusive prefix
++    if (threadIdx.x == 0) {
++        s_prefix[0] = 0;
++    } else {
++        s_prefix[threadIdx.x] = s_counts[threadIdx.x - 1];
++    }
++    __syncthreads();
++
++    // Now each thread writes its selected elements starting at base_offset + s_prefix[threadIdx.x]
++    int64_t out_pos = base_offset + s_prefix[threadIdx.x];
++    for (int64_t idx = start; idx < end; ++idx) {
++        int64_t coords[4];
++        int64_t tmp = idx;
++        for (int d = input_ndim - 1; d >= 0; --d) {
++            coords[d] = tmp % input_shape[d];
++            tmp /= input_shape[d];
++        }
++        int64_t mask_offset = compute_mask_offset(coords, input_ndim, input_shape, mask_shape, mask_strides);
++        if (mask[mask_offset]) {
++            output[out_pos++] = input[idx];
++        }
++    }
++}
++
++// Host launcher for masked_select_forward.
++// Allocates output via callback? Since C++ cannot allocate without torch, the binding layer must allocate output and pass pointer.
++// We'll design launcher to take output pointer, input/mask pointers, shapes/strides, and total count precomputed? The binding will compute count using our kernels and then allocate output, or we can have a separate launcher that returns count.
++// For simplicity, we provide a single launcher that performs all steps: count, allocate? But allocation must be done outside using torch. So we need either:
++//   - A launcher that only gathers given precomputed block_offsets and total_count.
++//   - Or a launcher that computes counts internally and stores total_count, then binding allocates output and calls gather separately.
++// To keep interface clean, we can have two launchers: one for count (fills block_counts and total_count), and one for gather.
++
++// For the contract, the binding will call masked_select_forward with input, mask, output (preallocated). We can design launcher to perform count in one kernel, scan, then gather in another kernel, all inside. The binding will allocate output of correct size after we tell it the count? But binding needs to know count before allocation. So we need a way for binding to query count first.
++
++// Easiest: Provide a launcher `masked_select_count` that computes total count, then binding allocates output using torch::empty({count}), then calls `masked_select_gather` to fill output. But contract may expect a single forward function. We can structure as: binding will call a launcher that takes output pointer already allocated with correct size. How does binding know size? It can call count launcher first. So we expose two launchers, or one launcher with an output pointer and a boolean flag to indicate if count-only? We'll provide two separate extern "C" functions for clarity:
++//   - masked_select_forward_count(...) -> returns total count via pointer.
++//   - masked_select_forward_gather(...) -> uses precomputed block_offsets maybe? But block_offsets need to be stored somewhere. We can compute them in count phase and store in a device buffer; then gather uses that buffer. So we can have a single stateful launcher: first call computes block counts and block_offsets, stores in provided device buffers; second call uses those buffers. But that is messy.
++
++// Alternative: Combine count and gather into one kernel using atomic global counter BUT with stable order via a single global scan per block? Not possible without synchronization.
++
++// We can implement a single kernel that uses atomicAdd on a global counter only after a block-level stable ordering among threads (i.e., each block computes its local prefix and then atomically reserves a contiguous chunk of output positions). But that would require a single atomic per block, and within block we can order threads deterministically. However, blocks are not guaranteed to execute in blockIdx order, so the global ordering would be nondeterministic even if block chunks are contiguous. To ensure global order, block chunks must be assigned in order; we can use a global atomic counter that allocates block chunks in increasing block index? Not possible without ensuring block execution order.
++
++// Therefore, the two-pass approach is necessary for deterministic order. We'll provide two launchers and let binding call both.
++
++// Define launchers:
++//   - `masked_select_count_launcher`: takes input, mask, shape/strides, block_counts_ptr, block_offsets_ptr, total_count_ptr, num_blocks, stream. It runs count kernel, then scan kernel.
++//   - `masked_select_gather_launcher`: takes input, mask, output, block_offsets_ptr, shape/strides, num_blocks, stream. It runs gather kernel.
++
++// The binding will allocate block_counts and block_offsets device arrays of size num_blocks (computed based on total elements and tile size). Then call count, allocate output using total_count, then call gather. Then free temporary buffers.
++
++// We'll provide these launchers with C linkage.
++
++// For prelu_forward, simple elementwise.
++
++//------------------------------------------------------------------------------
++// PReLU kernel and launcher
++//------------------------------------------------------------------------------
++
++__global__ void prelu_kernel(const float* __restrict__ input, float* __restrict__ output, float weight, int64_t numel) {
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    if (idx < numel) {
++        float x = input[idx];
++        output[idx] = (x > 0.0f) ? x : (x * weight);
++    }
++}
++
++extern "C" void prelu_forward_launcher(
++    const float* input,
++    float* output,
++    float weight,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    prelu_kernel<<<blocks, threads, 0, stream>>>(input, output, weight, numel);
++    check_cuda_error_("prelu_forward_launcher");
++}
++
++//------------------------------------------------------------------------------
++// Masked select launchers
++//------------------------------------------------------------------------------
++
++// We need shape and stride arrays. We'll pass them as raw pointers to int64_t arrays in device memory? Actually they can be host memory but kernel needs device pointers. The binding can copy them to device or pass via kernel arguments as value structs. Since dims small, we can pass them as kernel arguments by value (e.g., int64_t shape[4], strides[4], etc). That avoids device memory allocation for metadata. However, passing arrays by value to kernel works if we copy to kernel parameter space; C++ allows array parameters in __global__? Typically, we pass pointers. Simpler: pass all shape/stride values as separate scalar arguments. For up to 4D, we can pass input_ndim, and arrays as pointers to constant memory? But we can't easily allocate constant memory from host without cudaMemcpyToSymbol (needs symbol). We can pass shape/strides as kernel arguments of type int64_t[4] by value using a struct.
++
++// Let's define a struct for shape/strides and pass by value.
++
++struct TensorMeta {
++    int ndim;
++    int64_t shape[4];
++    int64_t strides[4];
++};
++
++// We'll require ndim <=4, which is sufficient. We'll pad unused entries with 0.
++
++// Modify kernel signatures to accept TensorMeta for input and mask.
++
++__global__ void count_selected_kernel(
++    const float* __restrict__ input,
++    const bool* __restrict__ mask,
++    int64_t* __restrict__ block_counts,
++    int64_t total_elements,
++    TensorMeta input_meta,
++    TensorMeta mask_meta)
++{
++    // implementation as before, but using meta
++    // Note: compute_mask_offset needs mask_meta.ndim and shape/strides
++    constexpr int ITEMS_PER_THREAD = 8;
++    int64_t block_start = blockIdx.x * (int64_t)blockDim.x * ITEMS_PER_THREAD;
++    int64_t block_end = min(block_start + (int64_t)blockDim.x * ITEMS_PER_THREAD, total_elements);
++    int64_t local_count = 0;
++
++    for (int64_t base = block_start + threadIdx.x; base < block_end; base += blockDim.x) {
++        int64_t idx = base;
++        int64_t coords[4];
++        for (int d = input_meta.ndim - 1; d >= 0; --d) {
++            coords[d] = idx % input_meta.shape[d];
++            idx /= input_meta.shape[d];
++        }
++        int64_t mask_offset = compute_mask_offset(coords, input_meta.ndim, input_meta.shape, mask_meta);
++        if (mask[mask_offset]) {
++            local_count++;
++        }
++    }
++
++    __shared__ int64_t sdata[256];
++    sdata[threadIdx.x] = local_count;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) {
++            sdata[threadIdx.x] += sdata[threadIdx.x + s];
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        block_counts[blockIdx.x] = sdata[0];
++    }
++}
++
++// Update compute_mask_offset to accept mask_meta struct
++__device__ __forceinline__ int64_t compute_mask_offset(const int64_t* coords, int input_ndim, const int64_t* input_shape, const TensorMeta& mask_meta) {
++    int64_t offset = 0;
++    int mask_dim = mask_meta.ndim - 1;
++    for (int d = input_ndim - 1; d >= 0 && mask_dim >= 0; --d) {
++        int64_t coord = coords[d];
++        int64_t mask_extent = mask_meta.shape[mask_dim];
++        int64_t idx = (mask_extent == 1) ? 0 : coord;
++        offset += idx * mask_meta.strides[mask_dim];
++        --mask_dim;
++    }
++    return offset;
++}
++
++// Scan kernel now operates on block_counts of length numBlocks.
++// We'll still use a single block single thread loop for simplicity.
++__global__ void block_exclusive_scan_kernel(
++    const int64_t* __restrict__ block_counts,
++    int64_t* __restrict__ block_offsets,
++    int64_t* __restrict__ total_count,
++    int numBlocks)
++{
++    if (threadIdx.x == 0) {
++        int64_t sum = 0;
++        for (int i = 0; i < numBlocks; ++i) {
++            block_offsets[i] = sum;
++            sum += block_counts[i];
++        }
++        *total_count = sum;
++    }
++}
++
++__global__ void gather_selected_kernel(
++    const float* __restrict__ input,
++    const bool* __restrict__ mask,
++    float* __restrict__ output,
++    const int64_t* __restrict__ block_offsets,
++    int64_t total_elements,
++    TensorMeta input_meta,
++    TensorMeta mask_meta)
++{
++    constexpr int ITEMS_PER_THREAD = 8;
++    int64_t block_start = blockIdx.x * (int64_t)blockDim.x * ITEMS_PER_THREAD;
++    int64_t block_end = min(block_start + (int64_t)blockDim.x * ITEMS_PER_THREAD, total_elements);
++    int64_t base_offset = block_offsets[blockIdx.x];
++
++    int64_t range_length = block_end - block_start;
++    int64_t per_thread = (range_length + blockDim.x - 1) / blockDim.x;
++    int64_t start = block_start + threadIdx.x * per_thread;
++    int64_t end = min(start + per_thread, block_end);
++
++    int64_t local_count = 0;
++    for (int64_t idx = start; idx < end; ++idx) {
++        int64_t coords[4];
++        int64_t tmp = idx;
++        for (int d = input_meta.ndim - 1; d >= 0; --d) {
++            coords[d] = tmp % input_meta.shape[d];
++            tmp /= input_meta.shape[d];
++        }
++        int64_t mask_offset = compute_mask_offset(coords, input_meta.ndim, input_meta.shape, mask_meta);
++        if (mask[mask_offset]) {
++            local_count++;
++        }
++    }
++
++    __shared__ int64_t s_counts[256];
++    __shared__ int64_t s_prefix[256];
++    s_counts[threadIdx.x] = local_count;
++    __syncthreads();
++
++    // Hillis-Steele inclusive scan
++    for (int offset = 1; offset < blockDim.x; offset <<= 1) {
++        int64_t temp = 0;
++        if (threadIdx.x >= offset) {
++            temp = s_counts[threadIdx.x - offset];
++        }
++        __syncthreads();
++        if (threadIdx.x >= offset) {
++            s_counts[threadIdx.x] += temp;
++        }
++        __syncthreads();
++    }
++
++    if (threadIdx.x == 0) {
++        s_prefix[0] = 0;
++    } else {
++        s_prefix[threadIdx.x] = s_counts[threadIdx.x - 1];
++    }
++    __syncthreads();
++
++    int64_t out_pos = base_offset + s_prefix[threadIdx.x];
++    for (int64_t idx = start; idx < end; ++idx) {
++        int64_t coords[4];
++        int64_t tmp = idx;
++        for (int d = input_meta.ndim - 1; d >= 0; --d) {
++            coords[d] = tmp % input_meta.shape[d];
++            tmp /= input_meta.shape[d];
++        }
++        int64_t mask_offset = compute_mask_offset(coords, input_meta.ndim, input_meta.shape, mask_meta);
++        if (mask[mask_offset]) {
++            output[out_pos++] = input[idx];
++        }
++    }
++}
++
++// Host launchers for count and gather phases.
++// The binding will allocate block_counts and block_offsets device buffers of size numBlocks.
++// numBlocks = ceil(total_elements / (blockDim.x * ITEMS_PER_THREAD))
++
++extern "C" void masked_select_count_launcher(
++    const float* input,
++    const bool* mask,
++    int64_t total_elements,
++    TensorMeta input_meta,
++    TensorMeta mask_meta,
++    int64_t* block_counts,
++    int64_t* block_offsets,
++    int64_t* total_count,
++    int num_blocks,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    constexpr int ITEMS_PER_THREAD = 8;
++    // ensure num_blocks matches expected
++    count_selected_kernel<<<num_blocks, threads, 0, stream>>>(
++        input, mask, block_counts, total_elements, input_meta, mask_meta);
++    check_cuda_error_("count_selected_kernel");
++
++    block_exclusive_scan_kernel<<<1, 32, 0, stream>>>(
++        block_counts, block_offsets, total_count, num_blocks);
++    check_cuda_error_("block_exclusive_scan_kernel");
++}
++
++extern "C" void masked_select_gather_launcher(
++    const float* input,
++    const bool* mask,
++    float* output,
++    int64_t total_elements,
++    TensorMeta input_meta,
++    TensorMeta mask_meta,
++    const int64_t* block_offsets,
++    int num_blocks,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    constexpr int ITEMS_PER_THREAD = 8;
++    gather_selected_kernel<<<num_blocks, threads, 0, stream>>>(
++        input, mask, output, block_offsets, total_elements, input_meta, mask_meta);
++    check_cuda_error_("gather_selected_kernel");
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,186 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void prelu_forward_launcher(
++    const float* input,
++    float* output,
++    float weight,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void masked_select_count_launcher(
++    const float* input,
++    const bool* mask,
++    int64_t total_elements,
++    TensorMeta input_meta,
++    TensorMeta mask_meta,
++    int64_t* block_counts,
++    int64_t* block_offsets,
++    int64_t* total_count,
++    int num_blocks,
++    cudaStream_t stream);
++
++extern "C" void masked_select_gather_launcher(
++    const float* input,
++    const bool* mask,
++    float* output,
++    int64_t total_elements,
++    TensorMeta input_meta,
++    TensorMeta mask_meta,
++    const int64_t* block_offsets,
++    int num_blocks,
++    cudaStream_t stream);
++
++// Define TensorMeta (must match .cu definition)
++struct TensorMeta {
++    int ndim;
++    int64_t shape[4];
++    int64_t strides[4];
++};
++
++// Helper: fill TensorMeta from a torch::Tensor
++TensorMeta get_meta(const torch::Tensor& t) {
++    TensorMeta meta;
++    meta.ndim = t.dim();
++    TORCH_CHECK(meta.ndim <= 4, "Only up to 4D tensors are supported");
++    for (int i = 0; i < 4; ++i) {
++        meta.shape[i] = 0;
++        meta.strides[i] = 0;
++    }
++    for (int i = 0; i < meta.ndim; ++i) {
++        meta.shape[i] = t.size(i);
++        meta.strides[i] = t.stride(i);
++    }
++    return meta;
++}
++
++// masked_select_forward
++// Returns 1D tensor of selected values in row-major order.
++torch::Tensor masked_select_forward(torch::Tensor input, torch::Tensor mask) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(mask.is_cuda(), "mask must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(mask.dtype() == torch::kBool, "mask must be bool");
++
++    // Broadcast check: mask shape must be broadcastable to input shape.
++    // PyTorch broadcasting rules: trailing dims must be equal or one of them is 1.
++    int input_ndim = input.dim();
++    int mask_ndim = mask.dim();
++    TORCH_CHECK(mask_ndim <= input_ndim, "mask dims cannot exceed input dims");
++    for (int i = 1; i <= mask_ndim; ++i) {
++        int64_t in_dim = input.size(input_ndim - i);
++        int64_t mask_dim = mask.size(mask_ndim - i);
++        TORCH_CHECK(in_dim == mask_dim || in_dim == 1 || mask_dim == 1,
++                    "mask shape not broadcastable to input shape");
++    }
++
++    // Ensure input and mask are contiguous for kernel simplicity?
++    // The .cu kernels assume linear index over input and use strides to compute mask offset,
++    // but they access input[idx] directly, which requires input contiguous. We'll make contiguous copies.
++    auto input_contig = input.contiguous();
++    auto mask_contig = mask.contiguous();
++
++    int64_t total_elements = input_contig.numel();
++    TensorMeta input_meta = get_meta(input_contig);
++    TensorMeta mask_meta = get_meta(mask_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Choose block size and items per thread to match .cu kernels
++    const int threads = 256;
++    constexpr int ITEMS_PER_THREAD = 8;
++    int64_t num_blocks = (total_elements + (int64_t)threads * ITEMS_PER_THREAD - 1) /
++                         ((int64_t)threads * ITEMS_PER_THREAD);
++    TORCH_CHECK(num_blocks > 0, "input must not be empty");
++
++    // Allocate block_counts and block_offsets on device
++    auto block_counts = torch::empty({num_blocks},
++                                     torch::dtype(torch::kInt64).device(input.device()));
++    auto block_offsets = torch::empty({num_blocks},
++                                      torch::dtype(torch::kInt64).device(input.device()));
++    auto total_count_tensor = torch::empty({1},
++                                           torch::dtype(torch::kInt64).device(input.device()));
++
++    // First launcher: count and scan
++    masked_select_count_launcher(
++        input_contig.data_ptr<float>(),
++        mask_contig.data_ptr<bool>(),
++        total_elements,
++        input_meta,
++        mask_meta,
++        block_counts.data_ptr<int64_t>(),
++        block_offsets.data_ptr<int64_t>(),
++        total_count_tensor.data_ptr<int64_t>(),
++        (int)num_blocks,
++        stream);
++
++    // Copy total count to CPU
++    int64_t total_count_cpu;
++    cudaMemcpyAsync(&total_count_cpu, total_count_tensor.data_ptr<int64_t>(),
++                    sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
++    cudaStreamSynchronize(stream); // ensure copy complete
++
++    // Allocate output
++    auto output = torch::empty({total_count_cpu},
++                               torch::dtype(torch::kFloat32).device(input.device()));
++
++    // Second launcher: gather
++    masked_select_gather_launcher(
++        input_contig.data_ptr<float>(),
++        mask_contig.data_ptr<bool>(),
++        output.data_ptr<float>(),
++        total_elements,
++        input_meta,
++        mask_meta,
++        block_offsets.data_ptr<int64_t>(),
++        (int)num_blocks,
++        stream);
++
++    return output;
++}
++
++// prelu_forward
++// Applies PReLU with a single weight (num_parameters=1).
++torch::Tensor prelu_forward(torch::Tensor input, torch::Tensor weight) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(weight.numel() == 1, "weight must have exactly one element");
++
++    auto input_contig = input.contiguous();
++    auto output = torch::empty_like(input_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Copy weight to CPU to pass as scalar (simple, one element)
++    float weight_cpu;
++    cudaMemcpyAsync(&weight_cpu, weight.data_ptr<float>(), sizeof(float),
++                    cudaMemcpyDeviceToHost, stream);
++    cudaStreamSynchronize(stream);
++
++    prelu_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        weight_cpu,
++        input_contig.numel(),
++        stream);
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("masked_select_forward", &masked_select_forward,
++          "Stable masked_select implementation (CUDA)",
++          pybind11::arg("input"), pybind11::arg("mask"));
++    m.def("prelu_forward", &prelu_forward,
++          "PReLU with single weight (CUDA)",
++          pybind11::arg("input"), pybind11::arg("weight"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_parameters=1, init=0.25):
++        super().__init__()
++        self.prelu = nn.PReLU(num_parameters, init)
++
++    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
++        x = torch.masked_select(x, mask)
++        return self.prelu(x)
++
++    def debug_forward(self, *inputs):
++        # inputs: [x, mask]
++        x, mask = inputs
++        # 第一步：masked_select
++        x1 = torch.masked_select(x, mask)
++        yield 'step_001', x1
++        # 第二步：prelu（最终返回）
++        x2 = self.prelu(x1)
++        yield 'step_002', x2

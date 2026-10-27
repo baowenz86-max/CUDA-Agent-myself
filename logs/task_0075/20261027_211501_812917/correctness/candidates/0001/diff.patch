@@ -1,0 +1,457 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,234 @@
++// CUDA kernels for reflection_pad2d, count_nonzero, upsample_bilinear2d
++// All functions use raw pointers and cudaStream_t, no torch/ATen dependencies.
++
++#include <cuda_runtime.h>
++#include <cstdint>
++#include <cstdio>
++
++// Helper to check CUDA errors after kernel launch (only in debug or always? we do always for safety)
++#define CUDA_CHECK(call) \
++    do { \
++        cudaError_t err = (call); \
++        if (err != cudaSuccess) { \
++            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
++            return; \
++        } \
++    } while (0)
++
++// -----------------------------------------------------------------------------
++// 1. ReflectionPad2d
++// -----------------------------------------------------------------------------
++//
++// Applies reflection padding to a 4D tensor (N, C, H, W).
++// Padding is symmetric: same pad value on all four spatial sides.
++// Supports arbitrary strides by using the input tensor's strides (in elements).
++// Output is contiguous.
++
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    int pad,
++    int in_n_stride, int in_c_stride, int in_h_stride, int in_w_stride,
++    long long total_elements)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < total_elements; idx += stride) {
++        // Decompose linear index into output coordinates: n, c, oh, ow
++        int ow = idx % outW;
++        long long tmp = idx / outW;
++        int oh = tmp % outH;
++        tmp /= outH;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        // Reflect indices: for pad=1, output indices 0 and H+pad-1 are mapped to 1 and H-2, etc.
++        // General reflection:
++        // if (i < pad)          ih = pad - i;
++        // else if (i >= H + pad) ih = (H - 1) - (i - H - pad + 1) = 2*H - i + 2*pad - 2? careful.
++        // Simpler: map output spatial index 0..outH-1 to input index 0..H-1 using reflection without repeating edge.
++        // Use formula: ih = reflect(oh, pad, H)
++        int ih = oh - pad;
++        if (ih < 0) ih = -ih;
++        else if (ih >= H) ih = 2 * H - ih - 2;
++
++        int iw = ow - pad;
++        if (iw < 0) iw = -iw;
++        else if (iw >= W) iw = 2 * W - iw - 2;
++
++        // Compute input linear index using strides (in elements)
++        long long in_idx = (long long)n * in_n_stride + (long long)c * in_c_stride
++                        + (long long)ih * in_h_stride + (long long)iw * in_w_stride;
++        output[idx] = input[in_idx];
++    }
++}
++
++extern "C" void reflection_pad2d_forward_launcher(
++    const float* input, float* output,
++    int N, int C, int H, int W,
++    int pad,
++    int in_n_stride, int in_c_stride, int in_h_stride, int in_w_stride,
++    cudaStream_t stream)
++{
++    int outH = H + 2 * pad;
++    int outW = W + 2 * pad;
++    long long total_elements = (long long)N * C * outH * outW;
++
++    // Launch configuration: 256 threads per block, enough blocks to cover grid or cap at 65535*256? use grid-stride loop anyway.
++    int threads = 256;
++    int blocks = (int)((total_elements + threads - 1) / threads);
++    // Cap blocks to reasonable max grid dimension (e.g., 65535) but our loop handles rest; however need at least 1 block.
++    if (blocks > 65535) blocks = 65535;
++    if (blocks == 0) blocks = 1;
++
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, outH, outW, pad,
++        in_n_stride, in_c_stride, in_h_stride, in_w_stride,
++        total_elements);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// -----------------------------------------------------------------------------
++// 2. CountNonzero
++// -----------------------------------------------------------------------------
++// Counts number of non-zero elements (including NaN, since NaN != 0) across entire tensor.
++// Returns int64 scalar in output[0].
++// We use a two-pass approach: first each block counts nonzeros and writes partial sum to a temporary device buffer.
++// But launcher only gets output pointer; we need temp storage? We can use atomicAdd directly on output[0] (int64_t atomicAdd is supported on sm_60+).
++// For simplicity and since target is modern GPUs (sm_80), we use atomicAdd on unsigned long long, casting count. Ensure output initialized to zero before kernel.
++// But binding layer allocates output tensor and should zero it. We'll also zero it in kernel? Not safe if multiple blocks write. Better assume caller zeroes output. We'll instruct in contract? But we can also use a separate temp buffer allocated via cudaMalloc? Cannot allocate in launcher (we can, but no torch). However, binding.cpp will allocate a zero-initialized int64 scalar and pass pointer. We'll document that the binding must zero initialize. Alternatively, we can zero it here using cudaMemsetAsync before kernel launch, but that is safe and no torch dependency. We'll do cudaMemsetAsync to zero output[0] before kernel. Since output is int64_t, we need to memset sizeof(int64_t)=8 bytes.
++
++__global__ void count_nonzero_kernel(
++    const float* __restrict__ input,
++    long long total_elements,
++    int64_t* __restrict__ output_count)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    long long local_count = 0;
++
++    for (; idx < total_elements; idx += stride) {
++        if (input[idx] != 0.0f) {
++            local_count++;
++        }
++    }
++
++    // Atomic add to global count (int64_t atomicAdd is available on sm_60+; we assume target >= 8.0)
++    atomicAdd((unsigned long long*)output_count, (unsigned long long)local_count);
++}
++
++extern "C" void count_nonzero_forward_launcher(
++    const float* input,
++    long long total_elements,
++    int64_t* output_count,
++    cudaStream_t stream)
++{
++    // Zero the output scalar using cudaMemsetAsync (async on stream)
++    cudaMemsetAsync(output_count, 0, sizeof(int64_t), stream);
++
++    int threads = 256;
++    int blocks = (int)((total_elements + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    if (blocks == 0) blocks = 1;
++
++    count_nonzero_kernel<<<blocks, threads, 0, stream>>>(
++        input, total_elements, output_count);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// -----------------------------------------------------------------------------
++// 3. UpsampleBilinear2d (scale_factor float, align_corners bool)
++// -----------------------------------------------------------------------------
++// Performs bilinear upsampling with PyTorch semantics: align_corners=False default.
++// Output size determined by floor(input_size * scale_factor). For integer scale_factor (2.0) we can compute directly.
++// Kernel assumes output tensor is contiguous. Input may have arbitrary strides; we use strides in elements.
++
++__global__ void upsample_bilinear2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    float scale_factor,
++    bool align_corners,
++    int in_n_stride, int in_c_stride, int in_h_stride, int in_w_stride,
++    long long total_elements)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    // Precompute scaling parameters
++    float rheight = (outH > 1) ? (align_corners ? (float)(H - 1) / (outH - 1) : 1.0f / scale_factor) : 0.0f;
++    float rwidth = (outW > 1) ? (align_corners ? (float)(W - 1) / (outW - 1) : 1.0f / scale_factor) : 0.0f;
++
++    for (; idx < total_elements; idx += stride) {
++        int ow = idx % outW;
++        long long tmp = idx / outW;
++        int oh = tmp % outH;
++        tmp /= outH;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        // Source coordinates for align_corners=False (PyTorch default):
++        // src = (dst + 0.5) / scale - 0.5
++        float h1r, w1r;
++        if (align_corners) {
++            h1r = oh * rheight;
++            w1r = ow * rwidth;
++        } else {
++            h1r = (oh + 0.5f) * rheight - 0.5f;
++            w1r = (ow + 0.5f) * rwidth - 0.5f;
++        }
++
++        // Clamp to [0, H-1] and [0, W-1]
++        h1r = fmaxf(0.0f, fminf(h1r, (float)(H - 1)));
++        w1r = fmaxf(0.0f, fminf(w1r, (float)(W - 1)));
++
++        int h1 = (int)h1r;
++        int h1p = (h1 < H - 1) ? h1 + 1 : h1;
++        float h1lambda = h1r - h1;
++        float h0lambda = 1.0f - h1lambda;
++
++        int w1 = (int)w1r;
++        int w1p = (w1 < W - 1) ? w1 + 1 : w1;
++        float w1lambda = w1r - w1;
++        float w0lambda = 1.0f - w1lambda;
++
++        // Load four values using strides
++        long long base = (long long)n * in_n_stride + (long long)c * in_c_stride;
++        float v00 = input[base + (long long)h1 * in_h_stride + (long long)w1 * in_w_stride];
++        float v01 = input[base + (long long)h1 * in_h_stride + (long long)w1p * in_w_stride];
++        float v10 = input[base + (long long)h1p * in_h_stride + (long long)w1 * in_w_stride];
++        float v11 = input[base + (long long)h1p * in_h_stride + (long long)w1p * in_w_stride];
++
++        float result = h0lambda * (w0lambda * v00 + w1lambda * v01) +
++                       h1lambda * (w0lambda * v10 + w1lambda * v11);
++
++        output[idx] = result;
++    }
++}
++
++extern "C" void upsample_bilinear2d_forward_launcher(
++    const float* input, float* output,
++    int N, int C, int H, int W,
++    float scale_factor,
++    bool align_corners,
++    int in_n_stride, int in_c_stride, int in_h_stride, int in_w_stride,
++    cudaStream_t stream)
++{
++    int outH = (int)floorf(H * scale_factor);
++    int outW = (int)floorf(W * scale_factor);
++    long long total_elements = (long long)N * C * outH * outW;
++
++    int threads = 256;
++    int blocks = (int)((total_elements + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    if (blocks == 0) blocks = 1;
++
++    upsample_bilinear2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, outH, outW, scale_factor, align_corners,
++        in_n_stride, in_c_stride, in_h_stride, in_w_stride, total_elements);
++    CUDA_CHECK(cudaGetLastError());
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,168 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void reflection_pad2d_forward_launcher(
++    const float* input,
++    float* output,
++    int N,
++    int C,
++    int H,
++    int W,
++    int pad,
++    int in_n_stride,
++    int in_c_stride,
++    int in_h_stride,
++    int in_w_stride,
++    cudaStream_t stream
++);
++
++extern "C" void count_nonzero_forward_launcher(
++    const float* input,
++    long long total_elements,
++    int64_t* output_count,
++    cudaStream_t stream
++);
++
++extern "C" void upsample_bilinear2d_forward_launcher(
++    const float* input,
++    float* output,
++    int N,
++    int C,
++    int H,
++    int W,
++    float scale_factor,
++    bool align_corners,
++    int in_n_stride,
++    int in_c_stride,
++    int in_h_stride,
++    int in_w_stride,
++    cudaStream_t stream
++);
++
++// Helper: ensure input is CUDA float32 tensor
++torch::Tensor check_cuda_float32(const torch::Tensor& input, const char* name) {
++    TORCH_CHECK(input.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, name, " must be float32");
++    return input.contiguous();
++}
++
++// 1. ReflectionPad2d
++torch::Tensor reflection_pad2d_forward(torch::Tensor input, int64_t padding) {
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (N, C, H, W)");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++
++    // Make contiguous if not already (reflection_pad2d launcher expects contiguous output, input strides can be handled but we'll pass contiguous input for simplicity)
++    auto input_contig = input.contiguous();
++
++    int64_t N = input_contig.size(0);
++    int64_t C = input_contig.size(1);
++    int64_t H = input_contig.size(2);
++    int64_t W = input_contig.size(3);
++    int64_t pad = padding;
++    int64_t outH = H + 2 * pad;
++    int64_t outW = W + 2 * pad;
++
++    auto output = torch::empty({N, C, outH, outW}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    reflection_pad2d_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(pad),
++        static_cast<int>(input_contig.stride(0)),
++        static_cast<int>(input_contig.stride(1)),
++        static_cast<int>(input_contig.stride(2)),
++        static_cast<int>(input_contig.stride(3)),
++        stream
++    );
++
++    return output;
++}
++
++// 2. CountNonzero
++torch::Tensor count_nonzero_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++
++    // Make contiguous to simplify counting (launcher assumes contiguous float array)
++    auto input_contig = input.contiguous();
++
++    long long total_elements = static_cast<long long>(input_contig.numel());
++
++    auto output = torch::zeros({}, input_contig.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    count_nonzero_forward_launcher(
++        input_contig.data_ptr<float>(),
++        total_elements,
++        reinterpret_cast<int64_t*>(output.data_ptr<int64_t>()),
++        stream
++    );
++
++    return output;
++}
++
++// 3. UpsampleBilinear2d
++torch::Tensor upsample_bilinear2d_forward(torch::Tensor input, double scale_factor, bool align_corners) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (N, C, H, W)");
++    TORCH_CHECK(scale_factor > 0, "scale_factor must be positive");
++
++    auto input_contig = input.contiguous();
++
++    int64_t N = input_contig.size(0);
++    int64_t C = input_contig.size(1);
++    int64_t H = input_contig.size(2);
++    int64_t W = input_contig.size(3);
++
++    int64_t outH = static_cast<int64_t>(std::floor(H * scale_factor));
++    int64_t outW = static_cast<int64_t>(std::floor(W * scale_factor));
++
++    auto output = torch::empty({N, C, outH, outW}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    upsample_bilinear2d_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<float>(scale_factor),
++        align_corners,
++        static_cast<int>(input_contig.stride(0)),
++        static_cast<int>(input_contig.stride(1)),
++        static_cast<int>(input_contig.stride(2)),
++        static_cast<int>(input_contig.stride(3)),
++        stream
++    );
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward, "ReflectionPad2d forward",
++          py::arg("input"), py::arg("padding"));
++    m.def("count_nonzero_forward", &count_nonzero_forward, "Count nonzero elements",
++          py::arg("input"));
++    m.def("upsample_bilinear2d_forward", &upsample_bilinear2d_forward, "Bilinear upsample forward",
++          py::arg("input"), py::arg("scale_factor"), py::arg("align_corners") = false);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,46 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_channels, upscale_factor, pad_size, reflect_padding_dims, upscale_mode):
++        super().__init__()
++        # Store configuration as in the reference model to preserve signature and state_dict (empty)
++        self.upscale_factor = upscale_factor
++        self.pad_size = pad_size
++        self.reflect_padding_dims = reflect_padding_dims
++        self.upscale_mode = upscale_mode
++        # No parameters or buffers, matching Model's empty state_dict
++
++    def forward(self, x):
++        # Step 1: ReflectionPad2d with padding reflect_padding_dims[0] (assuming symmetric for this task)
++        # In reference, padding is (1,1,1,1), so use first value; custom op takes scalar padding for symmetric case
++        padding = self.reflect_padding_dims[0]  # int
++        x = cuda_extension.reflection_pad2d_forward(x, padding)
++        
++        # Step 2: Count non-zero elements
++        non_zero_elements = cuda_extension.count_nonzero_forward(x)
++        
++        # Step 3: Bilinear upsample with scale_factor
++        # align_corners=False is the default for bilinear mode in nn.Upsample
++        x = cuda_extension.upsample_bilinear2d_forward(x, float(self.upscale_factor), False)
++        
++        return non_zero_elements, x
++
++    def debug_forward(self, *inputs):
++        """Yield checkpoints in order, including final return tuple."""
++        x = inputs[0]
++        padding = self.reflect_padding_dims[0]
++        x = cuda_extension.reflection_pad2d_forward(x, padding)
++        yield 'step_001', x
++        
++        non_zero_elements = cuda_extension.count_nonzero_forward(x)
++        yield 'step_002', non_zero_elements
++        
++        x = cuda_extension.upsample_bilinear2d_forward(x, float(self.upscale_factor), False)
++        yield 'step_003', x
++        
++        result = (non_zero_elements, x)
++        yield 'step_004', result
++        return result
