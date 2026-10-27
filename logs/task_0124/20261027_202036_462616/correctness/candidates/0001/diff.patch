@@ -1,0 +1,138 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,59 @@
++#include <cuda_runtime.h>
++
++// Elementwise clamp kernel: out[i] = min(max(in[i], min_val), max_val)
++__global__ void clamp_kernel(const float* __restrict__ input,
++                             float* __restrict__ output,
++                             int64_t numel,
++                             float min_val,
++                             float max_val) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float val = input[i];
++        val = val < min_val ? min_val : val;
++        val = val > max_val ? max_val : val;
++        output[i] = val;
++    }
++}
++
++// Elementwise power kernel: out[i] = powf(in[i], exponent)
++__global__ void pow_kernel(const float* __restrict__ input,
++                           float* __restrict__ output,
++                           int64_t numel,
++                           float exponent) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = powf(input[i], exponent);
++    }
++}
++
++// Launcher for clamp_forward
++extern "C" void clamp_forward_launcher(float* output,
++                                       const float* input,
++                                       int64_t numel,
++                                       float min_val,
++                                       float max_val,
++                                       cudaStream_t stream) {
++    if (numel == 0) return;
++    const int block_size = 256;
++    // 限制 grid 大小以避免超过硬件限制，kernel 内部使用 grid-stride loop
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    clamp_kernel<<<static_cast<unsigned int>(grid_size), block_size, 0, stream>>>(
++        input, output, numel, min_val, max_val);
++}
++
++// Launcher for pow_forward
++extern "C" void pow_forward_launcher(float* output,
++                                      const float* input,
++                                      int64_t numel,
++                                      float exponent,
++                                      cudaStream_t stream) {
++    if (numel == 0) return;
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    pow_kernel<<<static_cast<unsigned int>(grid_size), block_size, 0, stream>>>(
++        input, output, numel, exponent);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,47 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void clamp_forward_launcher(float* output, const float* input, int64_t numel, float min_val, float max_val, cudaStream_t stream);
++extern "C" void pow_forward_launcher(float* output, const float* input, int64_t numel, float exponent, cudaStream_t stream);
++
++// clamp_forward wrapper
++torch::Tensor clamp_forward(torch::Tensor x, double min_val, double max_val) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    // Ensure contiguous for linear kernel
++    x = x.contiguous();
++    auto output = torch::empty_like(x);
++    int64_t numel = x.numel();
++    if (numel == 0) return output;
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    clamp_forward_launcher(output.data_ptr<float>(), x.data_ptr<float>(), numel, static_cast<float>(min_val), static_cast<float>(max_val), stream);
++    return output;
++}
++
++// pow_forward wrapper
++torch::Tensor pow_forward(torch::Tensor x, double exponent) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    // Ensure contiguous for linear kernel
++    x = x.contiguous();
++    auto output = torch::empty_like(x);
++    int64_t numel = x.numel();
++    if (numel == 0) return output;
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    pow_forward_launcher(output.data_ptr<float>(), x.data_ptr<float>(), numel, static_cast<float>(exponent), stream);
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("clamp_forward", &clamp_forward, "Apply torch.clamp elementwise",
++          pybind11::arg("x"), pybind11::arg("min_val") = -0.5, pybind11::arg("max_val") = 0.5);
++    m.def("pow_forward", &pow_forward, "Apply torch.pow elementwise",
++          pybind11::arg("x"), pybind11::arg("exponent") = 2.0);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, clamp_min, clamp_max, power_factor):
++        super().__init__()
++        self.clamp_min = clamp_min
++        self.clamp_max = clamp_max
++        self.power_factor = power_factor
++
++    def forward(self, x):
++        x = cuda_extension.clamp_forward(x, self.clamp_min, self.clamp_max)
++        x = cuda_extension.pow_forward(x, self.power_factor)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.clamp_forward(x, self.clamp_min, self.clamp_max)
++        yield 'step_001', x
++        x = cuda_extension.pow_forward(x, self.power_factor)
++        yield 'step_002', x
++        yield 'step_003', x

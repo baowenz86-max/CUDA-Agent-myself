@@ -1,0 +1,583 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,5 +1,7 @@
+ #include <cuda_runtime.h>
+-
++#include <cstdint>
++
++// Exp kernel (existing)
+ __global__ void exp_kernel(const float* input, float* output, int n) {
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int stride = blockDim.x * gridDim.x;
+@@ -13,8 +15,251 @@
+     int blocks = (n + threads - 1) / threads;
+     if (blocks == 0) return;
+     exp_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // error handling left to binding
+-    }
+-}
++}
++
++// Linear kernel: y = x * W^T + b
++// x: (batch, in_features), W: (out_features, in_features), b: (out_features,)
++// Each block handles one output element? Or one row. We'll do one thread per output element.
++__global__ void linear_kernel(const float* input, const float* weight, const float* bias,
++                              float* output, int batch, int in_features, int out_features) {
++    int row = blockIdx.x;       // batch index
++    int col = blockIdx.y;       // out_features index
++    if (row >= batch || col >= out_features) return;
++    int tid = threadIdx.x;      // reduce over in_features
++    __shared__ float sum[256];  // blockDim.x <= 256 assumed
++    float val = 0.0f;
++    for (int k = tid; k < in_features; k += blockDim.x) {
++        val += input[row * in_features + k] * weight[col * in_features + k];
++    }
++    sum[tid] = val;
++    __syncthreads();
++    // reduction within block
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sum[tid] += sum[tid + s];
++        }
++        __syncthreads();
++    }
++    if (tid == 0) {
++        output[row * out_features + col] = sum[0] + bias[col];
++    }
++}
++
++extern "C" void linear_launcher(const float* input, const float* weight, const float* bias,
++                                float* output, int batch, int in_features, int out_features,
++                                cudaStream_t stream) {
++    dim3 grid(batch, out_features);
++    const int threads = 256;
++    linear_kernel<<<grid, threads, 0, stream>>>(input, weight, bias, output, batch, in_features, out_features);
++}
++
++// LSTM kernel: we implement a naive sequential LSTM for 2 layers.
++// Input: (seq_len, batch, input_size), weights per layer: W_ih (4*hidden, input), W_hh (4*hidden, hidden), b_ih, b_hh.
++// Output: (seq_len, batch, hidden) for last layer.
++// Hidden state per layer: h_t, c_t of size (batch, hidden)
++// We'll launch one block per (layer, batch?) but sequential over time is needed.
++// Simpler: one block per layer? No, we need to process entire sequence; easiest is to have one block per layer and batch? Actually each time step depends on previous.
++// Approach: Use a single kernel that loops over seq_len and layers, with one block per batch element? That would require synchronization across batch? Not needed because hidden states are per batch element independently.
++// We can have one block per batch element, and inside that block process all layers and all time steps sequentially. That requires each block to have all weights for all layers in registers/shared? We could load weights on the fly but that's slow. Given small sizes (hidden=30, batch=16), it's feasible: each block (one per batch element) can have all weights in shared memory (or registers if they fit). We'll use a block of 256 threads, but reduce to 30 threads for compute? Better: one block per batch element, with hidden_size*4 maybe? But we need to compute matrix multiplications of sizes up to 4*hidden x input, small enough to do with one warp? We'll do a simple kernel: each block processes one batch element, loops over time, and within each time loops over layers. For each layer, it computes gates using threads (each thread computes one output element of the gates? that's 4*hidden elements, could be done by blockDim.x threads). Since hidden=30, 120 gates, block of 128 or 256 threads can compute them, but need reductions over input/hidden dimensions. That's inefficient but manageable.
++// For simplicity and correctness, we can implement a straightforward kernel where each block handles one batch element, uses all threads to compute each gate's dot products, but with small sizes it may be okay.
++// Alternative: use cuBLAS if available, but we assume not. We will implement our own GEMM for LSTM within the kernel.
++// This code is for fix; we'll do a basic implementation with shared memory for weights and states.
++
++// Constants: hidden_size <= 64? Actual hidden=30, input=20, batch=16. We'll hardcode max sizes via template? We'll use dynamic but assume max hidden <= 128, input <= 128, batch <= 64 to fit shared memory.
++
++__global__ void lstm_kernel(const float* input,  // (seq_len, batch, input_size)
++                            const float* W_ih_l0, const float* W_hh_l0,
++                            const float* b_ih_l0, const float* b_hh_l0,
++                            const float* W_ih_l1, const float* W_hh_l1,
++                            const float* b_ih_l1, const float* b_hh_l1,
++                            float* output,  // (seq_len, batch, hidden)
++                            int seq_len, int batch, int input_size, int hidden_size) {
++    // One block per batch element
++    int b = blockIdx.x;
++    if (b >= batch) return;
++    int tid = threadIdx.x;
++    int block_size = blockDim.x;
++
++    // Shared memory for weights and biases for both layers, and states.
++    // We'll assume hidden_size <= 64, input_size <= 64, gate_size = 4*hidden <= 256, batch <= 64.
++    extern __shared__ float smem[];
++    // Layout: 
++    // W_ih_l0 [4*hidden * input]
++    // W_hh_l0 [4*hidden * hidden]
++    // b_ih_l0 [4*hidden]
++    // b_hh_l0 [4*hidden]
++    // W_ih_l1 [4*hidden * hidden]
++    // W_hh_l1 [4*hidden * hidden]
++    // b_ih_l1 [4*hidden]
++    // b_hh_l1 [4*hidden]
++    // h0 [hidden]
++    // c0 [hidden]
++    // h1 [hidden]
++    // c1 [hidden]
++    // temporary gate vectors [4*hidden]
++    int offset = 0;
++    float* s_W_ih_l0 = smem + offset; offset += 4 * hidden_size * input_size;
++    float* s_W_hh_l0 = smem + offset; offset += 4 * hidden_size * hidden_size;
++    float* s_b_ih_l0 = smem + offset; offset += 4 * hidden_size;
++    float* s_b_hh_l0 = smem + offset; offset += 4 * hidden_size;
++    float* s_W_ih_l1 = smem + offset; offset += 4 * hidden_size * hidden_size;
++    float* s_W_hh_l1 = smem + offset; offset += 4 * hidden_size * hidden_size;
++    float* s_b_ih_l1 = smem + offset; offset += 4 * hidden_size;
++    float* s_b_hh_l1 = smem + offset; offset += 4 * hidden_size;
++    float* s_h0 = smem + offset; offset += hidden_size;
++    float* s_c0 = smem + offset; offset += hidden_size;
++    float* s_h1 = smem + offset; offset += hidden_size;
++    float* s_c1 = smem + offset; offset += hidden_size;
++    float* s_gates = smem + offset; // 4*hidden_size
++
++    // Load weights and biases into shared memory (cooperatively)
++    int total_weights = 4 * hidden_size * (input_size + hidden_size + 1) * 2;  // both layers
++    for (int i = tid; i < total_weights; i += block_size) {
++        // decode index
++        if (i < 4 * hidden_size * input_size) {
++            s_W_ih_l0[i] = W_ih_l0[i];
++        } else if (i < 4 * hidden_size * (input_size + hidden_size)) {
++            int j = i - 4 * hidden_size * input_size;
++            s_W_hh_l0[j] = W_hh_l0[j];
++        } else if (i < 4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size) {
++            int j = i - 4 * hidden_size * (input_size + hidden_size);
++            s_b_ih_l0[j] = b_ih_l0[j];
++            s_b_hh_l0[j] = b_hh_l0[j];
++        } else if (i < 4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size * 2) {
++            int j = i - (4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size);
++            s_b_hh_l0[j] = b_hh_l0[j];
++        } else if (i < 4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size * 2 + 4 * hidden_size * hidden_size) {
++            int j = i - (4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size * 2);
++            s_W_ih_l1[j] = W_ih_l1[j];
++        } else if (i < 4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size * 2 + 4 * hidden_size * hidden_size * 2) {
++            int j = i - (4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size * 2 + 4 * hidden_size * hidden_size);
++            s_W_hh_l1[j] = W_hh_l1[j];
++        } else if (i < 4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size * 2 + 4 * hidden_size * hidden_size * 2 + 4 * hidden_size) {
++            int j = i - (4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size * 2 + 4 * hidden_size * hidden_size * 2);
++            s_b_ih_l1[j] = b_ih_l1[j];
++        } else {
++            int j = i - (4 * hidden_size * (input_size + hidden_size) + 4 * hidden_size * 2 + 4 * hidden_size * hidden_size * 2 + 4 * hidden_size);
++            s_b_hh_l1[j] = b_hh_l1[j];
++        }
++    }
++    __syncthreads();
++
++    // Initialize hidden states to zero
++    for (int i = tid; i < hidden_size; i += block_size) {
++        s_h0[i] = 0.0f;
++        s_c0[i] = 0.0f;
++        s_h1[i] = 0.0f;
++        s_c1[i] = 0.0f;
++    }
++    __syncthreads();
++
++    // Process each time step sequentially
++    for (int t = 0; t < seq_len; t++) {
++        // Layer 0
++        // Compute gates: i, f, g, o = W_ih * x_t + b_ih + W_hh * h_prev + b_hh
++        // x_t is input[t * batch * input_size + b * input_size + :]
++        const float* x_t = input + t * batch * input_size + b * input_size;
++        // We need to compute 4*hidden outputs of gates. Each thread computes one gate element? That would require block_size >= 4*hidden (120). We'll use block_size threads, each computes a subset of gate elements, with reduction over input_size+hidden_size.
++        // For simplicity, each thread computes one gate element at a time, but that's slow but hidden=30, 4*30=120, block_size=256, so plenty.
++        // We'll have each thread compute one gate element if tid < 4*hidden_size.
++        if (tid < 4 * hidden_size) {
++            int gate_idx = tid;  // 0..119
++            float val = 0.0f;
++            // Add W_ih * x_t
++            for (int k = 0; k < input_size; k++) {
++                val += s_W_ih_l0[gate_idx * input_size + k] * x_t[k];
++            }
++            // Add b_ih
++            val += s_b_ih_l0[gate_idx];
++            // Add W_hh * h_prev
++            for (int k = 0; k < hidden_size; k++) {
++                val += s_W_hh_l0[gate_idx * hidden_size + k] * s_h0[k];
++            }
++            // Add b_hh
++            val += s_b_hh_l0[gate_idx];
++            s_gates[gate_idx] = val;
++        }
++        __syncthreads();
++
++        // Apply activations and update c, h
++        if (tid < hidden_size) {
++            int i = tid;
++            float ig = 1.0f / (1.0f + expf(-s_gates[i]));  // sigmoid
++            float fg = 1.0f / (1.0f + expf(-s_gates[hidden_size + i]));
++            float gg = tanhf(s_gates[2 * hidden_size + i]);
++            float og = 1.0f / (1.0f + expf(-s_gates[3 * hidden_size + i]));
++            float c_new = fg * s_c0[i] + ig * gg;
++            float h_new = og * tanhf(c_new);
++            s_c0[i] = c_new;
++            s_h0[i] = h_new;
++        }
++        __syncthreads();
++
++        // Layer 1 uses h0 as input
++        // Compute gates for layer 1
++        if (tid < 4 * hidden_size) {
++            int gate_idx = tid;
++            float val = 0.0f;
++            // W_ih_l1 * h0
++            for (int k = 0; k < hidden_size; k++) {
++                val += s_W_ih_l1[gate_idx * hidden_size + k] * s_h0[k];
++            }
++            val += s_b_ih_l1[gate_idx];
++            // W_hh_l1 * h1_prev
++            for (int k = 0; k < hidden_size; k++) {
++                val += s_W_hh_l1[gate_idx * hidden_size + k] * s_h1[k];
++            }
++            val += s_b_hh_l1[gate_idx];
++            s_gates[gate_idx] = val;
++        }
++        __syncthreads();
++
++        // Update c1, h1
++        if (tid < hidden_size) {
++            int i = tid;
++            float ig = 1.0f / (1.0f + expf(-s_gates[i]));
++            float fg = 1.0f / (1.0f + expf(-s_gates[hidden_size + i]));
++            float gg = tanhf(s_gates[2 * hidden_size + i]);
++            float og = 1.0f / (1.0f + expf(-s_gates[3 * hidden_size + i]));
++            float c_new = fg * s_c1[i] + ig * gg;
++            float h_new = og * tanhf(c_new);
++            s_c1[i] = c_new;
++            s_h1[i] = h_new;
++        }
++        __syncthreads();
++
++        // Write output for this time step: output[t * batch * hidden_size + b * hidden_size + i] = h1[i]
++        if (tid < hidden_size) {
++            output[t * batch * hidden_size + b * hidden_size + tid] = s_h1[tid];
++        }
++        __syncthreads();
++    }
++}
++
++extern "C" void lstm_launcher(const float* input,
++                               const float* W_ih_l0, const float* W_hh_l0,
++                               const float* b_ih_l0, const float* b_hh_l0,
++                               const float* W_ih_l1, const float* W_hh_l1,
++                               const float* b_ih_l1, const float* b_hh_l1,
++                               float* output,
++                               int seq_len, int batch, int input_size, int hidden_size,
++                               cudaStream_t stream) {
++    int threads = 256;
++    int blocks = batch;
++    // Calculate shared memory size
++    int smem_size = 0;
++    smem_size += 4 * hidden_size * input_size * sizeof(float);
++    smem_size += 4 * hidden_size * hidden_size * sizeof(float);
++    smem_size += 4 * hidden_size * sizeof(float);  // b_ih_l0
++    smem_size += 4 * hidden_size * sizeof(float);  // b_hh_l0
++    smem_size += 4 * hidden_size * hidden_size * sizeof(float);  // W_ih_l1
++    smem_size += 4 * hidden_size * hidden_size * sizeof(float);  // W_hh_l1
++    smem_size += 4 * hidden_size * sizeof(float);  // b_ih_l1
++    smem_size += 4 * hidden_size * sizeof(float);  // b_hh_l1
++    smem_size += hidden_size * sizeof(float) * 4; // h0,c0,h1,c1
++    smem_size += 4 * hidden_size * sizeof(float); // gates
++    lstm_kernel<<<blocks, threads, smem_size, stream>>>(
++        input, W_ih_l0, W_hh_l0, b_ih_l0, b_hh_l0,
++        W_ih_l1, W_hh_l1, b_ih_l1, b_hh_l1,
++        output, seq_len, batch, input_size, hidden_size);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,37 +1,38 @@
+-// Bindings for LSTM, Linear, and Exp custom ops
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cublas_v2.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include "../binding_registry.h"
+ 
++// Forward declarations of launchers from custom_ops.cu
+ extern "C" void exp_forward_launcher(const float* input, float* output, int n, cudaStream_t stream);
++extern "C" void linear_launcher(const float* input, const float* weight, const float* bias,
++                                float* output, int batch, int in_features, int out_features,
++                                cudaStream_t stream);
++extern "C" void lstm_launcher(const float* input,
++                               const float* W_ih_l0, const float* W_hh_l0,
++                               const float* b_ih_l0, const float* b_hh_l0,
++                               const float* W_ih_l1, const float* W_hh_l1,
++                               const float* b_ih_l1, const float* b_hh_l1,
++                               float* output,
++                               int seq_len, int batch, int input_size, int hidden_size,
++                               cudaStream_t stream);
+ 
+ #define CHECK_CUDA_TENSOR(t) \
+     TORCH_CHECK((t).is_cuda(), #t " must be a CUDA tensor"); \
+     TORCH_CHECK((t).is_contiguous(), #t " must be contiguous"); \
+     TORCH_CHECK((t).dtype() == torch::kFloat32, #t " must be float32")
+ 
+-static cublasHandle_t get_cublas_handle() {
+-    static cublasHandle_t handle = nullptr;
+-    if (!handle) {
+-        cublasCreate(&handle);
+-    }
+-    return handle;
++static inline cudaStream_t get_current_stream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
+ }
+ 
+-static cudnnHandle_t get_cudnn_handle() {
+-    static cudnnHandle_t handle = nullptr;
+-    if (!handle) {
+-        cudnnCreate(&handle);
+-    }
+-    return handle;
++static inline void check_cuda_error(const char* msg) {
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, msg, ": ", cudaGetErrorString(err));
+ }
+ 
+-// LSTM forward using cuDNN
+ torch::Tensor lstm_forward(
+     torch::Tensor input,
+     torch::Tensor weight_ih_l0,
+@@ -48,6 +49,7 @@
+     int64_t hidden_size,
+     int64_t num_layers
+ ) {
++    // Validate inputs
+     CHECK_CUDA_TENSOR(input);
+     CHECK_CUDA_TENSOR(weight_ih_l0);
+     CHECK_CUDA_TENSOR(weight_hh_l0);
+@@ -58,129 +60,36 @@
+     CHECK_CUDA_TENSOR(bias_ih_l1);
+     CHECK_CUDA_TENSOR(bias_hh_l1);
+ 
+-    TORCH_CHECK(seq_len > 0 && batch_size > 0 && input_size > 0 && hidden_size > 0 && num_layers == 2,
+-                "Only two-layer LSTM supported");
++    TORCH_CHECK(num_layers == 2, "Only two-layer LSTM supported");
++    TORCH_CHECK(input.size(0) == seq_len && input.size(1) == batch_size && input.size(2) == input_size,
++                "Input shape mismatch");
++    TORCH_CHECK(hidden_size > 0 && hidden_size <= 128, "hidden_size must be between 1 and 128");
++    TORCH_CHECK(input_size > 0 && input_size <= 128, "input_size must be between 1 and 128");
++    TORCH_CHECK(batch_size <= 64, "batch_size too large for this implementation");
+ 
+-    cudnnHandle_t cudnn = get_cudnn_handle();
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    cudnnSetStream(cudnn, stream);
++    // Allocate output with torch::empty_like? Output shape is (seq_len, batch, hidden)
++    auto output = torch::empty({seq_len, batch_size, hidden_size}, input.options());
+ 
+-    cudnnRNNDescriptor_t rnn_desc;
+-    cudnnCreateRNNDescriptor(&rnn_desc);
+-    cudnnSetRNNDescriptor_v8(rnn_desc,
+-                             CUDNN_RNN_ALGO_STANDARD,
+-                             CUDNN_RNN_RELU,
+-                             CUDNN_RNN_RELU,
+-                             CUDNN_UNIDIRECTIONAL,
+-                             CUDNN_LINEAR_INPUT,
+-                             CUDNN_DATA_FLOAT,
+-                             CUDNN_DATA_FLOAT,
+-                             CUDNN_DEFAULT_MATH,
+-                             (int)input_size,
+-                             (int)hidden_size,
+-                             (int)hidden_size,
+-                             (int)num_layers,
+-                             nullptr,
+-                             CUDNN_RNN_PADDED_IO_DISABLED);
++    cudaStream_t stream = get_current_stream();
+ 
+-    cudnnSetRNNMatrixMathType(rnn_desc, CUDNN_DEFAULT_MATH);
+-    cudnnSetRNNBiasMode(rnn_desc, CUDNN_RNN_DOUBLE_BIAS);
+-
+-    size_t weight_size;
+-    cudnnGetRNNWeightSpaceSize(cudnn, rnn_desc, &weight_size);
+-    void* d_wspace;
+-    cudaMalloc(&d_wspace, weight_size);
+-
+-    cudnnTensorDescriptor_t x_desc, y_desc;
+-    cudnnCreateTensorDescriptor(&x_desc);
+-    cudnnCreateTensorDescriptor(&y_desc);
+-    int dimsX[3] = {(int)seq_len, (int)batch_size, (int)input_size};
+-    int stridesX[3] = {batch_size * input_size, input_size, 1};
+-    cudnnSetTensorNdDescriptor(x_desc, CUDNN_DATA_FLOAT, 3, dimsX, stridesX);
+-    int dimsY[3] = {(int)seq_len, (int)batch_size, (int)hidden_size};
+-    int stridesY[3] = {batch_size * hidden_size, hidden_size, 1};
+-    cudnnSetTensorNdDescriptor(y_desc, CUDNN_DATA_FLOAT, 3, dimsY, stridesY);
+-
+-    cudnnFilterDescriptor_t w_desc_ih, w_desc_hh;
+-    cudnnCreateFilterDescriptor(&w_desc_ih);
+-    cudnnCreateFilterDescriptor(&w_desc_hh);
+-    cudnnSetFilterNdDescriptor(w_desc_ih, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 2, (int[]){4*(int)hidden_size, (int)input_size});
+-    cudnnSetFilterNdDescriptor(w_desc_hh, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 2, (int[]){4*(int)hidden_size, (int)hidden_size});
+-
+-    cudnnTensorDescriptor_t b_desc;
+-    cudnnCreateTensorDescriptor(&b_desc);
+-    cudnnSetTensor4dDescriptor(b_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 4*(int)hidden_size, 1, 1, 1);
+-
+-    for (int layer = 0; layer < num_layers; ++layer) {
+-        void* ptr_ih = nullptr;
+-        cudnnGetRNNWeightParams(cudnn, rnn_desc, layer, weight_size, d_wspace,
+-                                0, w_desc_ih, &ptr_ih, nullptr);
+-        cudaMemcpyAsync(ptr_ih, (layer == 0 ? weight_ih_l0.data_ptr<float>() : weight_ih_l1.data_ptr<float>()),
+-                        weight_ih_l0.numel() * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+-        void* ptr_hh = nullptr;
+-        cudnnGetRNNWeightParams(cudnn, rnn_desc, layer, weight_size, d_wspace,
+-                                1, w_desc_hh, &ptr_hh, nullptr);
+-        cudaMemcpyAsync(ptr_hh, (layer == 0 ? weight_hh_l0.data_ptr<float>() : weight_hh_l1.data_ptr<float>()),
+-                        weight_hh_l0.numel() * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+-        void* ptr_bih = nullptr;
+-        cudnnGetRNNWeightParams(cudnn, rnn_desc, layer, weight_size, d_wspace,
+-                                2, b_desc, &ptr_bih, nullptr);
+-        cudaMemcpyAsync(ptr_bih, (layer == 0 ? bias_ih_l0.data_ptr<float>() : bias_ih_l1.data_ptr<float>()),
+-                        bias_ih_l0.numel() * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+-        void* ptr_bhh = nullptr;
+-        cudnnGetRNNWeightParams(cudnn, rnn_desc, layer, weight_size, d_wspace,
+-                                3, b_desc, &ptr_bhh, nullptr);
+-        cudaMemcpyAsync(ptr_bhh, (layer == 0 ? bias_hh_l0.data_ptr<float>() : bias_hh_l1.data_ptr<float>()),
+-                        bias_hh_l0.numel() * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+-    }
+-
+-    // 使用 torch::empty_like 基于 input 创建输出，不能使用 torch::empty（但 torch::empty 也可能允许，为安全使用 torch::empty 但仅分配）
+-    auto output = torch::empty({seq_len, batch_size, hidden_size}, input.options());
+-    auto hx = torch::zeros({num_layers, batch_size, hidden_size}, input.options());
+-    auto cx = torch::zeros({num_layers, batch_size, hidden_size}, input.options());
+-    void* d_output = output.data_ptr<float>();
+-    void* d_hx = hx.data_ptr<float>();
+-    void* d_cx = cx.data_ptr<float>();
+-
+-    size_t work_size;
+-    cudnnGetRNNTempSpaceSizes(cudnn, rnn_desc, CUDNN_RNN_FWD_MODE_INFERENCE, nullptr, &work_size, nullptr);
+-    void* d_workspace;
+-    cudaMalloc(&d_workspace, work_size);
+-
+-    cudnnRNNForwardInference(cudnn,
+-                             rnn_desc,
+-                             CUDNN_RNN_FWD_MODE_INFERENCE,
+-                             nullptr,
+-                             x_desc,
+-                             input.data_ptr<float>(),
+-                             y_desc,
+-                             d_output,
+-                             nullptr,
+-                             d_hx,
+-                             nullptr,
+-                             nullptr,
+-                             nullptr,
+-                             d_cx,
+-                             nullptr,
+-                             nullptr,
+-                             d_wspace,
+-                             weight_size,
+-                             d_workspace,
+-                             work_size,
+-                             nullptr, 0);
+-
+-    cudaError_t cuda_err = cudaGetLastError();
+-    TORCH_CHECK(cuda_err == cudaSuccess, "CUDA error in lstm_forward: ", cudaGetErrorString(cuda_err));
+-
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyFilterDescriptor(w_desc_ih);
+-    cudnnDestroyFilterDescriptor(w_desc_hh);
+-    cudnnDestroyTensorDescriptor(b_desc);
+-    cudnnDestroyRNNDescriptor(rnn_desc);
+-    cudaFree(d_wspace);
+-    cudaFree(d_workspace);
+-
++    lstm_launcher(
++        input.data_ptr<float>(),
++        weight_ih_l0.data_ptr<float>(),
++        weight_hh_l0.data_ptr<float>(),
++        bias_ih_l0.data_ptr<float>(),
++        bias_hh_l0.data_ptr<float>(),
++        weight_ih_l1.data_ptr<float>(),
++        weight_hh_l1.data_ptr<float>(),
++        bias_ih_l1.data_ptr<float>(),
++        bias_hh_l1.data_ptr<float>(),
++        output.data_ptr<float>(),
++        (int)seq_len,
++        (int)batch_size,
++        (int)input_size,
++        (int)hidden_size,
++        stream
++    );
++    check_cuda_error("lstm_forward kernel launch failed");
+     return output;
+ }
+ 
+@@ -196,74 +105,45 @@
+ 
+     int64_t batch = input.size(0);
+     int64_t in_features = input.size(1);
+-    TORCH_CHECK(weight.size(0) == out_features, "weight shape mismatch");
+-    TORCH_CHECK(weight.size(1) == in_features, "weight shape mismatch");
++    TORCH_CHECK(weight.size(0) == out_features && weight.size(1) == in_features, "weight shape mismatch");
+     TORCH_CHECK(bias.size(0) == out_features, "bias size mismatch");
+-
+-    cublasHandle_t handle = get_cublas_handle();
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    cublasSetStream(handle, stream);
+ 
+     auto output = torch::empty({batch, out_features}, input.options());
+ 
+-    const float alpha = 1.0f;
+-    const float beta = 0.0f;
++    cudaStream_t stream = get_current_stream();
+ 
+-    // 使用 cublasSgemm 直接计算，不进行显式转置，利用 cublas 的转置参数
+-    // 计算 C = A * B^T，其中 A 为 weight (out, in) 行主序，B 为 input (batch, in) 行主序
+-    // 采用 cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, m, n, k, ...) 模式
+-    // 这里 m = out_features, n = batch, k = in_features
+-    // 将 weight 作为 col-major (in, out) 矩阵，lda = in_features，transa = CUBLAS_OP_T 得到 weight^T
+-    // 将 input 作为 col-major (batch, in) 矩阵，ldb = in_features，transb = CUBLAS_OP_T 得到 input^T
+-    // 但实际推导发现不匹配，改用以下可靠方法：
+-    // 使用 cublasSgemm 配合转置，并利用输出矩阵的存储方式避免显式转置。
+-    // 根据公式：对于行主序 A (m x k) 和 B (k x n)，C = A * B 可通过
+-    // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, n, m, k, &alpha, B, n, A, k, &beta, C, n);
+-    // 在我们的例子中，A = input (batch x in), B = weight^T (in x out), C = output (batch x out)
+-    // 我们不需要显式转置 weight，只需将 weight 视为 B 并传递其转置形式即可。
+-    // 因此，使用以下调用：
+-    // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, out_features, batch, in_features,
+-    //             &alpha, weight.data_ptr<float>(), out_features,
+-    //             input.data_ptr<float>(), in_features,
+-    //             &beta, output.data_ptr<float>(), out_features);
+-    // 但需要验证 weight 的存储方式：weight 是 (out, in) 行主序，在 col-major 解释下为 (in, out) 且 lda=out_features。
+-    // 上述调用中的第一个矩阵（A）期望为 (in, out) col-major，lda=out_features，与 weight 的存储一致！
+-    // 第二个矩阵（B）期望为 (batch, in) col-major，ldb=in_features，input 存储为 (batch, in) 行主序，
+-    // 但在 col-major 解释下应为 (in, batch) 且 ldb=in_features，因此需要转置，但使用 transb=CUBLAS_OP_T 可自动转置。
+-    // 经过仔细验证，下面这个调用是正确的：
+-    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, out_features, batch, in_features,
+-                &alpha, weight.data_ptr<float>(), out_features,
+-                input.data_ptr<float>(), in_features,
+-                &beta, output.data_ptr<float>(), out_features);
+-
+-    // 添加 bias：使用 cublasSaxpy 对每一列添加 bias[j]
+-    const float one = 1.0f;
+-    for (int64_t j = 0; j < out_features; ++j) {
+-        cublasSaxpy(handle, batch, &one, bias.data_ptr<float>() + j, 0, output.data_ptr<float>() + j * out_features, 1);
+-    }
+-
++    linear_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
++        (int)batch,
++        (int)in_features,
++        (int)out_features,
++        stream
++    );
++    check_cuda_error("linear_forward kernel launch failed");
+     return output;
+ }
+ 
+ torch::Tensor exp_forward(torch::Tensor input) {
+     CHECK_CUDA_TENSOR(input);
+     auto output = torch::empty_like(input);
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    exp_forward_launcher(input.data_ptr<float>(), output.data_ptr<float>(), input.numel(), stream);
+-    cudaError_t err = cudaGetLastError();
+-    TORCH_CHECK(err == cudaSuccess, "CUDA error in exp_forward: ", cudaGetErrorString(err));
++    cudaStream_t stream = get_current_stream();
++    exp_forward_launcher(input.data_ptr<float>(), output.data_ptr<float>(), (int)input.numel(), stream);
++    check_cuda_error("exp_forward kernel launch failed");
+     return output;
+ }
+ 
+ void register_custom_ops(pybind11::module& m) {
+-    m.def("lstm_forward", &lstm_forward, "LSTM forward (cuDNN)",
++    m.def("lstm_forward", &lstm_forward, "LSTM forward (custom CUDA kernel)",
+           py::arg("input"), py::arg("weight_ih_l0"), py::arg("weight_hh_l0"),
+           py::arg("bias_ih_l0"), py::arg("bias_hh_l0"),
+           py::arg("weight_ih_l1"), py::arg("weight_hh_l1"),
+           py::arg("bias_ih_l1"), py::arg("bias_hh_l1"),
+           py::arg("seq_len"), py::arg("batch_size"), py::arg("input_size"),
+           py::arg("hidden_size"), py::arg("num_layers"));
+-    m.def("linear_forward", &linear_forward, "Linear forward (cuBLAS)",
++    m.def("linear_forward", &linear_forward, "Linear forward (custom CUDA kernel)",
+           py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("out_features"));
+     m.def("exp_forward", &exp_forward, "Exp forward (custom CUDA kernel)",
+           py::arg("input"));

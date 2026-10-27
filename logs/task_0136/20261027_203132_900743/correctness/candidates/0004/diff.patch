@@ -1,0 +1,293 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -40,31 +40,32 @@
+                                   float* __restrict__ output,
+                                   int N, int C, int H, int W,
+                                   int outH, int outW) {
+-    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int total_out = N * C * outH * outW;
+-    if (out_idx >= total_out) return;
++    int stride = blockDim.x * gridDim.x;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    for (int out_idx = idx; out_idx < total_out; out_idx += stride) {
++        // Decode output index
++        int ow = out_idx % outW;
++        int oh = (out_idx / outW) % outH;
++        int c = (out_idx / (outW * outH)) % C;
++        int n = out_idx / (outW * outH * C);
+ 
+-    // Decode output index
+-    int ow = out_idx % outW;
+-    int oh = (out_idx / outW) % outH;
+-    int c = (out_idx / (outW * outH)) % C;
+-    int n = out_idx / (outW * outH * C);
++        int h_start = oh * 2;
++        int w_start = ow * 2;
+ 
+-    int h_start = oh * 2;
+-    int w_start = ow * 2;
+-
+-    float sum = 0.0f;
+-    for (int kh = 0; kh < 2; ++kh) {
+-        int h = h_start + kh;
+-        if (h >= H) continue; // though without padding and exact divisible, this is always valid
+-        for (int kw = 0; kw < 2; ++kw) {
+-            int w = w_start + kw;
+-            if (w >= W) continue;
+-            sum += input[((n * C + c) * H + h) * W + w];
++        float sum = 0.0f;
++        for (int kh = 0; kh < 2; ++kh) {
++            int h = h_start + kh;
++            if (h >= H) continue; // though without padding and exact divisible, this is always valid
++            for (int kw = 0; kw < 2; ++kw) {
++                int w = w_start + kw;
++                if (w >= W) continue;
++                sum += input[((n * C + c) * H + h) * W + w];
++            }
+         }
++        // Since kernel=2 and output dims are exactly H/2, W/2, the count is always 4.
++        output[out_idx] = sum * 0.25f;
+     }
+-    // Since kernel=2 and output dims are exactly H/2, W/2, the count is always 4.
+-    output[out_idx] = sum * 0.25f;
+ }
+ 
+ extern "C" void avg_pool2d_forward_launcher(
+@@ -83,27 +84,24 @@
+ // -----------------------------------------------------------------------------
+ // Flatten kernel: from input shape [N, C, H, W] (possibly non-contiguous) to
+ // output shape [N, C*H*W], preserving row-major order of original contiguous layout.
+-// Since input may be non-contiguous, we must respect its strides.
+-// We assume input is the output of avg_pool2d, which is contiguous, but for safety
+-// we handle general strides.
+-// The launcher will receive the input pointer and strides as int64_t? We'll keep int.
+ // -----------------------------------------------------------------------------
+ __global__ void flatten_kernel(const float* __restrict__ input,
+                                float* __restrict__ output,
+                                int N, int C, int H, int W,
+                                int sN, int sC, int sH, int sW) {
++    int total = N * C * H * W;
++    int stride = blockDim.x * gridDim.x;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = N * C * H * W;
+-    if (idx >= total) return;
++    for (int linear_idx = idx; linear_idx < total; linear_idx += stride) {
++        // Decode linear index into n,c,h,w assuming row-major contiguous order
++        int w = linear_idx % W;
++        int h = (linear_idx / W) % H;
++        int c = (linear_idx / (W * H)) % C;
++        int n = linear_idx / (W * H * C);
+ 
+-    // Decode linear index into n,c,h,w assuming row-major contiguous order
+-    int w = idx % W;
+-    int h = (idx / W) % H;
+-    int c = (idx / (W * H)) % C;
+-    int n = idx / (W * H * C);
+-
+-    int input_offset = n * sN + c * sC + h * sH + w * sW;
+-    output[idx] = input[input_offset];
++        int input_offset = n * sN + c * sC + h * sH + w * sW;
++        output[linear_idx] = input[input_offset];
++    }
+ }
+ 
+ extern "C" void flatten_forward_launcher(
+@@ -120,69 +118,11 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// Linear kernel: output = input @ weight^T + bias
+-// dimensions: input [M, K], weight [N, K], bias [N], output [M, N]
+-// We use a tiled matrix multiplication with shared memory, each block computes a tile of output.
+-// Since N=10 is small, we can have each block compute one row of output? Or use a simpler kernel.
+-// For performance, we use one block per output tile, with blockDim = (TILE_N, TILE_M).
+-// However, N=10, M=512, K=49152. We can set TILE_N=10, TILE_M=16, and compute per block.
+-// We'll create a generic kernel where gridDim.y = ceil(M/TILE_M), gridDim.x = ceil(N/TILE_N).
+-// Each block computes TILE_M x TILE_N outputs using shared memory tiles for A and B.
+-// Since K is large, we loop over K in chunks.
++// Linear kernel (not used if we use cuBLAS, but kept for completeness)
+ // -----------------------------------------------------------------------------
+ #define TILE_M 16
+ #define TILE_N 10  // because N=10
+ #define TILE_K 32
+-
+-__global__ void linear_kernel(const float* __restrict__ input,
+-                              const float* __restrict__ weight,
+-                              const float* __restrict__ bias,
+-                              float* __restrict__ output,
+-                              int M, int N, int K) {
+-    __shared__ float As[TILE_M][TILE_K];
+-    __shared__ float Bs[TILE_K][TILE_N];
+-
+-    int row = blockIdx.y * TILE_M + threadIdx.y;
+-    int col = blockIdx.x * TILE_N + threadIdx.x;
+-
+-    float sum = 0.0f;
+-
+-    for (int k0 = 0; k0 < K; k0 += TILE_K) {
+-        // Load tile of A (input) from global to shared
+-        if (row < M && (k0 + threadIdx.x) < K) {
+-            As[threadIdx.y][threadIdx.x] = input[row * K + k0 + threadIdx.x];
+-        } else {
+-            As[threadIdx.y][threadIdx.x] = 0.0f;
+-        }
+-
+-        // Load tile of B (weight^T) from global to shared: weight is [N, K], so B[k, n] = weight[n, k]
+-        // We need Bs[local_k][n] = weight[n, k0 + local_k]
+-        if (col < N && (k0 + threadIdx.y) < K) {
+-            // threadIdx.y is 0..TILE_M-1, but we need to fill Bs dimensions TILE_K x TILE_N.
+-            // To fully load Bs, each thread should load one element.
+-            // We have blockDim.x = TILE_N, blockDim.y = TILE_M, total threads = TILE_N*TILE_M >= TILE_K*TILE_N? not necessarily.
+-            // Simplification: use blockDim.x=TILE_N, blockDim.y=TILE_M, but for loading B we need all threads cooperate.
+-            // Better: use a separate loading approach with a loop.
+-            // Since N=10 is small, we can allocate Bs as [TILE_K][TILE_N] and load using a loop over k.
+-            // We'll redesign: each thread loads multiple elements if needed.
+-            // For simplicity, we can assume blockDim.x = TILE_N, blockDim.y = TILE_M, and TILE_M*TILE_N = 160 threads.
+-            // TILE_K*TILE_N = 320 elements, so each thread loads 2 elements for B.
+-            // We'll implement loops.
+-        }
+-    }
+-    // This kernel needs careful design. To avoid complexity, we can use a simpler non-tiled kernel with one thread per output element,
+-    // but K is large (49152) causing many loads. However, N=10, M=512, total outputs=5120, each requires 49152 multiplications,
+-    // total 251M ops. A naive kernel may be slower than torch.compile but may still meet 5% if other ops dominate? Probably not,
+-    // but we don't have binding yet to test performance. We'll implement a reasonably optimized version.
+-    // Alternative: use cuBLAS via cublasSgemm, but we are in .cu and can call cublas. We can include cublas_v2.h and use cublas handle.
+-    // However, the launcher would need a cublas handle, which we can create/destroy? Better to keep pure CUDA.
+-    // Given the small N=10, we can have each block compute one column (10 outputs) for a tile of rows, using warp-level reduction?
+-    // We'll implement a tiled kernel with proper loading loops, but it may be overkill. Let's implement a simpler one:
+-    // Each thread computes one output element by looping over K. Grid = (ceil(N/??), ceil(M/??)) with blockDim multiple.
+-    // But to use shared memory, we can have blockDim.x = TILE_N, blockDim.y = TILE_M, and load tiles.
+-    // We'll write a correct kernel with shared memory, but may not be fully optimized. That's acceptable.
+-    // We'll restart the linear kernel implementation from scratch below.
+-}
+ 
+ __global__ void linear_kernel_v2(const float* __restrict__ input,
+                                  const float* __restrict__ weight,
+@@ -211,8 +151,6 @@
+         }
+ 
+         // Load B tile: Bs[threadRow][threadCol] = weight[(blockCol+threadCol)*K + k0+threadRow]
+-        // Note: weight is [N, K], so weight[n, k]. We want Bs[k][n] = weight[n, k].
+-        // Here threadRow indexes k (0..TILE_K-1) and threadCol indexes n (0..TILE_N-1).
+         int globalColB = blockCol + threadCol; // n index
+         int globalRowB = k0 + threadRow;       // k index
+         if (globalColB < N && globalRowB < K) {
+@@ -246,7 +184,7 @@
+     float* output,
+     int M, int N, int K,
+     cudaStream_t stream) {
+-    dim3 blockDim(TILE_N, TILE_M); // (16,16) = 256 threads
++    dim3 blockDim(TILE_N, TILE_M); // (10,16) = 160 threads, not 256
+     dim3 gridDim((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+     linear_kernel_v2<<<gridDim, blockDim, 0, stream>>>(input, weight, bias, output, M, N, K);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -27,8 +27,7 @@
+     int sN, int sC, int sH, int sW,
+     cudaStream_t stream);
+ 
+-// For linear, we use cuBLAS, so no launcher from .cu is needed.
+-// We will implement a helper to call cublasSgemm.
++// Linear forward uses cuBLAS, so no launcher declaration needed.
+ 
+ // Helper to get cuBLAS handle for current device/stream, cached per thread
+ typedef struct {
+@@ -63,7 +62,6 @@
+ torch::Tensor sigmoid_forward(torch::Tensor input) {
+     TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+-    // Input can be non-contiguous, but our kernel assumes contiguous. We can make contiguous if needed.
+     auto input_contig = input.contiguous();
+     auto output = torch::empty_like(input_contig);
+ 
+@@ -82,8 +80,6 @@
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "sigmoid_forward_launcher failed: ", cudaGetErrorString(err));
+ 
+-    // Preserve original shape and strides if input was non-contiguous? PyTorch operations return contiguous by default.
+-    // The reference output is contiguous, so returning a contiguous tensor is fine.
+     return output;
+ }
+ 
+@@ -137,7 +133,6 @@
+     TORCH_CHECK(start_dim == 1, "Only start_dim=1 is supported");
+     TORCH_CHECK(input.dim() == 4, "Input must be 4D (N,C,H,W)");
+ 
+-    // Flatten from dim 1 to end, always produce contiguous output
+     int64_t N = input.size(0);
+     int64_t C = input.size(1);
+     int64_t H = input.size(2);
+@@ -150,10 +145,8 @@
+         return output;
+     }
+ 
+-    // Ensure input is contiguous for our flatten kernel, which assumes row-major contiguous indexing.
+-    auto input_contig = input.contiguous();
+-
+-    // Get strides (contiguous strides: C*H*W, H*W, W, 1)
++    auto input_contig = input.contiguous();
++
+     int sN = static_cast<int>(C * H * W);
+     int sC = static_cast<int>(H * W);
+     int sH = static_cast<int>(W);
+@@ -203,30 +196,6 @@
+     if (output.numel() == 0) {
+         return output;
+     }
+-
+-    // Use cuBLAS: C = alpha * A * B + beta * C
+-    // We need: output = input @ weight.T + bias
+-    // In cuBLAS column-major, we can treat row-major A (N x K) as column-major A^T (K x N).
+-    // And row-major B (M x K) as column-major B^T (K x M).
+-    // Then C^T (M x N) = B^T (K x M) * A^T (K x N), so C = A * B^T, which is what we want.
+-    // We set: cublas operation on A (input) as CUBLAS_OP_T, on B (weight) as CUBLAS_OP_N.
+-    // Wait, let's be careful.
+-    // Standard cuBLAS: C = op(A) * op(B), with A m x k, B k x n, C m x n.
+-    // If we treat input as row-major N x K, we can view it as column-major transposed: A_col = input^T, which is K x N.
+-    // Similarly, weight^T row-major M x K -> column-major transposed: B_col = (weight^T)^T = weight, which is K x M.
+-    // Then C_col = A_col * B_col, which is (K x N) * (K x M) -> not valid.
+-    // Alternative: We want C = input (N x K) * weight^T (K x M).
+-    // Use cublasSgemm with column-major storage: we can pass transa = CUBLAS_OP_T, transb = CUBLAS_OP_N,
+-    // and set A = input (row-major NxK) but treated as column-major; B = weight (row-major MxK) treated as column-major.
+-    // Let's derive: In column-major, A (m x k) with op(A) = A^T means we have A^T (k x m).
+-    // We want m = N, k = K, n = M.
+-    // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, input, K, weight, K, &beta, output, N)
+-    // Here: lda = K (leading dimension of input as column-major, but input is row-major with leading dimension K).
+-    // ldb = K (leading dimension of weight as column-major, weight is row-major with leading dimension K).
+-    // ldc = N (leading dimension of output, output row-major leading dimension M, but column-major leading dim = N).
+-    // Wait, output is row-major N x M, leading dimension = M (number of columns). But cublas expects column-major, so output_col would be M x N? Actually cublas assumes column-major, so if we pass row-major output as column-major, its leading dimension should be number of rows in column-major interpretation, which is N (number of rows of original array). So ldc = N.
+-    // Let's set: alpha=1, beta=0 first, compute matmul, then add bias.
+-    // Or use beta=1 and prefill output with bias? No, we'll do separate.
+ 
+     cublasHandle_t handle = get_cublas_handle();
+     const float alpha = 1.0f;
+@@ -243,27 +212,7 @@
+     );
+     TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "cublasSgemm failed");
+ 
+-    // Add bias: output += bias broadcast across rows
+-    // We need a kernel for this, or we can use cublasSgemm with beta=1 and pre-filled output? But output is uninitialized.
+-    // Alternative: Use cublasSgemm with beta=1 and set output to bias repeated? That requires filling.
+-    // Simpler: Use a custom kernel for bias add, or use cudaMemcpy2D? We can incorporate bias in the .cu linear launcher instead.
+-    // But we already have a linear_kernel_v2 in .cu that includes bias, though it's not used if we use cuBLAS.
+-    // To keep things simple and avoid extra kernel, we can call cublasSgemm with beta=1 and set output to bias using a simple CUDA kernel.
+-    // However, better to implement bias addition using a custom kernel or use cublasSgemm with beta=1 after filling output with bias.
+-    // We'll implement a small bias addition using a CUDA kernel? But we cannot modify .cu now? The task says only .cpp, but we can add a new kernel to .cu? The task says "只允许修改 model_new.py、kernels/custom_ops.cu，或 kernels/ 下的 .cpp 文件" so we can modify .cu, but the current phase says only generate or modify kernels/ 下的绑定 .cpp 文件. So we cannot modify .cu in this phase. Therefore, we must rely on existing .cu launchers or pure C++ (cuBLAS/cuDNN) in .cpp. Since we cannot add new CUDA kernels in .cpp, we must use cuBLAS for linear and handle bias separately without a kernel.
+-    // We can use cublasSgemm with beta=0 to get the matmul result, then use cudaMemcpy? Not for bias.
+-    // Alternatively, we can use cublasSgemm with beta=1 and ensure output is pre-filled with bias by using cudaMemset? No, bias varies per column.
+-    // Option: Use a second cublas call to add bias? cuBLAS has no direct bias add, but we can do a rank-1 update? The bias is constant across rows, so we can use cublasSger (rank-1 update) to add bias: output = output + ones * bias^T, where ones is a vector of 1s length N.
+-    // That would require an additional matrix-vector operation, but cuBLAS can do it efficiently. We can first compute matmul, then add bias using cublasSger with alpha=1, x = ones (length N), y = bias (length M), resulting in output += ones * bias^T. Need to allocate a ones vector, but that's a one-time cost? We can allocate a small vector of 1.0f each call or cache it.
+-    // Or simpler: use cublasSgemm with beta=1 and pre-set output with bias by using a custom approach? There's cublasSetMatrix with custom? Not feasible without kernel.
+-    // Another option: Use cublasSgemm to compute input @ weight^T, then use cublasSaxpy to add bias to each row? cublasSaxpy operates on vectors, but we need to add bias vector to each row of matrix, which is a rank-1 update as described.
+-    // Let's implement bias addition via cublasSger (rank-1 update). We need a ones vector of length N (number of rows) and bias vector of length M (columns). Then C = alpha*x*y^T + C. This adds bias to each row.
+-    // Allocate ones tensor (N) as float, fill with 1.0f. Could cache it or create each call. N is known and small (512), so overhead minimal.
+-    // We'll create a ones tensor and fill with 1.0f using torch::ones or by memset? torch::ones is allowed? It's a tensor creation, not computation. We can use torch::ones({N}, input.options()) which is acceptable as tensor creation. But it creates a new tensor with ones, which is fine.
+-    // Then call cublasSger(handle, N, M, &alpha, ones_ptr, 1, bias_ptr, 1, output_ptr, ldc).
+-    // Note: cublasSger computes A = alpha*x*y^T + A, where A is m x n. x length m, y length n. We want output += bias for each row: output[i][j] += bias[j]. So x = ones (m=N), y = bias (n=M). Good.
+-
+-    // Create ones tensor
++    // Add bias: output += ones * bias^T
+     auto ones = torch::ones({N}, input_contig.options());
+ 
+     const float one_alpha = 1.0f;

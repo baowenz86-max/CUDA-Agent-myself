@@ -1,0 +1,283 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,131 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// CUDA kernels for reflection_pad2d, elementwise maximum, and elementwise minimum.
++// All operate on float32 tensors. Launchers assume contiguous inputs and outputs.
++// Binding layer should allocate output tensor contiguous and call these functions.
++
++template <typename T>
++__device__ __forceinline__ T reflect_index(T idx, T size) {
++    // Reflection padding: index maps to [0, size-1]
++    if (idx < 0) idx = -idx;
++    if (idx >= size) idx = 2 * size - 2 - idx;
++    // The above may still be out of range if pad is larger than size-1,
++    // but for usual cases pad <= size-1. For safety, clamp.
++    if (idx < 0) idx = 0;
++    if (idx >= size) idx = size - 1;
++    return idx;
++}
++
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t batch,
++    int64_t channels,
++    int64_t in_h,
++    int64_t in_w,
++    int64_t out_h,
++    int64_t out_w,
++    int pad_size
++) {
++    int64_t total = batch * channels * out_h * out_w;
++    int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = index; i < total; i += stride) {
++        int64_t ow = i % out_w;
++        int64_t tmp = i / out_w;
++        int64_t oh = tmp % out_h;
++        tmp /= out_h;
++        int64_t c = tmp % channels;
++        int64_t b = tmp / channels;
++
++        int64_t ih = oh - pad_size;
++        int64_t iw = ow - pad_size;
++        ih = reflect_index(ih, in_h);
++        iw = reflect_index(iw, in_w);
++
++        int64_t input_idx = ((b * channels + c) * in_h + ih) * in_w + iw;
++        output[i] = input[input_idx];
++    }
++}
++
++__global__ void maximum_kernel(
++    const float* __restrict__ a,
++    const float* __restrict__ b,
++    float* __restrict__ out,
++    int64_t numel
++) {
++    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t idx = i; idx < numel; idx += stride) {
++        out[idx] = fmaxf(a[idx], b[idx]);
++    }
++}
++
++__global__ void minimum_kernel(
++    const float* __restrict__ a,
++    const float* __restrict__ b,
++    float* __restrict__ out,
++    int64_t numel
++) {
++    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t idx = i; idx < numel; idx += stride) {
++        out[idx] = fminf(a[idx], b[idx]);
++    }
++}
++
++// Launcher functions with C linkage, to be called from binding.cpp
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int64_t batch,
++    int64_t channels,
++    int64_t in_h,
++    int64_t in_w,
++    int pad_size,
++    cudaStream_t stream
++) {
++    int64_t out_h = in_h + 2 * pad_size;
++    int64_t out_w = in_w + 2 * pad_size;
++    int64_t total = batch * channels * out_h * out_w;
++
++    const int threads = 256;
++    int64_t blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    if (blocks < 1) blocks = 1;
++
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, batch, channels, in_h, in_w, out_h, out_w, pad_size);
++}
++
++extern "C" void maximum_launcher(
++    const float* a,
++    const float* b,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    const int threads = 256;
++    int64_t blocks = (numel + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    if (blocks < 1) blocks = 1;
++
++    maximum_kernel<<<blocks, threads, 0, stream>>>(a, b, out, numel);
++}
++
++extern "C" void minimum_launcher(
++    const float* a,
++    const float* b,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    const int threads = 256;
++    int64_t blocks = (numel + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    if (blocks < 1) blocks = 1;
++
++    minimum_kernel<<<blocks, threads, 0, stream>>>(a, b, out, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,114 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int64_t batch,
++    int64_t channels,
++    int64_t in_h,
++    int64_t in_w,
++    int pad_size,
++    cudaStream_t stream
++);
++
++extern "C" void maximum_launcher(
++    const float* a,
++    const float* b,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++extern "C" void minimum_launcher(
++    const float* a,
++    const float* b,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++static torch::Tensor reflection_pad2d_forward(torch::Tensor input, int64_t pad_size) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++
++    int64_t batch = input.size(0);
++    int64_t channels = input.size(1);
++    int64_t in_h = input.size(2);
++    int64_t in_w = input.size(3);
++    int64_t out_h = in_h + 2 * pad_size;
++    int64_t out_w = in_w + 2 * pad_size;
++
++    auto output = torch::empty({batch, channels, out_h, out_w}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    reflection_pad2d_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch,
++        channels,
++        in_h,
++        in_w,
++        static_cast<int>(pad_size),
++        stream
++    );
++    return output;
++}
++
++static torch::Tensor maximum_forward(torch::Tensor a, torch::Tensor b) {
++    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "Both inputs must be CUDA tensors");
++    TORCH_CHECK(a.dtype() == torch::kFloat32 && b.dtype() == torch::kFloat32, "Both inputs must be float32");
++    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "Both inputs must be contiguous");
++    TORCH_CHECK(a.sizes() == b.sizes(), "Input shapes must match for elementwise maximum");
++
++    auto output = torch::empty_like(a);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    maximum_launcher(
++        a.data_ptr<float>(),
++        b.data_ptr<float>(),
++        output.data_ptr<float>(),
++        a.numel(),
++        stream
++    );
++    return output;
++}
++
++static torch::Tensor minimum_forward(torch::Tensor a, torch::Tensor b) {
++    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "Both inputs must be CUDA tensors");
++    TORCH_CHECK(a.dtype() == torch::kFloat32 && b.dtype() == torch::kFloat32, "Both inputs must be float32");
++    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "Both inputs must be contiguous");
++    TORCH_CHECK(a.sizes() == b.sizes(), "Input shapes must match for elementwise minimum");
++
++    auto output = torch::empty_like(a);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    minimum_launcher(
++        a.data_ptr<float>(),
++        b.data_ptr<float>(),
++        output.data_ptr<float>(),
++        a.numel(),
++        stream
++    );
++    return output;
++}
++
++static void register_custom_ops(pybind11::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "ReflectionPad2d forward (CUDA)",
++          pybind11::arg("input"), pybind11::arg("pad_size"));
++    m.def("maximum_forward", &maximum_forward,
++          "Elementwise maximum (CUDA)",
++          pybind11::arg("a"), pybind11::arg("b"));
++    m.def("minimum_forward", &minimum_forward,
++          "Elementwise minimum (CUDA)",
++          pybind11::arg("a"), pybind11::arg("b"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,29 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, pad_size, input_channels, input_height, input_width):
++        super().__init__()
++        self.pad_size = pad_size
++        self.input_height = input_height
++        self.input_width = input_width
++
++    def forward(self, x, y):
++        x_padded = cuda_extension.reflection_pad2d_forward(x, self.pad_size)
++        y_padded = cuda_extension.reflection_pad2d_forward(y, self.pad_size)
++        max_val = cuda_extension.maximum_forward(x_padded, y_padded)
++        min_val = cuda_extension.minimum_forward(max_val, x_padded)
++        return min_val
++
++    def debug_forward(self, x, y):
++        x_padded = cuda_extension.reflection_pad2d_forward(x, self.pad_size)
++        yield 'step_001', x_padded
++        y_padded = cuda_extension.reflection_pad2d_forward(y, self.pad_size)
++        yield 'step_002', y_padded
++        max_val = cuda_extension.maximum_forward(x_padded, y_padded)
++        yield 'step_003', max_val
++        min_val = cuda_extension.minimum_forward(max_val, x_padded)
++        yield 'step_004', min_val
++        yield 'step_005', min_val

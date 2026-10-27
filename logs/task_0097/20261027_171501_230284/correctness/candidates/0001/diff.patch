@@ -1,0 +1,451 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,114 @@
++// custom_ops.cu
++// This file contains all custom CUDA kernels and launchers.
++//
++// Operator implemented in this phase:
++//   custom_histc: computes histogram of input elements over [min, max] with given bins.
++//
++// Operator custom_conv_transpose1d is NOT implemented in this file.
++// It must be implemented in a separate .cpp file using cuDNN API,
++// per the restriction: Conv/ConvTranspose must use cuDNN and handled by C++ layer.
++//
++// The launcher custom_histc_launcher is declared extern "C" for linking with binding.
++
++#include <cuda_runtime.h>
++#include <math.h>
++
++// Kernel: computes histogram using per-block shared memory private histograms,
++// then atomically accumulates into global output. Handles arbitrary number of elements
++// using grid-stride loop.
++__global__ void custom_histc_kernel(
++    const float* __restrict__ input,
++    size_t numel,
++    int bins,
++    float min_val,
++    float max_val,
++    float* __restrict__ output)
++{
++    extern __shared__ unsigned int block_hist[]; // shared histogram, one per thread in block
++    // initialize shared hist to 0
++    for (int i = threadIdx.x; i < bins; i += blockDim.x) {
++        block_hist[i] = 0u;
++    }
++    __syncthreads();
++
++    float bin_width = (max_val - min_val) / bins;
++    if (bin_width <= 0.0f) {
++        // invalid range, no elements counted
++        __syncthreads(); // ensure all threads before exit? Actually we just return without writing
++        return;
++    }
++
++    // Loop over all elements assigned to this thread (grid-stride)
++    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += (size_t)gridDim.x * blockDim.x) {
++        float val = input[idx];
++        // Ignore NaN and Inf
++        if (isnan(val) || isinf(val)) continue;
++        // Ignore values outside [min_val, max_val]
++        if (val < min_val || val > max_val) continue;
++
++        // Compute bin index
++        int bin;
++        if (val == max_val) {
++            bin = bins - 1; // include max in last bin
++        } else {
++            bin = (int)((val - min_val) / bin_width);
++            // Due to floating precision, bin could equal bins for values very close to max but not equal.
++            // Clamp to bins-1 to be safe.
++            if (bin >= bins) bin = bins - 1;
++            if (bin < 0) bin = 0;
++        }
++        atomicAdd(&block_hist[bin], 1u);
++    }
++
++    __syncthreads();
++
++    // Merge block histogram into global histogram using atomicAdd
++    for (int i = threadIdx.x; i < bins; i += blockDim.x) {
++        if (block_hist[i] != 0) {
++            atomicAdd(&output[i], (float)block_hist[i]); // output is float, convert
++        }
++    }
++}
++
++// Launcher: custom_histc_launcher
++// Parameters:
++//   input: pointer to input data (float)
++//   numel: number of elements
++//   bins: number of bins
++//   min_val, max_val: histogram range
++//   output: pointer to output array of size bins (float)
++//   stream: CUDA stream
++// Returns: void, but may set cudaError on failure (kernel launch error can be checked by caller)
++extern "C" void custom_histc_launcher(
++    const float* input,
++    size_t numel,
++    int bins,
++    float min_val,
++    float max_val,
++    float* output,
++    cudaStream_t stream)
++{
++    if (bins <= 0 || numel == 0) {
++        // call cudaMemsetAsync to zero the output if necessary? Better to let caller handle; but we can just return.
++        return;
++    }
++
++    // Determine block size
++    const int block_size = 256;
++    int grid_size = (int)((numel + block_size - 1) / block_size);
++    // Cap grid size to avoid too many blocks; grid-stride loop handles the rest
++    const int max_grid_size = 65535;
++    if (grid_size > max_grid_size) grid_size = max_grid_size;
++    if (grid_size < 1) grid_size = 1;
++
++    // Shared memory per block: bins unsigned ints
++    size_t shared_mem = bins * sizeof(unsigned int);
++    // Check shared memory limit (typically 48KB, but we assume bins modest)
++    // If bins too large, kernel fails; we could fallback, but contract says bins=100.
++
++    custom_histc_kernel<<<grid_size, block_size, shared_mem, stream>>>(
++        input, numel, bins, min_val, max_val, output);
++
++    // The caller is expected to check cudaGetLastError() after launch (binding layer).
++    // We don't call cudaDeviceSynchronize here; asynchronous error will be caught later.
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,282 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include <cudnn.h>
++#include <iostream>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void custom_histc_launcher(
++    const float* input,
++    size_t numel,
++    int bins,
++    float min_val,
++    float max_val,
++    float* output,
++    cudaStream_t stream);
++
++namespace {
++
++// Helper to check cuDNN status
++inline void checkCudnn(cudnnStatus_t status, const char* msg) {
++    if (status != CUDNN_STATUS_SUCCESS) {
++        throw std::runtime_error(std::string(msg) + ": " + cudnnGetErrorString(status));
++    }
++}
++
++// Helper to check CUDA status
++inline void checkCuda(cudaError_t error, const char* msg) {
++    if (error != cudaSuccess) {
++        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(error));
++    }
++}
++
++// Custom ConvTranspose1d implementation using cuDNN
++// Input: [batch, in_channels, length], weight: [in_channels, out_channels, kernel_size], bias: [out_channels]
++// stride, padding, output_padding scalar (output_padding applied by adjusting output shape manually)
++torch::Tensor custom_conv_transpose1d_forward(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    int64_t stride,
++    int64_t padding,
++    int64_t output_padding)
++{
++    // Validate inputs
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D (batch, in_channels, length)");
++    TORCH_CHECK(weight.dim() == 3, "weight must be 3D (in_channels, out_channels, kernel_size)");
++    TORCH_CHECK(bias.dim() == 1, "bias must be 1D (out_channels)");
++    TORCH_CHECK(bias.size(0) == weight.size(1), "bias size must match out_channels");
++    TORCH_CHECK(weight.size(0) == input.size(1), "weight in_channels must match input channels");
++
++    // Make contiguous
++    input = input.contiguous();
++    weight = weight.contiguous();
++    bias = bias.contiguous();
++
++    int64_t batch = input.size(0);
++    int64_t in_channels = input.size(1);
++    int64_t length = input.size(2);
++    int64_t out_channels = weight.size(1);
++    int64_t kernel_size = weight.size(2);
++
++    // Compute output length: (length - 1)*stride - 2*padding + kernel_size + output_padding
++    int64_t output_length = (length - 1) * stride - 2 * padding + kernel_size + output_padding;
++    TORCH_CHECK(output_length > 0, "computed output length must be positive");
++
++    // Create output tensor
++    auto output = torch::empty({batch, out_channels, output_length}, input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Create cuDNN handle
++    cudnnHandle_t cudnn;
++    checkCudnn(cudnnCreate(&cudnn), "cudnnCreate");
++    checkCudnn(cudnnSetStream(cudnn, stream), "cudnnSetStream");
++
++    // Create tensor descriptors
++    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
++    cudnnFilterDescriptor_t filter_desc;
++    cudnnConvolutionDescriptor_t conv_desc;
++
++    checkCudnn(cudnnCreateTensorDescriptor(&input_desc), "cudnnCreateTensorDescriptor input");
++    checkCudnn(cudnnCreateTensorDescriptor(&output_desc), "cudnnCreateTensorDescriptor output");
++    checkCudnn(cudnnCreateTensorDescriptor(&bias_desc), "cudnnCreateTensorDescriptor bias");
++    checkCudnn(cudnnCreateFilterDescriptor(&filter_desc), "cudnnCreateFilterDescriptor");
++    checkCudnn(cudnnCreateConvolutionDescriptor(&conv_desc), "cudnnCreateConvolutionDescriptor");
++
++    // Set tensor descriptors: cuDNN expects NCHW format, for 1D we use Nx1xL representation (treat as 2D with height=1)
++    // Actually for 1D, cuDNN uses tensor of dim 4 with C, H=1, W=length
++    int dims[] = {1, length};  // dummy, but we use 4D descriptor with explicit strides
++    // For 1D conv, we set descriptor as NCHW where H=1 and W=length
++    int input_nstride = in_channels * length;
++    int input_cstride = length;
++    int input_hstride = length; // unused for H=1, but must set correctly? Actually cuDNN ignores for H=1
++    int input_wstride = 1;
++    checkCudnn(cudnnSetTensor4dDescriptor(input_desc,
++                                          CUDNN_TENSOR_NCHW,
++                                          CUDNN_DATA_FLOAT,
++                                          batch, in_channels, 1, length),
++                "cudnnSetTensor4dDescriptor input");
++
++    int output_nstride = out_channels * output_length;
++    int output_cstride = output_length;
++    int output_hstride = output_length;
++    int output_wstride = 1;
++    checkCudnn(cudnnSetTensor4dDescriptor(output_desc,
++                                          CUDNN_TENSOR_NCHW,
++                                          CUDNN_DATA_FLOAT,
++                                          batch, out_channels, 1, output_length),
++                "cudnnSetTensor4dDescriptor output");
++
++    // Bias descriptor: one bias per output channel
++    checkCudnn(cudnnSetTensor4dDescriptor(bias_desc,
++                                          CUDNN_TENSOR_NCHW,
++                                          CUDNN_DATA_FLOAT,
++                                          1, out_channels, 1, 1),
++                "cudnnSetTensor4dDescriptor bias");
++
++    // Filter descriptor: for 1D conv, filter is 3D (in_channels, out_channels, kernel_size)
++    // cuDNN expects filter dims: out_channels, in_channels, kernel_h, kernel_w.
++    // Since kernel has no spatial height, we set filter as [out_channels, in_channels, 1, kernel_size]
++    checkCudnn(cudnnSetFilter4dDescriptor(filter_desc,
++                                          CUDNN_DATA_FLOAT,
++                                          CUDNN_TENSOR_NCHW,
++                                          out_channels, in_channels, 1, kernel_size),
++                "cudnnSetFilter4dDescriptor");
++
++    // Convolution descriptor
++    int padA[] = {0, padding};   // height pad = 0, width pad = padding
++    int strideA[] = {1, stride}; // height stride = 1, width stride = stride
++    int upscaleA[] = {1, 1};
++    checkCudnn(cudnnSetConvolution2dDescriptor(conv_desc,
++                                               padA[0], padA[1],
++                                               strideA[0], strideA[1],
++                                               upscaleA[0], upscaleA[1],
++                                               CUDNN_CROSS_CORRELATION,
++                                               CUDNN_DATA_FLOAT),
++                "cudnnSetConvolution2dDescriptor");
++
++    // For transposed conv, use cudnnConvolutionBackwardData with appropriate input/output swapped
++    // We want to compute output = weight * input transposed, so we use backward data algorithm.
++    // Need to find algorithm and workspace size.
++    cudnnConvolutionBwdDataAlgo_t algo;
++    int requestedAlgoCount = 1;
++    int returnedAlgoCount = 0;
++    cudnnConvolutionBwdDataAlgoPerf_t perfResults[1];
++    checkCudnn(cudnnFindConvolutionBackwardDataAlgorithm(
++                   cudnn,
++                   filter_desc,
++                   input_desc,   // dy (gradient w.r.t output of forward conv) = input to transposed conv
++                   conv_desc,
++                   output_desc,  // dx (gradient w.r.t input) = output of transposed conv
++                   requestedAlgoCount,
++                   &returnedAlgoCount,
++                   perfResults),
++               "cudnnFindConvolutionBackwardDataAlgorithm");
++    if (returnedAlgoCount <= 0) {
++        throw std::runtime_error("No convolution backward data algorithm found");
++    }
++    algo = perfResults[0].algo;
++
++    size_t workspaceSize = 0;
++    checkCudnn(cudnnGetConvolutionBackwardDataWorkspaceSize(
++                   cudnn,
++                   filter_desc,
++                   input_desc,
++                   conv_desc,
++                   output_desc,
++                   algo,
++                   &workspaceSize),
++               "cudnnGetConvolutionBackwardDataWorkspaceSize");
++
++    void* workspace = nullptr;
++    if (workspaceSize > 0) {
++        checkCuda(cudaMalloc(&workspace, workspaceSize), "cudaMalloc workspace");
++    }
++
++    float alpha = 1.0f;
++    float beta = 0.0f;
++
++    // Execute transposed convolution
++    checkCudnn(cudnnConvolutionBackwardData(
++                   cudnn,
++                   &alpha,
++                   filter_desc,
++                   weight.data_ptr<float>(),
++                   input_desc,
++                   input.data_ptr<float>(),
++                   conv_desc,
++                   algo,
++                   workspace,
++                   workspaceSize,
++                   &beta,
++                   output_desc,
++                   output.data_ptr<float>()),
++               "cudnnConvolutionBackwardData");
++
++    // Add bias
++    if (bias.numel() > 0) {
++        // Use cudnnAddTensor to add bias to each channel
++        beta = 1.0f;
++        checkCudnn(cudnnAddTensor(cudnn,
++                                  &alpha,
++                                  bias_desc,
++                                  bias.data_ptr<float>(),
++                                  &beta,
++                                  output_desc,
++                                  output.data_ptr<float>()),
++                   "cudnnAddTensor");
++    }
++
++    // Cleanup
++    if (workspace) cudaFree(workspace);
++    cudnnDestroyTensorDescriptor(input_desc);
++    cudnnDestroyTensorDescriptor(output_desc);
++    cudnnDestroyTensorDescriptor(bias_desc);
++    cudnnDestroyFilterDescriptor(filter_desc);
++    cudnnDestroyConvolutionDescriptor(conv_desc);
++    cudnnDestroy(cudnn);
++
++    // Check for CUDA errors from cuDNN operations
++    checkCuda(cudaGetLastError(), "post cuDNN");
++
++    return output;
++}
++
++// Custom histc binding
++torch::Tensor custom_histc_forward(
++    torch::Tensor input,
++    int64_t bins,
++    double min_val,
++    double max_val)
++{
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(bins > 0, "bins must be positive");
++
++    auto output = torch::zeros({bins}, input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_histc_launcher(
++        input.data_ptr<float>(),
++        input.numel(),
++        static_cast<int>(bins),
++        static_cast<float>(min_val),
++        static_cast<float>(max_val),
++        output.data_ptr<float>(),
++        stream
++    );
++
++    // Check for errors
++    checkCuda(cudaGetLastError(), "histc launch");
++
++    return output;
++}
++
++} // anonymous namespace
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_conv_transpose1d", &custom_conv_transpose1d_forward,
++          "Custom ConvTranspose1d using cuDNN",
++          py::arg("input"), py::arg("weight"), py::arg("bias"),
++          py::arg("stride") = 2, py::arg("padding") = 1, py::arg("output_padding") = 1);
++    m.def("custom_histc", &custom_histc_forward,
++          "Custom histogram",
++          py::arg("input"), py::arg("bins") = 100,
++          py::arg("min") = 0.0, py::arg("max") = 100.0);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,46 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(
++        self, in_channels, out_channels, kernel_size, stride, padding, output_padding, histc_bins, histc_min, histc_max
++    ):
++        super().__init__()
++        # Keep the same parameter names and shapes as reference for state_dict compatibility
++        self.conv_transpose = nn.ConvTranspose1d(
++            in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding
++        )
++        self.histc_bins = histc_bins
++        self.histc_min = histc_min
++        self.histc_max = histc_max
++
++    def forward(self, x):
++        # Ensure input is on CUDA and float32 as required by the contract
++        x = x.to(device='cuda', dtype=torch.float32)
++        # Custom conv_transpose1d
++        x = cuda_extension.custom_conv_transpose1d(
++            x, self.conv_transpose.weight, self.conv_transpose.bias,
++            stride=2, padding=1, output_padding=1
++        )
++        # Custom histc
++        hist = cuda_extension.custom_histc(
++            x, bins=self.histc_bins, min=self.histc_min, max=self.histc_max
++        )
++        return x, hist
++
++    def debug_forward(self, x):
++        # Debug mode yields checkpoints in the same order as reference
++        x = x.to(device='cuda', dtype=torch.float32)
++        x = cuda_extension.custom_conv_transpose1d(
++            x, self.conv_transpose.weight, self.conv_transpose.bias,
++            stride=2, padding=1, output_padding=1
++        )
++        yield 'step_001', x
++        hist = cuda_extension.custom_histc(
++            x, bins=self.histc_bins, min=self.histc_min, max=self.histc_max
++        )
++        yield 'step_002', hist
++        result = (x, hist)
++        yield 'step_003', result

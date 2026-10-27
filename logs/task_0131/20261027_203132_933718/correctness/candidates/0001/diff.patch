@@ -1,0 +1,146 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,41 @@
++#include <cuda_runtime.h>
++#include <cmath>
++
++// Elementwise ReLU: out[i] = max(in[i], 0)
++__global__ void relu_kernel(const float* __restrict__ in, float* __restrict__ out, long long n) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (long long i = idx; i < n; i += stride) {
++        float v = in[i];
++        out[i] = v > 0.0f ? v : 0.0f;
++    }
++}
++
++// Exact GELU: out[i] = 0.5 * x * (1 + erf(x / sqrt(2)))
++__global__ void gelu_kernel(const float* __restrict__ in, float* __restrict__ out, long long n) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    const float inv_sqrt2 = 0.70710678118654752440f;
++    for (long long i = idx; i < n; i += stride) {
++        float v = in[i];
++        out[i] = 0.5f * v * (1.0f + erff(v * inv_sqrt2));
++    }
++}
++
++// Launcher for ReLU. Input and output are contiguous float32 tensors on current CUDA stream.
++extern "C" void custom_relu_launcher(const float* input, float* output, long long numel, cudaStream_t stream) {
++    const int threads = 256;
++    long long blocks_ll = (numel + threads - 1) / threads;
++    if (blocks_ll > 2147483647LL) blocks_ll = 2147483647LL;
++    int blocks = (int)blocks_ll;
++    relu_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++// Launcher for exact GELU. Input and output are contiguous float32 tensors on current CUDA stream.
++extern "C" void custom_gelu_launcher(const float* input, float* output, long long numel, cudaStream_t stream) {
++    const int threads = 256;
++    long long blocks_ll = (numel + threads - 1) / threads;
++    if (blocks_ll > 2147483647LL) blocks_ll = 2147483647LL;
++    int blocks = (int)blocks_ll;
++    gelu_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,76 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_relu_launcher(const float* input, float* output, long long numel, cudaStream_t stream);
++extern "C" void custom_gelu_launcher(const float* input, float* output, long long numel, cudaStream_t stream);
++
++// Helper to validate input tensor
++static void check_input(const torch::Tensor& x, const char* name) {
++    TORCH_CHECK(x.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(x.numel() > 0, name, " must have at least one element");
++}
++
++// ReLU forward
++static torch::Tensor custom_relu_forward(torch::Tensor x) {
++    check_input(x, "custom_relu input");
++    
++    // Ensure contiguous for launcher
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++    
++    auto output = torch::empty_like(x);
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_relu_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<long long>(x.numel()),
++        stream
++    );
++    
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_relu kernel launch failed: ", cudaGetErrorString(err));
++    
++    return output;
++}
++
++// GELU forward
++static torch::Tensor custom_gelu_forward(torch::Tensor x) {
++    check_input(x, "custom_gelu input");
++    
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++    
++    auto output = torch::empty_like(x);
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_gelu_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<long long>(x.numel()),
++        stream
++    );
++    
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_gelu kernel launch failed: ", cudaGetErrorString(err));
++    
++    return output;
++}
++
++// Register both functions
++static void register_custom_ops(pybind11::module& m) {
++    m.def("custom_relu", &custom_relu_forward, "ReLU forward (CUDA)",
++          pybind11::arg("x"));
++    m.def("custom_gelu", &custom_gelu_forward, "GELU forward (CUDA)",
++          pybind11::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        x = cuda_extension.custom_relu(x)
++        x = cuda_extension.custom_gelu(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_relu(x)
++        yield ('step_001', x)
++        x = cuda_extension.custom_gelu(x)
++        yield ('step_002', x)
++        yield ('step_003', x)

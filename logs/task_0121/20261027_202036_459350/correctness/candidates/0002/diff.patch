@@ -1,0 +1,344 @@
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,10 +1,12 @@
++// Custom binding for pad1d, conv_transpose2d (cuDNN via dynamic loading), add_bias
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
++#include <dlfcn.h>
+ #include <vector>
+ #include <stdexcept>
++#include <string>
+ #include "../binding_registry.h"
+ 
+ // Launcher declarations from custom_ops.cu
+@@ -19,27 +21,11 @@
+     int B, int C, int H, int W,
+     cudaStream_t stream);
+ 
+-extern "C" void custom_conv_transpose2d_forward_launcher(
+-    const float* x, const float* weight, const float* bias,
+-    float* out,
+-    int B, int C_in, int H_in, int W_in,
+-    int C_out, int kH, int kW,
+-    int stride, int output_padding,
+-    cudaStream_t stream);
+-
+ // Helper to check CUDA errors
+ #define CHECK_CUDA(call) { \
+     cudaError_t err = call; \
+     if (err != cudaSuccess) { \
+         throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err)); \
+-    } \
+-}
+-
+-// Helper to check cuDNN errors
+-#define CHECK_CUDNN(call) { \
+-    cudnnStatus_t err = call; \
+-    if (err != CUDNN_STATUS_SUCCESS) { \
+-        throw std::runtime_error(std::string("cuDNN error: ") + cudnnGetErrorString(err)); \
+     } \
+ }
+ 
+@@ -79,7 +65,139 @@
+     return out;
+ }
+ 
+-// ==================== conv_transpose2d (cuDNN) ====================
++// ==================== conv_transpose2d (cuDNN dynamic loading) ====================
++// Define necessary cuDNN types and function pointer types (minimal subset)
++typedef void* cudnnHandle_t;
++typedef void* cudnnTensorDescriptor_t;
++typedef void* cudnnFilterDescriptor_t;
++typedef void* cudnnConvolutionDescriptor_t;
++
++typedef enum {
++    CUDNN_STATUS_SUCCESS = 0,
++    CUDNN_STATUS_NOT_INITIALIZED = 1,
++    CUDNN_STATUS_ALLOC_FAILED = 2,
++    CUDNN_STATUS_BAD_PARAM = 3,
++    CUDNN_STATUS_INTERNAL_ERROR = 4,
++    CUDNN_STATUS_INVALID_VALUE = 5,
++    CUDNN_STATUS_ARCH_MISMATCH = 6,
++    CUDNN_STATUS_MAPPING_ERROR = 7,
++    CUDNN_STATUS_EXECUTION_FAILED = 8,
++    CUDNN_STATUS_NOT_SUPPORTED = 9,
++    CUDNN_STATUS_LICENSE_ERROR = 10,
++    CUDNN_STATUS_RUNTIME_PREREQUISITE_MISSING = 11,
++    CUDNN_STATUS_RUNTIME_IN_PROGRESS = 12,
++    CUDNN_STATUS_RUNTIME_FP_OVERFLOW = 13
++} cudnnStatus_t;
++
++typedef enum {
++    CUDNN_TENSOR_NCHW = 0,
++    CUDNN_TENSOR_NHWC = 1,
++    CUDNN_TENSOR_NCHW_VECT_C = 2
++} cudnnTensorFormat_t;
++
++typedef enum {
++    CUDNN_DATA_FLOAT = 0,
++    CUDNN_DATA_DOUBLE = 1,
++    CUDNN_DATA_HALF = 2,
++    CUDNN_DATA_INT8 = 3,
++    CUDNN_DATA_INT32 = 4,
++    CUDNN_DATA_INT8x4 = 5,
++    CUDNN_DATA_UINT8 = 6,
++    CUDNN_DATA_UINT8x4 = 7,
++    CUDNN_DATA_INT8x32 = 8
++} cudnnDataType_t;
++
++typedef enum {
++    CUDNN_CONVOLUTION = 0,
++    CUDNN_CROSS_CORRELATION = 1
++} cudnnConvolutionMode_t;
++
++typedef enum {
++    CUDNN_CONVOLUTION_BWD_DATA_ALGO_0 = 0,
++    CUDNN_CONVOLUTION_BWD_DATA_ALGO_1 = 1,
++    CUDNN_CONVOLUTION_BWD_DATA_FFT = 2,
++    CUDNN_CONVOLUTION_BWD_DATA_FFT_TILING = 3,
++    CUDNN_CONVOLUTION_BWD_DATA_WINOGRAD = 4,
++    CUDNN_CONVOLUTION_BWD_DATA_WINOGRAD_NONFUSED = 5,
++    CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT = 6
++} cudnnConvolutionBwdDataAlgo_t;
++
++// Function pointer types for used cuDNN APIs
++typedef cudnnStatus_t (*cudnnCreate_t)(cudnnHandle_t*);
++typedef cudnnStatus_t (*cudnnSetStream_t)(cudnnHandle_t, cudaStream_t);
++typedef cudnnStatus_t (*cudnnCreateTensorDescriptor_t)(cudnnTensorDescriptor_t*);
++typedef cudnnStatus_t (*cudnnSetTensor4dDescriptor_t)(cudnnTensorDescriptor_t, cudnnTensorFormat_t, cudnnDataType_t, int, int, int, int);
++typedef cudnnStatus_t (*cudnnCreateFilterDescriptor_t)(cudnnFilterDescriptor_t*);
++typedef cudnnStatus_t (*cudnnSetFilter4dDescriptor_t)(cudnnFilterDescriptor_t, cudnnDataType_t, cudnnTensorFormat_t, int, int, int, int);
++typedef cudnnStatus_t (*cudnnCreateConvolutionDescriptor_t)(cudnnConvolutionDescriptor_t*);
++typedef cudnnStatus_t (*cudnnSetConvolution2dDescriptor_t)(cudnnConvolutionDescriptor_t, int, int, int, int, int, int, cudnnConvolutionMode_t, cudnnDataType_t);
++typedef cudnnStatus_t (*cudnnGetConvolutionBackwardDataWorkspaceSize_t)(cudnnHandle_t, cudnnFilterDescriptor_t, cudnnTensorDescriptor_t, cudnnConvolutionDescriptor_t, cudnnTensorDescriptor_t, cudnnConvolutionBwdDataAlgo_t, size_t*);
++typedef cudnnStatus_t (*cudnnConvolutionBackwardData_t)(cudnnHandle_t, const void*, cudnnFilterDescriptor_t, const void*, cudnnTensorDescriptor_t, const void*, cudnnConvolutionDescriptor_t, cudnnConvolutionBwdDataAlgo_t, void*, size_t, const void*, cudnnTensorDescriptor_t, void*);
++typedef cudnnStatus_t (*cudnnDestroyTensorDescriptor_t)(cudnnTensorDescriptor_t);
++typedef cudnnStatus_t (*cudnnDestroyFilterDescriptor_t)(cudnnFilterDescriptor_t);
++typedef cudnnStatus_t (*cudnnDestroyConvolutionDescriptor_t)(cudnnConvolutionDescriptor_t);
++
++// Global function pointers, loaded once via dlopen
++static void* cudnn_lib = nullptr;
++static cudnnCreate_t cudnnCreate_fn = nullptr;
++static cudnnSetStream_t cudnnSetStream_fn = nullptr;
++static cudnnCreateTensorDescriptor_t cudnnCreateTensorDescriptor_fn = nullptr;
++static cudnnSetTensor4dDescriptor_t cudnnSetTensor4dDescriptor_fn = nullptr;
++static cudnnCreateFilterDescriptor_t cudnnCreateFilterDescriptor_fn = nullptr;
++static cudnnSetFilter4dDescriptor_t cudnnSetFilter4dDescriptor_fn = nullptr;
++static cudnnCreateConvolutionDescriptor_t cudnnCreateConvolutionDescriptor_fn = nullptr;
++static cudnnSetConvolution2dDescriptor_t cudnnSetConvolution2dDescriptor_fn = nullptr;
++static cudnnGetConvolutionBackwardDataWorkspaceSize_t cudnnGetConvolutionBackwardDataWorkspaceSize_fn = nullptr;
++static cudnnConvolutionBackwardData_t cudnnConvolutionBackwardData_fn = nullptr;
++static cudnnDestroyTensorDescriptor_t cudnnDestroyTensorDescriptor_fn = nullptr;
++static cudnnDestroyFilterDescriptor_t cudnnDestroyFilterDescriptor_fn = nullptr;
++static cudnnDestroyConvolutionDescriptor_t cudnnDestroyConvolutionDescriptor_fn = nullptr;
++
++// Load cuDNN symbols once
++static void load_cudnn_symbols() {
++    if (cudnn_lib != nullptr) return; // already loaded
++    // Try common library names
++    const char* libnames[] = {"libcudnn.so", "libcudnn.so.8", "libcudnn.so.7", nullptr};
++    for (int i = 0; libnames[i] != nullptr; ++i) {
++        cudnn_lib = dlopen(libnames[i], RTLD_LAZY | RTLD_GLOBAL);
++        if (cudnn_lib) break;
++    }
++    if (!cudnn_lib) {
++        throw std::runtime_error("Failed to load cuDNN library. Please ensure cuDNN is installed and in library path.");
++    }
++    // Load function pointers
++    #define LOAD_SYMBOL(name) \
++        name##_fn = reinterpret_cast<name##_t>(dlsym(cudnn_lib, #name)); \
++        if (!name##_fn) { \
++            dlclose(cudnn_lib); \
++            cudnn_lib = nullptr; \
++            throw std::runtime_error("Failed to load cuDNN symbol: " #name); \
++        }
++    LOAD_SYMBOL(cudnnCreate);
++    LOAD_SYMBOL(cudnnSetStream);
++    LOAD_SYMBOL(cudnnCreateTensorDescriptor);
++    LOAD_SYMBOL(cudnnSetTensor4dDescriptor);
++    LOAD_SYMBOL(cudnnCreateFilterDescriptor);
++    LOAD_SYMBOL(cudnnSetFilter4dDescriptor);
++    LOAD_SYMBOL(cudnnCreateConvolutionDescriptor);
++    LOAD_SYMBOL(cudnnSetConvolution2dDescriptor);
++    LOAD_SYMBOL(cudnnGetConvolutionBackwardDataWorkspaceSize);
++    LOAD_SYMBOL(cudnnConvolutionBackwardData);
++    LOAD_SYMBOL(cudnnDestroyTensorDescriptor);
++    LOAD_SYMBOL(cudnnDestroyFilterDescriptor);
++    LOAD_SYMBOL(cudnnDestroyConvolutionDescriptor);
++    #undef LOAD_SYMBOL
++}
++
++// Helper macro to call cuDNN functions via pointers and check status
++#define CHECK_CUDNN(call) { \
++    cudnnStatus_t status = call; \
++    if (status != CUDNN_STATUS_SUCCESS) { \
++        throw std::runtime_error(std::string("cuDNN error with status code: ") + std::to_string(static_cast<int>(status))); \
++    } \
++}
++
++// ConvTranspose2d implementation using cuDNN backward data
+ torch::Tensor custom_conv_transpose2d_forward(
+     torch::Tensor x,
+     torch::Tensor weight,
+@@ -89,13 +207,23 @@
+ {
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+-    TORCH_CHECK(bias.is_cuda() || !bias.defined(), "bias must be a CUDA tensor if defined");
++    // bias can be undefined
++    if (bias.defined()) {
++        TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor if defined");
++    }
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+-    TORCH_CHECK(!bias.defined() || bias.dtype() == torch::kFloat32, "bias must be float32 if defined");
++    if (bias.defined()) {
++        TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32 if defined");
++    }
+     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+-    TORCH_CHECK(!bias.defined() || bias.is_contiguous(), "bias must be contiguous if defined");
++    if (bias.defined()) {
++        TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous if defined");
++    }
++
++    // Load cuDNN symbols if not already loaded
++    load_cudnn_symbols();
+ 
+     int64_t B = x.size(0);
+     int64_t C_in = x.size(1);
+@@ -106,24 +234,24 @@
+     int64_t kW = weight.size(3);
+ 
+     // Output dimensions for ConvTranspose2d with stride and output_padding
+-    int64_t H_out = (H_in - 1) * stride - 0 + (kH - 1) + 1 + output_padding;
+-    int64_t W_out = (W_in - 1) * stride - 0 + (kW - 1) + 1 + output_padding;
++    int64_t H_out = (H_in - 1) * stride + (kH - 1) + 1 + output_padding;
++    int64_t W_out = (W_in - 1) * stride + (kW - 1) + 1 + output_padding;
+ 
+     auto out = torch::empty({B, C_out, H_out, W_out}, x.options());
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // cuDNN handle (create if not existing, but we can use a static handle for simplicity)
++    // Create cuDNN handle (static, but we need to ensure it's created after load)
+     static cudnnHandle_t handle = nullptr;
+     if (handle == nullptr) {
+-        CHECK_CUDNN(cudnnCreate(&handle));
+-    }
+-    CHECK_CUDNN(cudnnSetStream(handle, stream));
+-
+-    // Tensor descriptor for input
+-    cudnnTensorDescriptor_t x_desc;
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&x_desc));
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
++        CHECK_CUDNN((*cudnnCreate_fn)(&handle));
++    }
++    CHECK_CUDNN((*cudnnSetStream_fn)(handle, stream));
++
++    // Descriptors
++    cudnnTensorDescriptor_t x_desc = nullptr;
++    CHECK_CUDNN((*cudnnCreateTensorDescriptor_fn)(&x_desc));
++    CHECK_CUDNN((*cudnnSetTensor4dDescriptor_fn)(
+         x_desc,
+         CUDNN_TENSOR_NCHW,
+         CUDNN_DATA_FLOAT,
+@@ -133,10 +261,9 @@
+         static_cast<int>(W_in)
+     ));
+ 
+-    // Filter descriptor: ConvTranspose uses weight shape [C_in, C_out, kH, kW]
+-    cudnnFilterDescriptor_t w_desc;
+-    CHECK_CUDNN(cudnnCreateFilterDescriptor(&w_desc));
+-    CHECK_CUDNN(cudnnSetFilter4dDescriptor(
++    cudnnFilterDescriptor_t w_desc = nullptr;
++    CHECK_CUDNN((*cudnnCreateFilterDescriptor_fn)(&w_desc));
++    CHECK_CUDNN((*cudnnSetFilter4dDescriptor_fn)(
+         w_desc,
+         CUDNN_DATA_FLOAT,
+         CUDNN_TENSOR_NCHW,
+@@ -146,10 +273,9 @@
+         static_cast<int>(kW)
+     ));
+ 
+-    // Output tensor descriptor
+-    cudnnTensorDescriptor_t y_desc;
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&y_desc));
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
++    cudnnTensorDescriptor_t y_desc = nullptr;
++    CHECK_CUDNN((*cudnnCreateTensorDescriptor_fn)(&y_desc));
++    CHECK_CUDNN((*cudnnSetTensor4dDescriptor_fn)(
+         y_desc,
+         CUDNN_TENSOR_NCHW,
+         CUDNN_DATA_FLOAT,
+@@ -159,12 +285,10 @@
+         static_cast<int>(W_out)
+     ));
+ 
+-    // Convolution descriptor for transpose (backward data)
+-    cudnnConvolutionDescriptor_t conv_desc;
+-    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+-    // For ConvTranspose2d, padding is 0 (since PyTorch ConvTranspose2d with no padding argument defaults to 0)
+-    // We can set pad = 0, stride, dilation = 1, mode = CROSS_CORRELATION
+-    CHECK_CUDNN(cudnnSetConvolution2dDescriptor(
++    cudnnConvolutionDescriptor_t conv_desc = nullptr;
++    CHECK_CUDNN((*cudnnCreateConvolutionDescriptor_fn)(&conv_desc));
++    // For ConvTranspose2d, padding is 0 in the underlying cuDNN call (as PyTorch does not set padding for this module)
++    CHECK_CUDNN((*cudnnSetConvolution2dDescriptor_fn)(
+         conv_desc,
+         0, 0, // pad_h, pad_w
+         static_cast<int>(stride), static_cast<int>(stride),
+@@ -173,20 +297,19 @@
+         CUDNN_DATA_FLOAT
+     ));
+ 
+-    // Algorithm
+-    cudnnConvolutionBwdDataAlgo_t algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1; // or use get algo
++    // Use a fixed algorithm (could use get algo for performance, but this is a repair)
++    cudnnConvolutionBwdDataAlgo_t algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
+     size_t workspace_size = 0;
+-    CHECK_CUDNN(cudnnGetConvolutionBackwardDataWorkspaceSize(
++    CHECK_CUDNN((*cudnnGetConvolutionBackwardDataWorkspaceSize_fn)(
+         handle, w_desc, x_desc, conv_desc, y_desc, algo, &workspace_size));
+ 
+-    // Allocate workspace if needed
+     void* workspace = nullptr;
+     if (workspace_size > 0) {
+         CHECK_CUDA(cudaMalloc(&workspace, workspace_size));
+     }
+ 
+     float alpha = 1.0f, beta = 0.0f;
+-    CHECK_CUDNN(cudnnConvolutionBackwardData(
++    CHECK_CUDNN((*cudnnConvolutionBackwardData_fn)(
+         handle,
+         &alpha,
+         w_desc, weight.data_ptr<float>(),
+@@ -199,8 +322,6 @@
+ 
+     // Add bias if defined
+     if (bias.defined()) {
+-        // Use custom_add_bias_forward_component or directly add via cuDNN? cuDNN has bias in convolution forward, but for transpose we can just call our add_bias launcher
+-        // bias shape [C_out]
+         custom_add_bias_forward_launcher(
+             out.data_ptr<float>(),
+             bias.data_ptr<float>(),
+@@ -213,11 +334,11 @@
+         );
+     }
+ 
+-    // Cleanup
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(x_desc));
+-    CHECK_CUDNN(cudnnDestroyFilterDescriptor(w_desc));
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(y_desc));
+-    CHECK_CUDNN(cudnnDestroyConvolutionDescriptor(conv_desc));
++    // Cleanup descriptors
++    CHECK_CUDNN((*cudnnDestroyTensorDescriptor_fn)(x_desc));
++    CHECK_CUDNN((*cudnnDestroyFilterDescriptor_fn)(w_desc));
++    CHECK_CUDNN((*cudnnDestroyTensorDescriptor_fn)(y_desc));
++    CHECK_CUDNN((*cudnnDestroyConvolutionDescriptor_fn)(conv_desc));
+     if (workspace) {
+         CHECK_CUDA(cudaFree(workspace));
+     }

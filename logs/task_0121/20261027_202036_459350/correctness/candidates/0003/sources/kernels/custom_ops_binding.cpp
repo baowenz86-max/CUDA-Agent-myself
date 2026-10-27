@@ -1,0 +1,287 @@
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include <ATen/cudnn/cudnn-wrapper.h>
+#include <vector>
+#include <stdexcept>
+#include "../binding_registry.h"
+
+// Launcher declarations from custom_ops.cu
+extern "C" void custom_pad1d_forward_launcher(
+    const float* x, float* out,
+    int B, int C, int H, int W,
+    int pad_left, int pad_right,
+    cudaStream_t stream);
+
+extern "C" void custom_add_bias_forward_launcher(
+    const float* x, const float* bias, float* out,
+    int B, int C, int H, int W,
+    cudaStream_t stream);
+
+extern "C" void custom_conv_transpose2d_forward_launcher(
+    const float* x, const float* weight, const float* bias,
+    float* out,
+    int B, int C_in, int H_in, int W_in,
+    int C_out, int kH, int kW,
+    int stride, int output_padding,
+    cudaStream_t stream);
+
+// Helper to check CUDA errors
+#define CHECK_CUDA(call) { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err)); \
+    } \
+}
+
+// Helper to check cuDNN errors
+#define CHECK_CUDNN(call) { \
+    cudnnStatus_t err = call; \
+    if (err != CUDNN_STATUS_SUCCESS) { \
+        throw std::runtime_error(std::string("cuDNN error: ") + cudnnGetErrorString(err)); \
+    } \
+}
+
+// ==================== pad1d ====================
+torch::Tensor custom_pad1d_forward(
+    torch::Tensor x,
+    int64_t padding_left,
+    int64_t padding_right)
+{
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+
+    int64_t B = x.size(0);
+    int64_t C = x.size(1);
+    int64_t H = x.size(2);
+    int64_t W = x.size(3);
+    int64_t out_W = W + padding_left + padding_right;
+
+    auto out = torch::empty({B, C, H, out_W}, x.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    custom_pad1d_forward_launcher(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(C),
+        static_cast<int>(H),
+        static_cast<int>(W),
+        static_cast<int>(padding_left),
+        static_cast<int>(padding_right),
+        stream
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+    return out;
+}
+
+// ==================== conv_transpose2d (cuDNN) ====================
+torch::Tensor custom_conv_transpose2d_forward(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int64_t stride,
+    int64_t output_padding)
+{
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda() || !bias.defined(), "bias must be a CUDA tensor if defined");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+    TORCH_CHECK(!bias.defined() || bias.dtype() == torch::kFloat32, "bias must be float32 if defined");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(!bias.defined() || bias.is_contiguous(), "bias must be contiguous if defined");
+
+    int64_t B = x.size(0);
+    int64_t C_in = x.size(1);
+    int64_t H_in = x.size(2);
+    int64_t W_in = x.size(3);
+    int64_t C_out = weight.size(1);
+    int64_t kH = weight.size(2);
+    int64_t kW = weight.size(3);
+
+    // Output dimensions for ConvTranspose2d with stride and output_padding
+    int64_t H_out = (H_in - 1) * stride - 0 + (kH - 1) + 1 + output_padding;
+    int64_t W_out = (W_in - 1) * stride - 0 + (kW - 1) + 1 + output_padding;
+
+    auto out = torch::empty({B, C_out, H_out, W_out}, x.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    // cuDNN handle (create if not existing, but we can use a static handle for simplicity)
+    static cudnnHandle_t handle = nullptr;
+    if (handle == nullptr) {
+        CHECK_CUDNN(cudnnCreate(&handle));
+    }
+    CHECK_CUDNN(cudnnSetStream(handle, stream));
+
+    // Tensor descriptor for input
+    cudnnTensorDescriptor_t x_desc;
+    CHECK_CUDNN(cudnnCreateTensorDescriptor(&x_desc));
+    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+        x_desc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        static_cast<int>(B),
+        static_cast<int>(C_in),
+        static_cast<int>(H_in),
+        static_cast<int>(W_in)
+    ));
+
+    // Filter descriptor: ConvTranspose uses weight shape [C_in, C_out, kH, kW]
+    cudnnFilterDescriptor_t w_desc;
+    CHECK_CUDNN(cudnnCreateFilterDescriptor(&w_desc));
+    CHECK_CUDNN(cudnnSetFilter4dDescriptor(
+        w_desc,
+        CUDNN_DATA_FLOAT,
+        CUDNN_TENSOR_NCHW,
+        static_cast<int>(C_in),
+        static_cast<int>(C_out),
+        static_cast<int>(kH),
+        static_cast<int>(kW)
+    ));
+
+    // Output tensor descriptor
+    cudnnTensorDescriptor_t y_desc;
+    CHECK_CUDNN(cudnnCreateTensorDescriptor(&y_desc));
+    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+        y_desc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        static_cast<int>(B),
+        static_cast<int>(C_out),
+        static_cast<int>(H_out),
+        static_cast<int>(W_out)
+    ));
+
+    // Convolution descriptor for transpose (backward data)
+    cudnnConvolutionDescriptor_t conv_desc;
+    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+    // For ConvTranspose2d, padding is 0 (since PyTorch ConvTranspose2d with no padding argument defaults to 0)
+    // We can set pad = 0, stride, dilation = 1, mode = CROSS_CORRELATION
+    CHECK_CUDNN(cudnnSetConvolution2dDescriptor(
+        conv_desc,
+        0, 0, // pad_h, pad_w
+        static_cast<int>(stride), static_cast<int>(stride),
+        1, 1, // dilation_h, dilation_w
+        CUDNN_CROSS_CORRELATION,
+        CUDNN_DATA_FLOAT
+    ));
+
+    // Algorithm
+    cudnnConvolutionBwdDataAlgo_t algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1; // or use get algo
+    size_t workspace_size = 0;
+    CHECK_CUDNN(cudnnGetConvolutionBackwardDataWorkspaceSize(
+        handle, w_desc, x_desc, conv_desc, y_desc, algo, &workspace_size));
+
+    // Allocate workspace if needed
+    void* workspace = nullptr;
+    if (workspace_size > 0) {
+        CHECK_CUDA(cudaMalloc(&workspace, workspace_size));
+    }
+
+    float alpha = 1.0f, beta = 0.0f;
+    CHECK_CUDNN(cudnnConvolutionBackwardData(
+        handle,
+        &alpha,
+        w_desc, weight.data_ptr<float>(),
+        x_desc, x.data_ptr<float>(),
+        conv_desc, algo,
+        workspace, workspace_size,
+        &beta,
+        y_desc, out.data_ptr<float>()
+    ));
+
+    // Add bias if defined
+    if (bias.defined()) {
+        // Use custom_add_bias_forward_component or directly add via cuDNN? cuDNN has bias in convolution forward, but for transpose we can just call our add_bias launcher
+        // bias shape [C_out]
+        custom_add_bias_forward_launcher(
+            out.data_ptr<float>(),
+            bias.data_ptr<float>(),
+            out.data_ptr<float>(),
+            static_cast<int>(B),
+            static_cast<int>(C_out),
+            static_cast<int>(H_out),
+            static_cast<int>(W_out),
+            stream
+        );
+    }
+
+    // Cleanup
+    CHECK_CUDNN(cudnnDestroyTensorDescriptor(x_desc));
+    CHECK_CUDNN(cudnnDestroyFilterDescriptor(w_desc));
+    CHECK_CUDNN(cudnnDestroyTensorDescriptor(y_desc));
+    CHECK_CUDNN(cudnnDestroyConvolutionDescriptor(conv_desc));
+    if (workspace) {
+        CHECK_CUDA(cudaFree(workspace));
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    return out;
+}
+
+// ==================== add_bias ====================
+torch::Tensor custom_add_bias_forward(
+    torch::Tensor x,
+    torch::Tensor bias)
+{
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+
+    int64_t B = x.size(0);
+    int64_t C = x.size(1);
+    int64_t H = x.size(2);
+    int64_t W = x.size(3);
+
+    auto out = torch::empty_like(x);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    custom_add_bias_forward_launcher(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(C),
+        static_cast<int>(H),
+        static_cast<int>(W),
+        stream
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+    return out;
+}
+
+// ==================== Register bindings ====================
+void register_custom_ops(pybind11::module& m) {
+    m.def("custom_pad1d_forward", &custom_pad1d_forward,
+          "ConstantPad1d forward (CUDA)",
+          pybind11::arg("x"),
+          pybind11::arg("padding_left"),
+          pybind11::arg("padding_right"));
+
+    m.def("custom_conv_transpose2d_forward", &custom_conv_transpose2d_forward,
+          "ConvTranspose2d forward using cuDNN (CUDA)",
+          pybind11::arg("x"),
+          pybind11::arg("weight"),
+          pybind11::arg("bias"),
+          pybind11::arg("stride"),
+          pybind11::arg("output_padding"));
+
+    m.def("custom_add_bias_forward", &custom_add_bias_forward,
+          "Add bias with shape [C,1,1] to x (CUDA)",
+          pybind11::arg("x"),
+          pybind11::arg("bias"));
+}
+
+REGISTER_BINDING(custom_ops, register_custom_ops);

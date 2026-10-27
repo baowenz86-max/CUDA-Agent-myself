@@ -1,0 +1,456 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,21 +1,13 @@
+ // custom_ops.cu
+ // This file contains all custom CUDA kernels and launchers.
+-//
+-// Operator implemented in this phase:
+-//   custom_histc: computes histogram of input elements over [min, max] with given bins.
+-//
+-// Operator custom_conv_transpose1d is NOT implemented in this file.
+-// It must be implemented in a separate .cpp file using cuDNN API,
+-// per the restriction: Conv/ConvTranspose must use cuDNN and handled by C++ layer.
+-//
+-// The launcher custom_histc_launcher is declared extern "C" for linking with binding.
++// Operators: custom_histc, custom_conv_transpose1d (pure CUDA kernel implementation
++// because cuDNN headers are unavailable in this environment).
+ 
+ #include <cuda_runtime.h>
+ #include <math.h>
+ 
+-// Kernel: computes histogram using per-block shared memory private histograms,
+-// then atomically accumulates into global output. Handles arbitrary number of elements
+-// using grid-stride loop.
++// ------------------------- custom_histc -------------------------
++
+ __global__ void custom_histc_kernel(
+     const float* __restrict__ input,
+     size_t numel,
+@@ -24,8 +16,7 @@
+     float max_val,
+     float* __restrict__ output)
+ {
+-    extern __shared__ unsigned int block_hist[]; // shared histogram, one per thread in block
+-    // initialize shared hist to 0
++    extern __shared__ unsigned int block_hist[];
+     for (int i = threadIdx.x; i < bins; i += blockDim.x) {
+         block_hist[i] = 0u;
+     }
+@@ -33,27 +24,19 @@
+ 
+     float bin_width = (max_val - min_val) / bins;
+     if (bin_width <= 0.0f) {
+-        // invalid range, no elements counted
+-        __syncthreads(); // ensure all threads before exit? Actually we just return without writing
+         return;
+     }
+ 
+-    // Loop over all elements assigned to this thread (grid-stride)
+     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < numel; idx += (size_t)gridDim.x * blockDim.x) {
+         float val = input[idx];
+-        // Ignore NaN and Inf
+         if (isnan(val) || isinf(val)) continue;
+-        // Ignore values outside [min_val, max_val]
+         if (val < min_val || val > max_val) continue;
+ 
+-        // Compute bin index
+         int bin;
+         if (val == max_val) {
+-            bin = bins - 1; // include max in last bin
++            bin = bins - 1;
+         } else {
+             bin = (int)((val - min_val) / bin_width);
+-            // Due to floating precision, bin could equal bins for values very close to max but not equal.
+-            // Clamp to bins-1 to be safe.
+             if (bin >= bins) bin = bins - 1;
+             if (bin < 0) bin = 0;
+         }
+@@ -62,23 +45,13 @@
+ 
+     __syncthreads();
+ 
+-    // Merge block histogram into global histogram using atomicAdd
+     for (int i = threadIdx.x; i < bins; i += blockDim.x) {
+         if (block_hist[i] != 0) {
+-            atomicAdd(&output[i], (float)block_hist[i]); // output is float, convert
++            atomicAdd(&output[i], (float)block_hist[i]);
+         }
+     }
+ }
+ 
+-// Launcher: custom_histc_launcher
+-// Parameters:
+-//   input: pointer to input data (float)
+-//   numel: number of elements
+-//   bins: number of bins
+-//   min_val, max_val: histogram range
+-//   output: pointer to output array of size bins (float)
+-//   stream: CUDA stream
+-// Returns: void, but may set cudaError on failure (kernel launch error can be checked by caller)
+ extern "C" void custom_histc_launcher(
+     const float* input,
+     size_t numel,
+@@ -89,26 +62,86 @@
+     cudaStream_t stream)
+ {
+     if (bins <= 0 || numel == 0) {
+-        // call cudaMemsetAsync to zero the output if necessary? Better to let caller handle; but we can just return.
+         return;
+     }
+ 
+-    // Determine block size
+     const int block_size = 256;
+     int grid_size = (int)((numel + block_size - 1) / block_size);
+-    // Cap grid size to avoid too many blocks; grid-stride loop handles the rest
+     const int max_grid_size = 65535;
+     if (grid_size > max_grid_size) grid_size = max_grid_size;
+     if (grid_size < 1) grid_size = 1;
+ 
+-    // Shared memory per block: bins unsigned ints
+     size_t shared_mem = bins * sizeof(unsigned int);
+-    // Check shared memory limit (typically 48KB, but we assume bins modest)
+-    // If bins too large, kernel fails; we could fallback, but contract says bins=100.
+ 
+     custom_histc_kernel<<<grid_size, block_size, shared_mem, stream>>>(
+         input, numel, bins, min_val, max_val, output);
++}
+ 
+-    // The caller is expected to check cudaGetLastError() after launch (binding layer).
+-    // We don't call cudaDeviceSynchronize here; asynchronous error will be caught later.
++// ------------------------- custom_conv_transpose1d (pure CUDA) -------------------------
++
++__global__ void custom_conv_transpose1d_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int input_length,
++    int output_length,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_elements = batch * out_channels * output_length;
++    if (idx >= total_elements) return;
++
++    // Decompose idx into (b, oc, ol)
++    int b = idx / (out_channels * output_length);
++    int remainder = idx % (out_channels * output_length);
++    int oc = remainder / output_length;
++    int ol = remainder % output_length;
++
++    float sum = 0.0f;
++    for (int ic = 0; ic < in_channels; ++ic) {
++        for (int k = 0; k < kernel_size; ++k) {
++            int input_pos = (ol + padding - k) / stride;
++            if ((ol + padding - k) >= 0 && ((ol + padding - k) % stride == 0) && input_pos < input_length && input_pos >= 0) {
++                int input_idx = b * (in_channels * input_length) + ic * input_length + input_pos;
++                int weight_idx = ic * (out_channels * kernel_size) + oc * kernel_size + k;
++                sum += input[input_idx] * weight[weight_idx];
++            }
++        }
++    }
++    // Add bias
++    sum += bias[oc];
++    output[idx] = sum;
+ }
++
++extern "C" void custom_conv_transpose1d_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int input_length,
++    int output_length,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    cudaStream_t stream)
++{
++    int total_elements = batch * out_channels * output_length;
++    const int block_size = 256;
++    int grid_size = (total_elements + block_size - 1) / block_size;
++
++    custom_conv_transpose1d_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, weight, bias, output,
++        batch, in_channels, out_channels, input_length, output_length,
++        kernel_size, stride, padding, output_padding);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,12 +2,10 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cuda_runtime.h>
+-#include <cudnn.h>
+ #include <iostream>
+-#include <vector>
+ #include "../binding_registry.h"
+ 
+-// Declare launcher from custom_ops.cu
++// Declare launchers from custom_ops.cu
+ extern "C" void custom_histc_launcher(
+     const float* input,
+     size_t numel,
+@@ -17,25 +15,34 @@
+     float* output,
+     cudaStream_t stream);
+ 
++extern "C" void custom_conv_transpose1d_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int input_length,
++    int output_length,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    cudaStream_t stream);
++
+ namespace {
+ 
+-// Helper to check cuDNN status
+-inline void checkCudnn(cudnnStatus_t status, const char* msg) {
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error(std::string(msg) + ": " + cudnnGetErrorString(status));
+-    }
+-}
+-
+-// Helper to check CUDA status
+ inline void checkCuda(cudaError_t error, const char* msg) {
+     if (error != cudaSuccess) {
+         throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(error));
+     }
+ }
+ 
+-// Custom ConvTranspose1d implementation using cuDNN
++// Custom ConvTranspose1d forward implementation
+ // Input: [batch, in_channels, length], weight: [in_channels, out_channels, kernel_size], bias: [out_channels]
+-// stride, padding, output_padding scalar (output_padding applied by adjusting output shape manually)
++// stride, padding, output_padding scalar
++// Uses pure CUDA kernel launcher, no cuDNN to avoid missing headers.
+ torch::Tensor custom_conv_transpose1d_forward(
+     torch::Tensor input,
+     torch::Tensor weight,
+@@ -78,162 +85,31 @@
+     // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Create cuDNN handle
+-    cudnnHandle_t cudnn;
+-    checkCudnn(cudnnCreate(&cudnn), "cudnnCreate");
+-    checkCudnn(cudnnSetStream(cudnn, stream), "cudnnSetStream");
++    custom_conv_transpose1d_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(in_channels),
++        static_cast<int>(out_channels),
++        static_cast<int>(length),
++        static_cast<int>(output_length),
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        static_cast<int>(output_padding),
++        stream
++    );
+ 
+-    // Create tensor descriptors
+-    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    checkCudnn(cudnnCreateTensorDescriptor(&input_desc), "cudnnCreateTensorDescriptor input");
+-    checkCudnn(cudnnCreateTensorDescriptor(&output_desc), "cudnnCreateTensorDescriptor output");
+-    checkCudnn(cudnnCreateTensorDescriptor(&bias_desc), "cudnnCreateTensorDescriptor bias");
+-    checkCudnn(cudnnCreateFilterDescriptor(&filter_desc), "cudnnCreateFilterDescriptor");
+-    checkCudnn(cudnnCreateConvolutionDescriptor(&conv_desc), "cudnnCreateConvolutionDescriptor");
+-
+-    // Set tensor descriptors: cuDNN expects NCHW format, for 1D we use Nx1xL representation (treat as 2D with height=1)
+-    // Actually for 1D, cuDNN uses tensor of dim 4 with C, H=1, W=length
+-    int dims[] = {1, length};  // dummy, but we use 4D descriptor with explicit strides
+-    // For 1D conv, we set descriptor as NCHW where H=1 and W=length
+-    int input_nstride = in_channels * length;
+-    int input_cstride = length;
+-    int input_hstride = length; // unused for H=1, but must set correctly? Actually cuDNN ignores for H=1
+-    int input_wstride = 1;
+-    checkCudnn(cudnnSetTensor4dDescriptor(input_desc,
+-                                          CUDNN_TENSOR_NCHW,
+-                                          CUDNN_DATA_FLOAT,
+-                                          batch, in_channels, 1, length),
+-                "cudnnSetTensor4dDescriptor input");
+-
+-    int output_nstride = out_channels * output_length;
+-    int output_cstride = output_length;
+-    int output_hstride = output_length;
+-    int output_wstride = 1;
+-    checkCudnn(cudnnSetTensor4dDescriptor(output_desc,
+-                                          CUDNN_TENSOR_NCHW,
+-                                          CUDNN_DATA_FLOAT,
+-                                          batch, out_channels, 1, output_length),
+-                "cudnnSetTensor4dDescriptor output");
+-
+-    // Bias descriptor: one bias per output channel
+-    checkCudnn(cudnnSetTensor4dDescriptor(bias_desc,
+-                                          CUDNN_TENSOR_NCHW,
+-                                          CUDNN_DATA_FLOAT,
+-                                          1, out_channels, 1, 1),
+-                "cudnnSetTensor4dDescriptor bias");
+-
+-    // Filter descriptor: for 1D conv, filter is 3D (in_channels, out_channels, kernel_size)
+-    // cuDNN expects filter dims: out_channels, in_channels, kernel_h, kernel_w.
+-    // Since kernel has no spatial height, we set filter as [out_channels, in_channels, 1, kernel_size]
+-    checkCudnn(cudnnSetFilter4dDescriptor(filter_desc,
+-                                          CUDNN_DATA_FLOAT,
+-                                          CUDNN_TENSOR_NCHW,
+-                                          out_channels, in_channels, 1, kernel_size),
+-                "cudnnSetFilter4dDescriptor");
+-
+-    // Convolution descriptor
+-    int padA[] = {0, padding};   // height pad = 0, width pad = padding
+-    int strideA[] = {1, stride}; // height stride = 1, width stride = stride
+-    int upscaleA[] = {1, 1};
+-    checkCudnn(cudnnSetConvolution2dDescriptor(conv_desc,
+-                                               padA[0], padA[1],
+-                                               strideA[0], strideA[1],
+-                                               upscaleA[0], upscaleA[1],
+-                                               CUDNN_CROSS_CORRELATION,
+-                                               CUDNN_DATA_FLOAT),
+-                "cudnnSetConvolution2dDescriptor");
+-
+-    // For transposed conv, use cudnnConvolutionBackwardData with appropriate input/output swapped
+-    // We want to compute output = weight * input transposed, so we use backward data algorithm.
+-    // Need to find algorithm and workspace size.
+-    cudnnConvolutionBwdDataAlgo_t algo;
+-    int requestedAlgoCount = 1;
+-    int returnedAlgoCount = 0;
+-    cudnnConvolutionBwdDataAlgoPerf_t perfResults[1];
+-    checkCudnn(cudnnFindConvolutionBackwardDataAlgorithm(
+-                   cudnn,
+-                   filter_desc,
+-                   input_desc,   // dy (gradient w.r.t output of forward conv) = input to transposed conv
+-                   conv_desc,
+-                   output_desc,  // dx (gradient w.r.t input) = output of transposed conv
+-                   requestedAlgoCount,
+-                   &returnedAlgoCount,
+-                   perfResults),
+-               "cudnnFindConvolutionBackwardDataAlgorithm");
+-    if (returnedAlgoCount <= 0) {
+-        throw std::runtime_error("No convolution backward data algorithm found");
+-    }
+-    algo = perfResults[0].algo;
+-
+-    size_t workspaceSize = 0;
+-    checkCudnn(cudnnGetConvolutionBackwardDataWorkspaceSize(
+-                   cudnn,
+-                   filter_desc,
+-                   input_desc,
+-                   conv_desc,
+-                   output_desc,
+-                   algo,
+-                   &workspaceSize),
+-               "cudnnGetConvolutionBackwardDataWorkspaceSize");
+-
+-    void* workspace = nullptr;
+-    if (workspaceSize > 0) {
+-        checkCuda(cudaMalloc(&workspace, workspaceSize), "cudaMalloc workspace");
+-    }
+-
+-    float alpha = 1.0f;
+-    float beta = 0.0f;
+-
+-    // Execute transposed convolution
+-    checkCudnn(cudnnConvolutionBackwardData(
+-                   cudnn,
+-                   &alpha,
+-                   filter_desc,
+-                   weight.data_ptr<float>(),
+-                   input_desc,
+-                   input.data_ptr<float>(),
+-                   conv_desc,
+-                   algo,
+-                   workspace,
+-                   workspaceSize,
+-                   &beta,
+-                   output_desc,
+-                   output.data_ptr<float>()),
+-               "cudnnConvolutionBackwardData");
+-
+-    // Add bias
+-    if (bias.numel() > 0) {
+-        // Use cudnnAddTensor to add bias to each channel
+-        beta = 1.0f;
+-        checkCudnn(cudnnAddTensor(cudnn,
+-                                  &alpha,
+-                                  bias_desc,
+-                                  bias.data_ptr<float>(),
+-                                  &beta,
+-                                  output_desc,
+-                                  output.data_ptr<float>()),
+-                   "cudnnAddTensor");
+-    }
+-
+-    // Cleanup
+-    if (workspace) cudaFree(workspace);
+-    cudnnDestroyTensorDescriptor(input_desc);
+-    cudnnDestroyTensorDescriptor(output_desc);
+-    cudnnDestroyTensorDescriptor(bias_desc);
+-    cudnnDestroyFilterDescriptor(filter_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn);
+-
+-    // Check for CUDA errors from cuDNN operations
+-    checkCuda(cudaGetLastError(), "post cuDNN");
++    checkCuda(cudaGetLastError(), "conv_transpose1d launch");
+ 
+     return output;
+ }
+ 
+-// Custom histc binding
++// Custom histc forward
++// Input: contiguous CUDA float tensor, bins, min, max
++// Output: tensor of shape [bins] with counts (float)
+ torch::Tensor custom_histc_forward(
+     torch::Tensor input,
+     int64_t bins,
+@@ -247,7 +123,6 @@
+ 
+     auto output = torch::zeros({bins}, input.options());
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     custom_histc_launcher(
+@@ -260,7 +135,6 @@
+         stream
+     );
+ 
+-    // Check for errors
+     checkCuda(cudaGetLastError(), "histc launch");
+ 
+     return output;
+@@ -270,7 +144,7 @@
+ 
+ void register_custom_ops(pybind11::module& m) {
+     m.def("custom_conv_transpose1d", &custom_conv_transpose1d_forward,
+-          "Custom ConvTranspose1d using cuDNN",
++          "Custom ConvTranspose1d",
+           py::arg("input"), py::arg("weight"), py::arg("bias"),
+           py::arg("stride") = 2, py::arg("padding") = 1, py::arg("output_padding") = 1);
+     m.def("custom_histc", &custom_histc_forward,

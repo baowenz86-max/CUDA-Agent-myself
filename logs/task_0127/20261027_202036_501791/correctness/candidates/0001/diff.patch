@@ -1,0 +1,225 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,85 @@
++#include <cuda_runtime.h>
++
++// Reflection padding kernel.
++// Supports arbitrary input strides by using stride parameters.
++// Output tensor is assumed contiguous with shape [N, C, H_out, W_out].
++// Each thread computes one output element.
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    int pad_top, int pad_bottom, int pad_left, int pad_right,
++    long long input_stride_n,   // stride to move batch
++    long long input_stride_c,   // stride to move channel
++    long long input_stride_h,   // stride to move height
++    long long input_stride_w    // stride to move width
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * H_out * W_out;
++    if (idx >= total) return;
++
++    // Decompose linear index into n, c, oh, ow
++    int ow = idx % W_out;
++    int tmp = idx / W_out;
++    int oh = tmp % H_out;
++    tmp /= H_out;
++    int c = tmp % C;
++    int n = tmp / C;
++
++    // Compute reflected input coordinates
++    int ih = oh - pad_top;
++    // reflect if out of range
++    if (ih < 0) ih = -ih;
++    int max_ih = H_in - 1;
++    if (ih > max_ih) {
++        int period = 2 * H_in - 2;
++        ih = ih % period;
++        if (ih >= H_in) ih = period - ih;
++    }
++
++    int iw = ow - pad_left;
++    if (iw < 0) iw = -iw;
++    int max_iw = W_in - 1;
++    if (iw > max_iw) {
++        int period = 2 * W_in - 2;
++        iw = iw % period;
++        if (iw >= W_in) iw = period - iw;
++    }
++
++    // Compute input offset using strides
++    long long input_offset = n * input_stride_n + c * input_stride_c
++                             + ih * input_stride_h + iw * input_stride_w;
++    output[idx] = input[input_offset];
++}
++
++// Launcher function (C interface)
++// input: pointer to input data (float)
++// output: pointer to output data (float, preallocated contiguous)
++// N,C,H_in,W_in: input dims
++// pad_top,pad_bottom,pad_left,pad_right: padding amounts
++// input_strides: array of 4 strides in elements for input tensor (n,c,h,w)
++// stream: CUDA stream
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in,
++    int pad_top, int pad_bottom, int pad_left, int pad_right,
++    const long long* input_strides,
++    cudaStream_t stream
++) {
++    int H_out = H_in + pad_top + pad_bottom;
++    int W_out = W_in + pad_left + pad_right;
++    int total = N * C * H_out * W_out;
++
++    const int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output,
++        N, C, H_in, W_in,
++        H_out, W_out,
++        pad_top, pad_bottom, pad_left, pad_right,
++        input_strides[0], input_strides[1], input_strides[2], input_strides[3]
++    );
++}
+--- before/kernels/reflection_pad2d_binding.cpp
++++ after/kernels/reflection_pad2d_binding.cpp
+@@ -0,0 +1,89 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in,
++    int pad_top, int pad_bottom, int pad_left, int pad_right,
++    const long long* input_strides,
++    cudaStream_t stream
++);
++
++// PyTorch binding wrapper
++torch::Tensor reflection_pad2d_forward(
++    torch::Tensor input,
++    int64_t padding_top,
++    int64_t padding_bottom,
++    int64_t padding_left,
++    int64_t padding_right
++) {
++    // Validate input
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    // Get dimensions
++    int N = input.size(0);
++    int C = input.size(1);
++    int H_in = input.size(2);
++    int W_in = input.size(3);
++
++    // Validate padding non-negative and within bounds to avoid undefined behavior
++    TORCH_CHECK(padding_top >= 0 && padding_bottom >= 0 && padding_left >= 0 && padding_right >= 0,
++                "Padding must be non-negative");
++    // The kernel reflects modulo period, so padding can be arbitrary non-negative, but for safety we limit to reasonable size
++
++    // Compute output dimensions
++    int H_out = H_in + padding_top + padding_bottom;
++    int W_out = W_in + padding_left + padding_right;
++
++    // Allocate output tensor (contiguous)
++    auto output = torch::empty({N, C, H_out, W_out}, input.options());
++
++    // Get input strides (in elements)
++    long long input_strides[4];
++    input_strides[0] = input.stride(0);
++    input_strides[1] = input.stride(1);
++    input_strides[2] = input.stride(2);
++    input_strides[3] = input.stride(3);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    reflection_pad2d_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H_in, W_in,
++        static_cast<int>(padding_top),
++        static_cast<int>(padding_bottom),
++        static_cast<int>(padding_left),
++        static_cast<int>(padding_right),
++        input_strides,
++        stream
++    );
++
++    // Check for kernel errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration
++void register_reflection_pad2d(pybind11::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "Reflection padding forward (CUDA)",
++          py::arg("input"),
++          py::arg("padding_top"),
++          py::arg("padding_bottom"),
++          py::arg("padding_left"),
++          py::arg("padding_right"));
++}
++
++REGISTER_BINDING(reflection_pad2d, register_reflection_pad2d);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,42 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, padding_size):
++        super().__init__()
++        # Keep the same module as reference for state_dict compatibility;
++        # it is not used in forward, since forward must use the custom CUDA op.
++        self.reflection_pad = nn.ReflectionPad2d(padding_size)
++        self.padding_top = padding_size[0]
++        self.padding_bottom = padding_size[1]
++        self.padding_left = padding_size[2]
++        self.padding_right = padding_size[3]
++
++    def forward(self, x):
++        # Call custom CUDA reflection padding operator
++        x = cuda_extension.reflection_pad2d_forward(
++            x,
++            self.padding_top,
++            self.padding_bottom,
++            self.padding_left,
++            self.padding_right
++        )
++        # torch.detach is a non-computational path, keep as native call
++        x = torch.detach(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        # Yield checkpoints in order
++        x = inputs[0]
++        x_padded = cuda_extension.reflection_pad2d_forward(
++            x,
++            self.padding_top,
++            self.padding_bottom,
++            self.padding_left,
++            self.padding_right
++        )
++        yield 'step_001', x_padded
++        x_detached = torch.detach(x_padded)
++        yield 'step_002', x_detached
++        yield 'step_003', x_detached

@@ -1,0 +1,342 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,168 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// CUDA kernels and launchers for bilinear 2x upsampling and adaptive average pooling.
++// No PyTorch dependencies are used. Binding layer will call these extern "C" launchers.
++
++// -----------------------------------------------------------------------------
++// Bilinear upsampling with scale_factor (integer) for 4D tensor [N, C, H, W]
++// align_corners = false, half-pixel centers.
++// input may be non-contiguous; strides are provided separately.
++// -----------------------------------------------------------------------------
++__global__ void bilinear_upsample_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int out_H, int out_W,
++    int scale_factor,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    int64_t out_n_stride, int64_t out_c_stride, int64_t out_h_stride, int64_t out_w_stride)
++{
++    int64_t total_elements = (int64_t)N * C * out_H * out_W;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++
++    float scale = static_cast<float>(scale_factor);
++
++    for (int64_t linear = idx; linear < total_elements; linear += stride) {
++        // decompose linear index: n, c, oh, ow (row-major over output)
++        int ow = static_cast<int>(linear % out_W);
++        int64_t tmp = linear / out_W;
++        int oh = static_cast<int>(tmp % out_H);
++        tmp /= out_H;
++        int c = static_cast<int>(tmp % C);
++        int n = static_cast<int>(tmp / C);
++
++        // half-pixel mapping: in_coordinate = (out_coordinate + 0.5) / scale - 0.5
++        float x = (static_cast<float>(ow) + 0.5f) / scale - 0.5f;
++        float y = (static_cast<float>(oh) + 0.5f) / scale - 0.5f;
++
++        // clamp to [0, H-1] and [0, W-1] for sampling
++        if (x < 0.0f) x = 0.0f;
++        if (y < 0.0f) y = 0.0f;
++        if (x > static_cast<float>(W - 1)) x = static_cast<float>(W - 1);
++        if (y > static_cast<float>(H - 1)) y = static_cast<float>(H - 1);
++
++        int x0 = static_cast<int>(floorf(x));
++        int y0 = static_cast<int>(floorf(y));
++        int x1 = x0 + 1;
++        int y1 = y0 + 1;
++
++        // clamp indices
++        if (x1 >= W) x1 = W - 1;
++        if (y1 >= H) y1 = H - 1;
++
++        float fx = x - static_cast<float>(x0);
++        float fy = y - static_cast<float>(y0);
++
++        const float* in_base = input + n * in_n_stride + c * in_c_stride;
++        float v00 = in_base[y0 * in_h_stride + x0 * in_w_stride];
++        float v01 = in_base[y0 * in_h_stride + x1 * in_w_stride];
++        float v10 = in_base[y1 * in_h_stride + x0 * in_w_stride];
++        float v11 = in_base[y1 * in_h_stride + x1 * in_w_stride];
++
++        float top = v00 * (1.0f - fx) + v01 * fx;
++        float bottom = v10 * (1.0f - fx) + v11 * fx;
++        float value = top * (1.0f - fy) + bottom * fy;
++
++        output[n * out_n_stride + c * out_c_stride + oh * out_h_stride + ow * out_w_stride] = value;
++    }
++}
++
++extern "C" void interpolate_bilinear_scale_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int scale_factor,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    int64_t out_n_stride, int64_t out_c_stride, int64_t out_h_stride, int64_t out_w_stride,
++    cudaStream_t stream)
++{
++    int out_H = H * scale_factor;
++    int out_W = W * scale_factor;
++    int64_t total_elements = (int64_t)N * C * out_H * out_W;
++
++    const int block_size = 256;
++    int64_t blocks64 = (total_elements + block_size - 1) / block_size;
++    // Limit grid dimension to a reasonable maximum, but use grid-stride loop to handle rest
++    int blocks = static_cast<int>(min(blocks64, (int64_t)65535));
++    if (blocks == 0) blocks = 1;
++
++    bilinear_upsample_kernel<<<blocks, block_size, 0, stream>>>(
++        input, output, N, C, H, W, out_H, out_W, scale_factor,
++        in_n_stride, in_c_stride, in_h_stride, in_w_stride,
++        out_n_stride, out_c_stride, out_h_stride, out_w_stride);
++}
++
++// -----------------------------------------------------------------------------
++// Adaptive average pooling for 4D tensor [N, C, H, W] to [N, C, out_h, out_w]
++// Mirrors PyTorch's adaptive average pooling: for each output position (oh, ow),
++// compute start and end indices in input:
++//   start_index = floor(oh * H / out_h)
++//   end_index   = ceil((oh+1) * H / out_h)
++// similarly for width, then average all values in that window.
++// -----------------------------------------------------------------------------
++__global__ void adaptive_avg_pool2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int out_h, int out_w,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    int64_t out_n_stride, int64_t out_c_stride, int64_t out_h_stride, int64_t out_w_stride)
++{
++    int64_t total_elements = (int64_t)N * C * out_h * out_w;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++
++    for (int64_t linear = idx; linear < total_elements; linear += stride) {
++        // decompose output index: n, c, oh, ow
++        int ow = static_cast<int>(linear % out_w);
++        int64_t tmp = linear / out_w;
++        int oh = static_cast<int>(tmp % out_h);
++        tmp /= out_h;
++        int c = static_cast<int>(tmp % C);
++        int n = static_cast<int>(tmp / C);
++
++        int h_start = (oh * H) / out_h;
++        int h_end = ((oh + 1) * H + out_h - 1) / out_h;  // ceil division
++        int w_start = (ow * W) / out_w;
++        int w_end = ((ow + 1) * W + out_w - 1) / out_w;
++
++        float sum = 0.0f;
++        int count = 0;
++
++        const float* in_base = input + n * in_n_stride + c * in_c_stride;
++        for (int ih = h_start; ih < h_end; ++ih) {
++            for (int iw = w_start; iw < w_end; ++iw) {
++                sum += in_base[ih * in_h_stride + iw * in_w_stride];
++                ++count;
++            }
++        }
++
++        float avg = (count > 0) ? (sum / static_cast<float>(count)) : 0.0f;
++        output[n * out_n_stride + c * out_c_stride + oh * out_h_stride + ow * out_w_stride] = avg;
++    }
++}
++
++extern "C" void adaptive_avg_pool2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int out_h, int out_w,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    int64_t out_n_stride, int64_t out_c_stride, int64_t out_h_stride, int64_t out_w_stride,
++    cudaStream_t stream)
++{
++    int64_t total_elements = (int64_t)N * C * out_h * out_w;
++    if (total_elements == 0) return;
++
++    const int block_size = 256;
++    int64_t blocks64 = (total_elements + block_size - 1) / block_size;
++    int blocks = static_cast<int>(min(blocks64, (int64_t)65535));
++    if (blocks == 0) blocks = 1;
++
++    adaptive_avg_pool2d_kernel<<<blocks, block_size, 0, stream>>>(
++        input, output, N, C, H, W, out_h, out_w,
++        in_n_stride, in_c_stride, in_h_stride, in_w_stride,
++        out_n_stride, out_c_stride, out_h_stride, out_w_stride);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,132 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void interpolate_bilinear_scale_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int scale_factor,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    int64_t out_n_stride, int64_t out_c_stride, int64_t out_h_stride, int64_t out_w_stride,
++    cudaStream_t stream);
++
++extern "C" void adaptive_avg_pool2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int out_h, int out_w,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    int64_t out_n_stride, int64_t out_c_stride, int64_t out_h_stride, int64_t out_w_stride,
++    cudaStream_t stream);
++
++// PyTorch wrapper for bilinear upsampling with integer scale factor
++torch::Tensor interpolate_bilinear_scale(torch::Tensor x, int64_t scale_factor) {
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4D (N, C, H, W)");
++    TORCH_CHECK(scale_factor > 0, "scale_factor must be positive");
++
++    int N = static_cast<int>(x.size(0));
++    int C = static_cast<int>(x.size(1));
++    int H = static_cast<int>(x.size(2));
++    int W = static_cast<int>(x.size(3));
++    int out_H = H * static_cast<int>(scale_factor);
++    int out_W = W * static_cast<int>(scale_factor);
++
++    // Input may be non-contiguous, so we pass strides
++    int64_t in_n_stride = x.stride(0);
++    int64_t in_c_stride = x.stride(1);
++    int64_t in_h_stride = x.stride(2);
++    int64_t in_w_stride = x.stride(3);
++
++    // Allocate contiguous output
++    auto output = torch::empty({N, C, out_H, out_W}, x.options());
++    int64_t out_n_stride = output.stride(0);
++    int64_t out_c_stride = output.stride(1);
++    int64_t out_h_stride = output.stride(2);
++    int64_t out_w_stride = output.stride(3);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    interpolate_bilinear_scale_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        static_cast<int>(scale_factor),
++        in_n_stride, in_c_stride, in_h_stride, in_w_stride,
++        out_n_stride, out_c_stride, out_h_stride, out_w_stride,
++        stream
++    );
++
++    // Check for kernel launch errors
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA kernel launch failed for interpolate_bilinear_scale");
++
++    return output;
++}
++
++// PyTorch wrapper for adaptive average pooling
++torch::Tensor adaptive_avg_pool2d(torch::Tensor x, int64_t out_h, int64_t out_w) {
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4D (N, C, H, W)");
++    TORCH_CHECK(out_h > 0 && out_w > 0, "Output spatial dimensions must be positive");
++
++    int N = static_cast<int>(x.size(0));
++    int C = static_cast<int>(x.size(1));
++    int H = static_cast<int>(x.size(2));
++    int W = static_cast<int>(x.size(3));
++    int h = static_cast<int>(out_h);
++    int w = static_cast<int>(out_w);
++
++    // Input may be non-contiguous
++    int64_t in_n_stride = x.stride(0);
++    int64_t in_c_stride = x.stride(1);
++    int64_t in_h_stride = x.stride(2);
++    int64_t in_w_stride = x.stride(3);
++
++    // Allocate contiguous output
++    auto output = torch::empty({N, C, h, w}, x.options());
++    int64_t out_n_stride = output.stride(0);
++    int64_t out_c_stride = output.stride(1);
++    int64_t out_h_stride = output.stride(2);
++    int64_t out_w_stride = output.stride(3);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    adaptive_avg_pool2d_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        h, w,
++        in_n_stride, in_c_stride, in_h_stride, in_w_stride,
++        out_n_stride, out_c_stride, out_h_stride, out_w_stride,
++        stream
++    );
++
++    // Check for kernel launch errors
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA kernel launch failed for adaptive_avg_pool2d");
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("interpolate_bilinear_scale", &interpolate_bilinear_scale,
++          "Bilinear upsampling with integer scale factor",
++          py::arg("x"), py::arg("scale_factor"));
++    m.def("adaptive_avg_pool2d", &adaptive_avg_pool2d,
++          "Adaptive average pooling 2D",
++          py::arg("x"), py::arg("out_h"), py::arg("out_w"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,33 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, scale_factor, mode, pools):
++        super().__init__()
++        self.scale_factor = scale_factor
++        self.mode = mode
++        # 保持与参考 state_dict 一致：pools 为 ParameterList，但无参数
++        self.pools = nn.ParameterList(pools)
++
++    def forward(self, x):
++        x = cuda_extension.interpolate_bilinear_scale(x, self.scale_factor)
++        pooled_tensors = [
++            cuda_extension.adaptive_avg_pool2d(x, pool.output_size[0], pool.output_size[1])
++            for pool in self.pools
++        ]
++        return pooled_tensors
++
++    def debug_forward(self, x):
++        """Return generator yielding (checkpoint_id, value) in reference order."""
++        x = cuda_extension.interpolate_bilinear_scale(x, self.scale_factor)
++        yield "step_001", x
++
++        pooled_tensors = [
++            cuda_extension.adaptive_avg_pool2d(x, pool.output_size[0], pool.output_size[1])
++            for pool in self.pools
++        ]
++        yield "step_002", pooled_tensors
++
++        yield "step_003", pooled_tensors

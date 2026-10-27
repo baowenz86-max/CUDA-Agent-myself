@@ -1,0 +1,402 @@
+--- before/kernels/conv_transpose1d_binding.cpp
++++ after/kernels/conv_transpose1d_binding.cpp
+@@ -1,18 +1,28 @@
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+-#include <cudnn.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+-// Helper to check cuDNN status
+-#define CHECK_CUDNN(status) { \
+-    if (status != CUDNN_STATUS_SUCCESS) { \
+-        TORCH_CHECK(false, "cuDNN error: ", cudnnGetErrorString(status)); \
+-    } \
+-}
++// Declare launcher from custom_ops.cu
++extern "C" void conv_transpose1d_forward_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int length_in,
++    int length_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    cudaStream_t stream
++);
+ 
+-// PyTorch wrapper for ConvTranspose1d using cuDNN
++// PyTorch wrapper for ConvTranspose1d using custom CUDA kernel
+ torch::Tensor conv_transpose1d_forward(
+     torch::Tensor input,
+     torch::Tensor weight,
+@@ -61,168 +71,27 @@
+     // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // cuDNN handle (create per call for simplicity; could reuse but okay)
+-    cudnnHandle_t cudnn_handle;
+-    CHECK_CUDNN(cudnnCreate(&cudnn_handle));
+-    CHECK_CUDNN(cudnnSetStream(cudnn_handle, stream));
+-
+-    // Set tensor descriptors
+-    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&input_desc));
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&output_desc));
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&bias_desc));
+-    CHECK_CUDNN(cudnnCreateFilterDescriptor(&filter_desc));
+-    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+-
+-    // Set input descriptor: [batch, in_channels, length] -> treat as [batch, in_channels, length, 1]? 
+-    // cuDNN supports NCHW for 2D, but for 1D we can use NCHW with height=1? Actually cuDNN has 2D and 3D only.
+-    // For 1D conv, PyTorch internally uses 2D with height=1. Alternatively, use CUDNN_TENSOR_NCHW with dims [batch, in_channels, length].
+-    // cuDNN supports rank >= 4? Actually, cudnnSetTensor4dDescriptor can be used if we treat 1D as 2D with height=1.
+-    // However, simpler: since this is a small model, we can implement using cudnnConvolutionBackwardData or cudnnConvolutionForward with specific settings.
+-    // Let's set input as [batch, in_channels, 1, length] and output as [batch, out_channels, 1, length_out] (2D spatial).
+-    // Then use cudnnConvolutionBackwardData with appropriate filter and conv descriptors.
+-    
+-    // Use 2D descriptors with height=1
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                           batch, in_channels, 1, length_in));
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                           batch, out_channels, 1, length_out));
+-    if (bias_contig.defined()) {
+-        CHECK_CUDNN(cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                               1, out_channels, 1, 1));
+-    }
+-
+-    // Set filter descriptor: [in_channels, out_channels, kernel_size] -> for backward data, filter is [in_channels, out_channels, kernel_size]
+-    // cuDNN Filter descriptor for conv: [out_channels, in_channels, kernel_height, kernel_width] but for backward data, weight layout is [in_channels, out_channels, kh, kw]
+-    // We'll set filter as [in_channels, out_channels, kernel_size, 1]
+-    CHECK_CUDNN(cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+-                                           in_channels, out_channels, kernel_size, 1));
+-
+-    // Set convolution descriptor for backward data (which is equivalent to transposed convolution)
+-    // For ConvTranspose, we use cudnnConvolutionBackwardData with mode CUDNN_CROSS_CORRELATION.
+-    // Set conv descriptor with appropriate padding, stride, dilation=1.
+-    CHECK_CUDNN(cudnnSetConvolution2dDescriptor(conv_desc,
+-                                                 padding, padding,   // pad_h, pad_w (equal)
+-                                                 stride, stride,     // stride_h, stride_w (equal)
+-                                                 1, 1,               // dilation_h, dilation_w
+-                                                 CUDNN_CROSS_CORRELATION,
+-                                                 CUDNN_DATA_FLOAT));
+-
+-    // Determine workspace size for backward data algorithm
+-    cudnnConvolutionBwdDataAlgo_t algo;
+-    // Query best algo
+-    CHECK_CUDNN(cudnnGetConvolutionBackwardDataAlgorithm(
+-        cudnn_handle,
+-        filter_desc,
+-        output_desc,   // dy (output gradient) -> for backward data, dy has shape of original conv output
+-        conv_desc,
+-        input_desc,    // dx (input gradient) -> shape of original conv input
+-        CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST,
+-        0,
+-        &algo));
+-
+-    size_t workspace_size = 0;
+-    CHECK_CUDNN(cudnnGetConvolutionBackwardDataWorkspaceSize(
+-        cudnn_handle,
+-        filter_desc,
+-        output_desc,
+-        conv_desc,
+-        input_desc,
+-        algo,
+-        &workspace_size));
+-
+-    // Allocate workspace if needed
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaMalloc(&workspace, workspace_size);
+-    }
+-
+-    // Note: In ConvTranspose, the roles of input and output are reversed relative to forward conv.
+-    // In cudnnConvolutionBackwardData, dx is computed from dy, w, and conv_desc, where:
+-    //   dy shape = original conv output shape (here: output of transposed conv? Actually careful).
+-    // For transposed conv, PyTorch calls cudnnConvolutionBackwardData with filter, diff_output (the input to transposed conv?), etc.
+-    // We can map:
+-    //   dy = input_contig (shape [batch, in_channels, length_in]) ??? No, backward data uses dy as the "output gradient" which is gradient w.r.t. conv forward output, which for transposed conv is the input x? Let's derive.
+-    // Better: Use the approach of swapping input and output descriptors for backward data.
+-    // For transposed convolution (deconvolution), the operation can be implemented as the gradient of a standard convolution with respect to its input, using the same weight but with the roles of the stride and padding interpreted accordingly.
+-    // Specifically, torch.nn.functional.conv_transpose1d(input, weight, bias, stride, padding, output_padding) is equivalent to the gradient of a convolution with input size = output size, output size = input size, but with weight transpose? Actually, the transposed convolution can be computed using cudnnConvolutionBackwardData with:
+-    //   w = weight (shape [in_channels, out_channels, kernel_size])
+-    //   dy = grad_output w.r.t. the transposed conv output, which is actually the input tensor x of shape [batch, in_channels, length_in]
+-    //   dx = grad_input w.r.t. the transposed conv input, which is the output tensor of shape [batch, out_channels, length_out]
+-    // Wait, this seems reversed. Let's check: In standard convolution, forward: y = conv(x, w). Backward data: dx = conv_backward_data(dy, w). If we apply backward data to produce x from y using w, that's exactly a transposed convolution? Actually, transposed convolution is the gradient of the conv with respect to the input, i.e., if we have a conv layer with weight w and stride s and padding p, then its backward pass computes dx from dy using a transposed convolution with same w and stride s and padding p, but with output_padding to handle ambiguity. So to implement transposed convolution as a cuDNN call, we can use cudnnConvolutionBackwardData with:
+-    //   dy = input (our original x to conv_transpose, shape [batch, in_channels, length_in])
+-    //   w = weight (shape [in_channels, out_channels, kernel_size])
+-    //   dx = output (shape [batch, out_channels, length_out])
+-    //   conv_desc must describe the *original* convolution that we are differentiating. That original convolution should have input shape = output of transposed conv, output shape = input of transposed conv, weight shape = [in_channels, out_channels, kernel_size], stride = stride, padding = padding, dilation = 1. But the original convolution's input channels = out_channels, output channels = in_channels. However, weight shape is [in_channels, out_channels, kernel_size], which is the same as for the original convolution? In cuDNN, for backward data, the filter descriptor still has dimensions [K, C, R, S] where K = number of output feature maps of the original convolution (= in_channels), C = number of input feature maps of the original convolution (= out_channels). So filter desc should be [in_channels, out_channels, kernel_size, 1]. That matches our weight shape.
+-    //   dx (gradient w.r.t. original input) will have shape [batch, out_channels, length_out].
+-    // So we should set:
+-    //   dy_desc (input gradient? Actually in cudnnConvolutionBackwardData, the arguments are:
+-    //      handle, filterDesc, dyDesc, convDesc, dxDesc, algo, workspace, workspaceSize, beta, dx).
+-    //   dyDesc: descriptor for the gradient of the loss w.r.t. the output of the original convolution, which has shape [batch, out_channels? Wait, original convolution output channels = in_channels, so dyDesc should be [batch, in_channels, length_in] and dxDesc [batch, out_channels, length_out].
+-    // So we set dyDesc = input_contig description (since our input x is treated as dy), dxDesc = output description.
+-    // But our current setup above used input_desc for dx and output_desc for dy, which is reversed. Let's correct.
+-    // We need to reorder the descriptions:
+-    //   dxDesc = output tensor descriptor (shape [batch, out_channels, length_out])
+-    //   dyDesc = input tensor descriptor (shape [batch, in_channels, length_in])
+-    //   filterDesc = weight descriptor (shape [in_channels, out_channels, kernel_size])
+-    //   convDesc describes the original convolution with stride/padding/dilation.
+-    // Then call cudnnConvolutionBackwardData(handle, &alpha, filterDesc, weight, dyDesc, input, convDesc, algo, workspace, workspace_size, &beta, dxDesc, output).
+-    // Note: alpha=1, beta=0 initially; beta may be used if bias is added separately, but we can incorporate bias via beta or separate addition. Since output is zero-initialized, we can set beta=0 and then add bias using cudnnAddTensor or a custom kernel. Alternatively, use beta=1 if we pre-fill output with bias. But we don't have a pre-filled output. So after computing dx, we add bias using cudnnAddTensor.
+-
+-    // Correct descriptor assignments:
+-    // input_desc (dy) should be [batch, in_channels, 1, length_in]
+-    // output_desc (dx) should be [batch, out_channels, 1, length_out]
+-    // We already set them accordingly, but we had assigned input_desc to input_contig and output_desc to output. That's correct.
+-    // So dyDesc = input_desc, dxDesc = output_desc.
+-
+-    // Now call backward data
+-    float alpha = 1.0f, beta = 0.0f;
+-    CHECK_CUDNN(cudnnConvolutionBackwardData(
+-        cudnn_handle,
+-        &alpha,
+-        filter_desc,
++    // Call launcher
++    conv_transpose1d_forward_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
+         weight_contig.data_ptr<float>(),
+-        input_desc,
+-        input_contig.data_ptr<float>(),
+-        conv_desc,
+-        algo,
+-        workspace,
+-        workspace_size,
+-        &beta,
+-        output_desc,
+-        output.data_ptr<float>()));
+-
+-    // Add bias if defined
+-    if (bias_contig.defined()) {
+-        float beta_bias = 1.0f;
+-        CHECK_CUDNN(cudnnAddTensor(cudnn_handle,
+-                                   &alpha,
+-                                   bias_desc,
+-                                   bias_contig.data_ptr<float>(),
+-                                   &beta_bias,
+-                                   output_desc,
+-                                   output.data_ptr<float>()));
+-    }
+-
+-    // Free workspace
+-    if (workspace) {
+-        cudaFree(workspace);
+-    }
+-
+-    // Destroy descriptors and handle
+-    cudnnDestroyTensorDescriptor(input_desc);
+-    cudnnDestroyTensorDescriptor(output_desc);
+-    cudnnDestroyTensorDescriptor(bias_desc);
+-    cudnnDestroyFilterDescriptor(filter_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn_handle);
++        bias_contig.defined() ? bias_contig.data_ptr<float>() : nullptr,
++        batch,
++        in_channels,
++        out_channels,
++        length_in,
++        length_out,
++        kernel_size,
++        stride,
++        padding,
++        output_padding,
++        stream
++    );
+ 
+     // Check for errors
+     cudaError_t err = cudaGetLastError();
+-    TORCH_CHECK(err == cudaSuccess, "conv_transpose1d_forward failed: ", cudaGetErrorString(err));
++    TORCH_CHECK(err == cudaSuccess, "conv_transpose1d_forward kernel launch failed: ", cudaGetErrorString(err));
+ 
+     return output;
+ }
+@@ -230,7 +99,7 @@
+ // Registration
+ void register_conv_transpose1d(pybind11::module& m) {
+     m.def("conv_transpose1d_forward", &conv_transpose1d_forward,
+-          "ConvTranspose1d forward using cuDNN",
++          "ConvTranspose1d forward using custom CUDA kernel",
+           py::arg("input"),
+           py::arg("weight"),
+           py::arg("bias") = py::none(),
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,12 +1,52 @@
+-// CUDA kernels for custom operations.
+-// This file contains only non-convolutional CUDA kernels.
+-// ConvTranspose1d uses cuDNN and is implemented in the binding layer (kernels/conv_transpose1d_binding.cpp).
+ #include <cuda_runtime.h>
++
++// ConvTranspose1d kernel: each thread computes one output element.
++// Output shape: [batch, out_channels, length_out]
++// Input shape: [batch, in_channels, length_in]
++// Weight shape: [in_channels, out_channels, kernel_size]
++// Bias shape: [out_channels] (optional, nullptr if absent)
++__global__ void conv_transpose1d_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int length_in,
++    int length_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= batch * out_channels * length_out) return;
++
++    int b = idx / (out_channels * length_out);
++    int rem = idx % (out_channels * length_out);
++    int oc = rem / length_out;
++    int ol = rem % length_out;
++
++    float sum = 0.0f;
++    for (int ic = 0; ic < in_channels; ++ic) {
++        for (int k = 0; k < kernel_size; ++k) {
++            int il = ol + padding - k;
++            if (il % stride != 0) continue;
++            il /= stride;
++            if (il < 0 || il >= length_in) continue;
++            sum += input[(b * in_channels + ic) * length_in + il] *
++                   weight[(ic * out_channels + oc) * kernel_size + k];
++        }
++    }
++    if (bias != nullptr) {
++        sum += bias[oc];
++    }
++    output[idx] = sum;
++}
+ 
+ // Softmax over dim=1 for a 3D tensor of shape [batch, channels, length].
+ // Each thread block handles one (batch, length) position, computing softmax over channels.
+-// Uses shared memory reduction to compute max and sum, ensuring numerical stability.
+-// Assumes input is contiguous: stride[0] = channels*length, stride[1] = length, stride[2] = 1.
+ template <int BLOCK_SIZE>
+ __global__ void softmax_dim1_kernel(
+     float* __restrict__ output,
+@@ -15,14 +55,10 @@
+     int channels,
+     int length)
+ {
+-    // Each block processes one (batch, length) position.
+-    // Block index: blockIdx.x = batch * length + l (if using 2D grid), else we use a 1D grid of size batch*length.
+-    // We launch grid of blocks equal to batch * length, so blockIdx.x encodes both b and l.
+     int idx = blockIdx.x;
+     int b = idx / length;
+     int l = idx % length;
+ 
+-    // Base pointer for this (b, l) column.
+     const float* in_col = input + (size_t)b * channels * length + l;
+     float* out_col = output + (size_t)b * channels * length + l;
+ 
+@@ -31,18 +67,15 @@
+     int tid = threadIdx.x;
+     int stride = BLOCK_SIZE;
+ 
+-    // Step 1: find max value across channels.
+     float max_val = -INFINITY;
+     for (int c = tid; c < channels; c += stride) {
+         float v = in_col[(size_t)c * length];
+         if (v > max_val) max_val = v;
+     }
+ 
+-    // Store per-thread max into shared memory and reduce.
+     smem[tid] = max_val;
+     __syncthreads();
+ 
+-    // Reduction for max.
+     for (unsigned int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+             if (smem[tid + s] > smem[tid]) smem[tid] = smem[tid + s];
+@@ -52,17 +85,14 @@
+     float block_max = smem[0];
+     __syncthreads();
+ 
+-    // Step 2: compute exp(x - max) and sum.
+     float sum = 0.0f;
+     for (int c = tid; c < channels; c += stride) {
+         float v = in_col[(size_t)c * length];
+         float e = expf(v - block_max);
+         sum += e;
+-        // Store exp in output temporarily; later divide by sum.
+         out_col[(size_t)c * length] = e;
+     }
+ 
+-    // Reduce sum across threads.
+     smem[tid] = sum;
+     __syncthreads();
+ 
+@@ -75,18 +105,38 @@
+     float total_sum = smem[0];
+     __syncthreads();
+ 
+-    // Step 3: divide exp values by sum to get softmax probabilities.
+     for (int c = tid; c < channels; c += stride) {
+         out_col[(size_t)c * length] /= total_sum;
+     }
+ }
+ 
+-// Launcher for softmax_dim1_forward.
+-// Parameters:
+-//   output: pointer to output tensor (float, CUDA, contiguous)
+-//   input: pointer to input tensor (float, CUDA, contiguous)
+-//   batch, channels, length: dimensions (channels is the softmax dimension)
+-//   stream: CUDA stream for kernel launch
++// Launcher for conv_transpose1d_forward
++extern "C" void conv_transpose1d_forward_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int length_in,
++    int length_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    cudaStream_t stream)
++{
++    int total_elements = batch * out_channels * length_out;
++    int threads = 256;
++    int blocks = (total_elements + threads - 1) / threads;
++    conv_transpose1d_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, weight, bias,
++        batch, in_channels, out_channels, length_in, length_out, kernel_size,
++        stride, padding, output_padding);
++}
++
++// Launcher for softmax_dim1_forward
+ extern "C" void softmax_dim1_forward_launcher(
+     float* output,
+     const float* input,
+@@ -99,9 +149,6 @@
+     int total_positions = batch * length;
+     dim3 grid(total_positions);
+     dim3 block(BLOCK_SIZE);
+-
+-    // Ensure BLOCK_SIZE is at least enough to cover typical channel counts.
+-    // For channels <= BLOCK_SIZE, reduction works fine; for larger, grid-stride loop handles it.
+     softmax_dim1_kernel<BLOCK_SIZE><<<grid, block, 0, stream>>>(
+         output, input, batch, channels, length);
+ }

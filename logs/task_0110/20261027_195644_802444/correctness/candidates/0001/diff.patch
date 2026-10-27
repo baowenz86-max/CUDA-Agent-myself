@@ -1,0 +1,435 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,206 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel to clamp tensor element-wise: y = min(max(x, min_val), max_val)
++__global__ void clamp_kernel(
++    float* __restrict__ out,
++    const float* __restrict__ in,
++    int64_t total,
++    const int64_t* __restrict__ in_strides,
++    int ndim,
++    float min_val,
++    float max_val)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (; idx < total; idx += stride) {
++        // compute multi-index from linear idx assuming row-major contiguous layout
++        // but with provided strides for input; output assumed contiguous (allocated by binding)
++        int64_t rem = idx;
++        int64_t in_offset = 0;
++        // handle up to 4 dimensions (N,C,H,W)
++        for (int d = ndim - 1; d >= 0; --d) {
++            int64_t dim = (d == ndim - 1) ? rem : 0; // will compute sizes dynamically not needed here
++            // We need shape info; for simplicity compute using provided shape via strides? We have only strides.
++            // Instead we infer shape from strides and total? Not exact. So assume 4D with known shapes from total and strides.
++            // We'll pass shape info via additional parameters? The launcher will pass shape dims.
++            // But kernel signature lacks shape; we'll assume dimensions are inferred by stride pattern.
++            // To keep simple, this kernel is for contiguous case where we can directly index.
++            // For general strides, we'll have separate kernel with shape parameters.
++            // To avoid complexity, we'll have specialized kernel for 4D stride case.
++        }
++        // Placeholder to avoid unused warning - will be replaced
++    }
++}
++
++// Specialized 4D clamp kernel with stride support
++__global__ void clamp_kernel_4d_strided(
++    float* __restrict__ out,
++    const float* __restrict__ in,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride,
++    float min_val, float max_val)
++{
++    int64_t total = (int64_t)N * C * H * W;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (; idx < total; idx += stride) {
++        int n = idx / (C * H * W);
++        int rem = idx % (C * H * W);
++        int c = rem / (H * W);
++        rem = rem % (H * W);
++        int h = rem / W;
++        int w = rem % W;
++        int64_t in_offset = n * in_N_stride + c * in_C_stride + h * in_H_stride + w * in_W_stride;
++        int64_t out_offset = n * out_N_stride + c * out_C_stride + h * out_H_stride + w * out_W_stride;
++        float val = in[in_offset];
++        val = fminf(fmaxf(val, min_val), max_val);
++        out[out_offset] = val;
++    }
++}
++
++// Specialized 4D BN eval kernel with stride support for input and output
++__global__ void bn2d_eval_kernel_4d_strided(
++    float* __restrict__ out,
++    const float* __restrict__ in,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    float eps,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride)
++{
++    int64_t total = (int64_t)N * C * H * W;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (; idx < total; idx += stride) {
++        int n = idx / (C * H * W);
++        int rem = idx % (C * H * W);
++        int c = rem / (H * W);
++        rem = rem % (H * W);
++        int h = rem / W;
++        int w = rem % W;
++        int64_t in_offset = n * in_N_stride + c * in_C_stride + h * in_H_stride + w * in_W_stride;
++        int64_t out_offset = n * out_N_stride + c * out_C_stride + h * out_H_stride + w * out_W_stride;
++        float val = in[in_offset];
++        float mean = running_mean[c];
++        float var = running_var[c];
++        float invstd = rsqrtf(var + eps);
++        float gamma = weight ? weight[c] : 1.0f;
++        float beta = bias ? bias[c] : 0.0f;
++        val = gamma * (val - mean) * invstd + beta;
++        out[out_offset] = val;
++    }
++}
++
++// Fused clamp + BN eval kernel (4D, strided)
++__global__ void clamp_bn2d_eval_kernel_4d_strided(
++    float* __restrict__ out,
++    const float* __restrict__ in,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    float eps,
++    float clamp_min, float clamp_max,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride)
++{
++    int64_t total = (int64_t)N * C * H * W;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (; idx < total; idx += stride) {
++        int n = idx / (C * H * W);
++        int rem = idx % (C * H * W);
++        int c = rem / (H * W);
++        rem = rem % (H * W);
++        int h = rem / W;
++        int w = rem % W;
++        int64_t in_offset = n * in_N_stride + c * in_C_stride + h * in_H_stride + w * in_W_stride;
++        int64_t out_offset = n * out_N_stride + c * out_C_stride + h * out_H_stride + w * out_W_stride;
++        float val = in[in_offset];
++        val = fminf(fmaxf(val, clamp_min), clamp_max);
++        float mean = running_mean[c];
++        float var = running_var[c];
++        float invstd = rsqrtf(var + eps);
++        float gamma = weight ? weight[c] : 1.0f;
++        float beta = bias ? bias[c] : 0.0f;
++        val = gamma * (val - mean) * invstd + beta;
++        out[out_offset] = val;
++    }
++}
++
++// Launchers
++extern "C" void clamp_forward_launcher(
++    float* out,
++    const float* in,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride,
++    float min_val, float max_val,
++    cudaStream_t stream)
++{
++    int64_t total = (int64_t)N * C * H * W;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    // cap grid to reasonable max
++    if (blocks > 65535) blocks = 65535;
++    clamp_kernel_4d_strided<<<blocks, threads, 0, stream>>>(
++        out, in, N, C, H, W,
++        out_N_stride, out_C_stride, out_H_stride, out_W_stride,
++        in_N_stride, in_C_stride, in_H_stride, in_W_stride,
++        min_val, max_val);
++}
++
++extern "C" void bn2d_eval_forward_launcher(
++    float* out,
++    const float* in,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride,
++    cudaStream_t stream)
++{
++    int64_t total = (int64_t)N * C * H * W;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    bn2d_eval_kernel_4d_strided<<<blocks, threads, 0, stream>>>(
++        out, in, weight, bias, running_mean, running_var, eps,
++        N, C, H, W,
++        out_N_stride, out_C_stride, out_H_stride, out_W_stride,
++        in_N_stride, in_C_stride, in_H_stride, in_W_stride);
++}
++
++extern "C" void clamp_bn2d_forward_launcher(
++    float* out,
++    const float* in,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    float clamp_min, float clamp_max,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride,
++    cudaStream_t stream)
++{
++    int64_t total = (int64_t)N * C * H * W;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    clamp_bn2d_eval_kernel_4d_strided<<<blocks, threads, 0, stream>>>(
++        out, in, weight, bias, running_mean, running_var, eps, clamp_min, clamp_max,
++        N, C, H, W,
++        out_N_stride, out_C_stride, out_H_stride, out_W_stride,
++        in_N_stride, in_C_stride, in_H_stride, in_W_stride);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,183 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void clamp_forward_launcher(
++    float* out,
++    const float* in,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride,
++    float min_val, float max_val,
++    cudaStream_t stream);
++
++extern "C" void bn2d_eval_forward_launcher(
++    float* out,
++    const float* in,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride,
++    cudaStream_t stream);
++
++extern "C" void clamp_bn2d_forward_launcher(
++    float* out,
++    const float* in,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    float clamp_min, float clamp_max,
++    int N, int C, int H, int W,
++    int64_t out_N_stride, int64_t out_C_stride, int64_t out_H_stride, int64_t out_W_stride,
++    int64_t in_N_stride, int64_t in_C_stride, int64_t in_H_stride, int64_t in_W_stride,
++    cudaStream_t stream);
++
++namespace {
++
++// Helper to extract 4D dims and strides, ensuring contiguity via clone if needed?
++// We allow arbitrary strides, so we pass raw strides.
++void validate_4d_cuda_float(const torch::Tensor& x, const char* name) {
++    TORCH_CHECK(x.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(x.dim() == 4, name, " must be 4D (N,C,H,W)");
++}
++
++void validate_channel_tensor(const torch::Tensor& t, const char* name, bool nullable) {
++    if (nullable && !t.defined()) return;
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.dim() == 1, name, " must be 1D (C)");
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++
++} // anonymous namespace
++
++torch::Tensor clamp_forward(torch::Tensor x, double min_val, double max_val) {
++    validate_4d_cuda_float(x, "x");
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    auto out = torch::empty_like(x); // same shape, strides, dtype, device
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    clamp_forward_launcher(
++        out.data_ptr<float>(),
++        x.data_ptr<float>(),
++        N, C, H, W,
++        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        static_cast<float>(min_val), static_cast<float>(max_val),
++        stream);
++
++    return out;
++}
++
++torch::Tensor bn2d_eval_forward(torch::Tensor x, c10::optional<torch::Tensor> weight, c10::optional<torch::Tensor> bias, torch::Tensor running_mean, torch::Tensor running_var, double eps) {
++    validate_4d_cuda_float(x, "x");
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    TORCH_CHECK(running_mean.is_cuda() && running_mean.dtype() == torch::kFloat32 && running_mean.dim() == 1 && running_mean.is_contiguous(), "running_mean must be contiguous float32 CUDA 1D tensor");
++    TORCH_CHECK(running_var.is_cuda() && running_var.dtype() == torch::kFloat32 && running_var.dim() == 1 && running_var.is_contiguous(), "running_var must be contiguous float32 CUDA 1D tensor");
++    TORCH_CHECK(running_mean.size(0) == C, "running_mean size must match C");
++    TORCH_CHECK(running_var.size(0) == C, "running_var size must match C");
++
++    const float* weight_ptr = nullptr;
++    const float* bias_ptr = nullptr;
++    if (weight.has_value() && weight->defined()) {
++        TORCH_CHECK(weight->is_cuda() && weight->dtype() == torch::kFloat32 && weight->dim() == 1 && weight->is_contiguous(), "weight must be contiguous float32 CUDA 1D tensor");
++        TORCH_CHECK(weight->size(0) == C, "weight size must match C");
++        weight_ptr = weight->data_ptr<float>();
++    }
++    if (bias.has_value() && bias->defined()) {
++        TORCH_CHECK(bias->is_cuda() && bias->dtype() == torch::kFloat32 && bias->dim() == 1 && bias->is_contiguous(), "bias must be contiguous float32 CUDA 1D tensor");
++        TORCH_CHECK(bias->size(0) == C, "bias size must match C");
++        bias_ptr = bias->data_ptr<float>();
++    }
++
++    auto out = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    bn2d_eval_forward_launcher(
++        out.data_ptr<float>(),
++        x.data_ptr<float>(),
++        weight_ptr,
++        bias_ptr,
++        running_mean.data_ptr<float>(),
++        running_var.data_ptr<float>(),
++        static_cast<float>(eps),
++        N, C, H, W,
++        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        stream);
++
++    return out;
++}
++
++torch::Tensor clamp_bn2d_forward(torch::Tensor x, c10::optional<torch::Tensor> weight, c10::optional<torch::Tensor> bias, torch::Tensor running_mean, torch::Tensor running_var, double eps) {
++    // Same validations as bn2d_eval_forward, but with clamp values fixed to 0 and 1
++    validate_4d_cuda_float(x, "x");
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    TORCH_CHECK(running_mean.is_cuda() && running_mean.dtype() == torch::kFloat32 && running_mean.dim() == 1 && running_mean.is_contiguous(), "running_mean must be contiguous float32 CUDA 1D tensor");
++    TORCH_CHECK(running_var.is_cuda() && running_var.dtype() == torch::kFloat32 && running_var.dim() == 1 && running_var.is_contiguous(), "running_var must be contiguous float32 CUDA 1D tensor");
++    TORCH_CHECK(running_mean.size(0) == C, "running_mean size must match C");
++    TORCH_CHECK(running_var.size(0) == C, "running_var size must match C");
++
++    const float* weight_ptr = nullptr;
++    const float* bias_ptr = nullptr;
++    if (weight.has_value() && weight->defined()) {
++        TORCH_CHECK(weight->is_cuda() && weight->dtype() == torch::kFloat32 && weight->dim() == 1 && weight->is_contiguous(), "weight must be contiguous float32 CUDA 1D tensor");
++        TORCH_CHECK(weight->size(0) == C, "weight size must match C");
++        weight_ptr = weight->data_ptr<float>();
++    }
++    if (bias.has_value() && bias->defined()) {
++        TORCH_CHECK(bias->is_cuda() && bias->dtype() == torch::kFloat32 && bias->dim() == 1 && bias->is_contiguous(), "bias must be contiguous float32 CUDA 1D tensor");
++        TORCH_CHECK(bias->size(0) == C, "bias size must match C");
++        bias_ptr = bias->data_ptr<float>();
++    }
++
++    auto out = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    clamp_bn2d_forward_launcher(
++        out.data_ptr<float>(),
++        x.data_ptr<float>(),
++        weight_ptr,
++        bias_ptr,
++        running_mean.data_ptr<float>(),
++        running_var.data_ptr<float>(),
++        static_cast<float>(eps),
++        0.0f, 1.0f,
++        N, C, H, W,
++        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        stream);
++
++    return out;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("clamp_forward", &clamp_forward, "Clamp forward", py::arg("x"), py::arg("min_val"), py::arg("max_val"));
++    m.def("bn2d_eval_forward", &bn2d_eval_forward, "BatchNorm2d eval forward", py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("running_mean"), py::arg("running_var"), py::arg("eps"));
++    m.def("clamp_bn2d_forward", &clamp_bn2d_forward, "Fused clamp and BatchNorm2d eval forward", py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("running_mean"), py::arg("running_var"), py::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,37 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features, eps, momentum):
++        super().__init__()
++        self.batch_norm = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum)
++        self.clamp_lower_bound = 0.0
++        self.clamp_upper_bound = 1.0
++
++    def forward(self, x):
++        return cuda_extension.clamp_bn2d_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.batch_norm.eps
++        )
++
++    def debug_forward(self, x):
++        step_001 = cuda_extension.clamp_forward(
++            x, self.clamp_lower_bound, self.clamp_upper_bound
++        )
++        yield 'step_001', step_001
++        step_002 = cuda_extension.bn2d_eval_forward(
++            step_001,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.batch_norm.eps
++        )
++        yield 'step_002', step_002
++        yield 'step_003', step_002

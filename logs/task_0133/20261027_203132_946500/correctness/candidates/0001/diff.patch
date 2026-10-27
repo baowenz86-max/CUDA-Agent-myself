@@ -1,0 +1,367 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,165 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// CUDA kernels for constant_pad1d and nearest-neighbor interpolation
++// All launchers use raw pointers and cudaStream_t, no PyTorch dependencies.
++
++__global__ void constant_pad1d_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t out_width,
++    int64_t in_width,
++    int64_t pad_left,
++    int64_t pad_right,
++    float value,
++    int64_t batch,
++    int64_t channels,
++    int64_t height,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w
++) {
++    int64_t total = batch * channels * height * out_width;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int64_t w = i % out_width;
++        int64_t tmp = i / out_width;
++        int64_t h = tmp % height;
++        tmp /= height;
++        int64_t c = tmp % channels;
++        int64_t b = tmp / channels;
++
++        int64_t out_index = b * out_stride_b + c * out_stride_c + h * out_stride_h + w * out_stride_w;
++        int64_t in_w = w - pad_left;
++        if (in_w >= 0 && in_w < in_width) {
++            int64_t in_index = b * in_stride_b + c * in_stride_c + h * in_stride_h + in_w * in_stride_w;
++            output[out_index] = input[in_index];
++        } else {
++            output[out_index] = value;
++        }
++    }
++}
++
++__global__ void interpolate_nearest_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t output_height,
++    int64_t output_width,
++    int64_t input_height,
++    int64_t input_width,
++    int64_t batch,
++    int64_t channels,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w
++) {
++    int64_t total = batch * channels * output_height * output_width;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int64_t ow = i % output_width;
++        int64_t tmp = i / output_width;
++        int64_t oh = tmp % output_height;
++        tmp /= output_height;
++        int64_t c = tmp % channels;
++        int64_t b = tmp / channels;
++
++        int64_t ih = (oh * input_height) / output_height;
++        int64_t iw = (ow * input_width) / output_width;
++
++        int64_t in_index = b * in_stride_b + c * in_stride_c + ih * in_stride_h + iw * in_stride_w;
++        int64_t out_index = b * out_stride_b + c * out_stride_c + oh * out_stride_h + ow * out_stride_w;
++        output[out_index] = input[in_index];
++    }
++}
++
++extern "C" void constant_pad1d_launcher(
++    float* output,
++    const float* input,
++    int64_t batch,
++    int64_t channels,
++    int64_t height,
++    int64_t width,
++    int64_t pad_left,
++    int64_t pad_right,
++    float value,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w,
++    cudaStream_t stream
++) {
++    int64_t out_width = width + pad_left + pad_right;
++    int64_t total = batch * channels * height * out_width;
++    if (total <= 0) return;
++
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 1048576) blocks = 1048576; // grid-stride loop handles large sizes
++
++    constant_pad1d_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, out_width, width, pad_left, pad_right, value,
++        batch, channels, height,
++        in_stride_b, in_stride_c, in_stride_h, in_stride_w,
++        out_stride_b, out_stride_c, out_stride_h, out_stride_w
++    );
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Error will be checked by binding layer; no throw here
++    }
++}
++
++extern "C" void interpolate_nearest_launcher(
++    float* output,
++    const float* input,
++    int64_t batch,
++    int64_t channels,
++    int64_t input_height,
++    int64_t input_width,
++    int64_t output_height,
++    int64_t output_width,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w,
++    cudaStream_t stream
++) {
++    int64_t total = batch * channels * output_height * output_width;
++    if (total <= 0) return;
++
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 1048576) blocks = 1048576;
++
++    interpolate_nearest_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, output_height, output_width, input_height, input_width,
++        batch, channels,
++        in_stride_b, in_stride_c, in_stride_h, in_stride_w,
++        out_stride_b, out_stride_c, out_stride_h, out_stride_w
++    );
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Error will be checked by binding layer
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,170 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void constant_pad1d_launcher(
++    float* output,
++    const float* input,
++    int64_t batch,
++    int64_t channels,
++    int64_t height,
++    int64_t width,
++    int64_t pad_left,
++    int64_t pad_right,
++    float value,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w,
++    cudaStream_t stream);
++
++extern "C" void interpolate_nearest_launcher(
++    float* output,
++    const float* input,
++    int64_t batch,
++    int64_t channels,
++    int64_t input_height,
++    int64_t input_width,
++    int64_t output_height,
++    int64_t output_width,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w,
++    cudaStream_t stream);
++
++static torch::Tensor constant_pad1d_forward(
++    torch::Tensor x,
++    int64_t pad_left,
++    int64_t pad_right,
++    double value) {
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4D (batch, channels, height, width)");
++
++    int64_t batch = x.size(0);
++    int64_t channels = x.size(1);
++    int64_t height = x.size(2);
++    int64_t width = x.size(3);
++
++    int64_t out_width = width + pad_left + pad_right;
++    auto output = torch::empty({batch, channels, height, out_width}, x.options());
++
++    // Get input strides (may be non-contiguous)
++    int64_t in_stride_b = x.stride(0);
++    int64_t in_stride_c = x.stride(1);
++    int64_t in_stride_h = x.stride(2);
++    int64_t in_stride_w = x.stride(3);
++
++    // Output is contiguous, so strides are straightforward
++    int64_t out_stride_b = output.stride(0);
++    int64_t out_stride_c = output.stride(1);
++    int64_t out_stride_h = output.stride(2);
++    int64_t out_stride_w = output.stride(3);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    constant_pad1d_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        batch,
++        channels,
++        height,
++        width,
++        pad_left,
++        pad_right,
++        static_cast<float>(value),
++        in_stride_b,
++        in_stride_c,
++        in_stride_h,
++        in_stride_w,
++        out_stride_b,
++        out_stride_c,
++        out_stride_h,
++        out_stride_w,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "constant_pad1d kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++static torch::Tensor interpolate_nearest_forward(
++    torch::Tensor x,
++    int64_t output_height,
++    int64_t output_width) {
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4D (batch, channels, height, width)");
++
++    int64_t batch = x.size(0);
++    int64_t channels = x.size(1);
++    int64_t input_height = x.size(2);
++    int64_t input_width = x.size(3);
++
++    auto output = torch::empty({batch, channels, output_height, output_width}, x.options());
++
++    int64_t in_stride_b = x.stride(0);
++    int64_t in_stride_c = x.stride(1);
++    int64_t in_stride_h = x.stride(2);
++    int64_t in_stride_w = x.stride(3);
++
++    int64_t out_stride_b = output.stride(0);
++    int64_t out_stride_c = output.stride(1);
++    int64_t out_stride_h = output.stride(2);
++    int64_t out_stride_w = output.stride(3);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    interpolate_nearest_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        batch,
++        channels,
++        input_height,
++        input_width,
++        output_height,
++        output_width,
++        in_stride_b,
++        in_stride_c,
++        in_stride_h,
++        in_stride_w,
++        out_stride_b,
++        out_stride_c,
++        out_stride_h,
++        out_stride_w,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "interpolate_nearest kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("constant_pad1d", &constant_pad1d_forward,
++          "ConstantPad1d on last dimension",
++          pybind11::arg("x"),
++          pybind11::arg("pad_left"),
++          pybind11::arg("pad_right"),
++          pybind11::arg("value"));
++    m.def("interpolate_nearest", &interpolate_nearest_forward,
++          "Nearest neighbor interpolation",
++          pybind11::arg("x"),
++          pybind11::arg("output_height"),
++          pybind11::arg("output_width"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, pad_size, size_before, size_after):
++        super().__init__()
++        self.pad_size = pad_size
++        self.size_after = size_after
++
++    def forward(self, x):
++        x = cuda_extension.constant_pad1d(x, self.pad_size[0], self.pad_size[1], 0.0)
++        x = cuda_extension.interpolate_nearest(x, self.size_after[0], self.size_after[1])
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.constant_pad1d(x, self.pad_size[0], self.pad_size[1], 0.0)
++        yield ('step_001', x)
++        x = cuda_extension.interpolate_nearest(x, self.size_after[0], self.size_after[1])
++        yield ('step_002', x)
++        yield ('step_003', x)

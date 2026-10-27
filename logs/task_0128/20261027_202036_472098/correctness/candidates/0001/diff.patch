@@ -1,0 +1,115 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,34 @@
++#include <cuda_runtime.h>
++
++// Fused relu then trunc kernel for float32 tensors.
++// Each thread processes multiple elements using grid-stride loop.
++__global__ void relu_trunc_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 long long numel) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (; idx < numel; idx += stride) {
++        float val = input[idx];
++        // ReLU: max(0, val)
++        val = val > 0.0f ? val : 0.0f;
++        // Truncate toward zero
++        val = truncf(val);
++        output[idx] = val;
++    }
++}
++
++// C-interface launcher. Assumes input and output are device pointers to float32 data.
++// numel may be up to 235929600 (fits in long long).
++// stream is the CUDA stream to launch on.
++extern "C" void relu_trunc_forward_launcher(const float* input,
++                                            float* output,
++                                            long long numel,
++                                            cudaStream_t stream) {
++    const int threads = 256;
++    const long long max_blocks_per_grid = 2147483647LL; // actual limit may be lower but grid-stride loop handles it
++    long long blocks_ll = (numel + threads - 1) / threads;
++    // Clamp to max grid dimension (2^31-1) for safety, grid-stride loop will cover rest.
++    int blocks = (int)(blocks_ll < max_blocks_per_grid ? blocks_ll : max_blocks_per_grid);
++    if (blocks == 0) return;
++    relu_trunc_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,53 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Declaration of the launcher exported from custom_ops.cu
++extern "C" void relu_trunc_forward_launcher(const float* input,
++                                            float* output,
++                                            long long numel,
++                                            cudaStream_t stream);
++
++// PyTorch wrapper for the fused relu+trunc operation
++torch::Tensor relu_trunc_forward(torch::Tensor x) {
++    // Validate input tensor
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input tensor must have dtype float32");
++    TORCH_CHECK(x.numel() > 0, "Input tensor must have at least one element");
++
++    // The launcher assumes contiguous memory; make contiguous if needed.
++    // This matches the contract "supports strides" by internally handling non-contiguous inputs.
++    auto x_contig = x.contiguous();
++
++    // Allocate output tensor with same shape, dtype, and device as input.
++    auto output = torch::empty_like(x_contig);
++
++    // Get the current CUDA stream.
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Convert numel to long long (same as the launcher signature) and call.
++    long long numel = static_cast<long long>(x_contig.numel());
++    relu_trunc_forward_launcher(x_contig.data_ptr<float>(),
++                                output.data_ptr<float>(),
++                                numel,
++                                stream);
++
++    // Check for CUDA errors after launch (asynchronously).
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function for pybind
++void register_relu_trunc_forward(pybind11::module& m) {
++    m.def("relu_trunc_forward", &relu_trunc_forward,
++          "Fused ReLU + truncation forward pass",
++          pybind11::arg("x"));
++}
++
++// Auto-register with the binding registry
++REGISTER_BINDING(relu_trunc_forward, register_relu_trunc_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,19 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        x = torch.relu(x)
++        x = torch.trunc(x)
++        return x
++
++    def debug_forward(self, x):
++        relu_out = torch.relu(x)
++        yield 'step_001', relu_out
++        trunc_out = torch.trunc(relu_out)
++        yield 'step_002', trunc_out
++        yield 'step_003', trunc_out

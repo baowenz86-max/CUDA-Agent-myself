@@ -1,0 +1,144 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,4 +1,5 @@
+ #include <cuda_runtime.h>
++#include <math_constants.h>
+ 
+ // Helper: ceil division
+ __device__ __forceinline__ int ceil_div(int a, int b) {
+@@ -9,11 +10,7 @@
+ // Each block handles one (n, spatial_index), threads across C
+ // Grid: N * H * W blocks, blockDim = C_threads (power of 2 >= C, up to 1024)
+ // For C=3 we use blockDim=32 for simplicity; dynamic C supported via shared memory reduction.
+-// To support arbitrary C, we use blockDim = next_power_of_2(C) but cap at 1024,
+-// and each thread loads one or more elements in strided fashion.
+-// For C=3 a simpler kernel is sufficient and fast.
+-
+-#define MAX_C 32 // Max channels handled in one block; if C > 32 we need different strategy, but contract C=3
++#define MAX_C 32
+ 
+ template <int BLOCK_SIZE>
+ __global__ void log_softmax_dim1_kernel(
+@@ -33,19 +30,13 @@
+     int n = spatial_idx / (H * W);
+     int hw = spatial_idx % (H * W);
+ 
+-    // Each thread handles channel(s) tid, tid+BLOCK_SIZE, ...
+     float local_max = -CUDART_INF_F;
+     for (int c = tid; c < C; c += BLOCK_SIZE) {
+-        int idx = ((n * C + c) * H + hw) * W; // incorrect? We need spatial index: n*C*H*W + c*H*W + hw
+-        // Actually flatten: input[n][c][h][w] => index = n*C*H*W + c*H*W + h*W + w
+-        // Here hw is linear within H*W: h = hw / W, w = hw % W
+-        // So index = n*C*H*W + c*H*W + hw
+         int idx = n * C * H * W + c * H * W + hw;
+         float val = input[idx];
+         local_max = fmaxf(local_max, val);
+     }
+ 
+-    // Block reduction for max
+     s_max[tid] = local_max;
+     __syncthreads();
+ 
+@@ -59,7 +50,6 @@
+     float block_max = s_max[0];
+     __syncthreads();
+ 
+-    // Compute sum of exp(x - max)
+     float local_sum = 0.0f;
+     for (int c = tid; c < C; c += BLOCK_SIZE) {
+         int idx = n * C * H * W + c * H * W + hw;
+@@ -82,7 +72,6 @@
+ 
+     float log_sum = logf(block_sum);
+ 
+-    // Write output: log_softmax = x - max - log(sum)
+     for (int c = tid; c < C; c += BLOCK_SIZE) {
+         int idx = n * C * H * W + c * H * W + hw;
+         float val = input[idx];
+@@ -90,7 +79,6 @@
+     }
+ }
+ 
+-// Similar for softmax (without log)
+ template <int BLOCK_SIZE>
+ __global__ void softmax_dim1_kernel(
+     float* __restrict__ output,
+@@ -156,7 +144,6 @@
+     }
+ }
+ 
+-// ReflectionPad2d kernel for NCHW layout, pad=2
+ __global__ void reflection_pad2d_kernel(
+     float* __restrict__ output,
+     const float* __restrict__ input,
+@@ -168,26 +155,19 @@
+     int total = N * C * H_out * W_out;
+     if (idx >= total) return;
+ 
+-    // Decode output coordinates
+     int w = idx % W_out;
+     int h = (idx / W_out) % H_out;
+     int c = (idx / (W_out * H_out)) % C;
+     int n = idx / (W_out * H_out * C);
+ 
+-    // Compute source coordinates with reflection
+     int src_h = h - pad_h;
+     if (src_h < 0) src_h = -src_h;
+     if (src_h >= H_in) src_h = 2 * H_in - 2 - src_h;
+-    // For pad=2, H_in >= 2 always, but we handle general case:
+-    // Use while loops for multiple reflections if H_in < pad, but unlikely.
+ 
+     int src_w = w - pad_w;
+     if (src_w < 0) src_w = -src_w;
+     if (src_w >= W_in) src_w = 2 * W_in - 2 - src_w;
+ 
+-    // For general reflection where source may still be out of bounds, apply repeatedly
+-    // But for H_in=256, pad=2, single reflection enough.
+-    // For safety, use loop:
+     while (src_h < 0 || src_h >= H_in) {
+         if (src_h < 0) src_h = -src_h;
+         else if (src_h >= H_in) src_h = 2 * H_in - 2 - src_h;
+@@ -201,8 +181,6 @@
+     output[idx] = input[in_idx];
+ }
+ 
+-// Launchers
+-
+ extern "C" void log_softmax_launcher(
+     float* output,
+     const float* input,
+@@ -210,13 +188,8 @@
+     int dim,
+     cudaStream_t stream)
+ {
+-    // Only dim=1 supported per contract
+-    if (dim != 1) {
+-        // We could leave output unchanged or set error, but caller ensures dim=1
+-        return;
+-    }
++    if (dim != 1) return;
+     int total_spatial = N * H * W;
+-    // Choose block size: next power of 2 >= C, but at least 32 and max 256 for occupancy
+     int block_size = 32;
+     while (block_size < C) block_size <<= 1;
+     if (block_size > 256) block_size = 256;
+@@ -244,8 +217,6 @@
+                 output, input, N, C, H, W, total_spatial);
+             break;
+         default:
+-            // For larger C, need multiple threads per channel, but not expected
+-            // Use block_size = 256 with grid-stride over channels
+             log_softmax_dim1_kernel<256><<<grid, block, shared_mem_size, stream>>>(
+                 output, input, N, C, H, W, total_spatial);
+             break;
+@@ -259,9 +230,7 @@
+     int dim,
+     cudaStream_t stream)
+ {
+-    if (dim != 1) {
+-        return;
+-    }
++    if (dim != 1) return;
+     int total_spatial = N * H * W;
+     int block_size = 32;
+     while (block_size < C) block_size <<= 1;

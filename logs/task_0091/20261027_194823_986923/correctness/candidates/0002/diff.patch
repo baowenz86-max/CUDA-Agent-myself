@@ -1,0 +1,313 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -99,3 +99,71 @@
+         x, bias, output, total, C, H, W,
+         stride_batch, stride_channel, stride_h, stride_w);
+ }
++
++// ---- Convolution kernel (direct convolution) ----
++// Implements 2D convolution with stride 1, padding 0, dilation 1, groups 1.
++// Input: N x C x H x W, Weight: K x C x kH x kW, Output: N x K x outH x outW.
++// All tensors are assumed contiguous (as PyTorch tensors are for this task).
++__global__ void conv2d_direct_kernel(
++    const float* input,
++    const float* weight,
++    const float* bias,   // can be NULL if no bias
++    float* output,
++    int N, int C, int H, int W,
++    int K, int kH, int kW,
++    int outH, int outW,
++    int use_bias)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * K * outH * outW;
++    // grid-stride loop over output elements
++    for (int i = idx; i < total; i += blockDim.x * gridDim.x) {
++        int ow = i % outW;
++        int oh = (i / outW) % outH;
++        int k = (i / (outW * outH)) % K;
++        int n = i / (outW * outH * K);
++
++        float sum = 0.0f;
++        // For each input channel and kernel position
++        for (int c = 0; c < C; ++c) {
++            for (int kh = 0; kh < kH; ++kh) {
++                for (int kw = 0; kw < kW; ++kw) {
++                    int h_in = oh + kh;  // padding=0, stride=1
++                    int w_in = ow + kw;
++                    // Bounds checking (not needed exactly if outH,outW computed properly without padding)
++                    // but we check anyway.
++                    if (h_in < H && w_in < W) {
++                        float in_val = input[((n * C + c) * H + h_in) * W + w_in];
++                        float w_val = weight[((k * C + c) * kH + kh) * kW + kw];
++                        sum += in_val * w_val;
++                    }
++                }
++            }
++        }
++        if (use_bias) {
++            sum += bias[k];
++        }
++        output[i] = sum;
++    }
++}
++
++// Launcher for conv2d_forward.
++extern "C" void conv2d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C, int H, int W,
++    int K, int kH, int kW,
++    int outH, int outW,
++    int use_bias,
++    cudaStream_t stream)
++{
++    int total = N * K * outH * outW;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    conv2d_direct_kernel<<<blocks, threads, 0, stream>>>(
++        input, weight, bias, output,
++        N, C, H, W, K, kH, kW, outH, outW, use_bias);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,12 +1,8 @@
+-// Binding file for custom ops: triu_forward, conv2d_forward, bias_add_forward
+-// Only handles PyTorch tensor wrapping and calls to CUDA launchers or cuDNN.
+-// No CUDA kernels are defined here.
+-
++// Binding file for custom ops without cuDNN dependency.
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include "../binding_registry.h"
+ 
+@@ -26,6 +22,17 @@
+     long long stride_batch, long long stride_channel, long long stride_h, long long stride_w,
+     cudaStream_t stream);
+ 
++extern "C" void conv2d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C, int H, int W,
++    int K, int kH, int kW,
++    int outH, int outW,
++    int use_bias,
++    cudaStream_t stream);
++
+ // Helper: check tensor is CUDA float32
+ torch::Tensor triu_forward(torch::Tensor x) {
+     TORCH_CHECK(x.is_cuda(), "triu_forward: input must be a CUDA tensor");
+@@ -35,30 +42,20 @@
+     // Output should preserve shape and strides to ensure no layout change
+     auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
+ 
+-    // Prepare dimensions and strides for the last two dims and outer dimensions
+     int64_t H = x.size(-2);
+     int64_t W = x.size(-1);
+     int64_t N = 1, C = 1;
+-    if (x.dim() == 2) {
+-        // Treat as shape (H, W) with N=C=1
++    if (x.dim() == 4) {
++        N = x.size(0);
++        C = x.size(1);
++    } else if (x.dim() == 2) {
++        N = x.size(0);
++        C = 1;
+     } else {
+-        // For dim > 2, we assume (N, C, H, W) but handle arbitrary leading dims by
+-        // computing outer product shape. The kernel uses N*C as total outer count,
+-        // but in the kernel the outer index is i/(H*W), so we need total outer elements.
+-        // We can pass N*C = outer_elements, and stride_batch = stride of outer index.
+-        // However the kernel expects N and C separately to compute c and outer.
+-        // To keep it simple and correct for the known 4D case, pass N and C accordingly.
+-        if (x.dim() == 4) {
+-            N = x.size(0);
+-            C = x.size(1);
+-        } else {
+-            // General fallback: flatten all leading dims into batch, C=1
+-            N = x.numel() / (H * W);
+-            C = 1;
+-        }
+-    }
+-
+-    // Strides for batch, channel, height, width
++        N = x.numel() / (H * W);
++        C = 1;
++    }
++
+     long long stride_batch, stride_channel, stride_h, stride_w;
+     if (x.dim() == 4) {
+         stride_batch = x.stride(0);
+@@ -71,7 +68,6 @@
+         stride_h = x.stride(0);
+         stride_w = x.stride(1);
+     } else {
+-        // General case: assume contiguous-like or last dims stride 1, and compute as if flattened
+         stride_batch = H * W;
+         stride_channel = H * W;
+         stride_h = W;
+@@ -80,8 +76,7 @@
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Call launcher; for in-place we could pass output and input same, but here output is separate.
+-    // The launcher does not copy, so we must copy input to output first if pointers differ.
++    // Copy input to output if different pointers.
+     if (output.data_ptr<float>() != x.data_ptr<float>()) {
+         cudaMemcpyAsync(output.data_ptr<float>(), x.data_ptr<float>(),
+                         x.numel() * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+@@ -108,7 +103,6 @@
+     TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias_add_forward: bias must be float32");
+     TORCH_CHECK(x.dim() == 4, "bias_add_forward: x must be 4D (N,C,H,W)");
+     TORCH_CHECK(bias.numel() == x.size(1), "bias_add_forward: bias size must match C");
+-    // Note: bias may have shape (C,1,1) or (C,), numel==C is enough; we use bias[c] in kernel.
+ 
+     auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
+ 
+@@ -136,7 +130,7 @@
+     return output;
+ }
+ 
+-// cuDNN convolution wrapper
++// Convolution wrapper using custom direct kernel (no cuDNN).
+ torch::Tensor conv2d_forward(
+     torch::Tensor input,
+     torch::Tensor weight,
+@@ -157,98 +151,39 @@
+     }
+     TORCH_CHECK(input.dim() == 4, "conv2d_forward: input must be 4D (N,C,H,W)");
+     TORCH_CHECK(weight.dim() == 4, "conv2d_forward: weight must be 4D (out_channels, in_channels/groups, kH, kW)");
++    TORCH_CHECK(stride == 1 && padding == 0 && dilation == 1 && groups == 1, "conv2d_forward: only stride=1, padding=0, dilation=1, groups=1 supported");
+ 
+     int N = static_cast<int>(input.size(0));
+     int C = static_cast<int>(input.size(1));
+     int H = static_cast<int>(input.size(2));
+     int W = static_cast<int>(input.size(3));
+     int K = static_cast<int>(weight.size(0));
+-    int C_per_group = static_cast<int>(weight.size(1));
+     int kH = static_cast<int>(weight.size(2));
+     int kW = static_cast<int>(weight.size(3));
+-    int G = static_cast<int>(groups);
+-
+-    TORCH_CHECK(C == G * C_per_group, "conv2d_forward: input channels mismatch with groups");
+-
+-    int outH = (H + 2 * padding - dilation * (kH - 1) - 1) / stride + 1;
+-    int outW = (W + 2 * padding - dilation * (kW - 1) - 1) / stride + 1;
++
++    int outH = (H - kH) + 1;
++    int outW = (W - kW) + 1;
+ 
+     auto output = torch::empty({N, K, outH, outW}, input.options());
+ 
+-    // cuDNN setup
+-    cudnnHandle_t cudnn_handle;
+-    cudnnCreate(&cudnn_handle);
+-    cudnnSetStream(cudnn_handle, c10::cuda::getCurrentCUDAStream().stream());
+-
+-    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    cudnnCreateTensorDescriptor(&input_desc);
+-    cudnnCreateTensorDescriptor(&output_desc);
+-    cudnnCreateTensorDescriptor(&bias_desc);
+-    cudnnCreateFilterDescriptor(&filter_desc);
+-    cudnnCreateConvolutionDescriptor(&conv_desc);
+-
+-    // Set tensor descriptors (NHWC vs NCHW; PyTorch uses NCHW)
+-    cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C, H, W);
+-    cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, K, outH, outW);
+-
+-    // Bias descriptor: one bias per output channel, shape (1,K,1,1)
+-    cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, K, 1, 1);
+-
+-    cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, K, C_per_group, kH, kW);
+-
+-    cudnnSetConvolution2dDescriptor(
+-        conv_desc,
+-        padding, padding,
+-        stride, stride,
+-        dilation, dilation,
+-        CUDNN_CROSS_CORRELATION, // PyTorch uses cross-correlation
+-        CUDNN_DATA_FLOAT
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    const float* bias_ptr = nullptr;
++    int use_bias = 0;
++    if (bias.has_value()) {
++        bias_ptr = bias->data_ptr<float>();
++        use_bias = 1;
++    }
++
++    conv2d_forward_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias_ptr,
++        output.data_ptr<float>(),
++        N, C, H, W, K, kH, kW, outH, outW,
++        use_bias,
++        stream
+     );
+-    if (G > 1) {
+-        cudnnSetConvolutionGroupCount(conv_desc, G);
+-    }
+-
+-    // Determine algorithm
+-    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+-    cudnnGetConvolutionForwardAlgorithm_v7(cudnn_handle, input_desc, filter_desc, conv_desc, output_desc, 1, 0, &algo);
+-
+-    size_t workspace_size = 0;
+-    cudnnGetConvolutionForwardWorkspaceSize(cudnn_handle, input_desc, filter_desc, conv_desc, output_desc, algo, &workspace_size);
+-
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaMalloc(&workspace, workspace_size);
+-    }
+-
+-    float alpha = 1.0f, beta = 0.0f;
+-    cudnnConvolutionForward(
+-        cudnn_handle,
+-        &alpha,
+-        input_desc, input.data_ptr<float>(),
+-        filter_desc, weight.data_ptr<float>(),
+-        conv_desc, algo,
+-        workspace, workspace_size,
+-        &beta,
+-        output_desc, output.data_ptr<float>()
+-    );
+-
+-    if (bias.has_value()) {
+-        // beta = 1 for add bias
+-        beta = 1.0f;
+-        cudnnAddTensor(cudnn_handle, &alpha, bias_desc, bias->data_ptr<float>(), &beta, output_desc, output.data_ptr<float>());
+-        beta = 0.0f; // reset
+-    }
+-
+-    cudaFree(workspace);
+-    cudnnDestroyTensorDescriptor(input_desc);
+-    cudnnDestroyTensorDescriptor(output_desc);
+-    cudnnDestroyTensorDescriptor(bias_desc);
+-    cudnnDestroyFilterDescriptor(filter_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn_handle);
+ 
+     return output;
+ }
+@@ -257,7 +192,7 @@
+ void register_custom_ops(pybind11::module& m) {
+     m.def("triu_forward", &triu_forward, "Apply upper triangular mask to last two dimensions",
+           py::arg("x"));
+-    m.def("conv2d_forward", &conv2d_forward, "2D convolution via cuDNN",
++    m.def("conv2d_forward", &conv2d_forward, "2D convolution via custom kernel",
+           py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("stride"),
+           py::arg("padding"), py::arg("dilation"), py::arg("groups"));
+     m.def("bias_add_forward", &bias_add_forward, "Add bias with broadcasting",

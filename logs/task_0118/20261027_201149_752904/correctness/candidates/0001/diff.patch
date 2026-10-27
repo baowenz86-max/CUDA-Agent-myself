@@ -1,0 +1,319 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,104 @@
++#include <cuda_runtime.h>
++
++// BatchNorm2d eval forward kernel
++// x: input tensor [N, C, H, W] with arbitrary strides
++// weight, bias, running_mean, running_var: size C
++// eps: scalar
++// output: same shape as x, contiguous
++__global__ void batchnorm2d_eval_kernel(
++    const float* __restrict__ x,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    float eps,
++    float* __restrict__ out,
++    int N, int C, int H, int W,
++    long long x_stride_n, long long x_stride_c, long long x_stride_h, long long x_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long total = (long long)N * C * H * W;
++    if (idx >= total) return;
++
++    // Decompose linear index into n,c,h,w using output strides (assumed contiguous)
++    int n = idx / (out_stride_n);
++    int rem = idx % out_stride_n;
++    int c = rem / out_stride_c;
++    rem = rem % out_stride_c;
++    int h = rem / out_stride_h;
++    int w = rem % out_stride_h;
++
++    // Compute corresponding input index using input strides
++    long long in_idx = n * x_stride_n + c * x_stride_c + h * x_stride_h + w * x_stride_w;
++
++    float val = x[in_idx];
++    float scale = weight[c] / sqrtf(running_var[c] + eps);
++    float shift = bias[c] - running_mean[c] * scale;
++    out[idx] = val * scale + shift;
++}
++
++// Sum over dim=1 (channels) with keepdim=True
++// input: [N, C, H, W] arbitrary strides, output: [N, 1, H, W] contiguous
++__global__ void sum_dim1_keepdim_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int N, int C, int H, int W,
++    long long x_stride_n, long long x_stride_c, long long x_stride_h, long long x_stride_w)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long total = (long long)N * H * W;
++    if (idx >= total) return;
++
++    // Output index corresponds to (n, 0, h, w) in output contiguous tensor
++    int n = idx / (H * W);
++    int rem = idx % (H * W);
++    int h = rem / W;
++    int w = rem % W;
++
++    float sum = 0.0f;
++    for (int c = 0; c < C; ++c) {
++        long long in_idx = n * x_stride_n + c * x_stride_c + h * x_stride_h + w * x_stride_w;
++        sum += x[in_idx];
++    }
++    out[idx] = sum;
++}
++
++// Launcher for batchnorm2d_eval_forward
++extern "C" void batchnorm2d_eval_forward_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    float* out,
++    int N, int C, int H, int W,
++    long long x_stride_n, long long x_stride_c, long long x_stride_h, long long x_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
++    cudaStream_t stream)
++{
++    long long total = (long long)N * C * H * W;
++    int threads = 256;
++    long long blocks = (total + threads - 1) / threads;
++    batchnorm2d_eval_kernel<<<blocks, threads, 0, stream>>>(
++        x, weight, bias, running_mean, running_var, eps, out,
++        N, C, H, W,
++        x_stride_n, x_stride_c, x_stride_h, x_stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w);
++}
++
++// Launcher for sum_dim_keepdim_forward
++extern "C" void sum_dim1_keepdim_launcher(
++    const float* x,
++    float* out,
++    int N, int C, int H, int W,
++    long long x_stride_n, long long x_stride_c, long long x_stride_h, long long x_stride_w,
++    cudaStream_t stream)
++{
++    long long total = (long long)N * H * W;
++    int threads = 256;
++    long long blocks = (total + threads - 1) / threads;
++    sum_dim1_keepdim_kernel<<<blocks, threads, 0, stream>>>(
++        x, out, N, C, H, W, x_stride_n, x_stride_c, x_stride_h, x_stride_w);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,171 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void batchnorm2d_eval_forward_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    float* out,
++    int N, int C, int H, int W,
++    long long x_stride_n, long long x_stride_c, long long x_stride_h, long long x_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
++    cudaStream_t stream
++);
++
++extern "C" void sum_dim1_keepdim_launcher(
++    const float* x,
++    float* out,
++    int N, int C, int H, int W,
++    long long x_stride_n, long long x_stride_c, long long x_stride_h, long long x_stride_w,
++    cudaStream_t stream
++);
++
++// Helper: return current CUDA stream
++static cudaStream_t get_current_stream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// BatchNorm2d eval forward
++// Inputs: x [N,C,H,W] (float32, CUDA, may be non-contiguous), weight/bias/running_mean/running_var [C] (float32, CUDA, contiguous), eps (float, optional)
++// Output: contiguous CUDA tensor of same shape as x
++torch::Tensor batchnorm2d_eval_forward(
++    torch::Tensor x,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    torch::Tensor running_mean,
++    torch::Tensor running_var,
++    double eps = 1e-05
++) {
++    // Check types and devices
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(running_mean.is_cuda(), "running_mean must be a CUDA tensor");
++    TORCH_CHECK(running_var.is_cuda(), "running_var must be a CUDA tensor");
++
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.scalar_type() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(running_mean.scalar_type() == torch::kFloat32, "running_mean must be float32");
++    TORCH_CHECK(running_var.scalar_type() == torch::kFloat32, "running_var must be float32");
++
++    TORCH_CHECK(x.dim() == 4, "x must be 4D [N,C,H,W]");
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == C, "weight must be 1D of size C");
++    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == C, "bias must be 1D of size C");
++    TORCH_CHECK(running_mean.dim() == 1 && running_mean.size(0) == C, "running_mean must be 1D of size C");
++    TORCH_CHECK(running_var.dim() == 1 && running_var.size(0) == C, "running_var must be 1D of size C");
++
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++    TORCH_CHECK(running_mean.is_contiguous(), "running_mean must be contiguous");
++    TORCH_CHECK(running_var.is_contiguous(), "running_var must be contiguous");
++
++    // x may be non-contiguous; we support arbitrary strides
++    // Output tensor: same shape as x, contiguous
++    auto out = torch::empty_like(x);
++    // Ensure out is contiguous (empty_like preserves memory format, but x might be non-contiguous; we force contiguous)
++    out = out.contiguous();
++
++    // Get strides (in elements)
++    auto x_strides = x.strides();
++    auto out_strides = out.strides();
++    // Convert to long long for launcher
++    long long x_stride_n = x_strides[0];
++    long long x_stride_c = x_strides[1];
++    long long x_stride_h = x_strides[2];
++    long long x_stride_w = x_strides[3];
++    long long out_stride_n = out_strides[0];
++    long long out_stride_c = out_strides[1];
++    long long out_stride_h = out_strides[2];
++    long long out_stride_w = out_strides[3];
++
++    cudaStream_t stream = get_current_stream();
++
++    batchnorm2d_eval_forward_launcher(
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        running_mean.data_ptr<float>(),
++        running_var.data_ptr<float>(),
++        static_cast<float>(eps),
++        out.data_ptr<float>(),
++        N, C, H, W,
++        x_stride_n, x_stride_c, x_stride_h, x_stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w,
++        stream
++    );
++
++    // Check for kernel launch errors
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "batchnorm2d_eval_forward kernel launch failed");
++
++    return out;
++}
++
++// Sum over dimension 1 with keepdim=True
++// Input: x [N,C,H,W] (float32, CUDA, may be non-contiguous), dim (int)
++// Output: contiguous CUDA tensor of shape [N,1,H,W]
++torch::Tensor sum_dim_keepdim_forward(torch::Tensor x, int64_t dim) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D [N,C,H,W]");
++    TORCH_CHECK(dim == 1, "only dim=1 is supported");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Output shape: [N,1,H,W], contiguous
++    auto out = torch::empty({N, 1, H, W}, x.options());
++
++    auto x_strides = x.strides();
++    long long x_stride_n = x_strides[0];
++    long long x_stride_c = x_strides[1];
++    long long x_stride_h = x_strides[2];
++    long long x_stride_w = x_strides[3];
++
++    cudaStream_t stream = get_current_stream();
++
++    sum_dim1_keepdim_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        N, C, H, W,
++        x_stride_n, x_stride_c, x_stride_h, x_stride_w,
++        stream
++    );
++
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "sum_dim_keepdim_forward kernel launch failed");
++
++    return out;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("batchnorm2d_eval_forward", &batchnorm2d_eval_forward,
++          "BatchNorm2d eval forward",
++          pybind11::arg("x"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"),
++          pybind11::arg("running_mean"),
++          pybind11::arg("running_var"),
++          pybind11::arg("eps") = 1e-05);
++
++    m.def("sum_dim_keepdim_forward", &sum_dim_keepdim_forward,
++          "Sum over dim with keepdim=True",
++          pybind11::arg("x"),
++          pybind11::arg("dim"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,35 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
++        super().__init__()
++        self.batchnorm2d = nn.BatchNorm2d(in_channels)
++
++    def forward(self, x):
++        x = cuda_extension.batchnorm2d_eval_forward(
++            x,
++            self.batchnorm2d.weight,
++            self.batchnorm2d.bias,
++            self.batchnorm2d.running_mean,
++            self.batchnorm2d.running_var,
++            self.batchnorm2d.eps
++        )
++        x = cuda_extension.sum_dim_keepdim_forward(x, 1)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.batchnorm2d_eval_forward(
++            x,
++            self.batchnorm2d.weight,
++            self.batchnorm2d.bias,
++            self.batchnorm2d.running_mean,
++            self.batchnorm2d.running_var,
++            self.batchnorm2d.eps
++        )
++        yield 'step_001', x
++        x = cuda_extension.sum_dim_keepdim_forward(x, 1)
++        yield 'step_002', x
++        yield 'step_003', x

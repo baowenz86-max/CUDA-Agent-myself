@@ -1,0 +1,131 @@
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,6 +2,7 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
++#include <tuple>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+@@ -45,7 +46,6 @@
+ 
+ // linear_forward binding
+ torch::Tensor linear_forward(torch::Tensor input, torch::Tensor weight, c10::optional<torch::Tensor> bias_opt = c10::nullopt) {
+-    // Input validation
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+@@ -59,7 +59,6 @@
+     int out_features = weight.size(0);
+     TORCH_CHECK(weight.size(1) == in_features, "weight shape mismatch");
+ 
+-    // Bias optional
+     torch::Tensor bias;
+     if (bias_opt.has_value()) {
+         bias = bias_opt.value();
+@@ -96,7 +95,6 @@
+     torch::Tensor tail1_w2,
+     c10::List<int64_t> cutoffs_list,
+     double div_value) {
+-    // Input validation
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+@@ -104,7 +102,6 @@
+     int batch_size = input.size(0);
+     int input_size = input.size(1);
+ 
+-    // Validate all weight tensors
+     auto check_weight = [&](const torch::Tensor& w, const char* name, int expected_rows, int expected_cols) {
+         TORCH_CHECK(w.is_cuda(), name, " must be a CUDA tensor");
+         TORCH_CHECK(w.dtype() == torch::kFloat32, name, " must be float32");
+@@ -126,13 +123,11 @@
+     int cluster_size1 = tail1_w2.size(0);
+     check_weight(tail1_w2, "tail1_w2", cluster_size1, reduce_size1);
+ 
+-    // Extract cutoffs: must be a list of at least one int, first element is shortlist_size
+     TORCH_CHECK(cutoffs_list.size() >= 1, "cutoffs list must have at least one element");
+     int shortlist_size = cutoffs_list[0];
+     TORCH_CHECK(shortlist_size > 0, "shortlist_size must be positive");
+     TORCH_CHECK(shortlist_size + cluster_size0 + cluster_size1 == head_size - cutoffs_list.size(),
+                 "head_size must equal shortlist_size + sum of cluster sizes + number of clusters");
+-    // Above check: head_size = shortlist_size + n_clusters; n_clusters = cutoffs_list.size(); so shortlist_size + cluster sums = head_size - n_clusters
+ 
+     int n_classes = shortlist_size + cluster_size0 + cluster_size1;
+     auto output = torch::empty({batch_size, n_classes}, input.options());
+@@ -161,9 +156,8 @@
+     return output;
+ }
+ 
+-// topk binding
+-torch::return_types::topk topk(torch::Tensor input, int64_t k) {
+-    // Input validation
++// topk binding: returns std::tuple<torch::Tensor, torch::Tensor> to avoid torch::return_types::topk dependency
++std::tuple<torch::Tensor, torch::Tensor> topk(torch::Tensor input, int64_t k) {
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+@@ -188,7 +182,7 @@
+         stream
+     );
+ 
+-    return torch::return_types::topk(values, indices);
++    return std::make_tuple(values, indices);
+ }
+ 
+ // Registration
+@@ -200,7 +194,7 @@
+           "Adaptive log-softmax log probabilities",
+           py::arg("input"), py::arg("head_weight"), py::arg("tail0_w1"), py::arg("tail0_w2"),
+           py::arg("tail1_w1"), py::arg("tail1_w2"), py::arg("cutoffs"), py::arg("div_value"));
+-    m.def("topk", &topk, "Top-k values and indices", py::arg("input"), py::arg("k"));
++    m.def("topk", &topk, "Top-k values and indices (returns tuple)", py::arg("input"), py::arg("k"));
+ }
+ 
+ REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -6,14 +6,11 @@
+ class ModelNew(nn.Module):
+     def __init__(self, input_size, n_classes, cutoffs, div_value):
+         super().__init__()
+-        # Store parameters as in nn.Module, preserving state_dict keys
+         self.adaptive_log_softmax = nn.AdaptiveLogSoftmaxWithLoss(input_size, n_classes, cutoffs, div_value)
+ 
+     def forward(self, x, targets, k):
+-        # Move input to CUDA if needed (harness may provide CPU tensors)
+         if not x.is_cuda:
+             x = x.cuda()
+-        # Step 1: log_probs
+         log_probs = cuda_extension.adaptive_log_softmax_log_prob(
+             x.contiguous(),
+             self.adaptive_log_softmax.head.weight.contiguous(),
+@@ -24,14 +21,11 @@
+             self.adaptive_log_softmax.cutoffs,
+             self.adaptive_log_softmax.div_value
+         )
+-        # Step 2: topk
+-        topk_result = cuda_extension.topk(log_probs, k)
+-        # topk_result is a torch.return_types.topk object containing values and indices
+-        # We return a plain tuple as in reference
++        values, indices = cuda_extension.topk(log_probs, k)
++        topk_result = torch.return_types.topk((values, indices))
+         return topk_result.values, topk_result.indices
+ 
+     def debug_forward(self, x, targets, k):
+-        # Same computation but yields intermediate checkpoints
+         if not x.is_cuda:
+             x = x.cuda()
+         log_probs = cuda_extension.adaptive_log_softmax_log_prob(
+@@ -46,8 +40,8 @@
+         )
+         yield 'step_001', log_probs
+ 
+-        topk_result = cuda_extension.topk(log_probs, k)
++        values, indices = cuda_extension.topk(log_probs, k)
++        topk_result = torch.return_types.topk((values, indices))
+         yield 'step_002', (topk_result.values, topk_result.indices)
+ 
+-        # Final return
+         yield 'step_003', (topk_result.values, topk_result.indices)

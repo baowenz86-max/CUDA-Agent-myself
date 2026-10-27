@@ -1,0 +1,169 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,73 @@
++#include <cuda_runtime.h>
++
++// 逐元素 ELU kernel: y = x if x > 0 else expf(x) - 1.f
++__global__ void elu_kernel(const float* __restrict__ input,
++                           float* __restrict__ output,
++                           long long n) {
++    long long idx = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
++    long long stride = static_cast<long long>(blockDim.x) * gridDim.x;
++    for (; idx < n; idx += stride) {
++        float x = input[idx];
++        output[idx] = x > 0.f ? x : expf(x) - 1.f;
++    }
++}
++
++// 逐元素 sigmoid kernel: y = 1 / (1 + exp(-x))
++__global__ void sigmoid_kernel(const float* __restrict__ input,
++                               float* __restrict__ output,
++                               long long n) {
++    long long idx = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
++    long long stride = static_cast<long long>(blockDim.x) * gridDim.x;
++    for (; idx < n; idx += stride) {
++        float x = input[idx];
++        output[idx] = 1.f / (1.f + expf(-x));
++    }
++}
++
++// 融合 kernel: 先 ELU，再 sigmoid
++__global__ void elu_sigmoid_kernel(const float* __restrict__ input,
++                                   float* __restrict__ output,
++                                   long long n) {
++    long long idx = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
++    long long stride = static_cast<long long>(blockDim.x) * gridDim.x;
++    for (; idx < n; idx += stride) {
++        float x = input[idx];
++        float elu = x > 0.f ? x : expf(x) - 1.f;
++        output[idx] = 1.f / (1.f + expf(-elu));
++    }
++}
++
++// ============ Launchers (extern "C" for binding) ============
++
++extern "C" void elu_forward_launcher(const float* input,
++                                     float* output,
++                                     long long n,
++                                     cudaStream_t stream) {
++    int block_size = 256;
++    long long blocks_ll = (n + block_size - 1) / block_size;
++    int blocks = static_cast<int>(min(blocks_ll, 1073741824LL));
++    elu_kernel<<<blocks, block_size, 0, stream>>>(input, output, n);
++    cudaGetLastError();
++}
++
++extern "C" void sigmoid_forward_launcher(const float* input,
++                                          float* output,
++                                          long long n,
++                                          cudaStream_t stream) {
++    int block_size = 256;
++    long long blocks_ll = (n + block_size - 1) / block_size;
++    int blocks = static_cast<int>(min(blocks_ll, 1073741824LL));
++    sigmoid_kernel<<<blocks, block_size, 0, stream>>>(input, output, n);
++    cudaGetLastError();
++}
++
++extern "C" void elu_sigmoid_forward_launcher(const float* input,
++                                              float* output,
++                                              long long n,
++                                              cudaStream_t stream) {
++    int block_size = 256;
++    long long blocks_ll = (n + block_size - 1) / block_size;
++    int blocks = static_cast<int>(min(blocks_ll, 1073741824LL));
++    elu_sigmoid_kernel<<<blocks, block_size, 0, stream>>>(input, output, n);
++    cudaGetLastError();
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,54 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// 声明 .cu 中导出的 launcher
++extern "C" void elu_forward_launcher(const float* input, float* output, long long n, cudaStream_t stream);
++extern "C" void sigmoid_forward_launcher(const float* input, float* output, long long n, cudaStream_t stream);
++extern "C" void elu_sigmoid_forward_launcher(const float* input, float* output, long long n, cudaStream_t stream);
++
++static torch::Tensor check_and_contiguous(const torch::Tensor& x, const char* name) {
++    TORCH_CHECK(x.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, name, " must be float32");
++    if (!x.is_contiguous()) {
++        return x.contiguous();
++    }
++    return x;
++}
++
++torch::Tensor elu_forward(torch::Tensor x) {
++    auto x_contig = check_and_contiguous(x, "x");
++    auto y = torch::empty_like(x_contig);
++    long long n = x_contig.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    elu_forward_launcher(x_contig.data_ptr<float>(), y.data_ptr<float>(), n, stream);
++    return y;
++}
++
++torch::Tensor sigmoid_forward(torch::Tensor x) {
++    auto x_contig = check_and_contiguous(x, "x");
++    auto y = torch::empty_like(x_contig);
++    long long n = x_contig.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    sigmoid_forward_launcher(x_contig.data_ptr<float>(), y.data_ptr<float>(), n, stream);
++    return y;
++}
++
++torch::Tensor elu_sigmoid_forward(torch::Tensor x) {
++    auto x_contig = check_and_contiguous(x, "x");
++    auto y = torch::empty_like(x_contig);
++    long long n = x_contig.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    elu_sigmoid_forward_launcher(x_contig.data_ptr<float>(), y.data_ptr<float>(), n, stream);
++    return y;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("elu_forward", &elu_forward, "ELU forward");
++    m.def("sigmoid_forward", &sigmoid_forward, "Sigmoid forward");
++    m.def("elu_sigmoid_forward", &elu_sigmoid_forward, "Fused ELU + Sigmoid forward");
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,33 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        x = cuda_extension.elu_sigmoid_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        elu_out = cuda_extension.elu_forward(x)
++        yield "step_001", elu_out
++        sigmoid_out = cuda_extension.sigmoid_forward(elu_out)
++        yield "step_002", sigmoid_out
++        yield "step_003", sigmoid_out
++
++
++batch_size = 512
++channels = 64
++height = 128
++width = 128
++
++
++def get_inputs():
++    return [torch.randn(batch_size, channels, height, width)]
++
++
++def get_init_inputs():
++    return []

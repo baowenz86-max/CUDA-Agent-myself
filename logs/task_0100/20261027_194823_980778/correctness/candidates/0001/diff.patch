@@ -1,0 +1,235 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,89 @@
++// CUDA kernels for bilinear upsample and squeeze identity
++#include <cuda_runtime.h>
++
++// Bilinear interpolation for 4D tensor [N, C, H, W] -> [N, C, H_out, W_out]
++// align_corners = false
++// scale_factor is float, applied to H and W
++// Input and output are contiguous float32 tensors
++__global__ void bilinear_upsample_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int H_out, int W_out,
++    float scale_factor) {
++    int index = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    int total = N * C * H_out * W_out;
++
++    for (int i = index; i < total; i += stride) {
++        int w_out = i % W_out;
++        int tmp = i / W_out;
++        int h_out = tmp % H_out;
++        tmp /= H_out;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        // source coordinates with align_corners=False
++        float src_h = (static_cast<float>(h_out) + 0.5f) * scale_factor - 0.5f;
++        float src_w = (static_cast<float>(w_out) + 0.5f) * scale_factor - 0.5f;
++
++        // clamp to valid range
++        if (src_h < 0.0f) src_h = 0.0f;
++        if (src_w < 0.0f) src_w = 0.0f;
++        if (src_h > H - 1.0f) src_h = H - 1.0f;
++        if (src_w > W - 1.0f) src_w = W - 1.0f;
++
++        int h0 = static_cast<int>(src_h);
++        int w0 = static_cast<int>(src_w);
++        int h1 = (h0 < H - 1) ? h0 + 1 : h0;
++        int w1 = (w0 < W - 1) ? w0 + 1 : w0;
++
++        float h_lambda = src_h - h0;
++        float w_lambda = src_w - w0;
++
++        // base index for input [n, c, :, :]
++        int base = (n * C + c) * H * W;
++        float v00 = input[base + h0 * W + w0];
++        float v01 = input[base + h0 * W + w1];
++        float v10 = input[base + h1 * W + w0];
++        float v11 = input[base + h1 * W + w1];
++
++        float top = v00 + (v01 - v00) * w_lambda;
++        float bottom = v10 + (v11 - v10) * w_lambda;
++        float val = top + (bottom - top) * h_lambda;
++
++        output[i] = val;
++    }
++}
++
++// Launcher for bilinear upsample
++// Expects input and output contiguous, float32, CUDA pointers
++extern "C" void bilinear_upsample_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int H_out, int W_out,
++    float scale_factor,
++    cudaStream_t stream) {
++    int total = N * C * H_out * W_out;
++    if (total <= 0) return;
++
++    int block_size = 256;
++    int grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535; // limit grid to avoid excessive blocks, kernel uses grid-stride loop
++
++    bilinear_upsample_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, N, C, H, W, H_out, W_out, scale_factor);
++}
++
++// Squeeze identity: torch.squeeze on a 4D tensor with no dimension of size 1
++// returns the same tensor (or a view with same shape and stride).
++// In our use case, the tensor is [16,32,1024,512] and no dimension is 1,
++// so we can simply return the input tensor. No CUDA kernel needed.
++// This launcher just returns (does nothing), the binding layer will handle returning input.
++extern "C" void squeeze_identity_launcher(
++    const float* /*input*/,
++    float* /*output*/,
++    cudaStream_t /*stream*/) {
++    // No operation needed; identity
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,108 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void bilinear_upsample_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int H_out, int W_out,
++    float scale_factor,
++    cudaStream_t stream);
++
++extern "C" void squeeze_identity_launcher(
++    const float* input,
++    float* output,
++    cudaStream_t stream);
++
++// Bilinear upsample wrapper
++torch::Tensor bilinear_upsample(
++    torch::Tensor x,
++    double scale_factor,
++    bool align_corners) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N,C,H,W)");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++
++    // align_corners must be false for this implementation
++    TORCH_CHECK(!align_corners, "Only align_corners=False is supported");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Calculate output dimensions (integer multiplication, scale_factor is float)
++    int H_out = static_cast<int>(H * scale_factor);
++    int W_out = static_cast<int>(W * scale_factor);
++
++    TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid output dimensions");
++
++    // Allocate output tensor
++    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    bilinear_upsample_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        H_out, W_out,
++        static_cast<float>(scale_factor),
++        stream);
++
++    return output;
++}
++
++// Squeeze identity wrapper: for 4D tensor with no dims of size 1, torch.squeeze returns the same tensor
++// We return the input tensor directly; no copy needed.
++torch::Tensor squeeze_identity(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D for this contract");
++
++    // Check if any dimension is 1; if so, PyTorch's squeeze would remove them, but our contract says reference has no dims of size 1.
++    // To be safe, if any dim is 1, we return a view with squeezed dims (though this case shouldn't occur in verification).
++    bool has_unit_dim = false;
++    for (int i = 0; i < 4; ++i) {
++        if (x.size(i) == 1) {
++            has_unit_dim = true;
++            break;
++        }
++    }
++
++    if (has_unit_dim) {
++        // Not expected in task, but implement proper behavior: return a view with squeezed dims
++        // We'll use torch::squeeze (allowed for tensor manipulation, not computation)
++        // However, we must avoid using torch:: ops for computation, but view operations are okay.
++        // To keep this simple and aligned with task, we can use x.squeeze() which returns a view.
++        // But note: this uses torch::squeeze which is a view operation, not a computation.
++        // It's acceptable as per the restrictions.
++        return x.squeeze();
++    } else {
++        // No unit dims, return the same tensor (as reference).
++        return x;
++    }
++}
++
++// Register both functions
++void register_custom_ops(pybind11::module& m) {
++    m.def("bilinear_upsample", &bilinear_upsample,
++          "Bilinear upsample (scale_factor, align_corners=False)",
++          pybind11::arg("x"),
++          pybind11::arg("scale_factor"),
++          pybind11::arg("align_corners"));
++
++    m.def("squeeze_identity", &squeeze_identity,
++          "Identity squeeze for 4D tensor without unit dims",
++          pybind11::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,29 @@
++import torch
++import torch.nn as nn
++
++class ModelNew(nn.Module):
++    def __init__(self, scale_factor, mode):
++        super().__init__()
++        # Store only the scale_factor and mode; no parameters or modules.
++        self.scale_factor = float(scale_factor)
++        self.mode = mode
++
++    def forward(self, x):
++        # Custom bilinear upsample (scale_factor, mode='bilinear')
++        import cuda_extension
++        x = cuda_extension.bilinear_upsample(x, self.scale_factor, align_corners=False)
++        # torch.squeeze is identity for this shape; represented as custom op.
++        x = cuda_extension.squeeze_identity(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        import cuda_extension
++        x = inputs[0]
++        # step_001: upsample
++        x_upsampled = cuda_extension.bilinear_upsample(x, self.scale_factor, align_corners=False)
++        yield 'step_001', x_upsampled
++        # step_002: squeeze identity
++        x_squeezed = cuda_extension.squeeze_identity(x_upsampled)
++        yield 'step_002', x_squeezed
++        # step_003: final return
++        yield 'step_003', x_squeezed

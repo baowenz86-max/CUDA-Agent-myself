@@ -1,0 +1,212 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,97 @@
++// custom_ops.cu
++// All CUDA kernels and launchers for diag_embed and l1_norm_dim1.
++// No torch dependencies, only raw pointers, scalars, cudaStream_t.
++
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel to embed a [B, N] tensor into a [B, N, N] diagonal tensor.
++// output[b, i, j] = input[b, i] if i == j else 0.
++__global__ void diag_embed_kernel(float* __restrict__ output,
++                                  const float* __restrict__ input,
++                                  int B, int N) {
++    int total = B * N * N;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int linear = idx; linear < total; linear += stride) {
++        int j = linear % N;
++        int tmp = linear / N;
++        int i = tmp % N;
++        int b = tmp / N;
++        if (i == j) {
++            output[linear] = input[b * N + i];
++        } else {
++            output[linear] = 0.0f;
++        }
++    }
++}
++
++// Kernel to compute L1 norm along dim=1 for [B, N, N] tensor.
++// output[b, j] = sum_i |input[b, i, j]|.
++__global__ void l1_norm_dim1_kernel(float* __restrict__ output,
++                                    const float* __restrict__ input,
++                                    int B, int N) {
++    int total = B * N;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int linear = idx; linear < total; linear += stride) {
++        int j = linear % N;
++        int b = linear / N;
++        float sum = 0.0f;
++        for (int i = 0; i < N; ++i) {
++            float val = input[b * N * N + i * N + j];
++            sum += fabsf(val);
++        }
++        output[linear] = sum;
++    }
++}
++
++// Fused kernel: directly compute output[b, j] = |input[b, j]|,
++// because the intermediate tensor is diagonal, and L1 norm along dim=1
++// picks only element where i == j.
++__global__ void fused_diag_embed_l1_kernel(float* __restrict__ output,
++                                           const float* __restrict__ input,
++                                           int B, int N) {
++    int total = B * N;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int linear = idx; linear < total; linear += stride) {
++        output[linear] = fabsf(input[linear]);
++    }
++}
++
++// Launcher for diag_embed.
++extern "C" void diag_embed_launcher(float* output,
++                                    const float* input,
++                                    int B, int N,
++                                    cudaStream_t stream) {
++    int total = B * N * N;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    if (grid > 65535) grid = 65535; // grid-stride loop handles larger
++    diag_embed_kernel<<<grid, block, 0, stream>>>(output, input, B, N);
++}
++
++// Launcher for l1_norm_dim1.
++extern "C" void l1_norm_dim1_launcher(float* output,
++                                      const float* input,
++                                      int B, int N,
++                                      cudaStream_t stream) {
++    int total = B * N;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    if (grid > 65535) grid = 65535;
++    l1_norm_dim1_kernel<<<grid, block, 0, stream>>>(output, input, B, N);
++}
++
++// Fused launcher: input [B, N], output [B, N] = abs(input)
++extern "C" void fused_diag_embed_l1_launcher(float* output,
++                                             const float* input,
++                                             int B, int N,
++                                             cudaStream_t stream) {
++    int total = B * N;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    if (grid > 65535) grid = 65535;
++    fused_diag_embed_l1_kernel<<<grid, block, 0, stream>>>(output, input, B, N);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,80 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void diag_embed_launcher(float* output, const float* input, int B, int N, cudaStream_t stream);
++extern "C" void l1_norm_dim1_launcher(float* output, const float* input, int B, int N, cudaStream_t stream);
++
++// PyTorch wrapper for diag_embed
++torch::Tensor diag_embed(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 2, "Input must be 2D");
++
++    int64_t B = x.size(0);
++    int64_t N = x.size(1);
++
++    // Output shape [B, N, N]
++    auto output = torch::empty({B, N, N}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    diag_embed_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(B),
++        static_cast<int>(N),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "diag_embed kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// PyTorch wrapper for l1_norm_dim1
++torch::Tensor l1_norm_dim1(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 3, "Input must be 3D");
++
++    int64_t B = x.size(0);
++    int64_t N = x.size(1);
++    // Note: dimension 2 should also be N, but we don't strictly need to check here.
++    // TORCH_CHECK(x.size(2) == N, "Expected square matrix in last two dims");
++
++    // Output shape [B, N]
++    auto output = torch::empty({B, N}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    l1_norm_dim1_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(B),
++        static_cast<int>(N),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "l1_norm_dim1 kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("diag_embed", &diag_embed, "Embed input into a diagonal tensor (CUDA)",
++          py::arg("x"));
++    m.def("l1_norm_dim1", &l1_norm_dim1, "Compute L1 norm along dim=1 (CUDA)",
++          py::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, size, p, dim):
++        super(ModelNew, self).__init__()
++        # 保持与原模型相同，但此处不需要任何参数，因为forward不使用self中的张量。
++        # 原模型在__init__中创建了diag和norm但未使用，state_dict为空，所以这里也保持为空。
++        # 注意：原模型创建了self.diag和self.norm，但未注册为Parameter，所以state_dict为空。
++        # 为了完全保持state_dict一致性，我们也可以创建相同的普通属性，但不影响。
++        # 这里不创建任何参数。
++
++    def forward(self, x):
++        x = cuda_extension.diag_embed(x)
++        x = cuda_extension.l1_norm_dim1(x)
++        return x
++
++    def debug_forward(self, x):
++        # 逐步计算，产生检查点
++        x1 = cuda_extension.diag_embed(x)
++        yield 'step_001', x1
++        x2 = cuda_extension.l1_norm_dim1(x1)
++        yield 'step_002', x2
++        yield 'step_003', x2

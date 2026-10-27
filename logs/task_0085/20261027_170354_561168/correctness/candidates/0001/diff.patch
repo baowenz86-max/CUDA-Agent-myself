@@ -1,0 +1,178 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,67 @@
++#include <cuda_runtime.h>
++
++// Elementwise clamp kernel: output[i] = min(max(input[i], min_val), max_val)
++__global__ void clamp_scalar_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t numel,
++    float min_val,
++    float max_val) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float val = input[i];
++        val = fminf(fmaxf(val, min_val), max_val);
++        output[i] = val;
++    }
++}
++
++// Elementwise subtract scalar kernel: output[i] = input[i] - scalar
++__global__ void sub_scalar_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t numel,
++    float scalar) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = input[i] - scalar;
++    }
++}
++
++// Helper to compute grid size with cap
++static inline int compute_grid_size(int64_t numel, int block_size) {
++    int64_t blocks = (numel + block_size - 1) / block_size;
++    // Limit grid to a reasonable maximum for good occupancy and avoid excessive launch overhead
++    const int max_blocks = 65535; // common launch bound
++    if (blocks > max_blocks) blocks = max_blocks;
++    return (int)blocks;
++}
++
++// Launcher for clamp_scalar
++// Extern "C" so binding.cpp can declare and call it without name mangling
++extern "C" void clamp_scalar_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    float min_val,
++    float max_val,
++    cudaStream_t stream) {
++    const int block_size = 256;
++    int grid_size = compute_grid_size(numel, block_size);
++    clamp_scalar_kernel<<<grid_size, block_size, 0, stream>>>(
++        output, input, numel, min_val, max_val);
++}
++
++// Launcher for sub_scalar
++extern "C" void sub_scalar_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    float scalar,
++    cudaStream_t stream) {
++    const int block_size = 256;
++    int grid_size = compute_grid_size(numel, block_size);
++    sub_scalar_kernel<<<grid_size, block_size, 0, stream>>>(
++        output, input, numel, scalar);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,80 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declarations from custom_ops.cu
++extern "C" void clamp_scalar_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    float min_val,
++    float max_val,
++    cudaStream_t stream);
++
++extern "C" void sub_scalar_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    float scalar,
++    cudaStream_t stream);
++
++// Wrapper for clamp_scalar
++torch::Tensor clamp_scalar(torch::Tensor x, double min_val, double max_val) {
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
++
++    auto output = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    clamp_scalar_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        x.numel(),
++        static_cast<float>(min_val),
++        static_cast<float>(max_val),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "clamp_scalar kernel launch failed: ", cudaGetErrorString(err));
++    return output;
++}
++
++// Wrapper for sub_scalar
++torch::Tensor sub_scalar(torch::Tensor x, double scalar) {
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
++
++    auto output = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    sub_scalar_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        x.numel(),
++        static_cast<float>(scalar),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "sub_scalar kernel launch failed: ", cudaGetErrorString(err));
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("clamp_scalar", &clamp_scalar,
++          "Clamp tensor elements to [min_val, max_val]",
++          pybind11::arg("x"),
++          pybind11::arg("min_val"),
++          pybind11::arg("max_val"));
++    m.def("sub_scalar", &sub_scalar,
++          "Subtract scalar from tensor elements",
++          pybind11::arg("x"),
++          pybind11::arg("scalar"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, min_value, max_value):
++        super().__init__()
++        self.min_value = min_value
++        self.max_value = max_value
++
++    def forward(self, x):
++        x = cuda_extension.clamp_scalar(x, self.min_value, self.max_value)
++        x = cuda_extension.sub_scalar(x, self.min_value)
++        return x
++
++    def debug_forward(self, x):
++        x_clamped = cuda_extension.clamp_scalar(x, self.min_value, self.max_value)
++        yield "step_001", x_clamped
++        x_sub = cuda_extension.sub_scalar(x_clamped, self.min_value)
++        yield "step_002", x_sub
++        yield "step_003", x_sub

@@ -1,0 +1,815 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,623 @@
++// custom_ops.cu
++// CUDA kernels and launchers for conv_transpose1d and flatten
++// No PyTorch dependencies, only raw pointers, scalars, and cudaStream_t
++
++#include <cuda_runtime.h>
++#include <cudnn.h>
++
++// -----------------------------------------------------------------------------
++// Error checking helpers (internal, not exposed)
++// -----------------------------------------------------------------------------
++#define CUDA_CHECK(condition)                                                  \
++  do {                                                                         \
++    cudaError_t error = (condition);                                           \
++    if (error != cudaSuccess) {                                                \
++      return error;                                                            \
++    }                                                                          \
++  } while (0)
++
++#define CUDNN_CHECK(condition)                                                 \
++  do {                                                                         \
++    cudnnStatus_t status = (condition);                                        \
++    if (status != CUDNN_STATUS_SUCCESS) {                                      \
++      return cudaErrorUnknown;                                                 \
++    }                                                                          \
++  } while (0)
++
++// -----------------------------------------------------------------------------
++// Flatten kernel: simply copies input elements to output with same layout
++// Input: [batch, channels, length], output: [batch, channels * length]
++// Since the input is contiguous and output is contiguous, a 1D elementwise copy
++// suffices. We implement as a simple grid-stride loop.
++// -----------------------------------------------------------------------------
++__global__ void flatten_kernel(const float* __restrict__ input,
++                               float* __restrict__ output,
++                               long long total_elements) {
++  long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++  long long stride = blockDim.x * gridDim.x;
++  for (long long i = idx; i < total_elements; i += stride) {
++    output[i] = input[i];
++  }
++}
++
++// Launcher for flatten: output must be preallocated with same number of elements
++// Returns cudaError_t
++cudaError_t flatten_launcher(const float* input,
++                             float* output,
++                             long long total_elements,
++                             cudaStream_t stream) {
++  if (total_elements <= 0) {
++    return cudaSuccess;
++  }
++  const int block_size = 256;
++  // Use enough blocks to cover all elements, grid-stride loop handles the rest
++  long long blocks = (total_elements + block_size - 1) / block_size;
++  // Cap blocks to avoid excessive grid dimensions, but still allow grid-stride loop
++  if (blocks > 65535) {
++    blocks = 65535;
++  }
++  flatten_kernel<<<(int)blocks, block_size, 0, stream>>>(input, output, total_elements);
++  return cudaGetLastError();
++}
++
++// -----------------------------------------------------------------------------
++// ConvTranspose1d using cuDNN
++// Since cuDNN supports 2D/3D convolutions, we map 1D transposed convolution to
++// 2D by adding a dummy height dimension of size 1.
++// Input tensor: [batch, in_channels, length]
++// Output tensor: [batch, out_channels, L_out]
++// We use cuDNN's transposed convolution (dgrad) with appropriate descriptors.
++// Bias is added as a separate tensor.
++// -----------------------------------------------------------------------------
++cudaError_t conv_transpose1d_forward_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,  // may be nullptr if no bias
++    float* output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int length,
++    int L_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    cudaStream_t stream) {
++
++  // Create cuDNN handle
++  cudnnHandle_t cudnn_handle;
++  CUDNN_CHECK(cudnnCreate(&cudnn_handle));
++  CUDNN_CHECK(cudnnSetStream(cudnn_handle, stream));
++
++  // We will describe tensors as 2D with N=batch, C=channels, H=1, W=length/L_out
++  const int dims = 4; // NCHW
++
++  // Input descriptor: [batch, in_channels, 1, length]
++  cudnnTensorDescriptor_t x_desc;
++  CUDNN_CHECK(cudnnCreateTensorDescriptor(&x_desc));
++  CUDNN_CHECK(cudnnSetTensor4dDescriptor(x_desc,
++                                         CUDNN_TENSOR_NCHW,
++                                         CUDNN_DATA_FLOAT,
++                                         batch,
++                                         in_channels,
++                                         1,
++                                         length));
++
++  // Output descriptor: [batch, out_channels, 1, L_out]
++  cudnnTensorDescriptor_t y_desc;
++  CUDNN_CHECK(cudnnCreateTensorDescriptor(&y_desc));
++  CUDNN_CHECK(cudnnSetTensor4dDescriptor(y_desc,
++                                         CUDNN_TENSOR_NCHW,
++                                         CUDNN_DATA_FLOAT,
++                                         batch,
++                                         out_channels,
++                                         1,
++                                         L_out));
++
++  // Weight descriptor for transposed convolution.
++  // In cuDNN, for a normal convolution with weight layout [out_channels, in_channels, kH, kW],
++  // the transposed convolution can be performed by swapping the roles of input and output and
++  // using the "dgrad" operation with the same weight descriptor.
++  // Our weight from PyTorch ConvTranspose1d has shape [in_channels, out_channels, kernel_size],
++  // which corresponds to the transposed convolution kernel (also named weight by PyTorch).
++  // cuDNN expects weight in [out_channels, in_channels, kH, kW] for the forward convolution, but
++  // for dgrad (transposed), it expects the same layout as the forward convolution.
++  // Let's verify mapping: PyTorch ConvTranspose1d weight shape: (in_channels, out_channels/groups, kernel_size).
++  // Here groups=1, so weight shape = [in_channels, out_channels, kernel_size].
++  // For cuDNN transposed convolution, we can set the filter descriptor with dimensions
++  // [out_channels, in_channels, 1, kernel_size] but we need to rearrange the weight data to
++  // match this layout. However, PyTorch's weight layout is exactly the transpose of this:
++  // [in_channels, out_channels, k]. The cuDNN descriptor typically expects the filter to be in
++  // [out_channels, in_channels, kh, kw] for both forward and backward data.
++  // In the backward data (dgrad) operation, the filter is used as is, so it must be in that layout.
++  // Thus we need a transposed copy of the weight tensor, or we can use the "convolution backward data"
++  // with a filter descriptor that matches the original [in_channels, out_channels, k], but cuDNN does
++  // not support filters with swapped dimensions directly; it always assumes filter layout
++  // [output_channels, input_channels, kh, kw].
++  // Therefore, we must create a transposed weight tensor on GPU and use it.
++  // In this specific task, kernel_size=3 and channels=16,32, which is small, so we can perform the
++  // weight transpose in a simple CUDA kernel before calling cuDNN, or we can use cudaMemcpy2D to
++  // do the transpose while copying. We choose to allocate a temporary buffer, transposed_weight.
++  // The original weight is contiguous with shape [in_channels, out_channels, kernel_size].
++  // The transposed weight shape for cuDNN is [out_channels, in_channels, kernel_size] because the
++  // height dimension is 1. We need to copy weight[ic][oc][k] to transposed_weight[oc][ic][k].
++  // We'll implement a small CUDA kernel for this transpose, which is allowed since it's a custom op.
++
++  // Filter descriptor: [out_channels, in_channels, 1, kernel_size]
++  cudnnFilterDescriptor_t filter_desc;
++  CUDNN_CHECK(cudnnCreateFilterDescriptor(&filter_desc));
++  CUDNN_CHECK(cudnnSetFilter4dDescriptor(filter_desc,
++                                         CUDNN_DATA_FLOAT,
++                                         CUDNN_TENSOR_NCHW,
++                                         out_channels,
++                                         in_channels,
++                                         1,
++                                         kernel_size));
++
++  // Allocate temporary buffer for transposed weight
++  float* transposed_weight = nullptr;
++  cudaError_t cuda_status = cudaMalloc(&transposed_weight,
++                                       in_channels * out_channels * kernel_size * sizeof(float));
++  if (cuda_status != cudaSuccess) {
++    cudnnDestroyTensorDescriptor(x_desc);
++    cudnnDestroyTensorDescriptor(y_desc);
++    cudnnDestroyFilterDescriptor(filter_desc);
++    cudnnDestroy(cudnn_handle);
++    return cuda_status;
++  }
++
++  // Transpose weight kernel: input shape [ic][oc][k] -> output [oc][ic][k]
++  dim3 block(256);
++  dim3 grid((in_channels * out_channels * kernel_size + 255) / 256);
++  // We'll launch a kernel to do the transpose
++  // Using a custom kernel for weight transpose
++  extern __global__ void weight_transpose_kernel(const float* __restrict__ src,
++                                                  float* __restrict__ dst,
++                                                  int in_channels,
++                                                  int out_channels,
++                                                  int kernel_size);
++  // Actually, define the kernel before launch; we haven't defined it yet.
++  // For now, we will implement a simple CPU-side loop? No, must be GPU.
++  // We'll define the kernel below and call it.
++  // To keep this file organized, let's define a kernel later, but for now we'll use a temporary approach:
++  // We'll create a small kernel function inside this launcher by declaring it outside.
++  // But within launcher, we can call a separate defined kernel.
++  // We'll define weight_transpose_kernel below and then call it.
++
++  // But we need to define the kernel before use. We'll move the definition above or below. Let's place the kernel above this launcher for simplicity.
++  // However, we've already started the launcher. We'll need to restructure. But for JSON output, we'll provide the complete file with proper ordering.
++  // Let's stop here and provide the final file with all definitions ordered correctly.
++
++  // We'll include the transpose kernel and then the launcher.
++
++  // For now, answer with the complete code.
++
++  return cudaSuccess; // placeholder, actual implementation below
++}
++
++// Define the weight transpose kernel (must be before use)
++__global__ void weight_transpose_kernel(const float* __restrict__ src,
++                                        float* __restrict__ dst,
++                                        int in_channels,
++                                        int out_channels,
++                                        int kernel_size) {
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int total = in_channels * out_channels * kernel_size;
++  if (idx < total) {
++    int k = idx % kernel_size;
++    int oc = (idx / kernel_size) % out_channels;
++    int ic = idx / (kernel_size * out_channels);
++    int src_idx = (ic * out_channels + oc) * kernel_size + k;
++    int dst_idx = (oc * in_channels + ic) * kernel_size + k;
++    dst[dst_idx] = src[src_idx];
++  }
++}
++
++// Now the complete launcher implementation (redo)
++cudaError_t conv_transpose1d_forward_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch,
++    int in_channels,
++    int out_channels,
++    int length,
++    int L_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_padding,
++    cudaStream_t stream) {
++
++  cudnnHandle_t cudnn_handle;
++  cudnnStatus_t status = cudnnCreate(&cudnn_handle);
++  if (status != CUDNN_STATUS_SUCCESS) return cudaErrorUnknown;
++  status = cudnnSetStream(cudnn_handle, stream);
++  if (status != CUDNN_STATUS_SUCCESS) {
++    cudnnDestroy(cudnn_handle);
++    return cudaErrorUnknown;
++  }
++
++  cudnnTensorDescriptor_t x_desc, y_desc;
++  cudnnCreateTensorDescriptor(&x_desc);
++  cudnnCreateTensorDescriptor(&y_desc);
++
++  cudnnSetTensor4dDescriptor(x_desc,
++                             CUDNN_TENSOR_NCHW,
++                             CUDNN_DATA_FLOAT,
++                             batch, in_channels, 1, length);
++  cudnnSetTensor4dDescriptor(y_desc,
++                             CUDNN_TENSOR_NCHW,
++                             CUDNN_DATA_FLOAT,
++                             batch, out_channels, 1, L_out);
++
++  cudnnFilterDescriptor_t filter_desc;
++  cudnnCreateFilterDescriptor(&filter_desc);
++  cudnnSetFilter4dDescriptor(filter_desc,
++                             CUDNN_DATA_FLOAT,
++                             CUDNN_TENSOR_NCHW,
++                             out_channels, in_channels, 1, kernel_size);
++
++  // Transpose weight to match cuDNN layout
++  float* transposed_weight = nullptr;
++  cudaError_t cuda_status = cudaMalloc(&transposed_weight,
++                                       in_channels * out_channels * kernel_size * sizeof(float));
++  if (cuda_status != cudaSuccess) {
++    cudnnDestroyTensorDescriptor(x_desc);
++    cudnnDestroyTensorDescriptor(y_desc);
++    cudnnDestroyFilterDescriptor(filter_desc);
++    cudnnDestroy(cudnn_handle);
++    return cuda_status;
++  }
++
++  int total_weight = in_channels * out_channels * kernel_size;
++  dim3 block(256);
++  dim3 grid((total_weight + 255) / 256);
++  weight_transpose_kernel<<<grid, block, 0, stream>>>(weight, transposed_weight,
++                                                       in_channels, out_channels, kernel_size);
++  cuda_status = cudaGetLastError();
++  if (cuda_status != cudaSuccess) {
++    cudaFree(transposed_weight);
++    cudnnDestroyTensorDescriptor(x_desc);
++    cudnnDestroyTensorDescriptor(y_desc);
++    cudnnDestroyFilterDescriptor(filter_desc);
++    cudnnDestroy(cudnn_handle);
++    return cuda_status;
++  }
++
++  // Convolution descriptor for transposed convolution
++  cudnnConvolutionDescriptor_t conv_desc;
++  cudnnCreateConvolutionDescriptor(&conv_desc);
++  // For transposed convolution, we can use cudnnSetConvolution2dDescriptor with
++  // padding = kernel_size - 1 - padding (adjusted for transposed)
++  // Actually, cudnn backward data performs transposed convolution.
++  // The relationship between forward convolution and backward data (transposed) is:
++  // Forward conv with padding p, stride s, dilation d gives output size:
++  //   output = (input + 2*p - kernel)/s + 1
++  // Backward data (transposed conv) from output (gradient) to input (gradient) uses the same
++  // conv descriptor but with swapped input/output dimensions and padding = kernel_size - 1 - p.
++  // So we set conv descriptor with stride = stride, padding = kernel_size - 1 - padding, dilation = 1.
++  // Then we call cudnnConvolutionBackwardData using x as "dy" and output as "dx".
++  // Wait, let's clarify:
++  // cudnnConvolutionBackwardData computes dX given dY, W, and conv_desc, where conv_desc describes
++  // the forward convolution that generated Y from X. So if we want to compute transposed convolution
++  // with stride s, padding p, and kernel k, we can use cudnnConvolutionBackwardData with conv_desc
++  // having stride s, padding p, and kernel k, and swap the roles of input and output:
++  //   dY shape = [batch, in_channels, L_out] -> actually it's [batch, out_channels? no]
++  // But cudnnConvolutionBackwardData expects dY to have the shape of the forward output,
++  // and dX to have the shape of the forward input.
++  // In our transposed conv, the input is x with shape [batch, in_channels, length],
++  // and the output is y with shape [batch, out_channels, L_out].
++  // This maps to a forward conv where "input" = conv_transpose output (y) shape [batch, out_channels, L_out],
++  // "output" = conv_transpose input (x) shape [batch, in_channels, length],
++  // and the filter is the same weight (transposed).
++  // So we can set conv_desc to describe a convolution from y (shape [batch, out_channels, L_out]) to
++  // x (shape [batch, in_channels, length]) with stride s, padding p, kernel k. But note that the
++  // forward conv output size formula gives length = (L_out + 2*p - k)/s + 1. Check: L_out = (length-1)*s - 2p + k + output_padding. So length = (L_out + 2p - k - output_padding)/s + 1. This includes output_padding, which is a bit tricky.
++  // cuDNN's convolution does not have output_padding parameter; it is applied as extra zero padding on
++  // the output of transposed convolution. We can handle it by first computing with appropriate padding
++  // and then cropping/padding the output. But for our specific case, output_padding=1, s=2, p=1, k=3,
++  // length=2048 -> L_out = 4096, output_padding=1 means the formula gives length = (4096 + 2*1 - 3 -1)/2 +1 = 2048, which matches.
++  // Another approach: use cudnnConvolutionBackwardData with conv_desc that has padding = k - 1 - p,
++  // stride = s, and no output_padding. Then the output size from cudnn will be (L_out - 1)*s - 2*(k-1-p) + k = (L_out -1)*s - 2k +2 +2p +k = (L_out-1)*s - k +2 +2p.
++  // That may not match desired length.
++  // Better to use cudnnConvolutionTranspose or cudnnConvolutionBackwardData with explicit padding,
++  // then adjust for output_padding by adding zeros at the end.
++  // Since output_padding is typically small, we can handle by first computing without output_padding,
++  // then initialize output to zero and copy the computed result into the appropriate location.
++  // But easiest: use cudnnConvolutionTranspose? Not available until cuDNN 8?
++  // Let's try to use cudnnConvolutionBackwardData with correct settings.
++
++  // Actually, the PyTorch implementation for ConvTranspose1d likely uses cudnnConvolutionBackwardData
++  // with padding = kernel_size - 1 - padding and stride = stride, and then adds output_padding zeros
++  // at the end. We can replicate that.
++
++  // Set conv descriptor for backward data:
++  // We want to compute x (shape [batch, in_channels, length]) from y (shape [batch, out_channels, L_out])
++  // using filter w (out_channels, in_channels, 1, k). This is a forward convolution where input is y,
++  // output is x, so the conv descriptor should have stride = stride, padding such that length = (L_out + 2*padding - k)/stride + 1.
++  // We want length = (L_out + 2*p - k - output_padding)/stride + 1, so set padding = p - output_padding/2? not integer.
++  // But output_padding is typically added at the end. So we can set conv_desc padding = p, stride = s, and
++  // then after computing, the output length from cudnn will be floor((L_out + 2*p - k)/s) + 1.
++  // For our numbers: L_out=4096, p=1, k=3, s=2 -> (4096+2-3)/2+1 = 2048.5 -> floor = 2048, +1 = 2049? Wait: (4096+2-3)=4095, /2 = 2047.5, floor=2047, +1=2048. So output length = 2048, which matches length without output_padding? Actually desired length is 2048, so output_padding=1 yields length = (2048-1)*2 -2*1 +3 +1 = 4096? Wait compute: (2048-1)*2 -2 +3 +1 = 2047*2 -2+3+1 = 4094 -2 +4 = 4096. So L_out=4096. So if we use conv_desc with padding=1, stride=2, output size from backward data would be (4096 + 2*1 - 3)/2 + 1 = 4095/2+1 = 2047+1=2048, which is exactly length. But we need to include output_padding? Actually output_padding is used to increase the output size when stride>1 and the output size is ambiguous. Here, because (4096+2-3)=4095 is odd, floor gives 2047, +1=2048, which is the smaller possible output size. To get the larger one (with output_padding=1), we would need to add one extra zero at the end of the computed output before applying the transposed conv? Let's think: The transposed conv formula is L_out = (L_in -1)*stride - 2*padding + kernel_size + output_padding. For given L_out, there can be two possible L_in if stride>1. output_padding chooses the larger one. In our case, desired L_in=2048, but without output_padding the formula gives L_out' = (2048-1)*2 -2 +3 = 4096? Wait that gives exactly 4096. So output_padding=1 actually increases L_out by 1? Let's recalc: without output_padding: L_out = (2048-1)*2 -2*1 +3 = 4094 -2 +3 = 4095? No: 2047*2 = 4094, minus 2 = 4092, plus 3 = 4095. So L_out=4095. With output_padding=1 -> 4096. So desired L_out=4096, which is one larger. If we use cudnn with padding=1, stride=2, and compute backward data from y shape [batch, out_channels, L_out=4096], the output x would have size floor((4096+2-3)/2)+1 = floor(4095/2)+1 = 2047+1 = 2048. That gives length=2048, but the actual transposed conv output y would be (2048-1)*2 -2 +3 = 4095, not 4096. So we need output_padding to add one extra zero at the end of x before convolution. But cudnn convolution doesn't have that option directly. However, we can compute backward data with a modified input dY that includes one extra zero column at the end, or we can compute with padding adjusted. Alternatively, we can use cudnnConvolutionBackwardData with conv_desc padding = p - output_padding? Not straightforward.
++
++  // A safer approach: use cudnnConvolutionBackwardData but first compute using stride and padding, and then
++  // handle output_padding by initializing output to zeros and computing into a temporary y of size L_out - output_padding,
++  // then copy to output with offset. But that changes shape. Let's instead use cudnnConvolutionBackwardData with the
++  // conv descriptor set to have padding = padding, stride = stride, and then the output will be of size
++  // (L_out + 2*padding - kernel_size)/stride + 1. If output_padding is such that this size is less than desired,
++  // we need to pad the input y with zeros on the right before the operation, or set the descriptor's dilation? 
++  // PyTorch's own CUDA implementation for ConvTranspose likely uses cudnnConvolutionBackwardData and then
++  // handles output_padding by adjusting the convolution parameters: they set padding = kernel_size - 1 - padding,
++  // and then after computing, they crop the last output_padding elements. We can look at typical implementation:
++  // In PyTorch, ConvTranspose2d uses cudnnConvolutionBackwardData with conv_desc with padding = kernel_size - 1 - padding,
++  // stride = stride, dilation = dilation. Then the output from cudnn has size 
++  // (L_out - 1) * stride - 2 * (kernel_size - 1 - padding) + kernel_size = (L_out-1)*stride + 2*padding - kernel_size + 2.
++  // For our L_out=4096, stride=2, padding=1, kernel=3: (4095)*2 +2 -3 +2 = 8190 +1 = 8191? That's too large.
++  // Wait, check: (L_out -1)*stride - 2*(k-1 - p) + k = (L_out-1)*s - 2k +2 +2p +k = (L_out-1)*s - k +2 +2p.
++  // For L_out=4096: 4095*2 -3 +2 +2 = 8190 -3 +4 = 8191? That's huge, not 2048. So that formula is for transposed conv where output is larger, not backward data.
++  // Actually, PyTorch's conv_transpose uses cudnnConvolutionBackwardData with conv_desc parameters computed such that
++  // the input to backward data is the "gradient" (which is the output of transposed conv), and the output is the "gradient" w.r.t input (which is the input of transposed conv). The conv_desc describes the forward convolution that would have produced the transposed conv output. So they set conv_desc's stride = stride, padding = padding, dilation = dilation, and then call cudnnConvolutionBackwardData with dY = input to transposed conv (x) and dX = output of transposed conv (y)? No, let's be precise.
++
++  // In cudnn, the forward convolution: y = conv(x, w) with conv_desc.
++  // Backward data: dx = conv_backward_data(w, dy, conv_desc) where dy has shape of y, dx has shape of x.
++  // For transposed conv, we want to compute y_t = conv_transpose(x_t, w_t, params).
++  // This is equivalent to dx = conv_backward_data(w_t, dy, conv_desc) where dy = x_t (input to transposed conv),
++  // dx = y_t (output of transposed conv), and conv_desc describes a forward convolution from y_t to x_t:
++  //   x_t = conv(y_t, w_t, conv_desc)
++  // So conv_desc must have stride = stride, padding = padding, dilation = dilation, and the kernel size = kernel_size.
++  // Then cudnnConvolutionBackwardData(w_t, x_t, conv_desc, ...) computes y_t.
++  // So the roles: y_t (output of transposed) is dx, x_t (input to transposed) is dy.
++  // Thus we set the input tensor descriptor for dy as x_t (batch, in_channels, length) and output tensor descriptor for dx as y_t (batch, out_channels, L_out).
++  // The conv_desc should have stride = stride, padding = padding, dilation = 1, and kernel size k.
++  // Then cudnnConvolutionBackwardData will compute dx (y_t) using dy (x_t) and w (with layout [out_channels, in_channels, k]).
++  // This is the correct mapping.
++  // Now output_padding: PyTorch's transposed conv output size is L_out = (L_in -1)*stride - 2*padding + k + output_padding.
++  // The cudnn backward data computes the output size based on conv_desc: 
++  //   output_height = 1 + (input_height + 2*padding - kernel_height) / stride (floor division)
++  // Here input_height for backward data is L_out (since dy has shape L_out? Wait, dy is x_t, so input height = length (L_in). Then dx (output) height = 1 + (L_in + 2*padding - kernel) / stride, using floor.
++  // For our numbers: length=2048, padding=1, kernel=3, stride=2, output height = 1 + (2048 + 2 -3)/2 = 1 + (2047)/2 = 1 + 1023 = 1024? That's not 4096. Something is off.
++  // Let's re-evaluate: if we set dy = x_t (shape [batch, in_channels, length=2048]), and conv_desc with stride=2, padding=1, then dx (y_t) size = 1 + (2048 + 2*1 -3)/2 = 1 + 2047/2 = 1+1023=1024. That is half of 2048, not L_out=4096. So this mapping is wrong. The transposed conv multiplies size, not divides. So backward data is not the right operation if we set input as the smaller size.
++
++  // Actually, cudnnConvolutionBackwardData computes the gradient with respect to the input of a forward convolution,
++  // given the gradient of the output. The forward convolution reduces size (if stride>1). The backward data therefore
++  // expands size. So for transposed conv (which expands size), the "input" to the transposed conv (x_t) should correspond
++  // to the "gradient of output" (dy) of the forward conv, and the "output" of transposed conv (y_t) should correspond to
++  // the "gradient of input" (dx). The forward conv would take y_t as input and produce x_t as output, with stride s, padding p.
++  // So y_t (large) -> x_t (small). Then backward data takes x_t (small) and produces y_t (large).
++  // Therefore, in cudnnConvolutionBackwardData, dy should have the shape of the forward conv output, which is x_t (small),
++  // and dx should have the shape of the forward conv input, which is y_t (large).
++  // So we set dy_desc = x_t shape (batch, in_channels, length), dx_desc = y_t shape (batch, out_channels, L_out).
++  // And conv_desc should have stride = stride (2), padding = padding (1), kernel = k (3).
++  // Then the output dx size = (dy_size - 1)*stride - 2*padding + kernel + maybe dilation? The formula for backward data:
++  //   dx_height = 1 + (dy_height - 1) * stride - 2 * padding + kernel_height (if using transpose convolution formula?)
++  // Check cudnn docs: for backward data, the output (dx) dimensions are computed as:
++  //   output_dim = 1 + (input_dim - 1) * stride + kernel_dim - 1 - 2 * padding (assuming dilation=1)
++  // Actually from cudnn documentation: the backward data operation is equivalent to a transposed convolution with the
++  // same parameters. So the output spatial size = (input_size - 1) * stride - 2 * padding + kernel_size.
++  // For our dy (length=2048), stride=2, padding=1, kernel=3 => dx size = (2048-1)*2 - 2 + 3 = 4094 -2 +3 = 4095.
++  // That is L_out without output_padding (4095). To get 4096, we need output_padding=1, which adds one extra zero at the end
++  // of dx. So we can compute with dy size = length, then allocate dx with size L_out (4096) and set the last column(s) to zero
++  // after calling cudnn with dx size 4095, but cudnn requires descriptor to match actual memory shape, so we cannot pass 4096
++  // when cudnn expects 4095. Alternatively, we can set the conv descriptor's pad to padding - output_padding? Not possible.
++  // Solution: we can pad dy (x_t) with an extra zero at the end (increase its length by 1) before calling backward data.
++  // Then the output size becomes (2049-1)*2 -2 +3 = 4097? That's too large.
++  // The correct way is to set the conv descriptor's padding = padding, and then after the call, ignore the last output_padding
++  // columns? But the output tensor must be exactly L_out. If cudnn computes 4095, we can allocate 4096 and copy the 4095
++  // result into the first 4095 positions, leaving the last position zero (or bias only). That's exactly what output_padding does:
++  // it adds extra zero columns at the end after the convolution. So we can proceed as follows:
++  // 1. Compute cudnn backward data into a temporary buffer of size 4095.
++  // 2. Copy that temporary buffer into output[0..4094], and set output[4095] = 0 (then add bias).
++  // 3. If output_padding > 0, the last output_padding elements are zero.
++  // This is straightforward and avoids complex tricks.
++
++  // So algorithm:
++  // - If output_padding > 0, compute without output_padding by setting L_out_no_pad = L_out - output_padding.
++  //   Use cudnn with dx_desc of size L_out_no_pad.
++  // - After cudnn, copy the result to the actual output tensor of size L_out, zeroing the last output_padding positions.
++  // - Add bias if provided.
++
++  // For our case, output_padding=1, so L_out_no_pad = 4095.
++  // We'll implement this.
++
++  // Let's compute L_out_no_pad:
++  int L_out_no_pad = L_out - output_padding;
++
++  // We need a temporary output buffer if output_padding > 0, or we can directly use output if output_padding==0.
++  float* temp_output = nullptr;
++  if (output_padding > 0) {
++    cudaMalloc(&temp_output, batch * out_channels * L_out_no_pad * sizeof(float));
++  } else {
++    temp_output = output;  // use directly
++  }
++
++  // Set y_desc to the no-pad size
++  cudnnSetTensor4dDescriptor(y_desc,
++                             CUDNN_TENSOR_NCHW,
++                             CUDNN_DATA_FLOAT,
++                             batch, out_channels, 1, L_out_no_pad);
++
++  // Create convolution descriptor for the transposed conv operation.
++  // For backward data, the conv descriptor should use the same stride/padding as the forward transposed conv,
++  // but with the roles of input and output reversed. However, we set the descriptor as if we are doing a forward
++  // convolution from y_t (large, not used) to x_t (small), but actually cudnn uses it for backward data.
++  // The convention: cudnnConvolutionBackwardData uses the same conv_desc as the forward convolution.
++  // So we set conv_desc with stride=stride, padding=padding, dilation=1, kernel=k.
++  // This will produce the desired L_out_no_pad = (L_in-1)*stride - 2*padding + kernel.
++
++  cudnnConvolutionDescriptor_t conv_desc;
++  cudnnCreateConvolutionDescriptor(&conv_desc);
++  cudnnSetConvolution2dDescriptor(conv_desc,
++                                  padding, padding, // vertical, horizontal pad
++                                  stride, stride,
++                                  1, 1, // dilation
++                                  CUDNN_CROSS_CORRELATION, // PyTorch uses cross-correlation
++                                  CUDNN_DATA_FLOAT);
++
++  // Determine algorithm
++  cudnnConvolutionBwdDataAlgo_t algo;
++  cudnnGetConvolutionBackwardDataAlgorithm(cudnn_handle,
++                                           filter_desc,
++                                           y_desc, // dy desc? Wait, order: need w, dy, conv, dx
++                                           conv_desc,
++                                           x_desc, // dx desc
++                                           CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST,
++                                           0,
++                                           &algo);
++  // Actually, signature: cudnnGetConvolutionBackwardDataAlgorithm(handle, wDesc, dyDesc, convDesc, dxDesc, preference, memoryLimitInbytes, algo)
++  // Here dyDesc is the input gradient (which is x_t shape: batch, in_channels, length).
++  // dxDesc is the output gradient (which is y_t shape: batch, out_channels, L_out_no_pad).
++  // So we use x_desc as dyDesc and y_desc as dxDesc.
++
++  cudnnGetConvolutionBackwardDataAlgorithm(cudnn_handle,
++                                           filter_desc,
++                                           x_desc, // dyDesc = x_t (small)
++                                           conv_desc,
++                                           y_desc, // dxDesc = y_t (large)
++                                           CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST,
++                                           0,
++                                           &algo);
++
++  // Workspace
++  size_t workspace_size = 0;
++  cudnnGetConvolutionBackwardDataWorkspaceSize(cudnn_handle,
++                                               filter_desc,
++                                               x_desc,
++                                               conv_desc,
++                                               y_desc,
++                                               algo,
++                                               &workspace_size);
++  void* workspace = nullptr;
++  if (workspace_size > 0) {
++    cudaMalloc(&workspace, workspace_size);
++  }
++
++  // Perform backward data: dx = conv_backward_data(w, dy)
++  float alpha = 1.0f, beta = 0.0f;
++  status = cudnnConvolutionBackwardData(cudnn_handle,
++                                        &alpha,
++                                        filter_desc,
++                                        transposed_weight,
++                                        x_desc, // dy
++                                        x,
++                                        conv_desc,
++                                        algo,
++                                        workspace,
++                                        workspace_size,
++                                        &beta,
++                                        y_desc, // dx
++                                        temp_output);
++
++  if (status != CUDNN_STATUS_SUCCESS) {
++    // cleanup
++    if (workspace) cudaFree(workspace);
++    if (output_padding > 0) cudaFree(temp_output);
++    cudaFree(transposed_weight);
++    cudnnDestroyTensorDescriptor(x_desc);
++    cudnnDestroyTensorDescriptor(y_desc);
++    cudnnDestroyFilterDescriptor(filter_desc);
++    cudnnDestroyConvolutionDescriptor(conv_desc);
++    cudnnDestroy(cudnn_handle);
++    return cudaErrorUnknown;
++  }
++
++  // If output_padding > 0, copy temp_output to output and zero last columns
++  if (output_padding > 0) {
++    // Copy the no-pad output into the first L_out_no_pad elements per batch/channel
++    // We can copy the entire contiguous temp_output (size batch*out_channels*L_out_no_pad) to output,
++    // then set the last output_padding elements per row to zero.
++    // Since output is contiguous with shape [batch, out_channels, L_out],
++    // each row (per batch and channel) has L_out elements, and we already have L_out_no_pad valid.
++    // We'll use a custom kernel to copy and zero.
++    dim3 block2(256);
++    dim3 grid2((batch * out_channels + 255) / 256);
++    // We'll define a kernel for this later.
++    extern __global__ void copy_and_zero_pad_kernel(const float* src, float* dst,
++                                                     int total_rows, int L_out_no_pad, int L_out);
++    // Actually define kernel above. We'll include it later.
++    copy_and_zero_pad_kernel<<<grid2, block2, 0, stream>>>(temp_output, output, batch * out_channels, L_out_no_pad, L_out);
++    cudaFree(temp_output);
++  }
++
++  // Add bias if provided
++  if (bias != nullptr) {
++    // Bias is shape [out_channels]. Add to each output element: output[b][c][l] += bias[c].
++    // We can use a simple kernel.
++    dim3 block3(256);
++    dim3 grid3((batch * out_channels * L_out + 255) / 256);
++    extern __global__ void add_bias_kernel(float* data, const float* bias,
++                                            int batch, int out_channels, int L_out);
++    add_bias_kernel<<<grid3, block3, 0, stream>>>(output, bias, batch, out_channels, L_out);
++  }
++
++  // Cleanup
++  if (workspace) cudaFree(workspace);
++  cudaFree(transposed_weight);
++  cudnnDestroyTensorDescriptor(x_desc);
++  cudnnDestroyTensorDescriptor(y_desc);
++  cudnnDestroyFilterDescriptor(filter_desc);
++  cudnnDestroyConvolutionDescriptor(conv_desc);
++  cudnnDestroy(cudnn_handle);
++
++  return cudaGetLastError();
++}
++
++// Define the copy_and_zero_pad_kernel
++__global__ void copy_and_zero_pad_kernel(const float* __restrict__ src,
++                                         float* __restrict__ dst,
++                                         int total_rows,
++                                         int L_out_no_pad,
++                                         int L_out) {
++  int row = blockIdx.x * blockDim.x + threadIdx.x;
++  if (row < total_rows) {
++    const float* src_row = src + (long long)row * L_out_no_pad;
++    float* dst_row = dst + (long long)row * L_out;
++    for (int i = 0; i < L_out_no_pad; ++i) {
++      dst_row[i] = src_row[i];
++    }
++    for (int i = L_out_no_pad; i < L_out; ++i) {
++      dst_row[i] = 0.0f;
++    }
++  }
++}
++
++// Define add_bias_kernel
++__global__ void add_bias_kernel(float* data,
++                                const float* bias,
++                                int batch,
++                                int out_channels,
++                                int L_out) {
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int total = batch * out_channels * L_out;
++  if (idx < total) {
++    int c = (idx / L_out) % out_channels;
++    data[idx] += bias[c];
++  }
++}
++
++// Note: The weight_transpose_kernel is defined earlier in the file, so it's fine.
++// Also need to ensure all kernels are defined before use in launchers.
++
++// Extern "C" interface for bindings (stable declarations)
++extern "C" {
++    cudaError_t flatten_launcher(const float* input, float* output, long long total_elements, cudaStream_t stream);
++    cudaError_t conv_transpose1d_forward_launcher(const float* x,
++                                                  const float* weight,
++                                                  const float* bias,
++                                                  float* output,
++                                                  int batch,
++                                                  int in_channels,
++                                                  int out_channels,
++                                                  int length,
++                                                  int L_out,
++                                                  int kernel_size,
++                                                  int stride,
++                                                  int padding,
++                                                  int output_padding,
++                                                  cudaStream_t stream);
++}
++
++// The definitions above already provide these functions, but we need to ensure they are not duplicated.
++// In the final file, we will have one definition of each.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,148 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" {
++    cudaError_t flatten_launcher(
++        const float* input,
++        float* output,
++        long long total_elements,
++        cudaStream_t stream);
++
++    cudaError_t conv_transpose1d_forward_launcher(
++        const float* x,
++        const float* weight,
++        const float* bias,
++        float* output,
++        int batch,
++        int in_channels,
++        int out_channels,
++        int length,
++        int L_out,
++        int kernel_size,
++        int stride,
++        int padding,
++        int output_padding,
++        cudaStream_t stream);
++}
++
++// PyTorch wrapper for ConvTranspose1d
++at::Tensor conv_transpose1d_forward(
++    at::Tensor x,
++    at::Tensor weight,
++    std::optional<at::Tensor> bias,
++    int64_t stride,
++    int64_t padding,
++    int64_t output_padding) {
++
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == at::kFloat, "x must be float32");
++    TORCH_CHECK(weight.dtype() == at::kFloat, "weight must be float32");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(x.dim() == 3, "x must be 3D [batch, in_channels, length]");
++    TORCH_CHECK(weight.dim() == 3, "weight must be 3D [in_channels, out_channels, kernel_size]");
++
++    int batch = x.size(0);
++    int in_channels = x.size(1);
++    int length = x.size(2);
++    int out_channels = weight.size(1);
++    int kernel_size = weight.size(2);
++
++    TORCH_CHECK(weight.size(0) == in_channels, "weight in_channels mismatch");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++    TORCH_CHECK(output_padding >= 0, "output_padding must be non-negative");
++    TORCH_CHECK(output_padding < stride, "output_padding must be less than stride");
++
++    // Bias check
++    at::Tensor bias_tensor;
++    bool has_bias = bias.has_value();
++    if (has_bias) {
++        bias_tensor = bias.value();
++        TORCH_CHECK(bias_tensor.is_cuda(), "bias must be a CUDA tensor");
++        TORCH_CHECK(bias_tensor.dtype() == at::kFloat, "bias must be float32");
++        TORCH_CHECK(bias_tensor.is_contiguous(), "bias must be contiguous");
++        TORCH_CHECK(bias_tensor.dim() == 1, "bias must be 1D [out_channels]");
++        TORCH_CHECK(bias_tensor.size(0) == out_channels, "bias size must match out_channels");
++    }
++
++    // Compute output length
++    int L_out = (length - 1) * stride - 2 * padding + kernel_size + output_padding;
++    TORCH_CHECK(L_out > 0, "L_out must be positive");
++
++    // Allocate output
++    auto output = at::empty({batch, out_channels, L_out}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    const float* bias_ptr = has_bias ? bias_tensor.data_ptr<float>() : nullptr;
++    cudaError_t err = conv_transpose1d_forward_launcher(
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias_ptr,
++        output.data_ptr<float>(),
++        batch,
++        in_channels,
++        out_channels,
++        length,
++        L_out,
++        kernel_size,
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        static_cast<int>(output_padding),
++        stream
++    );
++
++    TORCH_CHECK(err == cudaSuccess, "conv_transpose1d_forward_launcher failed with error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// PyTorch wrapper for flatten
++at::Tensor flatten(at::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == at::kFloat, "x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(x.dim() >= 1, "x must have at least one dimension");
++
++    long long total_elements = x.numel();
++    auto output = at::empty({x.size(0), total_elements / x.size(0)}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    cudaError_t err = flatten_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total_elements,
++        stream
++    );
++
++    TORCH_CHECK(err == cudaSuccess, "flatten_launcher failed with error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("conv_transpose1d_forward", &conv_transpose1d_forward,
++          "ConvTranspose1d forward using cuDNN",
++          pybind11::arg("x"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"),
++          pybind11::arg("stride"),
++          pybind11::arg("padding"),
++          pybind11::arg("output_padding"));
++    m.def("flatten", &flatten,
++          "Flatten tensor to 2D (batch, -1)",
++          pybind11::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,36 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding):
++        super().__init__()
++        self.conv_transpose1d = nn.ConvTranspose1d(
++            in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding
++        )
++
++    def forward(self, x):
++        x = cuda_extension.conv_transpose1d_forward(
++            x,
++            self.conv_transpose1d.weight,
++            self.conv_transpose1d.bias,
++            self.conv_transpose1d.stride[0],
++            self.conv_transpose1d.padding[0],
++            self.conv_transpose1d.output_padding[0],
++        )
++        x = cuda_extension.flatten(x)
++        return x
++
++    def debug_forward(self, x):
++        conv_out = cuda_extension.conv_transpose1d_forward(
++            x,
++            self.conv_transpose1d.weight,
++            self.conv_transpose1d.bias,
++            self.conv_transpose1d.stride[0],
++            self.conv_transpose1d.padding[0],
++            self.conv_transpose1d.output_padding[0],
++        )
++        flat_out = cuda_extension.flatten(conv_out)
++        yield 'step_001', conv_out
++        yield 'step_002', flat_out
++        yield 'step_003', flat_out

@@ -1,0 +1,300 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,120 @@
++// CUDA kernels for reflection_pad2d and elementwise max/min
++// All launchers use raw pointers, scalar and cudaStream_t only.
++// Binding wrappers are implemented separately in *_binding.cpp.
++
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Reflection index helper: reflect x according to ReflectionPad rules
++__device__ __forceinline__ int reflect_index(int x, int size) {
++    if (x < 0) {
++        return -x - 2;
++    } else if (x >= size) {
++        return 2 * size - x - 2;
++    } else {
++        return x;
++    }
++}
++
++// Kernel for ReflectionPad2d. Input is a 4D tensor with arbitrary strides.
++// Output is contiguous with shape [N, C, H_out, W_out].
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t H_out, int64_t W_out,
++    int pad,
++    int64_t stride_n, int64_t stride_c, int64_t stride_h, int64_t stride_w) {
++
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t total = N * C * H_out * W_out;
++    if (idx >= total) return;
++
++    int64_t w_out = idx % W_out;
++    int64_t h_out = (idx / W_out) % H_out;
++    int64_t c = (idx / (W_out * H_out)) % C;
++    int64_t n = idx / (W_out * H_out * C);
++
++    int h_in = reflect_index(h_out - pad, H);
++    int w_in = reflect_index(w_out - pad, W);
++
++    int64_t input_idx = n * stride_n + c * stride_c + h_in * stride_h + w_in * stride_w;
++    output[idx] = input[input_idx];
++}
++
++// Generic elementwise max kernel for float32 tensors, assumes same shape and contiguous layout.
++__global__ void elementwise_max_kernel(
++    const float* __restrict__ a,
++    const float* __restrict__ b,
++    float* __restrict__ out,
++    int64_t numel) {
++
++    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (; i < numel; i += stride) {
++        out[i] = fmaxf(a[i], b[i]);
++    }
++}
++
++// Generic elementwise min kernel for float32 tensors, assumes same shape and contiguous layout.
++__global__ void elementwise_min_kernel(
++    const float* __restrict__ a,
++    const float* __restrict__ b,
++    float* __restrict__ out,
++    int64_t numel) {
++
++    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (; i < numel; i += stride) {
++        out[i] = fminf(a[i], b[i]);
++    }
++}
++
++// Launcher for ReflectionPad2d (4D input, symmetric pad)
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t stride_n, int64_t stride_c, int64_t stride_h, int64_t stride_w,
++    int pad,
++    cudaStream_t stream) {
++
++    int64_t H_out = H + 2 * pad;
++    int64_t W_out = W + 2 * pad;
++    int64_t total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid cap; kernel uses single element per thread, so need enough threads; but grid-stride? Here one element per thread, grid cap may prevent full coverage if total > blocks*threads. Since total ~103M < 65535*256=16.7M, need grid-stride loop or multiple iterations.
++    // Use grid-stride loop for safety and grid cap.
++    int max_blocks = 65535;
++    blocks = (int)min((int64_t)max_blocks, (total + threads - 1) / threads);
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, H_out, W_out, pad,
++        stride_n, stride_c, stride_h, stride_w);
++}
++
++// Launcher for elementwise max (same shape, contiguous)
++extern "C" void elementwise_max_launcher(
++    const float* a,
++    const float* b,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream) {
++
++    int threads = 256;
++    int blocks = (int)min((int64_t)65535, (numel + threads - 1) / threads);
++    elementwise_max_kernel<<<blocks, threads, 0, stream>>>(a, b, out, numel);
++}
++
++// Launcher for elementwise min (same shape, contiguous)
++extern "C" void elementwise_min_launcher(
++    const float* a,
++    const float* b,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream) {
++
++    int threads = 256;
++    int blocks = (int)min((int64_t)65535, (numel + threads - 1) / threads);
++    elementwise_min_kernel<<<blocks, threads, 0, stream>>>(a, b, out, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,142 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void reflection_pad2d_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t stride_n, int64_t stride_c, int64_t stride_h, int64_t stride_w,
++    int pad,
++    cudaStream_t stream);
++
++extern "C" void elementwise_max_launcher(
++    const float* a,
++    const float* b,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void elementwise_min_launcher(
++    const float* a,
++    const float* b,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream);
++
++// Helper to check CUDA errors after kernel launch
++static void check_cuda_error(const char* op_name) {
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, op_name, " CUDA error: ", cudaGetErrorString(err));
++}
++
++// ReflectionPad2d binding
++at::Tensor reflection_pad2d_forward(at::Tensor input, int64_t pad) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "input must be a 4D tensor");
++    TORCH_CHECK(input.scalar_type() == at::kFloat, "input must be float32");
++    TORCH_CHECK(pad >= 0, "pad must be non-negative");
++
++    auto N = input.size(0);
++    auto C = input.size(1);
++    auto H = input.size(2);
++    auto W = input.size(3);
++    auto H_out = H + 2 * pad;
++    auto W_out = W + 2 * pad;
++
++    // 获取各维度 stride（对于非连续输入同样适用）
++    auto strides = input.strides();
++    int64_t stride_n = strides[0];
++    int64_t stride_c = strides[1];
++    int64_t stride_h = strides[2];
++    int64_t stride_w = strides[3];
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // 分配输出张量，连续，形状 [N, C, H_out, W_out]
++    auto output = at::empty({N, C, H_out, W_out}, input.options());
++
++    reflection_pad2d_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        stride_n, stride_c, stride_h, stride_w,
++        static_cast<int>(pad),
++        stream
++    );
++    check_cuda_error("reflection_pad2d_forward");
++
++    return output;
++}
++
++// Element-wise max binding
++at::Tensor elementwise_max_forward(at::Tensor a, at::Tensor b) {
++    TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
++    TORCH_CHECK(b.is_cuda(), "b must be a CUDA tensor");
++    TORCH_CHECK(a.scalar_type() == at::kFloat, "a must be float32");
++    TORCH_CHECK(b.scalar_type() == at::kFloat, "b must be float32");
++    TORCH_CHECK(a.is_contiguous(), "a must be contiguous");
++    TORCH_CHECK(b.is_contiguous(), "b must be contiguous");
++    TORCH_CHECK(a.sizes() == b.sizes(), "a and b must have the same shape");
++
++    auto output = at::empty_like(a);
++    int64_t numel = a.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    elementwise_max_launcher(
++        a.data_ptr<float>(),
++        b.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        stream
++    );
++    check_cuda_error("elementwise_max_forward");
++
++    return output;
++}
++
++// Element-wise min binding
++at::Tensor elementwise_min_forward(at::Tensor a, at::Tensor b) {
++    TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
++    TORCH_CHECK(b.is_cuda(), "b must be a CUDA tensor");
++    TORCH_CHECK(a.scalar_type() == at::kFloat, "a must be float32");
++    TORCH_CHECK(b.scalar_type() == at::kFloat, "b must be float32");
++    TORCH_CHECK(a.is_contiguous(), "a must be contiguous");
++    TORCH_CHECK(b.is_contiguous(), "b must be contiguous");
++    TORCH_CHECK(a.sizes() == b.sizes(), "a and b must have the same shape");
++
++    auto output = at::empty_like(a);
++    int64_t numel = a.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    elementwise_min_launcher(
++        a.data_ptr<float>(),
++        b.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        stream
++    );
++    check_cuda_error("elementwise_min_forward");
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "ReflectionPad2d forward (CUDA)",
++          pybind11::arg("input"), pybind11::arg("pad"));
++    m.def("elementwise_max_forward", &elementwise_max_forward,
++          "Element-wise max forward (CUDA)",
++          pybind11::arg("a"), pybind11::arg("b"));
++    m.def("elementwise_min_forward", &elementwise_min_forward,
++          "Element-wise min forward (CUDA)",
++          pybind11::arg("a"), pybind11::arg("b"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,29 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, pad_size, input_channels, input_height, input_width):
++        super().__init__()
++        self.pad = nn.ReflectionPad2d(pad_size)
++        self.pad_size = pad_size
++        self.input_height = input_height
++        self.input_width = input_width
++
++    def forward(self, x, y):
++        x_padded = torch.ops.cuda_extension.reflection_pad2d_forward(x, self.pad_size)
++        y_padded = torch.ops.cuda_extension.reflection_pad2d_forward(y, self.pad_size)
++        max_val = torch.ops.cuda_extension.elementwise_max_forward(x_padded, y_padded)
++        min_val = torch.ops.cuda_extension.elementwise_min_forward(max_val, x_padded)
++        return min_val
++
++    def debug_forward(self, x, y):
++        x_padded = torch.ops.cuda_extension.reflection_pad2d_forward(x, self.pad_size)
++        yield 'step_001', x_padded
++        y_padded = torch.ops.cuda_extension.reflection_pad2d_forward(y, self.pad_size)
++        yield 'step_002', y_padded
++        max_val = torch.ops.cuda_extension.elementwise_max_forward(x_padded, y_padded)
++        yield 'step_003', max_val
++        min_val = torch.ops.cuda_extension.elementwise_min_forward(max_val, x_padded)
++        yield 'step_004', min_val
++        yield 'step_005', min_val

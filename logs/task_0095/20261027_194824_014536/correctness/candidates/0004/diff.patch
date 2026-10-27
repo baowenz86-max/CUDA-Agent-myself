@@ -1,0 +1,528 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -3,8 +3,7 @@
+ // Non-convolution CUDA kernels for the model:
+ //   linspace_1d: generate 1D evenly spaced float32 values
+ //   elementwise_sub: x - y broadcasting over last dimension
+-// Conv/ConvTranspose are handled in a separate C++ binding using cuDNN,
+-// not in this .cu file (per contract).
++//   conv_transpose1d: 1D transposed convolution implemented with custom CUDA kernel
+ 
+ // Kernel: linspace_1d
+ // Generates steps elements from start to end inclusive.
+@@ -46,6 +45,56 @@
+         int x_idx = b * x_batch_stride + c * x_channel_stride + l;
+         int y_idx = l * y_stride;  // if y is contiguous, y_stride = 1
+         out[i] = x[x_idx] - y[y_idx];
++    }
++}
++
++// Kernel: conv_transpose1d
++// Performs 1D transposed convolution on float32 data.
++// Input x: [batch_size, in_channels, input_length]
++// Weight: [in_channels, out_channels, kernel_size]
++// Bias: [out_channels] (optional, may be null)
++// Output: [batch_size, out_channels, output_length]
++// Implementation: each output position (b, oc, l_out) computes sum over ic and k.
++// For ConvTranspose1d: output[b, oc, l_out] = bias[oc] + sum_{ic, k} input[b, ic, l_in] * weight[ic, oc, k]
++// where l_out = l_in * stride - padding + k, and l_in ranges over valid indices.
++// This kernel assumes input is contiguous (stride [in_channels*input_length, input_length, 1]),
++// weight contiguous, output contiguous.
++__global__ void conv_transpose1d_kernel(
++    const float* __restrict__ x,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ out,
++    int batch_size,
++    int in_channels,
++    int out_channels,
++    int input_length,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_length) {
++    int total = batch_size * out_channels * output_length;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride_total = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride_total) {
++        int l_out = i % output_length;
++        int oc = (i / output_length) % out_channels;
++        int b = i / (output_length * out_channels);
++
++        float sum = bias ? bias[oc] : 0.0f;
++        for (int ic = 0; ic < in_channels; ++ic) {
++            const float* x_batch_channel = x + (b * in_channels + ic) * input_length;
++            const float* w_channel = weight + (ic * out_channels + oc) * kernel_size;
++            for (int k = 0; k < kernel_size; ++k) {
++                // Compute l_in such that l_out = l_in * stride - padding + k
++                int l_in_times_stride = l_out + padding - k;
++                if (l_in_times_stride % stride != 0) continue;
++                int l_in = l_in_times_stride / stride;
++                if (l_in >= 0 && l_in < input_length) {
++                    sum += x_batch_channel[l_in] * w_channel[k];
++                }
++            }
++        }
++        out[i] = sum;
+     }
+ }
+ 
+@@ -99,3 +148,42 @@
+         x_batch_stride, x_channel_stride, y_stride);
+     return cudaGetLastError();
+ }
++
++// Host launcher for conv_transpose1d
++//   x: input data pointer, shape [batch_size, in_channels, input_length]
++//   weight: weight data pointer, shape [in_channels, out_channels, kernel_size]
++//   bias: bias data pointer, shape [out_channels] (may be null)
++//   out: output data pointer, shape [batch_size, out_channels, output_length]
++//   batch_size, in_channels, out_channels, input_length, kernel_size,
++//   stride, padding, output_padding: dimensions and parameters
++//   output_length: computed output length
++//   stream: CUDA stream
++// Returns cudaError_t.
++extern "C" cudaError_t conv_transpose1d_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    float* out,
++    int batch_size,
++    int in_channels,
++    int out_channels,
++    int input_length,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_length,
++    cudaStream_t stream) {
++    if (batch_size <= 0 || in_channels <= 0 || out_channels <= 0 ||
++        input_length <= 0 || kernel_size <= 0 || output_length <= 0) {
++        return cudaSuccess;
++    }
++    int total = batch_size * out_channels * output_length;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535; // grid-stride loop handles rest
++    conv_transpose1d_kernel<<<blocks, threads, 0, stream>>>(
++        x, weight, bias, out,
++        batch_size, in_channels, out_channels, input_length, kernel_size,
++        stride, padding, output_length);
++    return cudaGetLastError();
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -3,7 +3,6 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+@@ -16,35 +15,24 @@
+     int x_batch_stride, int x_channel_stride, int y_stride,
+     cudaStream_t stream);
+ 
+-// Helper to get cuDNN error string
+-static const char* cudnnGetErrorString(cudnnStatus_t status) {
+-    switch (status) {
+-        case CUDNN_STATUS_SUCCESS: return "CUDNN_STATUS_SUCCESS";
+-        case CUDNN_STATUS_NOT_INITIALIZED: return "CUDNN_STATUS_NOT_INITIALIZED";
+-        case CUDNN_STATUS_ALLOC_FAILED: return "CUDNN_STATUS_ALLOC_FAILED";
+-        case CUDNN_STATUS_BAD_PARAM: return "CUDNN_STATUS_BAD_PARAM";
+-        case CUDNN_STATUS_INTERNAL_ERROR: return "CUDNN_STATUS_INTERNAL_ERROR";
+-        case CUDNN_STATUS_INVALID_VALUE: return "CUDNN_STATUS_INVALID_VALUE";
+-        case CUDNN_STATUS_ARCH_MISMATCH: return "CUDNN_STATUS_ARCH_MISMATCH";
+-        case CUDNN_STATUS_MAPPING_ERROR: return "CUDNN_STATUS_MAPPING_ERROR";
+-        case CUDNN_STATUS_EXECUTION_FAILED: return "CUDNN_STATUS_EXECUTION_FAILED";
+-        case CUDNN_STATUS_NOT_SUPPORTED: return "CUDNN_STATUS_NOT_SUPPORTED";
+-        case CUDNN_STATUS_LICENSE_ERROR: return "CUDNN_STATUS_LICENSE_ERROR";
+-        case CUDNN_STATUS_RUNTIME_PREREQUISITE_MISSING: return "CUDNN_STATUS_RUNTIME_PREREQUISITE_MISSING";
+-        case CUDNN_STATUS_RUNTIME_IN_PROGRESS: return "CUDNN_STATUS_RUNTIME_IN_PROGRESS";
+-        case CUDNN_STATUS_RUNTIME_FP_OVERFLOW: return "CUDNN_STATUS_RUNTIME_FP_OVERFLOW";
+-        default: return "Unknown cudnn status";
+-    }
+-}
++extern "C" cudaError_t conv_transpose1d_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    float* out,
++    int batch_size,
++    int in_channels,
++    int out_channels,
++    int input_length,
++    int kernel_size,
++    int stride,
++    int padding,
++    int output_length,
++    cudaStream_t stream);
+ 
+ // Helper to check CUDA errors
+ static void checkCudaError(cudaError_t err, const char* msg) {
+     TORCH_CHECK(err == cudaSuccess, msg, ": ", cudaGetErrorString(err));
+-}
+-
+-// Helper to check cuDNN errors
+-static void checkCudnnError(cudnnStatus_t status, const char* msg) {
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, msg, ": ", cudnnGetErrorString(status));
+ }
+ 
+ // Helper to get current CUDA stream
+@@ -57,7 +45,7 @@
+     TORCH_CHECK(steps >= 0, "steps must be non-negative, got ", steps);
+     TORCH_CHECK(device_index >= 0, "device_index must be non-negative, got ", device_index);
+ 
+-    // Create tensor on specified device using empty_like? No, we need a new tensor. Use torch::empty with explicit options.
++    // Create tensor on specified device using empty
+     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::Device(torch::kCUDA, device_index));
+     auto output = torch::empty({steps}, options);
+ 
+@@ -118,7 +106,7 @@
+     return output;
+ }
+ 
+-// conv_transpose1d binding using cuDNN
++// conv_transpose1d binding using custom CUDA kernel
+ torch::Tensor conv_transpose1d_forward(
+     torch::Tensor x,
+     torch::Tensor weight,
+@@ -171,314 +159,23 @@
+     // Get current stream
+     cudaStream_t stream = getCurrentCudaStream();
+ 
+-    // Create cuDNN handle for this stream
+-    cudnnHandle_t cudnn_handle;
+-    cudnnStatus_t status = cudnnCreate(&cudnn_handle);
+-    checkCudnnError(status, "cudnnCreate failed");
+-    status = cudnnSetStream(cudnn_handle, stream);
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnSetStream failed");
+-    }
+-
+-    // Set up tensor descriptors
+-    cudnnTensorDescriptor_t x_desc, y_desc, b_desc;
+-    status = cudnnCreateTensorDescriptor(&x_desc);
+-    if (status == CUDNN_STATUS_SUCCESS) {
+-        status = cudnnCreateTensorDescriptor(&y_desc);
+-    }
+-    if (status == CUDNN_STATUS_SUCCESS) {
+-        status = cudnnCreateTensorDescriptor(&b_desc);
+-    }
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        // clean up partially created descriptors
+-        if (x_desc) cudnnDestroyTensorDescriptor(x_desc);
+-        if (y_desc) cudnnDestroyTensorDescriptor(y_desc);
+-        if (b_desc) cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnCreateTensorDescriptor failed");
+-    }
+-
+-    // Set x descriptor: [batch_size, in_channels, input_length] NCHW format for 1D
+-    status = cudnnSetTensor4dDescriptor(
+-        x_desc,
+-        CUDNN_TENSOR_NCHW,
+-        CUDNN_DATA_FLOAT,
+-        batch_size,
+-        in_channels,
+-        input_length,
+-        1  // height dimension (unused)
+-    );
+-
+-    if (status == CUDNN_STATUS_SUCCESS) {
+-        status = cudnnSetTensor4dDescriptor(
+-            y_desc,
+-            CUDNN_TENSOR_NCHW,
+-            CUDNN_DATA_FLOAT,
+-            batch_size,
+-            out_channels,
+-            output_length,
+-            1
+-        );
+-    }
+-
+-    if (status == CUDNN_STATUS_SUCCESS && bias.defined()) {
+-        // Bias descriptor for 1D: can use 4D with dimensions [1, out_channels, 1, 1]
+-        status = cudnnSetTensor4dDescriptor(
+-            b_desc,
+-            CUDNN_TENSOR_NCHW,
+-            CUDNN_DATA_FLOAT,
+-            1,
+-            out_channels,
+-            1,
+-            1
+-        );
+-    }
+-
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        // clean up and throw
+-        cudnnDestroyTensorDescriptor(x_desc);
+-        cudnnDestroyTensorDescriptor(y_desc);
+-        cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnSetTensor4dDescriptor failed");
+-    }
+-
+-    // Set up filter descriptor
+-    cudnnFilterDescriptor_t filter_desc;
+-    status = cudnnCreateFilterDescriptor(&filter_desc);
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        cudnnDestroyTensorDescriptor(x_desc);
+-        cudnnDestroyTensorDescriptor(y_desc);
+-        cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnCreateFilterDescriptor failed");
+-    }
+-
+-    // Reorder weight from [in_channels, out_channels, kernel_size] to [out_channels, in_channels, kernel_size]
+-    // We'll do a host-side reorder because weight is small.
+-    std::vector<float> weight_host(in_channels * out_channels * kernel_size);
+-    cudaError_t cuda_err = cudaMemcpyAsync(
+-        weight_host.data(),
++    // Call custom CUDA launcher
++    cudaError_t err = conv_transpose1d_launcher(
++        x.data_ptr<float>(),
+         weight.data_ptr<float>(),
+-        weight_host.size() * sizeof(float),
+-        cudaMemcpyDeviceToHost,
++        bias.defined() ? bias.data_ptr<float>() : nullptr,
++        output.data_ptr<float>(),
++        static_cast<int>(batch_size),
++        static_cast<int>(in_channels),
++        static_cast<int>(out_channels),
++        static_cast<int>(input_length),
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        static_cast<int>(output_length),
+         stream
+     );
+-    checkCudaError(cuda_err, "cudaMemcpyAsync weight to host failed");
+-    cuda_err = cudaStreamSynchronize(stream);
+-    checkCudaError(cuda_err, "cudaStreamSynchronize failed");
+-
+-    std::vector<float> weight_reordered(in_channels * out_channels * kernel_size);
+-    for (int64_t oc = 0; oc < out_channels; ++oc) {
+-        for (int64_t ic = 0; ic < in_channels; ++ic) {
+-            for (int64_t k = 0; k < kernel_size; ++k) {
+-                int64_t src_idx = (ic * out_channels + oc) * kernel_size + k;
+-                int64_t dst_idx = (oc * in_channels + ic) * kernel_size + k;
+-                weight_reordered[dst_idx] = weight_host[src_idx];
+-            }
+-        }
+-    }
+-
+-    float* d_weight_reordered = nullptr;
+-    cuda_err = cudaMalloc(&d_weight_reordered, weight_reordered.size() * sizeof(float));
+-    checkCudaError(cuda_err, "cudaMalloc for reordered weight failed");
+-
+-    cuda_err = cudaMemcpyAsync(
+-        d_weight_reordered,
+-        weight_reordered.data(),
+-        weight_reordered.size() * sizeof(float),
+-        cudaMemcpyHostToDevice,
+-        stream
+-    );
+-    checkCudaError(cuda_err, "cudaMemcpyAsync reordered weight to device failed");
+-
+-    // Set filter descriptor with reordered weight.
+-    status = cudnnSetFilter4dDescriptor(
+-        filter_desc,
+-        CUDNN_DATA_FLOAT,
+-        CUDNN_TENSOR_NCHW,
+-        out_channels,
+-        in_channels,
+-        kernel_size,
+-        1
+-    );
+-
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        cudaFree(d_weight_reordered);
+-        cudnnDestroyTensorDescriptor(x_desc);
+-        cudnnDestroyTensorDescriptor(y_desc);
+-        cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroyFilterDescriptor(filter_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnSetFilter4dDescriptor failed");
+-    }
+-
+-    // Set convolution descriptor for backward data (transposed conv)
+-    cudnnConvolutionDescriptor_t conv_desc;
+-    status = cudnnCreateConvolutionDescriptor(&conv_desc);
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        cudaFree(d_weight_reordered);
+-        cudnnDestroyTensorDescriptor(x_desc);
+-        cudnnDestroyTensorDescriptor(y_desc);
+-        cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroyFilterDescriptor(filter_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnCreateConvolutionDescriptor failed");
+-    }
+-
+-    // Set convolution descriptor: 1D convolution, padding, stride
+-    status = cudnnSetConvolution2dDescriptor(
+-        conv_desc,
+-        padding,        // vertical padding
+-        0,              // horizontal padding
+-        stride,         // vertical stride
+-        1,              // horizontal stride
+-        1,              // dilation vertical
+-        1,              // dilation horizontal
+-        CUDNN_CROSS_CORRELATION,
+-        CUDNN_DATA_FLOAT
+-    );
+-
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        cudaFree(d_weight_reordered);
+-        cudnnDestroyTensorDescriptor(x_desc);
+-        cudnnDestroyTensorDescriptor(y_desc);
+-        cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroyFilterDescriptor(filter_desc);
+-        cudnnDestroyConvolutionDescriptor(conv_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnSetConvolution2dDescriptor failed");
+-    }
+-
+-    // Find best algorithm for backward data
+-    cudnnConvolutionBwdDataAlgo_t algo;
+-    status = cudnnGetConvolutionBackwardDataAlgorithm(
+-        cudnn_handle,
+-        filter_desc,
+-        y_desc,   // dxDesc
+-        conv_desc,
+-        x_desc,   // dyDesc
+-        CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST,
+-        0,
+-        &algo
+-    );
+-
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        cudaFree(d_weight_reordered);
+-        cudnnDestroyTensorDescriptor(x_desc);
+-        cudnnDestroyTensorDescriptor(y_desc);
+-        cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroyFilterDescriptor(filter_desc);
+-        cudnnDestroyConvolutionDescriptor(conv_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnGetConvolutionBackwardDataAlgorithm failed");
+-    }
+-
+-    // Allocate workspace
+-    size_t workspace_size = 0;
+-    status = cudnnGetConvolutionBackwardDataWorkspaceSize(
+-        cudnn_handle,
+-        filter_desc,
+-        x_desc,  // dyDesc
+-        conv_desc,
+-        y_desc,  // dxDesc
+-        algo,
+-        &workspace_size
+-    );
+-
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        cudaFree(d_weight_reordered);
+-        cudnnDestroyTensorDescriptor(x_desc);
+-        cudnnDestroyTensorDescriptor(y_desc);
+-        cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroyFilterDescriptor(filter_desc);
+-        cudnnDestroyConvolutionDescriptor(conv_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnGetConvolutionBackwardDataWorkspaceSize failed");
+-    }
+-
+-    void* d_workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cuda_err = cudaMalloc(&d_workspace, workspace_size);
+-        if (cuda_err != cudaSuccess) {
+-            cudaFree(d_weight_reordered);
+-            cudnnDestroyTensorDescriptor(x_desc);
+-            cudnnDestroyTensorDescriptor(y_desc);
+-            cudnnDestroyTensorDescriptor(b_desc);
+-            cudnnDestroyFilterDescriptor(filter_desc);
+-            cudnnDestroyConvolutionDescriptor(conv_desc);
+-            cudnnDestroy(cudnn_handle);
+-            checkCudaError(cuda_err, "cudaMalloc workspace failed");
+-        }
+-    }
+-
+-    // Execute convolution backward data
+-    float alpha = 1.0f;
+-    float beta = 0.0f;
+-    status = cudnnConvolutionBackwardData(
+-        cudnn_handle,
+-        &alpha,
+-        filter_desc,
+-        d_weight_reordered,
+-        x_desc,  // dyDesc = input
+-        x.data_ptr<float>(),
+-        conv_desc,
+-        algo,
+-        d_workspace,
+-        workspace_size,
+-        &beta,
+-        y_desc,  // dxDesc = output
+-        output.data_ptr<float>()
+-    );
+-
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        if (d_workspace) cudaFree(d_workspace);
+-        cudaFree(d_weight_reordered);
+-        cudnnDestroyTensorDescriptor(x_desc);
+-        cudnnDestroyTensorDescriptor(y_desc);
+-        cudnnDestroyTensorDescriptor(b_desc);
+-        cudnnDestroyFilterDescriptor(filter_desc);
+-        cudnnDestroyConvolutionDescriptor(conv_desc);
+-        cudnnDestroy(cudnn_handle);
+-        checkCudnnError(status, "cudnnConvolutionBackwardData failed");
+-    }
+-
+-    // Add bias if provided
+-    if (bias.defined()) {
+-        float alpha_bias = 1.0f;
+-        float beta_bias = 1.0f;
+-        status = cudnnAddTensor(
+-            cudnn_handle,
+-            &alpha_bias,
+-            b_desc,
+-            bias.data_ptr<float>(),
+-            &beta_bias,
+-            y_desc,
+-            output.data_ptr<float>()
+-        );
+-        if (status != CUDNN_STATUS_SUCCESS) {
+-            if (d_workspace) cudaFree(d_workspace);
+-            cudaFree(d_weight_reordered);
+-            cudnnDestroyTensorDescriptor(x_desc);
+-            cudnnDestroyTensorDescriptor(y_desc);
+-            cudnnDestroyTensorDescriptor(b_desc);
+-            cudnnDestroyFilterDescriptor(filter_desc);
+-            cudnnDestroyConvolutionDescriptor(conv_desc);
+-            cudnnDestroy(cudnn_handle);
+-            checkCudnnError(status, "cudnnAddTensor bias failed");
+-        }
+-    }
+-
+-    // Cleanup
+-    if (d_workspace) cudaFree(d_workspace);
+-    cudaFree(d_weight_reordered);
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyTensorDescriptor(b_desc);
+-    cudnnDestroyFilterDescriptor(filter_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn_handle);
++    checkCudaError(err, "conv_transpose1d_launcher failed");
+ 
+     return output;
+ }
+@@ -496,7 +193,7 @@
+           pybind11::arg("x"),
+           pybind11::arg("y"));
+     m.def("conv_transpose1d", &conv_transpose1d_forward,
+-          "1D transposed convolution using cuDNN",
++          "1D transposed convolution using custom CUDA kernel",
+           pybind11::arg("x"),
+           pybind11::arg("weight"),
+           pybind11::arg("bias"),

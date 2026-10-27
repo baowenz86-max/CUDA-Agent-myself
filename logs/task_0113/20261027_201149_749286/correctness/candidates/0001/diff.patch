@@ -1,0 +1,176 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,74 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel: computes argmax along dim=1 for input shape [N, C, H, W]
++// Each thread computes one output element.
++// grid: enough blocks to cover total_output = N * H * W
++// block: 256 threads
++__global__ void argmax_dim1_kernel(
++    const float* __restrict__ input,
++    int64_t* __restrict__ output,
++    int64_t total_output,
++    int64_t spatial_size, // H*W
++    int channels
++) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++
++    for (int64_t out_idx = idx; out_idx < total_output; out_idx += stride) {
++        // decompose out_idx into n and spatial offset
++        int64_t n = out_idx / spatial_size;
++        int64_t spatial = out_idx % spatial_size;
++
++        // base pointer for this batch and spatial location
++        const float* base = input + n * channels * spatial_size + spatial;
++
++        int64_t max_channel = 0;
++        float max_val = base[0];
++
++        for (int c = 1; c < channels; ++c) {
++            float val = base[c * spatial_size];
++            if (val > max_val) {
++                max_val = val;
++                max_channel = c;
++            }
++        }
++
++        output[out_idx] = max_channel;
++    }
++}
++
++// Launcher: called from binding
++// input: device pointer to float tensor, contiguous (caller should ensure contiguous)
++// output: device pointer to int64 tensor, allocated by caller
++// N, C, H, W: dimensions (C is the argmax dimension)
++// stream: CUDA stream
++extern "C" void argmax_dim1_launcher(
++    const float* input,
++    int64_t* output,
++    int64_t N,
++    int C,
++    int64_t H,
++    int64_t W,
++    cudaStream_t stream
++) {
++    int64_t spatial_size = H * W;
++    int64_t total_output = N * spatial_size;
++    
++    if (total_output == 0) return;
++
++    // Choose block size and grid size
++    int block_size = 256;
++    int grid_size = static_cast<int>((total_output + block_size - 1) / block_size);
++    // Cap grid size to avoid too many blocks (max grid dim x is 2^31-1)
++    // For total_output up to about 67M, grid_size ~ 262144, within limits.
++    // Keep grid size reasonable: use min with 65535 * 2 to allow grid stride loop.
++    // Actually we can use grid-stride loop with a fixed number of blocks for better occupancy.
++    int max_grid = 65535 * 32; // ~2M
++    if (grid_size > max_grid) {
++        grid_size = max_grid;
++    }
++
++    argmax_dim1_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, total_output, spatial_size, C);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,64 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declared in custom_ops.cu
++extern "C" void argmax_dim1_launcher(
++    const float* input,
++    int64_t* output,
++    int64_t N,
++    int C,
++    int64_t H,
++    int64_t W,
++    cudaStream_t stream
++);
++
++// PyTorch wrapper for argmax along dim=1
++torch::Tensor argmax_dim1_forward(torch::Tensor x) {
++    // Checks
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    // Ensure contiguous for simple indexing in kernel
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++
++    auto N = x.size(0);
++    auto C = x.size(1);
++    auto H = x.size(2);
++    auto W = x.size(3);
++
++    // Allocate output tensor of shape [N, H, W] and dtype int64
++    auto output = torch::empty({N, H, W}, x.options().dtype(torch::kInt64));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    argmax_dim1_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<int64_t>(),
++        N,
++        static_cast<int>(C),
++        H,
++        W,
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++void register_argmax_dim1(pybind11::module& m) {
++    m.def("argmax_dim1_forward", &argmax_dim1_forward,
++          "Compute argmax along dim=1 for 4D input (N, C, H, W)",
++          pybind11::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(argmax_dim1, register_argmax_dim1);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,29 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        return cuda_extension.argmax_dim1_forward(x)
++
++    def debug_forward(self, x):
++        out = cuda_extension.argmax_dim1_forward(x)
++        yield "step_001", out
++
++
++batch_size = 16
++channels = 3
++height = 4096
++width = 1024
++
++
++def get_inputs():
++    return [torch.randn(batch_size, channels, height, width)]
++
++
++def get_init_inputs():
++    return []

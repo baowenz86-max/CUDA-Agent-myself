@@ -1,0 +1,163 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,58 @@
++#include <cuda_runtime.h>
++
++__global__ void hardsigmoid_kernel(const float* __restrict__ input,
++                                  float* __restrict__ output,
++                                  int64_t numel) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float x = input[i];
++        // hardsigmoid: clamp(x + 3, 0, 6) / 6
++        float clamped = fminf(fmaxf(x + 3.0f, 0.0f), 6.0f);
++        output[i] = clamped * (1.0f / 6.0f);
++    }
++}
++
++__global__ void relu_kernel(const float* __restrict__ input,
++                           float* __restrict__ output,
++                           int64_t numel) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = fmaxf(input[i], 0.0f);
++    }
++}
++
++extern "C" void hardsigmoid_forward_launcher(const float* input,
++                                             float* output,
++                                             int64_t numel,
++                                             cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    // Cap grid size to avoid excessive launch overhead while still allowing grid-stride loop
++    if (grid_size > 65535) grid_size = 65535;
++    hardsigmoid_kernel<<<static_cast<int>(grid_size), block_size, 0, stream>>>(
++        input, output, numel);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // The launcher cannot throw exceptions in this restricted context.
++        // We rely on the binding layer to check errors after launch; this call
++        // ensures the error is captured here and not masked by later launches.
++        // No output is written on failure.
++    }
++}
++
++extern "C" void relu_forward_launcher(const float* input,
++                                      float* output,
++                                      int64_t numel,
++                                      cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    relu_kernel<<<static_cast<int>(grid_size), block_size, 0, stream>>>(
++        input, output, numel);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Same as above: error captured, binding layer may check cudaGetLastError again.
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,76 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void hardsigmoid_forward_launcher(const float* input,
++                                             float* output,
++                                             int64_t numel,
++                                             cudaStream_t stream);
++
++extern "C" void relu_forward_launcher(const float* input,
++                                      float* output,
++                                      int64_t numel,
++                                      cudaStream_t stream);
++
++// Wrapper for hardsigmoid activation
++torch::Tensor hardsigmoid_forward(torch::Tensor x) {
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "hardsigmoid_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "hardsigmoid_forward: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "hardsigmoid_forward: input must be contiguous");
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    hardsigmoid_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "hardsigmoid_forward: CUDA kernel launch failed with error ",
++                cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for ReLU activation
++torch::Tensor relu_forward(torch::Tensor y) {
++    // Input checks
++    TORCH_CHECK(y.is_cuda(), "relu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(y.dtype() == torch::kFloat32, "relu_forward: input must be float32");
++    TORCH_CHECK(y.is_contiguous(), "relu_forward: input must be contiguous");
++
++    auto output = torch::empty_like(y);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    relu_forward_launcher(
++        y.data_ptr<float>(),
++        output.data_ptr<float>(),
++        y.numel(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "relu_forward: CUDA kernel launch failed with error ",
++                cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("hardsigmoid_forward", &hardsigmoid_forward, "HardSigmoid activation forward",
++          py::arg("x"));
++    m.def("relu_forward", &relu_forward, "ReLU activation forward",
++          py::arg("y"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x, y):
++        x = cuda_extension.hardsigmoid_forward(x)
++        y = cuda_extension.relu_forward(y)
++        return x, y
++
++    def debug_forward(self, x, y):
++        x = cuda_extension.hardsigmoid_forward(x)
++        yield 'step_001', x
++        y = cuda_extension.relu_forward(y)
++        yield 'step_002', y
++        yield 'step_003', (x, y)

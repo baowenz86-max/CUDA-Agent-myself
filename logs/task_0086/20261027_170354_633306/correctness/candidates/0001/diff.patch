@@ -1,0 +1,423 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,198 @@
++#include <cuda_runtime.h>
++#include <cmath>
++
++// -----------------------------------------------------------------------------
++// ReflectionPad2d forward kernel
++// Implements PyTorch nn.ReflectionPad2d exactly: output is reflection across
++// input edges without repeating the edge pixel.
++// Input: float32 CUDA tensor with arbitrary strides (supports non-contiguous).
++// Output: contiguous tensor of shape [N, C, H+pad_top+pad_bottom, W+pad_left+pad_right].
++// -----------------------------------------------------------------------------
++
++__global__ void reflection_pad2d_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int N, int C, int H, int W,
++    int out_H, int out_W,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    long long in_stride_N, long long in_stride_C, long long in_stride_H, long long in_stride_W)
++{
++    long long total = (long long)N * C * out_H * out_W;
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < total; idx += stride) {
++        // decompose output index
++        int ow = idx % out_W;
++        long long tmp = idx / out_W;
++        int oh = tmp % out_H;
++        tmp /= out_H;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        int ih = oh - pad_top;
++        int iw = ow - pad_left;
++
++        // reflection mapping for height
++        if (ih < 0) ih = -ih;  // since padding >=0, this reflects properly
++        else if (ih >= H) ih = 2 * (H - 1) - ih;
++
++        // reflection mapping for width
++        if (iw < 0) iw = -iw;
++        else if (iw >= W) iw = 2 * (W - 1) - iw;
++
++        // The above works only if pad <= H-1 or W-1 respectively. If padding
++        // is larger, multiple reflections are needed. For this specific task
++        // pad=1 and H,W>=2, so single reflection is sufficient. To be robust
++        // we could implement a while loop, but PyTorch requires pad <= H-1.
++
++        long long in_idx = (long long)n * in_stride_N
++                         + (long long)c * in_stride_C
++                         + (long long)ih * in_stride_H
++                         + (long long)iw * in_stride_W;
++        output[idx] = input[in_idx];
++    }
++}
++
++extern "C" void reflection_pad2d_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    long long in_stride_N, long long in_stride_C, long long in_stride_H, long long in_stride_W,
++    cudaStream_t stream)
++{
++    int out_H = H + pad_top + pad_bottom;
++    int out_W = W + pad_left + pad_right;
++    long long total = (long long)N * C * out_H * out_W;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid-stride loop handles rest
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, N, C, H, W, out_H, out_W,
++        pad_left, pad_right, pad_top, pad_bottom,
++        in_stride_N, in_stride_C, in_stride_H, in_stride_W);
++}
++
++// -----------------------------------------------------------------------------
++// Scaled Dot Product Attention forward kernel
++// Implements PyTorch F.scaled_dot_product_attention(q, k, v, is_causal)
++// assuming q,k,v are 4D tensors of shape [N, H, L, D] and [N, H, S, D] and
++// [N, H, S, V] respectively. For this task, L=S and V=D.
++// Output shape equals q shape: [N, H, L, V].
++// The scale factor is 1/sqrt(D).
++// If is_causal is true, we apply causal mask -inf for positions j > i.
++// The implementation uses one thread per output element (n, h, l, v).
++// Naive implementation for simplicity; can be optimized later if needed.
++// -----------------------------------------------------------------------------
++
++__global__ void sdp_attention_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ q,
++    const float* __restrict__ k,
++    const float* __restrict__ v,
++    int N, int H, int L, int S, int D, int V,
++    bool is_causal,
++    float scale,
++    long long q_stride_N, long long q_stride_H, long long q_stride_L, long long q_stride_D,
++    long long k_stride_N, long long k_stride_H, long long k_stride_S, long long k_stride_D,
++    long long v_stride_N, long long v_stride_H, long long v_stride_S, long long v_stride_V)
++{
++    long long total = (long long)N * H * L * V;
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < total; idx += stride) {
++        int v_idx = idx % V;
++        long long tmp = idx / V;
++        int l = tmp % L;
++        tmp /= L;
++        int h = tmp % H;
++        int n = tmp / H;
++
++        // base pointers for this batch and head
++        const float* q_base = q + (long long)n * q_stride_N + (long long)h * q_stride_H;
++        const float* k_base = k + (long long)n * k_stride_N + (long long)h * k_stride_H;
++        const float* v_base = v + (long long)n * v_stride_N + (long long)h * v_stride_H;
++
++        // compute scores for this query position l against all keys s
++        // We allocate small arrays on stack to avoid repeated global reads.
++        // D and S are likely small (D=32, S=1026). Max S maybe 1026 here.
++        // Use fixed maximum capacity to avoid dynamic allocation in kernel.
++        // For this task, S max is 1026, D=32, so we can use constants.
++        // However, to be general, we use dynamic shared memory? For simplicity,
++        // we recompute dot products and store scores in registers per thread? 
++        // But each thread handles one output element, and needs entire row of scores.
++        // Better approach: each thread block handles one or more query positions
++        // cooperatively. Since this is a naive implementation, for correctness
++        // we let each thread compute the whole row sequentially. This is slow
++        // but correct. For performance, a tiled implementation is preferred.
++        // Given the task is correctness-first, we implement a straightforward
++        // sequential version per thread.
++
++        float sum_exp = 0.0f;
++        float acc = 0.0f;
++
++        // Compute max score for numerical stability
++        float max_score = -1e30f;
++        for (int s = 0; s < S; ++s) {
++            if (is_causal && s > l) {
++                // masked position
++                continue;
++            }
++            float dot = 0.0f;
++            const float* q_ptr = q_base + (long long)l * q_stride_L;
++            const float* k_ptr = k_base + (long long)s * k_stride_S;
++            for (int d = 0; d < D; ++d) {
++                dot += q_ptr[d * q_stride_D] * k_ptr[d * k_stride_D];
++            }
++            dot *= scale;
++            if (dot > max_score) max_score = dot;
++        }
++
++        // Now compute exp and sum
++        for (int s = 0; s < S; ++s) {
++            if (is_causal && s > l) continue;
++            float dot = 0.0f;
++            const float* q_ptr = q_base + (long long)l * q_stride_L;
++            const float* k_ptr = k_base + (long long)s * k_stride_S;
++            for (int d = 0; d < D; ++d) {
++                dot += q_ptr[d * q_stride_D] * k_ptr[d * k_stride_D];
++            }
++            dot = (dot * scale) - max_score;
++            float exp_val = expf(dot);
++            sum_exp += exp_val;
++            // accumulate weighted value for this output dimension v_idx
++            const float* v_ptr = v_base + (long long)s * v_stride_S + (long long)v_idx * v_stride_V;
++            acc += exp_val * v_ptr[0];
++        }
++
++        output[idx] = acc / sum_exp;
++    }
++}
++
++extern "C" void scaled_dot_product_attention_launcher(
++    float* output,
++    const float* q,
++    const float* k,
++    const float* v,
++    int N, int H, int L, int S, int D, int V,
++    bool is_causal,
++    long long q_stride_N, long long q_stride_H, long long q_stride_L, long long q_stride_D,
++    long long k_stride_N, long long k_stride_H, long long k_stride_S, long long k_stride_D,
++    long long v_stride_N, long long v_stride_H, long long v_stride_S, long long v_stride_V,
++    cudaStream_t stream)
++{
++    float scale = 1.0f / sqrtf((float)D);
++    long long total = (long long)N * H * L * V;
++    int threads = 128;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    sdp_attention_kernel<<<blocks, threads, 0, stream>>>(
++        output, q, k, v,
++        N, H, L, S, D, V,
++        is_causal, scale,
++        q_stride_N, q_stride_H, q_stride_L, q_stride_D,
++        k_stride_N, k_stride_H, k_stride_S, k_stride_D,
++        v_stride_N, v_stride_H, v_stride_S, v_stride_V);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,184 @@
++// PyTorch bindings for custom reflection padding and scaled dot product attention.
++// This file uses torch types and pybind11 but contains NO CUDA kernels.
++// CUDA kernels are implemented in custom_ops.cu.
++
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void reflection_pad2d_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    long long in_stride_N, long long in_stride_C, long long in_stride_H, long long in_stride_W,
++    cudaStream_t stream);
++
++extern "C" void scaled_dot_product_attention_launcher(
++    float* output,
++    const float* q,
++    const float* k,
++    const float* v,
++    int N, int H, int L, int S, int D, int V,
++    bool is_causal,
++    long long q_stride_N, long long q_stride_H, long long q_stride_L, long long q_stride_D,
++    long long k_stride_N, long long k_stride_H, long long k_stride_S, long long k_stride_D,
++    long long v_stride_N, long long v_stride_H, long long v_stride_S, long long v_stride_V,
++    cudaStream_t stream);
++
++// Helper to extract integer strides from a tensor dimension; negative not expected
++static inline long long get_stride(const torch::Tensor& t, int64_t dim) {
++    TORCH_CHECK(dim >= 0 && dim < t.dim(), "dimension index out of range");
++    return (long long)t.stride(dim);
++}
++
++// Forward function for reflection padding
++// Parameters: input tensor, pad_left, pad_right, pad_top, pad_bottom
++// Returns: padded output tensor (contiguous, same dtype/device)
++torch::Tensor reflection_pad2d_forward(
++    torch::Tensor input,
++    int64_t pad_left,
++    int64_t pad_right,
++    int64_t pad_top,
++    int64_t pad_bottom) {
++    // Input checks
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4-dimensional (N, C, H, W)");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(pad_left >= 0 && pad_right >= 0 && pad_top >= 0 && pad_bottom >= 0,
++                "Padding must be non-negative");
++
++    const int64_t N = input.size(0);
++    const int64_t C = input.size(1);
++    const int64_t H = input.size(2);
++    const int64_t W = input.size(3);
++
++    const int64_t out_H = H + pad_top + pad_bottom;
++    const int64_t out_W = W + pad_left + pad_right;
++
++    // Check that reflections are valid (padding <= H-1 and W-1)
++    TORCH_CHECK(pad_top <= H - 1 && pad_bottom <= H - 1,
++                "Reflection padding top/bottom must not exceed H-1");
++    TORCH_CHECK(pad_left <= W - 1 && pad_right <= W - 1,
++                "Reflection padding left/right must not exceed W-1");
++
++    // Allocate contiguous output tensor with same dtype/device
++    auto output = torch::empty({N, C, out_H, out_W}, input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Extract input strides (can be non-contiguous but must be positive)
++    long long in_stride_N = get_stride(input, 0);
++    long long in_stride_C = get_stride(input, 1);
++    long long in_stride_H = get_stride(input, 2);
++    long long in_stride_W = get_stride(input, 3);
++
++    // Call launcher
++    reflection_pad2d_launcher(
++        output.data_ptr<float>(),
++        input.data_ptr<float>(),
++        (int)N, (int)C, (int)H, (int)W,
++        (int)pad_left, (int)pad_right, (int)pad_top, (int)pad_bottom,
++        in_stride_N, in_stride_C, in_stride_H, in_stride_W,
++        stream);
++
++    // Check for kernel launch errors (optional but recommended)
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "reflection_pad2d_forward CUDA error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Forward function for scaled dot product attention
++// Parameters: q, k, v tensors, is_causal bool
++// Returns: attention output tensor with shape of q
++torch::Tensor scaled_dot_product_attention_forward(
++    torch::Tensor q,
++    torch::Tensor k,
++    torch::Tensor v,
++    bool is_causal) {
++    // Check devices and dtypes
++    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "All inputs must be CUDA tensors");
++    TORCH_CHECK(q.scalar_type() == torch::kFloat32 &&
++                k.scalar_type() == torch::kFloat32 &&
++                v.scalar_type() == torch::kFloat32,
++                "All inputs must be float32");
++
++    // Check shapes: q: [N, H, L, D], k: [N, H, S, D], v: [N, H, S, V]
++    TORCH_CHECK(q.dim() == 4, "q must be 4-dimensional");
++    TORCH_CHECK(k.dim() == 4, "k must be 4-dimensional");
++    TORCH_CHECK(v.dim() == 4, "v must be 4-dimensional");
++    const int64_t N = q.size(0);
++    const int64_t H = q.size(1);
++    const int64_t L = q.size(2);
++    const int64_t D = q.size(3);
++    TORCH_CHECK(k.size(0) == N && k.size(1) == H, "k batch/head dims must match q");
++    const int64_t S = k.size(2);
++    TORCH_CHECK(k.size(3) == D, "k last dim must match q last dim");
++    TORCH_CHECK(v.size(0) == N && v.size(1) == H, "v batch/head dims must match q");
++    TORCH_CHECK(v.size(2) == S, "v second-to-last dim must match k");
++    const int64_t V = v.size(3);
++
++    // Allocate output: same shape as q
++    auto output = torch::empty_like(q, q.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Extract strides (support non-contiguous tensors)
++    long long q_stride_N = get_stride(q, 0);
++    long long q_stride_H = get_stride(q, 1);
++    long long q_stride_L = get_stride(q, 2);
++    long long q_stride_D = get_stride(q, 3);
++
++    long long k_stride_N = get_stride(k, 0);
++    long long k_stride_H = get_stride(k, 1);
++    long long k_stride_S = get_stride(k, 2);
++    long long k_stride_D = get_stride(k, 3);
++
++    long long v_stride_N = get_stride(v, 0);
++    long long v_stride_H = get_stride(v, 1);
++    long long v_stride_S = get_stride(v, 2);
++    long long v_stride_V = get_stride(v, 3);
++
++    // Call launcher
++    scaled_dot_product_attention_launcher(
++        output.data_ptr<float>(),
++        q.data_ptr<float>(),
++        k.data_ptr<float>(),
++        v.data_ptr<float>(),
++        (int)N, (int)H, (int)L, (int)S, (int)D, (int)V,
++        is_causal,
++        q_stride_N, q_stride_H, q_stride_L, q_stride_D,
++        k_stride_N, k_stride_H, k_stride_S, k_stride_D,
++        v_stride_N, v_stride_H, v_stride_S, v_stride_V,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "scaled_dot_product_attention_forward CUDA error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "ReflectionPad2d forward (CUDA)",
++          pybind11::arg("input"),
++          pybind11::arg("pad_left"),
++          pybind11::arg("pad_right"),
++          pybind11::arg("pad_top"),
++          pybind11::arg("pad_bottom"));
++    m.def("scaled_dot_product_attention_forward", &scaled_dot_product_attention_forward,
++          "Scaled Dot Product Attention forward (CUDA)",
++          pybind11::arg("q"),
++          pybind11::arg("k"),
++          pybind11::arg("v"),
++          pybind11::arg("is_causal"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,32 @@
++import torch
++import torch.nn as nn
++from torch import Tensor
++
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, pad, embed_dim, num_heads, bias):
++        super().__init__()
++        self.pad = tuple(pad)
++        self.embed_dim = embed_dim
++        self.num_heads = num_heads
++        self.bias = bias
++
++    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
++        q_padded = cuda_extension.reflection_pad2d_forward(q.to('cuda'), self.pad[0], self.pad[1], self.pad[2], self.pad[3])
++        k_padded = cuda_extension.reflection_pad2d_forward(k.to('cuda'), self.pad[0], self.pad[1], self.pad[2], self.pad[3])
++        v_padded = cuda_extension.reflection_pad2d_forward(v.to('cuda'), self.pad[0], self.pad[1], self.pad[2], self.pad[3])
++        out = cuda_extension.scaled_dot_product_attention_forward(q_padded, k_padded, v_padded, self.bias)
++        return out
++
++    def debug_forward(self, q: Tensor, k: Tensor, v: Tensor):
++        q_padded = cuda_extension.reflection_pad2d_forward(q.to('cuda'), self.pad[0], self.pad[1], self.pad[2], self.pad[3])
++        yield 'step_001', q_padded
++        k_padded = cuda_extension.reflection_pad2d_forward(k.to('cuda'), self.pad[0], self.pad[1], self.pad[2], self.pad[3])
++        yield 'step_002', k_padded
++        v_padded = cuda_extension.reflection_pad2d_forward(v.to('cuda'), self.pad[0], self.pad[1], self.pad[2], self.pad[3])
++        yield 'step_003', v_padded
++        out = cuda_extension.scaled_dot_product_attention_forward(q_padded, k_padded, v_padded, self.bias)
++        yield 'step_004', out
++        yield 'step_005', out

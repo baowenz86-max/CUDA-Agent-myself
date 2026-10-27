@@ -1,0 +1,388 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,15 +1,5 @@
+ #include <cuda_runtime.h>
+ 
+-// CUDA kernels for non-convolution custom operators.
+-// ConvTranspose (deconv_forward) is handled by cuDNN in the C++ binding layer,
+-// not here.
+-
+-// -----------------------------------------------------------------------------
+-// ReLU forward kernel: output = max(0, x)
+-// Supports arbitrary contiguous or strided tensors by using a flat index and
+-// linear offset computation from the base pointer. Since the output tensor is
+-// allocated as contiguous, we write through the output base pointer.
+-// -----------------------------------------------------------------------------
+ __global__ void relu_forward_kernel(const float* __restrict__ input,
+                                     float* __restrict__ output,
+                                     int64_t numel) {
+@@ -21,31 +11,13 @@
+     }
+ }
+ 
+-// -----------------------------------------------------------------------------
+-// PixelShuffle forward kernel.
+-// Rearranges elements from (N, C*r^2, H, W) to (N, C, H*r, W*r).
+-// Input may have arbitrary strides; output is allocated contiguous.
+-// We use a grid-stride loop over output elements.
+-// Output index mapping:
+-//   n = idx / (C_out * H_out * W_out)
+-//   rem = idx % (C_out * H_out * W_out)
+-//   c = rem / (H_out * W_out)
+-//   rem2 = rem % (H_out * W_out)
+-//   h_out = rem2 / W_out
+-//   w_out = rem2 % W_out
+-//   h_in = h_out / r, i = h_out % r
+-//   w_in = w_out / r, j = w_out % r
+-//   input_c = c * r^2 + i * r + j
+-//   input_idx = n * C_in * H_in * W_in + input_c * H_in * W_in + h_in * W_in + w_in
+-// Then output[idx] = input[input_idx]
+-// -----------------------------------------------------------------------------
+-template <int UPSACLE_FACTOR>
++template <int UPSACALE_FACTOR>
+ __global__ void pixel_shuffle_forward_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+     int64_t N, int64_t C_out, int64_t H_in, int64_t W_in,
+     int64_t H_out, int64_t W_out) {
+-    constexpr int r = UPSACLE_FACTOR;
++    constexpr int r = UPSACALE_FACTOR;
+     const int64_t C_in = C_out * r * r;
+     const int64_t out_plane = H_out * W_out;
+     const int64_t out_ch_stride = C_out * out_plane;
+@@ -75,8 +47,49 @@
+     }
+ }
+ 
+-// Host launchers with C linkage for binding layer.
+-// All parameters are primitive types and raw pointers; no PyTorch dependencies.
++__global__ void deconv_forward_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int64_t N, int64_t C_in, int64_t H_in, int64_t W_in,
++    int64_t C_out, int64_t kH, int64_t kW,
++    int64_t H_out, int64_t W_out,
++    int64_t stride, int64_t padding, int64_t output_padding,
++    int64_t total_output) {
++
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride_thread = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (; idx < total_output; idx += stride_thread) {
++        int64_t n = idx / (C_out * H_out * W_out);
++        int64_t rem = idx - n * C_out * H_out * W_out;
++        int64_t c_out = rem / (H_out * W_out);
++        int64_t rem2 = rem - c_out * H_out * W_out;
++        int64_t h_out = rem2 / W_out;
++        int64_t w_out = rem2 - h_out * W_out;
++
++        float val = (bias != nullptr) ? bias[c_out] : 0.0f;
++
++        for (int64_t c_in = 0; c_in < C_in; ++c_in) {
++            for (int64_t kh = 0; kh < kH; ++kh) {
++                for (int64_t kw = 0; kw < kW; ++kw) {
++                    int64_t h_in = h_out + padding - kh;
++                    int64_t w_in = w_out + padding - kw;
++                    if (h_in < 0 || w_in < 0 || h_in >= H_in * stride || w_in >= W_in * stride) continue;
++                    if (h_in % stride != 0 || w_in % stride != 0) continue;
++                    h_in /= stride;
++                    w_in /= stride;
++                    if (h_in >= H_in || w_in >= W_in) continue;
++
++                    int64_t input_idx = ((n * C_in + c_in) * H_in + h_in) * W_in + w_in;
++                    int64_t weight_idx = ((c_in * C_out + c_out) * kH + kh) * kW + kw;
++                    val += input[input_idx] * weight[weight_idx];
++                }
++            }
++        }
++        output[idx] = val;
++    }
++}
+ 
+ extern "C" void relu_forward_launcher(
+     const float* input,
+@@ -119,45 +132,31 @@
+         pixel_shuffle_forward_kernel<4><<<grid, block, 0, stream>>>(
+             input, output, N, C_out, H_in, W_in, H_out, W_out);
+     } else {
+-        // Fallback generic kernel for any upscale factor.
+-        // This is rarely used but prevents undefined behavior.
+-        // We will implement it below.
+-        pixel_shuffle_forward_generic<<<grid, block, 0, stream>>>(
+-            input, output, N, C_out, H_in, W_in, H_out, W_out, upscale_factor);
++        // Unsupported factor: do nothing (binding layer should have checked)
+     }
+ }
+ 
+-// Generic pixel shuffle kernel (for factors not in {2,3,4})
+-__global__ void pixel_shuffle_forward_generic(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    int64_t N, int64_t C_out, int64_t H_in, int64_t W_in,
+-    int64_t H_out, int64_t W_out, int r) {
+-    const int64_t C_in = C_out * r * r;
+-    const int64_t out_plane = H_out * W_out;
+-    const int64_t out_ch_stride = C_out * out_plane;
+-    const int64_t in_plane = H_in * W_in;
+-    const int64_t in_ch_stride = C_in * in_plane;
+-    const int64_t total = N * out_ch_stride;
+-
+-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+-    for (; idx < total; idx += stride) {
+-        int64_t n = idx / out_ch_stride;
+-        int64_t rem = idx - n * out_ch_stride;
+-        int64_t c = rem / out_plane;
+-        int64_t rem2 = rem - c * out_plane;
+-        int64_t h_out = rem2 / W_out;
+-        int64_t w_out = rem2 - h_out * W_out;
+-
+-        int64_t h_in = h_out / r;
+-        int64_t i = h_out - h_in * r;
+-        int64_t w_in = w_out / r;
+-        int64_t j = w_out - w_in * r;
+-
+-        int64_t input_c = c * r * r + i * r + j;
+-        int64_t input_idx = n * in_ch_stride + input_c * in_plane + h_in * W_in + w_in;
+-
+-        output[idx] = input[input_idx];
+-    }
++extern "C" void deconv_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int64_t N, int64_t C_in, int64_t H_in, int64_t W_in,
++    int64_t C_out, int64_t kH, int64_t kW,
++    int64_t H_out, int64_t W_out,
++    int64_t stride, int64_t padding, int64_t output_padding,
++    cudaStream_t stream) {
++    if (N <= 0 || C_in <= 0 || H_in <= 0 || W_in <= 0 || C_out <= 0 || H_out <= 0 || W_out <= 0) return;
++    int64_t total_output = N * C_out * H_out * W_out;
++    const int block = 256;
++    int64_t grid64 = (total_output + block - 1) / block;
++    if (grid64 > 65535) grid64 = 65535;
++    int grid = static_cast<int>(grid64);
++    deconv_forward_kernel<<<grid, block, 0, stream>>>(
++        input, weight, bias, output,
++        N, C_in, H_in, W_in,
++        C_out, kH, kW,
++        H_out, W_out,
++        stride, padding, output_padding,
++        total_output);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,7 +2,6 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <cstdint>
+ #include <stdexcept>
+ #include <string>
+@@ -27,27 +26,25 @@
+     int upscale_factor,
+     cudaStream_t stream);
+ 
++extern "C" void deconv_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int64_t N, int64_t C_in, int64_t H_in, int64_t W_in,
++    int64_t C_out, int64_t kH, int64_t kW,
++    int64_t H_out, int64_t W_out,
++    int64_t stride, int64_t padding, int64_t output_padding,
++    cudaStream_t stream);
++
+ namespace {
+ 
+-// Helper to check cuDNN status
+-void checkCudnn(cudnnStatus_t status, const char* msg) {
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error(std::string(msg) + ": " + cudnnGetErrorString(status));
++void check_cuda_error(cudaError_t err, const char* msg) {
++    if (err != cudaSuccess) {
++        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(err));
+     }
+ }
+ 
+-// Make tensor contiguous if not already
+-void ensure_contiguous(torch::Tensor& t) {
+-    if (!t.is_contiguous()) {
+-        t = t.contiguous();
+-    }
+-}
+-
+-// cuDNN-based ConvTranspose2d forward
+-// Input: x [N, C_in, H_in, W_in]
+-// Weight: weight [C_in, C_out, kH, kW] (PyTorch ConvTranspose2d weight layout)
+-// Bias: bias [C_out] or empty optional
+-// Returns output [N, C_out, H_out, W_out]
+ torch::Tensor deconv_forward_impl(
+     const torch::Tensor& x,
+     const torch::Tensor& weight,
+@@ -57,7 +54,6 @@
+     int64_t padding,
+     int64_t output_padding) {
+ 
+-    // Validate inputs
+     TORCH_CHECK(x.is_cuda(), "Input x must be a CUDA tensor");
+     TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+     if (bias.defined() && bias.numel() > 0) {
+@@ -68,9 +64,10 @@
+     TORCH_CHECK(weight.dim() == 4, "Weight must be 4D (C_in, C_out, kH, kW)");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Only float32 supported");
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "Only float32 supported");
+-    TORCH_CHECK(!bias.defined() || bias.dtype() == torch::kFloat32, "Only float32 bias supported");
++    if (bias.defined() && bias.numel() > 0) {
++        TORCH_CHECK(bias.dtype() == torch::kFloat32, "Only float32 bias supported");
++    }
+ 
+-    // Make contiguous copies if needed
+     auto x_contig = x.is_contiguous() ? x : x.contiguous();
+     auto weight_contig = weight.is_contiguous() ? weight : weight.contiguous();
+     auto bias_contig = (bias.defined() && bias.numel() > 0) ? (bias.is_contiguous() ? bias : bias.contiguous()) : torch::Tensor();
+@@ -90,101 +87,22 @@
+     int64_t W_out = (W_in - 1) * stride - 2 * padding + kW + output_padding;
+     TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid output dimensions");
+ 
+-    // Allocate output
+     auto output = torch::empty({N, C_out, H_out, W_out}, x_contig.options());
+ 
+-    // cuDNN handles
+-    cudnnHandle_t cudnn_handle;
+-    checkCudnn(cudnnCreate(&cudnn_handle), "cudnnCreate");
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    checkCudnn(cudnnSetStream(cudnn_handle, stream), "cudnnSetStream");
++    const float* input_ptr = x_contig.data_ptr<float>();
++    const float* weight_ptr = weight_contig.data_ptr<float>();
++    const float* bias_ptr = bias_contig.defined() ? bias_contig.data_ptr<float>() : nullptr;
++    float* output_ptr = output.data_ptr<float>();
+ 
+-    // Tensor descriptors
+-    cudnnTensorDescriptor_t x_desc, y_desc, b_desc;
+-    checkCudnn(cudnnCreateTensorDescriptor(&x_desc), "cudnnCreateTensorDescriptor x_desc");
+-    checkCudnn(cudnnCreateTensorDescriptor(&y_desc), "cudnnCreateTensorDescriptor y_desc");
+-    checkCudnn(cudnnCreateTensorDescriptor(&b_desc), "cudnnCreateTensorDescriptor b_desc");
+-
+-    // Set tensor descriptors with NCHW format
+-    checkCudnn(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                         N, C_in, H_in, W_in), "cudnnSetTensor4dDescriptor x");
+-    checkCudnn(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                         N, C_out, H_out, W_out), "cudnnSetTensor4dDescriptor y");
+-    checkCudnn(cudnnSetTensor4dDescriptor(b_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                         1, C_out, 1, 1), "cudnnSetTensor4dDescriptor bias");
+-
+-    // Filter descriptor (weight layout: [C_in, C_out, kH, kW])
+-    cudnnFilterDescriptor_t w_desc;
+-    checkCudnn(cudnnCreateFilterDescriptor(&w_desc), "cudnnCreateFilterDescriptor");
+-    checkCudnn(cudnnSetFilter4dDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+-                                         C_in, C_out, kH, kW), "cudnnSetFilter4dDescriptor");
+-
+-    // Convolution descriptor
+-    cudnnConvolutionDescriptor_t conv_desc;
+-    checkCudnn(cudnnCreateConvolutionDescriptor(&conv_desc), "cudnnCreateConvolutionDescriptor");
+-    checkCudnn(cudnnSetConvolution2dDescriptor(conv_desc,
+-                                               padding, padding,
+-                                               stride, stride,
+-                                               1, 1, // dilation
+-                                               CUDNN_CROSS_CORRELATION,
+-                                               CUDNN_DATA_FLOAT), "cudnnSetConvolution2dDescriptor");
+-
+-    // Choose algorithm
+-    cudnnConvolutionBwdDataAlgo_t algo;
+-    int requested_algo_count = 1;
+-    cudnnConvolutionBwdDataAlgoPerf_t perf_results;
+-    checkCudnn(cudnnFindConvolutionBackwardDataAlgorithm(
+-        cudnn_handle, w_desc, x_desc, conv_desc, y_desc, 1, &requested_algo_count, &perf_results),
+-        "cudnnFindConvolutionBackwardDataAlgorithm");
+-    algo = perf_results.algo;
+-
+-    // Workspace size
+-    size_t workspace_size = 0;
+-    checkCudnn(cudnnGetConvolutionBackwardDataWorkspaceSize(
+-        cudnn_handle, w_desc, x_desc, conv_desc, y_desc, algo, &workspace_size),
+-        "cudnnGetConvolutionBackwardDataWorkspaceSize");
+-
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
+-        TORCH_CHECK(cuda_status == cudaSuccess, "cudaMalloc failed for cuDNN workspace");
+-    }
+-
+-    // Perform convolution backward data (equivalent to transposed convolution forward)
+-    float alpha = 1.0f, beta = 0.0f;
+-    checkCudnn(cudnnConvolutionBackwardData(
+-        cudnn_handle,
+-        &alpha,
+-        w_desc, weight_contig.data_ptr<float>(),
+-        x_desc, x_contig.data_ptr<float>(),
+-        conv_desc, algo,
+-        workspace, workspace_size,
+-        &beta,
+-        y_desc, output.data_ptr<float>()),
+-        "cudnnConvolutionBackwardData");
+-
+-    // Add bias if provided
+-    if (bias_contig.defined() && bias_contig.numel() > 0) {
+-        float beta_bias = 1.0f;
+-        checkCudnn(cudnnAddTensor(cudnn_handle,
+-                                  &alpha,
+-                                  b_desc, bias_contig.data_ptr<float>(),
+-                                  &beta_bias,
+-                                  y_desc, output.data_ptr<float>()),
+-                   "cudnnAddTensor bias");
+-    }
+-
+-    // Cleanup
+-    if (workspace) {
+-        cudaFree(workspace);
+-    }
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyTensorDescriptor(b_desc);
+-    cudnnDestroyFilterDescriptor(w_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn_handle);
++    deconv_forward_launcher(
++        input_ptr, weight_ptr, bias_ptr, output_ptr,
++        N, C_in, H_in, W_in,
++        C_out, kH, kW,
++        H_out, W_out,
++        stride, padding, output_padding,
++        stream);
+ 
+     return output;
+ }
+@@ -193,6 +111,9 @@
+     TORCH_CHECK(x.is_cuda(), "Input must be CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Only float32 supported");
+     TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C*r^2, H, W)");
++
++    TORCH_CHECK(upscale_factor == 2 || upscale_factor == 3 || upscale_factor == 4,
++                "Only upscale_factor 2, 3, or 4 supported");
+ 
+     auto x_contig = x.is_contiguous() ? x : x.contiguous();
+ 
+@@ -239,7 +160,6 @@
+ 
+ } // anonymous namespace
+ 
+-// Python bindings
+ torch::Tensor deconv_forward(
+     torch::Tensor x,
+     torch::Tensor weight,
+@@ -260,7 +180,7 @@
+ }
+ 
+ void register_custom_ops(pybind11::module& m) {
+-    m.def("deconv_forward", &deconv_forward, "ConvTranspose2d forward using cuDNN",
++    m.def("deconv_forward", &deconv_forward, "ConvTranspose2d forward (custom CUDA kernel)",
+           py::arg("x"), py::arg("weight"), py::arg("bias"),
+           py::arg("kernel_size"), py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
+     m.def("pixel_shuffle_forward", &pixel_shuffle_forward, "PixelShuffle forward",

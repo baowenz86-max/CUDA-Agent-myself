@@ -1,0 +1,271 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -35,3 +35,59 @@
+     mul_bias_forward_kernel<<<(int)blocks, threads, 0, stream>>>(
+         input, bias, output, N, C, L, total);
+ }
++
++// CUDA kernel for conv_transpose1d_forward
++// Implements ConvTranspose1d with parameters:
++// input: [N, C_in, L_in] float32
++// weight: [C_in, C_out, K] float32  (PyTorch ConvTranspose1d weight layout)
++// bias: [C_out] float32
++// output: [N, C_out, L_out] float32
++// stride, padding, output_padding as given
++// L_out = (L_in - 1) * stride - 2 * padding + K + output_padding
++__global__ void conv_transpose1d_forward_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int N, int C_in, int C_out, int L_in, int L_out,
++    int K, int stride, int padding, int output_padding) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= N * C_out * L_out) return;
++    int n = idx / (C_out * L_out);
++    int rem = idx % (C_out * L_out);
++    int c_out = rem / L_out;
++    int l_out = rem % L_out;
++    float sum = 0.0f;
++    for (int c_in = 0; c_in < C_in; ++c_in) {
++        for (int k = 0; k < K; ++k) {
++            int l_in = l_out + 2 * padding - k;
++            if (l_in % stride != 0) continue;
++            l_in /= stride;
++            if (l_in >= 0 && l_in < L_in) {
++                sum += input[n * C_in * L_in + c_in * L_in + l_in] *
++                       weight[c_in * C_out * K + c_out * K + k];
++            }
++        }
++    }
++    output[idx] = sum + bias[c_out];
++}
++
++// Launcher for conv_transpose1d_forward
++extern "C" void conv_transpose1d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int C_out, int L_in, int L_out,
++    int K, int stride, int padding, int output_padding,
++    cudaStream_t stream) {
++    long long total = (long long)N * C_out * L_out;
++    int threads = 256;
++    long long blocks = (total + threads - 1) / threads;
++    if (blocks > 2147483647LL) blocks = 2147483647LL;
++    if (blocks == 0) return;
++    conv_transpose1d_forward_kernel<<<(int)blocks, threads, 0, stream>>>(
++        input, weight, bias, output,
++        N, C_in, C_out, L_in, L_out,
++        K, stride, padding, output_padding);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,11 +2,10 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include "../binding_registry.h"
+ 
+-// Declare launcher from custom_ops.cu
++// Declare launchers from custom_ops.cu
+ extern "C" void mul_bias_forward_launcher(
+     const float* input,
+     const float* bias,
+@@ -14,20 +13,21 @@
+     int N, int C, int L,
+     cudaStream_t stream);
+ 
++extern "C" void conv_transpose1d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int C_out, int L_in, int L_out,
++    int K, int stride, int padding, int output_padding,
++    cudaStream_t stream);
++
+ // Helper to get current CUDA stream
+ static cudaStream_t getCurrentCUDAStream() {
+     return c10::cuda::getCurrentCUDAStream().stream();
+ }
+ 
+-// Check CUDNN status
+-#define CHECK_CUDNN(expr)                                                      \
+-    do {                                                                        \
+-        cudnnStatus_t status = (expr);                                          \
+-        TORCH_CHECK(status == CUDNN_STATUS_SUCCESS,                             \
+-                    "cuDNN error: ", cudnnGetErrorString(status));              \
+-    } while (0)
+-
+-// conv_transpose1d_forward implementation using cuDNN
++// conv_transpose1d_forward implementation using custom CUDA kernel
+ torch::Tensor conv_transpose1d_forward(
+     torch::Tensor input,
+     torch::Tensor weight,
+@@ -60,140 +60,31 @@
+     TORCH_CHECK(bias.size(0) == C_out, "bias size must match output channels");
+ 
+     // Compute output length for ConvTranspose1d:
+-    // L_out = (L_in - 1) * stride - 2 * padding + K + output_padding
+     int64_t L_out = (L_in - 1) * stride - 2 * padding + K + output_padding;
+     TORCH_CHECK(L_out > 0, "calculated output length must be positive");
+ 
+     // Allocate output tensor [N, C_out, L_out]
+     auto output = torch::empty({N, C_out, L_out}, input.options());
+ 
+-    // --- cuDNN setup ---
+-    cudnnHandle_t handle;
+-    CHECK_CUDNN(cudnnCreate(&handle));
+-
+-    cudnnTensorDescriptor_t dy_desc, dx_desc, bias_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&dy_desc));
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&dx_desc));
+-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&bias_desc));
+-    CHECK_CUDNN(cudnnCreateFilterDescriptor(&filter_desc));
+-    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv_desc));
+-
+-    // Set tensor descriptors for NCHW (here NCL)
+-    // dy_desc corresponds to the conv_transpose input: [N, C_out, L_in]
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+-        dy_desc,
+-        CUDNN_TENSOR_NCHW,
+-        CUDNN_DATA_FLOAT,
++    cudaStream_t stream = getCurrentCUDAStream();
++    conv_transpose1d_forward_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
+         static_cast<int>(N),
++        static_cast<int>(C_in),
+         static_cast<int>(C_out),
+         static_cast<int>(L_in),
+-        1));
++        static_cast<int>(L_out),
++        static_cast<int>(K),
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        static_cast<int>(output_padding),
++        stream);
+ 
+-    // dx_desc corresponds to the conv_transpose output: [N, C_in, L_out]
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+-        dx_desc,
+-        CUDNN_TENSOR_NCHW,
+-        CUDNN_DATA_FLOAT,
+-        static_cast<int>(N),
+-        static_cast<int>(C_in),
+-        static_cast<int>(L_out),
+-        1));
+-
+-    // Set filter descriptor for ConvTranspose1d weight layout [C_in, C_out, K]
+-    // cuDNN filter descriptor expects [K, C, H, W] = [C_out, C_in, K, 1]
+-    // Use cudnnSetFilter4dDescriptor with format CUDNN_TENSOR_NCHW and dims
+-    CHECK_CUDNN(cudnnSetFilter4dDescriptor(
+-        filter_desc,
+-        CUDNN_DATA_FLOAT,
+-        CUDNN_TENSOR_NCHW,
+-        static_cast<int>(C_out),
+-        static_cast<int>(C_in),
+-        static_cast<int>(K),
+-        1));
+-
+-    // Set convolution descriptor for the forward convolution that corresponds
+-    // to the transpose operation. Padding and stride are from ConvTranspose.
+-    CHECK_CUDNN(cudnnSetConvolution2dDescriptor(
+-        conv_desc,
+-        static_cast<int>(padding),
+-        static_cast<int>(padding),
+-        static_cast<int>(stride),
+-        static_cast<int>(stride),
+-        1, 1, // dilation
+-        CUDNN_CROSS_CORRELATION,
+-        CUDNN_DATA_FLOAT));
+-
+-    // Algorithm selection: use a standard algorithm
+-    cudnnConvolutionBwdDataAlgo_t algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
+-
+-    // Workspace size query
+-    size_t workspace_size = 0;
+-    CHECK_CUDNN(cudnnGetConvolutionBackwardDataWorkspaceSize(
+-        handle,
+-        filter_desc,
+-        dy_desc,
+-        conv_desc,
+-        dx_desc,
+-        algo,
+-        &workspace_size));
+-
+-    // Allocate workspace if needed
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaMalloc(&workspace, workspace_size);
+-    }
+-
+-    // Perform backward data (equivalent to ConvTranspose forward)
+-    float alpha = 1.0f, beta = 0.0f;
+-    CHECK_CUDNN(cudnnConvolutionBackwardData(
+-        handle,
+-        &alpha,
+-        filter_desc,
+-        weight.data_ptr<float>(), // filter: original weight layout [C_in, C_out, K]
+-        dy_desc,
+-        input.data_ptr<float>(), // dy: conv_transpose input
+-        conv_desc,
+-        algo,
+-        workspace,
+-        workspace_size,
+-        &beta,
+-        dx_desc,
+-        output.data_ptr<float>())); // dx: conv_transpose output
+-
+-    // Add bias (bias shape [C_out], broadcast over N and L)
+-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(
+-        bias_desc,
+-        CUDNN_TENSOR_NCHW,
+-        CUDNN_DATA_FLOAT,
+-        1,
+-        static_cast<int>(C_out),
+-        1,
+-        1));
+-    float beta_add = 1.0f;
+-    CHECK_CUDNN(cudnnAddTensor(handle,
+-                               &alpha,
+-                               bias_desc,
+-                               bias.data_ptr<float>(),
+-                               &beta_add,
+-                               dx_desc,
+-                               output.data_ptr<float>()));
+-
+-    // Cleanup
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(dy_desc));
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(dx_desc));
+-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(bias_desc));
+-    CHECK_CUDNN(cudnnDestroyFilterDescriptor(filter_desc));
+-    CHECK_CUDNN(cudnnDestroyConvolutionDescriptor(conv_desc));
+-    CHECK_CUDNN(cudnnDestroy(handle));
+-    if (workspace) cudaFree(workspace);
+-
+-    // Check for CUDA errors
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "CUDA error: ", cudaGetErrorString(err));
+-
+     return output;
+ }
+ 
+@@ -232,7 +123,7 @@
+ // Registration
+ void register_custom_ops(pybind11::module& m) {
+     m.def("conv_transpose1d_forward", &conv_transpose1d_forward,
+-          "ConvTranspose1d forward using cuDNN",
++          "ConvTranspose1d forward using custom CUDA kernel",
+           py::arg("input"), py::arg("weight"), py::arg("bias"),
+           py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
+     m.def("mul_bias_forward", &mul_bias_forward,

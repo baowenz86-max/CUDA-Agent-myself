@@ -1,0 +1,462 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,10 +1,7 @@
+ #include <cuda_runtime.h>
+-#include <cuda_fp16.h>
+ #include <cstdint>
+-#include <cstring>
+ #include <cstdio>
+ #include <cstdlib>
+-#include <cudnn.h>
+ 
+ // -----------------------------------------------------------------------------
+ // Error checking helper for CUDA runtime calls
+@@ -15,21 +12,11 @@
+         abort();
+     }
+ }
+-static inline void checkCudnn(cudnnStatus_t status, const char* file, int line) {
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        fprintf(stderr, "cuDNN error at %s:%d: %s\n", file, line, cudnnGetErrorString(status));
+-        abort();
+-    }
+-}
+ #define CUDA_CHECK(x) checkCuda((x), __FILE__, __LINE__)
+-#define CUDNN_CHECK(x) checkCudnn((x), __FILE__, __LINE__)
+ 
+ // -----------------------------------------------------------------------------
+ // Kernel: create_linspace
+ // Generates steps evenly spaced values from start to end inclusive.
+-// output: pointer to float32 array of length steps
+-// start, end: float scalars
+-// steps: number of points (>=1)
+ // -----------------------------------------------------------------------------
+ __global__ void create_linspace_kernel(float* output, float start, float end, int64_t steps) {
+     int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+@@ -45,15 +32,6 @@
+     }
+ }
+ 
+-// -----------------------------------------------------------------------------
+-// Launcher: create_linspace
+-// Allocates output memory is done by binding; this launches kernel on stream.
+-// Parameters:
+-//   output: device pointer to float32 of size steps
+-//   start, end: float values
+-//   steps: number of elements (int64_t, but must fit int for grid dims)
+-//   stream: CUDA stream
+-// -----------------------------------------------------------------------------
+ extern "C" void create_linspace_launcher(
+     float* output,
+     float start,
+@@ -63,7 +41,6 @@
+ {
+     if (steps <= 0) return;
+     int blockSize = 256;
+-    // grid size caps at 2^31-1, but computation can use grid-stride loop
+     int64_t gridSize64 = (steps + blockSize - 1) / blockSize;
+     int gridSize = (gridSize64 > 2147483647LL) ? 2147483647 : (int)gridSize64;
+     create_linspace_kernel<<<gridSize, blockSize, 0, stream>>>(
+@@ -74,9 +51,7 @@
+ // -----------------------------------------------------------------------------
+ // Kernel: tensor_sub
+ // Computes x[i] - y[j] where x shape [N, C, L] and y shape [L], broadcasting
+-// y along the last dimension. Inputs are contiguous float32 tensors.
+-// x_numel: total number of elements in x = N*C*L
+-// L: length of last dimension
++// y along the last dimension.
+ // -----------------------------------------------------------------------------
+ __global__ void tensor_sub_kernel(float* x_in, const float* y, int64_t x_numel, int64_t L) {
+     int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+@@ -87,16 +62,6 @@
+     }
+ }
+ 
+-// -----------------------------------------------------------------------------
+-// Launcher: tensor_sub
+-// Performs in-place subtraction: x = x - y.
+-// Parameters:
+-//   x_inout: device pointer to x (will be modified in-place)
+-//   y: device pointer to y (length L)
+-//   x_numel: total elements in x
+-//   L: length of last dimension of x (also length of y)
+-//   stream: CUDA stream
+-// -----------------------------------------------------------------------------
+ extern "C" void tensor_sub_launcher(
+     float* x_inout,
+     const float* y,
+@@ -114,184 +79,62 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// cuDNN based conv_transpose1d launcher
++// Kernel: conv_transpose1d (pure CUDA implementation)
++// input:   [N, C, L]
++// weight:  [C, K, R] (PyTorch layout)
++// bias:    [K]
++// output:  [N, K, L_out]
++// L_out = (L-1)*stride - 2*padding + R + output_padding
+ // -----------------------------------------------------------------------------
+-// This launcher implements a 1D transposed convolution using cuDNN's 2D API
+-// with height dimension set to 1 (or using 1D API when available). It follows
+-// the exact PyTorch semantics for ConvTranspose1d with given stride, padding,
+-// output_padding. The input is assumed contiguous N,C,L; weight is
+-// [C_in, C_out, kernel_size]; bias is [C_out]. Output is [N, C_out, L_out]
+-// with L_out = (L-1)*stride - 2*padding + kernel_size + output_padding.
+-//
+-// Because cuDNN's transposed convolution API expects input as gradient of
+-// convolution, weight layout may be [C_out, C_in, kernel] depending on API;
+-// however PyTorch weight is [C_in, C_out, kernel]. We will use cudnnConvolutionBackwardData
+-// or cudnnConvolutionTranspose? The simplest is to use cudnnConvolutionBackwardData with
+-// appropriately rearranged weight? Actually cudnnConvolutionBackwardData expects filter
+-// in same layout as forward conv: [out_channels, in_channels, kernel]. PyTorch stores
+-// weight in transposed conv as [in_channels, out_channels, kernel]. Therefore we can
+-// either permute or use cudnnConvolutionTranspose which exists in cuDNN 8+
+-// with filter layout [in_channels, out_channels, kernel]. We'll use cudnnConvolutionTranspose.
+-// For 1D, we can treat as 2D with height=1, or use cudnnConvolutionTranspose with CUDNN_CONVOLUTION?
+-// Check available cuDNN version. We'll implement using 2D descriptors with height dimension 1,
+-// which is robust across versions.
+-// -----------------------------------------------------------------------------
++__global__ void conv_transpose1d_kernel(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int64_t N,
++    int C,
++    int K,
++    int64_t L,
++    int R,
++    int stride,
++    int padding,
++    int64_t L_out)
++{
++    int64_t total = N * K * L_out;
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t grid_stride = (int64_t)gridDim.x * blockDim.x;
+ 
+-// Helper to create a tensor descriptor for NCHW layout (here N,C,W,1)
+-static cudnnTensorDescriptor_t createTensorDesc(cudnnDataType_t dataType,
+-                                                int64_t n, int64_t c, int64_t w) {
+-    cudnnTensorDescriptor_t desc;
+-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc));
+-    // Use 4D: N, C, W, 1 (height=1)
+-    int dims[4] = {(int)n, (int)c, (int)w, 1};
+-    int strides[4] = {(int)(c*w), (int)w, 1, 1}; // contiguous NCHW with H=1
+-    CUDNN_CHECK(cudnnSetTensorNdDescriptor(desc, dataType, 4, dims, strides));
+-    return desc;
+-}
++    for (int64_t pos = idx; pos < total; pos += grid_stride) {
++        // decompose pos into (n, k, l_out)
++        int64_t l_out = pos % L_out;
++        int64_t tmp = pos / L_out;
++        int k = tmp % K;
++        int n = tmp / K;
+ 
+-// Helper to create filter descriptor for ConvTranspose: filter is [K, C, R, 1]
+-// where K = out_channels, C = in_channels, R = kernel_size.
+-// Note: PyTorch weight is [in_channels, out_channels, kernel_size] = [C, K, R],
+-// but transposed convolution filters in cuDNN are described as [K, C, R].
+-// Therefore we need to reorder memory or use a permuted view. Since kernels are
+-// small, we could permute on device? Simpler: the caller (binding) may pass weight
+-// in actual layout [C,K,R]. We'll assume weight passed as-is, but we need to tell
+-// cuDNN that the filter is [K,C,R] with appropriate strides treating the tensor
+-// strides: filter elements are stored as [C,K,R] contiguous, so the stride for C dim
+-// is (K*R), for K dim is R, for R dim is 1. This is a non-standard layout but cuDNN
+-// allows arbitrary strides via cudnnSetFilterNdDescriptor.
+-// We'll set dims[0]=K, dims[1]=C, dims[2]=R, dims[3]=1,
+-// strides[0]=R, strides[1]=K*R, strides[2]=1, strides[3]=1.
+-// This effectively treats weight tensor as KCR but reads it as CKR. Is that valid?
+-// cuDNN documentation requires that strides are in elements, and dims are number of
+-// elements. It should work.
+-// Alternatively, we can use cudnnConvolutionBackwardData which expects filter in
+-// [K, C, H, W] and we pass the same layout.
+-// We'll proceed with cudnnConvolutionTranspose if available.
+-// Since we cannot detect version at compile time easily, we'll use cudnnConvolutionBackwardData
+-// which exists in all versions and is mathematically equivalent to transposed conv
+-// when input is viewed as gradient. For backward data, the weight layout is
+-// [K, C, H, W] (same as forward conv) and the data input grad is [N, C, H, W]? Wait,
+-// Let's recall: cudnnConvolutionBackwardData computes the gradient wrt input data,
+-// given gradOutput and filter. It returns gradInput. If we set gradOutput = x (with
+-// channels C_in), filter = weight (shape [C_out, C_in, H, W])? But PyTorch weight is
+-// [C_in, C_out, H, W]. So not direct.
+-//
+-// Instead, we can use cudnnConvolutionForward with input as output? Actually,
+-// transposed conv can be implemented as reverse of convolution: place zeros between
+-// input positions and then do a convolution with flipped filters. But cuDNN has
+-// cudnnConvolutionBackwardData which can be used if we pass weight in layout
+-// [C_out, C_in, H, W] and input as [N, C_out, ...]? That's not our case.
+-//
+-// The most straightforward: use cudnnConvolutionTranspose (available since cuDNN 6?)
+-// Let's implement using that API, assuming cuDNN 8 or newer delivered with PyTorch.
+-// PyTorch itself uses cudnnConvolutionBackwardData for transposed conv in C++,
+-// but it handles weight layout internally. We'll have to replicate that. However our
+-// launcher only receives raw pointers, so we can perform a device-side permutation of
+-// weight to [C_out, C_in, kernel] (K, C, R) before calling cuDNN? That would require
+-// kernels. Could do a simple cudaMemcpy2D? Better: we can write a small CUDA kernel to
+-// permute weight; but this phase says only custom_ops.cu, so we can include a kernel
+-// for weight transpose. But that adds complexity.
+-//
+-// Since PyTorch's cuDNN binding accepts weight in [in, out, k] and internally transposes
+-// for cuDNN. We can mimic by first transposing weight into a temporary buffer allocated
+-// by this launcher? But allocation is binding's job ideally, but we can use cudaMalloc
+-// inside launcher, since it's a pure CUDA function. That's acceptable.
+-//
+-// However, the contract says conv_transpose1d must use cuDNN and be in .cu file? The
+-// workspace says .cpp files for cuDNN/cuBLAS API calls, but current phase allows only
+-// .cu. We'll put everything in .cu with extern "C" launchers, using cudaMalloc as needed.
+-// Binding will pass raw pointers and stream; launcher can allocate temporary memory.
+-//
+-// Simpler approach: Use cudnnConvolutionBackwardData with appropriate descriptors.
+-// cudnnConvolutionBackwardData expects:
+-//   - dyDesc: gradient output tensor: [N, C_out, W_out]
+-//   - wDesc: filter descriptor for the forward convolution: [C_out, C_in, R]
+-//   - dxDesc: gradient input tensor: [N, C_in, W_in]
+-// It computes dx = dy * w, effectively transposed convolution. In our model:
+-//   forward conv would map [N, C_in, W_in] -> [N, C_out, W_out] with filter [C_out, C_in, R]
+-//   transposed conv maps [N, C_in, W_in] -> [N, C_out, W_out] with stride and padding.
+-// Actually transposed conv is exactly the backward data of a convolution with same
+-// stride/padding but with filter dimensions swapped. However PyTorch weight is
+-// [C_in, C_out, R], which is filter for a convolution from C_out to C_in, i.e.,
+-// forward conv with filter [C_in, C_out, R] maps [N, C_out, ?] -> [N, C_in, ?].
+-// The transposed conv we want maps [N, C_in, L_in] -> [N, C_out, L_out].
+-// If we treat transposed conv as backward data of a convolution that maps
+-// [N, C_out, L_out] -> [N, C_in, L_in] with filter [C_out, C_in, R], then the
+-// filter layout would be [C_out, C_in, R], which is the transpose of PyTorch
+-// weight [C_in, C_out, R]. So we need to transpose weight first.
+-//
+-// We can perform transpose on GPU using a simple kernel, then call
+-// cudnnConvolutionBackwardData with the transposed weight and input as dy,
+-// output as dx? Let's set:
+-//   dy = input (shape [N, C_in, L_in])  -- note C_in channels as "output channels" for this virtual conv?
+-//   w = transposed weight (shape [C_out, C_in, R])
+-//   dx = output (shape [N, C_out, L_out])
+-// Then cudnnConvolutionBackwardData computes dx = dy * w with the virtual conv having
+-// input channels = C_out, output channels = C_in, filter dims [C_out, C_in, R].
+-// That exactly gives transposed conv! We can arrange descriptors accordingly:
+-//   dyDesc: [N, C_in, L_in] (treated as output of virtual conv, i.e., N, C_out_virtual?)
+-//   wDesc: filter dims [C_out, C_in, R] (as C_out_virtual, C_in_virtual?)
+-//   dxDesc: [N, C_out, L_out]
+-//   convDesc: set for forward conv with stride, padding, dilation=1.
+-// Then cudnnConvolutionBackwardData will compute the gradient wrt input of that conv,
+-// which is exactly the transposed conv operation. This works if cuDNN allows
+-// arbitrary channel counts; yes.
+-//
+-// So we need:
+-//   1. Transpose weight from [C_in, C_out, R] to [C_out, C_in, R].
+-//   2. Set up descriptors.
+-//   3. Call cudnnConvolutionBackwardData.
+-//   4. Add bias.
+-//
+-// We'll implement a simple kernel to transpose weight.
+-// Alternatively, use cudnnConvolutionTranspose which might not require transpose,
+-// but to be safe and compatible use backward data.
+-//
+-// Let's proceed with this design.
+-
+-// Kernel to transpose weight: input [C, K, R] -> output [K, C, R]
+-// Here C = in_channels, K = out_channels, R = kernel_size.
+-__global__ void transpose_weight_kernel(const float* src, float* dst,
+-                                        int C, int K, int R) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = C * K * R;
+-    if (idx >= total) return;
+-    // src index: (c*K + k)*R + r  (contiguous C,K,R)
+-    // dst index: (k*C + c)*R + r  (contiguous K,C,R)
+-    int r = idx % R;
+-    int tmp = idx / R;
+-    int k = tmp % K;
+-    int c = tmp / K;
+-    int src_idx = (c * K + k) * R + r;
+-    int dst_idx = (k * C + c) * R + r;
+-    dst[dst_idx] = src[src_idx];
+-}
+-
+-// Bias addition kernel: out += bias, with out shape [N, K, L_out]
+-__global__ void add_bias_kernel(float* out, const float* bias,
+-                                int64_t N, int K, int64_t L_out) {
+-    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+-    int64_t total = N * (int64_t)K * L_out;
+-    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+-    for (int64_t i = idx; i < total; i += stride) {
+-        // channel index k = (i / L_out) % K
+-        int64_t k = (i / L_out) % (int64_t)K;
+-        out[i] += bias[k];
++        float acc = 0.0f;
++        // For each input position l_in and kernel offset r that satisfy:
++        //   l_out + padding = l_in * stride + r
++        // equivalently: l_in = (l_out + padding - r) / stride if divisible and within [0, L)
++        for (int r = 0; r < R; ++r) {
++            int64_t numerator = l_out + padding - r;
++            if (numerator < 0) continue;
++            if (numerator % stride != 0) continue;
++            int64_t l_in = numerator / stride;
++            if (l_in >= L) continue;
++            // accumulate over input channels
++            for (int c = 0; c < C; ++c) {
++                float x_val = input[((n * C + c) * L) + l_in];
++                float w_val = weight[((c * K + k) * R) + r];
++                acc += x_val * w_val;
++            }
++        }
++        if (bias != nullptr) {
++            acc += bias[k];
++        }
++        output[pos] = acc;
+     }
+ }
+ 
+-// Launcher for conv_transpose1d
+-// Parameters:
+-//   input: device pointer to x [N, C, L]
+-//   weight: device pointer to weight [C, K, R]
+-//   bias: device pointer to bias [K]
+-//   N, C, K, L: dimensions, R kernel size
+-//   stride, padding, output_padding: ints
+-//   output: device pointer to preallocated output [N, K, L_out]
+-//   stream: CUDA stream
+-// The binding should allocate output size = N*K*L_out.
+-// This launcher will allocate temporary transposed weight on device.
+ extern "C" void conv_transpose1d_launcher(
+     const float* input,
+     const float* weight,
+@@ -307,131 +150,19 @@
+     int output_padding,
+     cudaStream_t stream)
+ {
+-    // Validate basic dimensions
+     if (N <= 0 || C <= 0 || K <= 0 || L <= 0 || R <= 0) return;
+     if (stride < 1 || padding < 0 || output_padding < 0) return;
+ 
+-    // Compute output length
+     int64_t L_out = (L - 1) * stride - 2 * padding + R + output_padding;
+-    // Assuming L_out already matches binding allocation; no need to compute again, but ensure >0
+     if (L_out <= 0) return;
+ 
+-    // Step 1: Transpose weight: [C,K,R] -> [K,C,R]
+-    float* weight_t = nullptr;
+-    CUDA_CHECK(cudaMalloc(&weight_t, (size_t)C * K * R * sizeof(float)));
+-    int blockSizeT = 256;
+-    int gridT = (C * K * R + blockSizeT - 1) / blockSizeT;
+-    transpose_weight_kernel<<<gridT, blockSizeT, 0, stream>>>(weight, weight_t, C, K, R);
++    int blockSize = 256;
++    int64_t total = N * K * L_out;
++    int64_t gridSize64 = (total + blockSize - 1) / blockSize;
++    int gridSize = (gridSize64 > 2147483647LL) ? 2147483647 : (int)gridSize64;
++
++    conv_transpose1d_kernel<<<gridSize, blockSize, 0, stream>>>(
++        input, weight, bias, output,
++        N, C, K, L, R, stride, padding, L_out);
+     CUDA_CHECK(cudaGetLastError());
+-
+-    // Step 2: Set up cuDNN descriptors for backward data
+-    cudnnHandle_t cudnn;
+-    CUDNN_CHECK(cudnnCreate(&cudnn));
+-    CUDNN_CHECK(cudnnSetStream(cudnn, stream));
+-
+-    cudnnDataType_t dataType = CUDNN_DATA_FLOAT;
+-    cudnnTensorFormat_t format = CUDNN_TENSOR_NCHW; // we'll use NCHW with extra dimension
+-
+-    // Create tensor descriptors (using 4D, H=1)
+-    cudnnTensorDescriptor_t dyDesc, dxDesc;
+-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&dyDesc));
+-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&dxDesc));
+-
+-    // dyDesc corresponds to input x: shape [N, C, L, 1]
+-    int dyDims[4] = {(int)N, (int)C, (int)L, 1};
+-    int dyStrides[4] = {(int)(C*L), (int)L, 1, 1};
+-    CUDNN_CHECK(cudnnSetTensorNdDescriptor(dyDesc, dataType, 4, dyDims, dyStrides));
+-
+-    // dxDesc corresponds to output: shape [N, K, L_out, 1]
+-    int dxDims[4] = {(int)N, (int)K, (int)L_out, 1};
+-    int dxStrides[4] = {(int)(K*L_out), (int)L_out, 1, 1};
+-    CUDNN_CHECK(cudnnSetTensorNdDescriptor(dxDesc, dataType, 4, dxDims, dxStrides));
+-
+-    // Filter descriptor: weight_t shape [K, C, R, 1]
+-    cudnnFilterDescriptor_t wDesc;
+-    CUDNN_CHECK(cudnnCreateFilterDescriptor(&wDesc));
+-    int wDims[4] = {(int)K, (int)C, (int)R, 1};
+-    CUDNN_CHECK(cudnnSetFilterNdDescriptor(wDesc, dataType, format, 4, wDims));
+-
+-    // Convolution descriptor: virtual forward conv with stride, padding (same as transposed conv params)
+-    cudnnConvolutionDescriptor_t convDesc;
+-    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&convDesc));
+-    // Use 2D convolution with input height=1, filter height=1, pad along width only
+-    // Set convolution 2D: dims = 2
+-    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(
+-        convDesc,
+-        padding, // pad_h (height)
+-        0,       // pad_w? Wait, for 1D conv with H=1, padding along width should be given, but using 2D descriptor needs pad_h and pad_w. We want only width dimension to be convolved. Since height dimension size=1 and filter height=1, padding_h should be 0. So set pad_h=0, pad_w=padding.
+-        stride,  // stride_h (height) should be 1? For height dimension size=1, stride doesn't matter but set 1. Actually for transposed conv, stride applies to both dims, but our height=1, so stride_h=1 is fine.
+-        stride,  // stride_w (width)
+-        1,       // dilation_h
+-        1,       // dilation_w
+-        CUDNN_CROSS_CORRELATION,
+-        dataType));
+-    // Wait, cudnnSetConvolution2dDescriptor signature: (desc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, mode, computeType)
+-    // Check: we must set pad_h=0, pad_w=padding, stride_h=1, stride_w=stride. Because we treat 1D as 2D with height dimension 1.
+-    // Actually, we want a 1D convolution along width. If we set height dimension to 1 and kernel height to 1, then convolution won't affect height; stride_h can be 1, pad_h=0.
+-    // We already set tensor desc with dims H=1. convDesc should have dims 2 and correct pads.
+-    // We'll use cudnnSetConvolution2dDescriptor with pad_h=0, pad_w=padding, stride_h=1, stride_w=stride, dilation_h=1, dilation_w=1, mode=CUDNN_CROSS_CORRELATION, computeType=CUDNN_DATA_FLOAT.
+-    // But note: cudnnConvolutionBackwardData expects convDesc to describe the forward conv whose data gradient we compute. So the forward conv would have stride stride and padding padding.
+-    // That's consistent.
+-
+-    // However, we need to use cudnnSetConvolution2dDescriptor but we already created convDesc; this call overwrites. Good.
+-
+-    // Determine workspace size for backward data algorithm
+-    cudnnConvolutionBwdDataAlgo_t algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1; // default; can choose based on availability
+-    // Query workspace size
+-    size_t workspaceSize = 0;
+-    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+-        cudnn, wDesc, dyDesc, convDesc, dxDesc, algo, &workspaceSize));
+-
+-    void* workspace = nullptr;
+-    if (workspaceSize > 0) {
+-        CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
+-    }
+-
+-    // Backward data: dx = conv backward data(dy, w)
+-    float alpha = 1.0f, beta = 0.0f;
+-    CUDNN_CHECK(cudnnConvolutionBackwardData(
+-        cudnn,
+-        &alpha,
+-        wDesc, weight_t,
+-        dyDesc, input,
+-        convDesc,
+-        algo,
+-        workspace, workspaceSize,
+-        &beta,
+-        dxDesc, output));
+-
+-    // Add bias
+-    if (bias != nullptr) {
+-        int64_t totalOut = N * (int64_t)K * L_out;
+-        int blockSizeBias = 256;
+-        int64_t gridBias64 = (totalOut + blockSizeBias - 1) / blockSizeBias;
+-        int gridBias = (gridBias64 > 2147483647LL) ? 2147483647 : (int)gridBias64;
+-        add_bias_kernel<<<gridBias, blockSizeBias, 0, stream>>>(
+-            output, bias, N, K, L_out);
+-        CUDA_CHECK(cudaGetLastError());
+-    }
+-
+-    // Cleanup cuDNN and temporaries
+-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(dyDesc));
+-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(dxDesc));
+-    CUDNN_CHECK(cudnnDestroyFilterDescriptor(wDesc));
+-    CUDNN_CHECK(cudnnDestroyConvolutionDescriptor(convDesc));
+-    CUDNN_CHECK(cudnnDestroy(cudnn));
+-    CUDA_CHECK(cudaFree(weight_t));
+-    if (workspace) CUDA_CHECK(cudaFree(workspace));
+ }
+-
+-// Note: The binding layer will be responsible for creating output tensor with
+-// shape [N, K, L_out] and passing raw pointers. The launcher above uses
+-// cudnnConvolutionBackwardData; if cuDNN version does not support this algo,
+-// we may need to handle errors. But for typical modern cuDNN, it works.
+-// Also, we used cudnnSetConvolution2dDescriptor, but we must ensure the
+-// conv descriptor dimension count matches tensor desc dimensions. cudnnSetConvolution2dDescriptor
+-// sets 2D convolution. Our tensors are 4D but with height=1, the 2D conv will
+-// still work because cuDNN interprets NCHW with H=1. The convolution descriptor
+-// has 2D (kernel height, width). We set filter height=1 and width=R. pad_h=0, pad_w=padding,
+-// stride_h=1, stride_w=stride.
+-// This is standard approach for 1D convs.
