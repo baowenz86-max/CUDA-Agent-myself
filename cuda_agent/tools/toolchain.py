@@ -26,10 +26,10 @@ def build_environment() -> dict[str, str]:
     root, cxx = cuda_home(), host_cxx()
     env.update({
         "CUDA_HOME": str(root),
-        "CUDACXX": str(root / "bin/nvcc"),
+        "CUDACXX": os.environ.get("CUDACXX", str(root / "bin/nvcc")),
         "CC": os.environ.get("CC", DEFAULT_HOST_CC),
         "CXX": cxx,
-        "CUDAHOSTCXX": cxx,
+        "CUDAHOSTCXX": os.environ.get("CUDAHOSTCXX", cxx),
         "PATH": f"{root / 'bin'}{os.pathsep}{env.get('PATH', '')}",
         "LD_LIBRARY_PATH": f"{root / 'lib64'}{os.pathsep}{env.get('LD_LIBRARY_PATH', '')}",
     })

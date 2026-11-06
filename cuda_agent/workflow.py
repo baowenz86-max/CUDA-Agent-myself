@@ -21,7 +21,7 @@ from typing import Mapping, Sequence
 from cuda_agent.api import run_agent
 from cuda_agent.candidates import CandidateStore, clean_sources, read_json
 from cuda_agent.validation import check_sources
-from cuda_agent.repair import failure_category, concise_log
+from cuda_agent.repair import failure_category, concise_log, TERMINAL_FAILURES
 from cuda_agent.log_setup import CURRENT_TASK_ID, configure_logging
 from cuda_agent.report import WorkflowReport
 from cuda_agent.tools.toolchain import build_environment
@@ -112,6 +112,14 @@ REPAIR_PROMPTS.update({
     "memory": "CUDA 内存错误：使用 memcheck/launch 诊断定位 kernel，核对指针 device、索引上界、分配大小、stride、stream 和对象生命周期。检查是否将 CPU Tensor 指针传给 CUDA kernel。诊断 unavailable 不能视为通过。",
 })
 
+REPAIR_PROMPTS.update({
+    'shape': REPAIR_PROMPTS['structure'],
+    'binding': REPAIR_PROMPTS['interface'],
+    'contract': REPAIR_PROMPTS['interface'],
+    'diagnostic_unreliable': '检查点映射不可信；禁止根据该检查点断言根因，使用正常 forward、runtime、shape 和源码证据。',
+    'unknown': '证据不足，明确缺口，使用可验证的保守根因假设。',
+})
+SEMANTIC_RULES += "\n区分事实、数学推断和假设；不能仅凭 digamma 等特殊函数的输出幅度断言输入幅度。不可信检查点不得用于根因断言。"
 
 
 @dataclass(frozen=True)
@@ -309,12 +317,16 @@ def send_feedback(error_log: str, workdir: Path, stage: str, run_dir: Path | Non
             "这是一次工作流阶段失败修复。请仅依据现有日志定位根因，保持正确代码不变，"
             "并只修改允许的生成文件。"
         )
+    diagnostic = read_json(run_dir / 'diagnostic.json', {}) if run_dir else {}
+    if diagnostic.get('failure_type') == 'diagnostic_unreliable' or any(
+            row.get('trustworthy') is False for row in diagnostic.get('checkpoints', [])):
+        repair_prompt += '\n' + REPAIR_PROMPTS['diagnostic_unreliable']
     return run_agent(
         f"""{repair_prompt}
 
 当前失败阶段：{stage}
 当前源码可能已恢复为最好候选。请结合 repair_context.json 区分当前主版本与被拒绝的修改，
-保留正确部分，按第一个错误检查点做最小修改。若连续两轮没有改善，必须提出不同且可验证的根因。
+保留正确部分，仅使用可信检查点定位首个分歧；映射不可靠时按正常 forward、runtime、shape 和源码证据修复。若连续两轮没有改善，必须提出不同且可验证的根因。
 只支持本任务实际使用的 dtype。不得修改诊断/验证器、放宽容限或以填零掩盖未写输出。
 修复基准的 candidate_id 与源码哈希见 repair_context.base_candidate_id/base_manifest，当前失败证据必须对应这一版本。
 连续无改善时 different_hypothesis_required=true：依据错误类别更换诊断方向，禁止提交已评估的相同源码。
@@ -383,6 +395,7 @@ def execute_workflow(
     run_dir.mkdir(parents=True, exist_ok=True)
     seed = int(os.environ.get("CUDA_AGENT_VERIFICATION_SEED", "2026")) + task_id * 100
     env.update(CUDA_AGENT_RUN_DIR=str(run_dir.resolve()), CUDA_AGENT_VERIFICATION_SEED=str(seed))
+    env["CUDA_AGENT_PYTHON"] = sys.executable
     store = CandidateStore(config.workdir, run_dir)
     sample = load_task(task_id)
     report.operators = str(sample.get("ops", "unknown"))
@@ -393,12 +406,18 @@ def execute_workflow(
     ready, reference_log = run_command((sys.executable, "-m", "utils.preflight"), config.workdir, env, gpu_pool)
     report.add_stage("reference contract", ready, time.monotonic() - started)
     if not ready:
+        report.failure_type = read_json(run_dir / "task_contract.json", {}).get("failure_type", failure_category({"stage": "reference", "error": reference_log}))
         report.failure_reason = "Reference preflight failed: " + reference_log[-6000:]
         return False
 
+    dependency = read_json(run_dir / 'dependencies.json', {})
+    if dependency.get('status') == 'passed':
+        from agent_workdir.utils.dependencies import configure_dependency
+        configure_dependency(dependency, env)
+
     def evaluate():
         # Reports belong to a specific source version; never reuse stale results.
-        for name in ("interface.json", "verification.json", "diagnostic.json"):
+        for name in ("interface.json", "interface_precompile.json", "verification.json", "diagnostic.json"):
             (run_dir / name).unlink(missing_ok=True)
         checks = check_sources(config.workdir, read_json(run_dir / "custom_ops_contract.json"))
         (run_dir / "source_checks.json").write_text(json.dumps(checks.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -406,18 +425,32 @@ def execute_workflow(
             LOGGER.warning("源代码诊断：%s", warning)
         if checks.errors:
             return "sources", False, "\n".join(checks.errors), None, None
+        if (run_dir / 'task_contract.json').exists():
+            interface_ok, interface_log = run_command((sys.executable, '-m', 'utils.preflight', '--interface-only'), config.workdir, env, gpu_pool)
+            if not interface_ok:
+                evidence = read_json(run_dir / 'interface_precompile.json', {})
+                return evidence.get('failure_type', 'interface'), False, interface_log, None, None
         compiled, compile_log = run_command(COMPILE_COMMAND, config.workdir, env, gpu_pool)
         if not compiled:
-            return "compile", False, compile_log, None, None
+            dependency = read_json(run_dir / 'dependencies.json', {})
+            category = 'environment' if dependency.get('status') == 'failed' else failure_category({'stage': 'compile', 'error': compile_log})
+            return category, False, compile_log, None, None
+        dependency = read_json(run_dir / 'dependencies.json', {})
+        if dependency.get('status') == 'passed':
+            from agent_workdir.utils.dependencies import configure_dependency
+            configure_dependency(dependency, env)
         interface_ok, interface_log = run_command((sys.executable, "-m", "utils.preflight", "--compiled"), config.workdir, env, gpu_pool)
         if not interface_ok:
-            return "interface", False, compile_log + "\n" + interface_log, None, None
+            return read_json(run_dir / "interface.json", {}).get("failure_type", "interface"), False, compile_log + "\n" + interface_log, None, None
         verified, verify_log = run_command(VERIFY_COMMAND, config.workdir, env, gpu_pool)
         verification = read_json(run_dir / "verification.json", {})
         # Exit code alone cannot establish that all fixed normal-forward checks ran.
         rows = verification.get("checks", [])
         verified = verified and verification.get("status") == "passed" and len(rows) == 5 and all(row.get("status") == "passed" for row in rows)
         diagnostic = None
+        terminal = failure_category({'stage': 'verification', 'verification': verification, 'error': verify_log})
+        if terminal in TERMINAL_FAILURES:
+            return terminal, False, verify_log, verification, None
         if not verified and (run_dir / "failure_inputs.pt").exists() and verification.get("first_failure"):
             _, diagnostic_log = run_command((*VERIFY_COMMAND, "--diagnose"), config.workdir, env, gpu_pool)
             diagnostic = read_json(run_dir / "diagnostic.json", {"status": "unavailable", "reason": diagnostic_log[-6000:]})
@@ -439,6 +472,10 @@ def execute_workflow(
                                                 "--replay", str(run_dir / "failure_inputs.pt")), config.workdir, env, gpu_pool)
                 diagnostic["sanitizer_log"] = sanitizer_log[-12000:]
                 (run_dir / "diagnostic.json").write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding="utf-8")
+        if diagnostic:
+            diagnostic_category = failure_category({'stage': 'runtime', 'error': str(diagnostic.get('reason', ''))})
+            if diagnostic_category in TERMINAL_FAILURES or diagnostic.get('failure_type') in TERMINAL_FAILURES:
+                return diagnostic_category if diagnostic_category in TERMINAL_FAILURES else diagnostic['failure_type'], False, verify_log, verification, diagnostic
         return "verification", verified, compile_log + "\n" + interface_log + "\n" + verify_log, verification, diagnostic
 
     report.repair_budget = config.repair_attempts
@@ -448,6 +485,7 @@ def execute_workflow(
     if not generated:
         record = store.capture("sources", False, "Generation failed; see workflow.log and api_calls.jsonl")
         report.best_candidate = str(Path(record["snapshot"]).relative_to(report.log_path.parent))
+        report.failure_type = "generation"
         report.failure_reason = "Initial three-stage generation failed; no regeneration or repair."
         return False
 
@@ -457,8 +495,9 @@ def execute_workflow(
         stage, success, log, verification, diagnostic = evaluate()
         record = store.capture(stage, success, log, verification, diagnostic)
         report.candidates_evaluated += 1
-        report.best_candidate = str(Path(store.best["snapshot"]).relative_to(report.log_path.parent))
-        details = record["decision"]
+        report.best_candidate = str(Path(store.best["snapshot"]).relative_to(report.log_path.parent)) if store.best else "none"
+        report.failure_type = failure_category(record) if not success else ""
+        details = record["decision"] + "; " + record["decision_reason"]
         if not success:
             details += "; " + concise_log(log)
             LOGGER.warning("%s失败：stage=%s reason=%s", label, stage, concise_log(log))
@@ -466,12 +505,19 @@ def execute_workflow(
         return success, log
 
     success, log = evaluate_candidate("initial candidate")
+    if report.failure_type in TERMINAL_FAILURES:
+        report.failure_reason = 'Task terminated: ' + report.failure_type + '; ' + concise_log(log)
+        return False
     api_failures = 0
     api_calls = 0
     while not success and report.repairs_used < config.repair_attempts:
+        if report.failure_type in TERMINAL_FAILURES:
+            report.failure_reason = 'Task terminated: ' + report.failure_type + '; ' + concise_log(log)
+            return False
         repair = report.repairs_used + 1
         store.restore_best()
         base = store.best
+        store.repair_base = base
         api_calls += 1
         LOGGER.info("修复 %d/%d；基准 candidate=%s category=%s", repair, config.repair_attempts, base['id'], failure_category(base))
         started = time.monotonic()
@@ -488,6 +534,7 @@ def execute_workflow(
                            report.repairs_used, config.repair_attempts)
             if api_failures >= MAX_CONSECUTIVE_REPAIR_API_FAILURES:
                 store.restore_best()
+                report.failure_type = failure_category(store.best) if store.best else report.failure_type
                 report.failure_reason = (f"Repair API failed {api_failures} consecutive times; "
                                          f"code repairs used {report.repairs_used}/{config.repair_attempts}. " +
                                          store.best_failure())
@@ -495,12 +542,18 @@ def execute_workflow(
             continue
         api_failures = 0
         success, log = evaluate_candidate(f"repair #{repair}")
+        if report.failure_type in TERMINAL_FAILURES:
+            report.repairs_used -= 1  # infrastructure/reference failures do not consume algorithm repair budget
+            report.failure_reason = 'Task terminated: ' + report.failure_type + '; ' + concise_log(log)
+            return False
 
     if success:
+        report.correctness_passed = True
         started = time.monotonic()
         profiled, profile_log = run_command(PROFILE_COMMAND, config.workdir, env, gpu_pool)
         report.add_stage("profiling", profiled, time.monotonic() - started)
         if not profiled:
+            report.profiling_failed = True
             report.failure_reason = "Correctness passed, but profiling failed: " + profile_log[-6000:]
             return False
         started = time.monotonic()
@@ -509,6 +562,7 @@ def execute_workflow(
         save_result(task_id, config.workdir, {"verification.log": log, "profile.log": profile_log})
         return True
     store.restore_best()
+    report.failure_type = failure_category(store.best) if store.best else report.failure_type
     report.failure_reason = f"Repair budget exhausted ({report.repairs_used}/{config.repair_attempts}). " + store.best_failure()
     return False
 

@@ -54,6 +54,18 @@ if torch is not None:
 
 @unittest.skipIf(torch is None, 'PyTorch is not installed')
 class TensorDiagnosticsTests(unittest.TestCase):
+    def test_cpu_migration_preserves_fixture_and_independent_inputs(self):
+        from agent_workdir.utils.verification import device_inputs
+        fixture = torch.arange(8.0)
+        original = fixture.clone()
+        reference = device_inputs([fixture], 'cpu')[0]
+        candidate = device_inputs([fixture], 'cpu')[0]
+        self.assertNotEqual(reference.data_ptr(), fixture.data_ptr())
+        self.assertNotEqual(candidate.data_ptr(), reference.data_ptr())
+        reference.add_(100)
+        torch.testing.assert_close(fixture, original)
+        torch.testing.assert_close(candidate, original)
+
     def test_sensitive_sign_failure_contains_prior_near_zero_values(self):
         diagnostic = diagnose(SignReference(), SignGenerated(), {'state_dict': {}},
                               [torch.tensor([-1e-7, 1.])], 2027, 'cpu')

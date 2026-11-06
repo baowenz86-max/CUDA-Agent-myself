@@ -237,7 +237,10 @@ class SelectionTests(unittest.TestCase):
         evidence['checks'][0]['error']['kind'] = kind
         evidence['first_failure'] = evidence['checks'][0]
         return {'stage': 'verification', 'verification': evidence,
-                'diagnostic': {'status': 'failed', 'matched_checkpoints': matched, 'input_seed': 2027}}
+                'diagnostic': {'status': 'failed', 'matched_checkpoints': matched, 'input_seed': 2027,
+                               'fixture_id': 'fixture', 'reference_sequence': ['a', 'b', 'c', 'd'],
+                               'checkpoints': [{'id': str(i), 'trustworthy': True, 'matched': True} for i in range(matched)] +
+                                              [{'id': str(matched), 'trustworthy': True, 'matched': False}]}}
 
     def test_task14_shape_fix_retained_for_order_repair(self):
         old = self.candidate('tensor_structure')
@@ -294,10 +297,10 @@ class SelectionTests(unittest.TestCase):
         new['verification']['checks'].append(later)
         new['verification']['first_failure'] = later
         new['diagnostic']['input_seed'] = 2028
-        new['diagnostic']['comparison'] = {'status': 'matched', 'input_seed': 2027, 'matched_checkpoints': 4}
+        new['diagnostic']['comparison'] = {'status': 'matched', 'input_seed': 2027, 'matched_checkpoints': 4, 'fixture_id': 'fixture', 'reference_sequence': ['a', 'b', 'c', 'd'], 'checkpoints': [{'id': str(i), 'trustworthy': True, 'matched': True} for i in range(4)]}
         self.assertTrue(better(new, old))
         new['diagnostic'] = {'status': 'unavailable'}
-        self.assertFalse(better(new, old))
+        self.assertTrue(better(new, old))  # missing diagnosis does not erase normal-forward progress
 
     def test_best_restore_aligns_reports_contract_and_immutable_failure_input(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -329,8 +332,8 @@ class SelectionTests(unittest.TestCase):
 class RoutingTests(unittest.TestCase):
     def test_failures_use_specific_prompts_and_runtime_message_survives_compaction(self):
         for kind, message, expected in [('runtime', 'TypeError: arguments incompatible', 'runtime'),
-                                        ('runtime', 'CUDA illegal memory access', 'memory'),
-                                        ('tensor_structure', '', 'structure'), ('tensor_values', '', 'numerical')]:
+                                        ('runtime', 'CUDA illegal memory access', 'runtime'),
+                                        ('tensor_structure', '', 'shape'), ('tensor_values', '', 'numerical')]:
             record = {'stage': 'verification', 'verification': {'first_failure': {'error': {'kind': kind, 'message': message}}}}
             self.assertEqual(failure_category(record), expected)
         compact = _compact({'error': {'kind': 'runtime', 'message': 'bias must be 1D'}, 'traceback': 'noise'})

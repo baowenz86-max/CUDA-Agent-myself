@@ -83,6 +83,19 @@ def _reject_repeated_sources(data, workdir, run_dir):
     for name in data.get('delete_files', []):
         proposed.pop(name, None)
     if proposed == sources:
+        if run_dir:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            context_path = run_dir / 'repair_context.json'
+            context = json.loads(context_path.read_text()) if context_path.exists() else {}
+            event = {'base_candidate_id': context.get('base_candidate_id'), 'repair_not_applied': True,
+                     'outcome': 'same_failure', 'same_fingerprint': True, 'reason': 'no_source_changes',
+                     'analysis': data.get('analysis'), 'before_hashes': context.get('base_manifest', {}),
+                     'after_hashes': context.get('base_manifest', {}),
+                     'before_fingerprint': (context.get('best_candidate') or {}).get('fingerprint'),
+                     'after_fingerprint': (context.get('best_candidate') or {}).get('fingerprint'),
+                     'changed_files': [], 'added_files': [], 'deleted_files': []}
+            with (run_dir / 'repair_effects.jsonl').open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + '\n')
         raise ValueError('Repair has no source changes; submit a different evidence-backed fix')
     path = run_dir / 'repair_context.json' if run_dir else None
     if not path or not path.exists():
@@ -189,10 +202,14 @@ def _build_context(workdir: Path, run_dir: Path | None = None) -> str:
     readonly = ["binding.cpp", "binding_registry.h", "utils/operator_contract.py"]
     extra = "".join(f"\n===== READ ONLY: {name} =====\n{_read_file(workdir / name)}\n" for name in readonly)
     if run_dir is not None:
-        for name in ("task_contract.json", "custom_ops_contract.json", "source_checks.json", "interface.json", "verification.json", "diagnostic.json", "repair_context.json"):
+        for name in ("task_contract.json", "custom_ops_contract.json", "source_checks.json", "interface.json", "interface_precompile.json", "dependencies.json", "verification.json", "diagnostic.json", "repair_context.json"):
             if (run_dir / name).exists():
                 data = json.loads(_read_file(run_dir / name))
                 extra += f"\n===== READ ONLY: {name} =====\n{json.dumps(_compact(data), ensure_ascii=False)}\n"
+    if run_dir is not None and (run_dir / 'custom_ops_contract.json').exists():
+        from agent_workdir.utils.operator_contract import binding_fragments
+        fragments = binding_fragments(json.loads((run_dir / 'custom_ops_contract.json').read_text()))
+        extra += '\n===== CONTRACT-DRIVEN BINDING FRAGMENTS =====\n' + json.dumps(fragments, ensure_ascii=False)
     return f"""
 ===== SKILL.md =====
 {_read_file(workdir / "SKILL.md")}
@@ -352,12 +369,20 @@ def _validate_analysis(data: dict, required: bool) -> dict | None:
     for field in ("evidence", "changes"):
         if not isinstance(analysis.get(field), list) or not analysis[field] or not all(isinstance(x, str) and x.strip() for x in analysis[field]):
             raise ValueError(f"修复回复必须提供非空字符串列表 analysis.{field}")
+    if 'target_files' in analysis:
+        if not isinstance(analysis['target_files'], list) or not all(
+                isinstance(name, str) and _is_allowed_path(Path(name)) for name in analysis['target_files']):
+            raise ValueError('analysis.target_files must list allowed generated source paths')
     return analysis
 
 
 def _record_call(run_dir, **event):
     if run_dir is not None:
         run_dir.mkdir(parents=True, exist_ok=True)
+        if event.get('stage') == 'repair':
+            context_path = run_dir / 'repair_context.json'
+            context = json.loads(context_path.read_text()) if context_path.exists() else {}
+            event.update(base_candidate_id=context.get('base_candidate_id'), base_manifest=context.get('base_manifest'))
         with (run_dir / "api_calls.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 
@@ -386,7 +411,7 @@ kernels/ 必须且只能有一个 .cu：custom_ops.cu。全部 CUDA kernel 和 l
 你的回复必须且只能是合法 JSON，不要使用 Markdown 代码块，不要解释。
 格式示例由当前阶段决定，见下文。全部文件内容必须放入 files 的 JSON 字符串中。
 
-files 中只放需要新增或修改的完整文件。省略文件不会删除文件。仅修复阶段可以额外返回 "delete_files": ["kernels/obsolete_binding.cpp"] 显式删除 kernels/ 下生成的源码；不能删除固定基础设施，不能同时写入和删除同一路径。仅删除时 files 可以为空对象。不要返回 shell 命令。修复必须提供 analysis，但其中内容是待验证假设，不能宣称已经运行测试。
+files 中只放需要新增或修改的完整文件。省略文件不会删除文件。仅修复阶段可以额外返回 "delete_files": ["kernels/obsolete_binding.cpp"] 显式删除 kernels/ 下生成的源码；不能删除固定基础设施，不能同时写入和删除同一路径。仅删除时 files 可以为空对象。不要返回 shell 命令。修复必须提供 analysis，可附 target_files 明确声称修改的源码路径；其中内容是待验证假设，不能宣称已经运行测试。
 """.strip()
 
     example = {"analysis": {"hypothesis": "根因假设或接口选择", "evidence": ["具体证据"],
@@ -425,6 +450,7 @@ files 中只放需要新增或修改的完整文件。省略文件不会删除�
     # an algorithm-repair attempt. Transport/I/O failures are not format retries.
     for correction in range(3):
         response_data = None
+        analysis = None
         content = ""
         try:
             request = Request(config.chat_completions_url,
@@ -458,7 +484,7 @@ files 中只放需要新增或修改的完整文件。省略文件不会删除�
                 "json" if isinstance(exc, json.JSONDecodeError) or '没有 JSON 对象' in failure else "response_validation")
             LOGGER.warning("API response rejected (%s): %s", category, failure)
             _record_call(run_dir, stage=allowed_stage or "repair", success=False,
-                         failure_category=category, error=failure, correction_attempt=correction,
+                         failure_category=category, error=failure, analysis=analysis, repair_not_applied="no source changes" in failure, correction_attempt=correction,
                          elapsed_seconds=time.monotonic() - started_at, **_response_metadata(response_data))
             if correction == 2:
                 return False

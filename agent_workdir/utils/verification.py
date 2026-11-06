@@ -4,6 +4,9 @@
 import argparse
 from contextlib import contextmanager
 import importlib
+import inspect
+import hashlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -81,7 +84,17 @@ def build_inputs(seed):
 
 
 def device_inputs(inputs, device):
-    return transform_tree(inputs, lambda t: t.to(device).clone())
+    def independent(tensor):
+        moved = tensor.to(device)
+        # to() preserves storage when device/dtype already match.
+        if moved is tensor:
+            return moved.clone()
+        if hasattr(tensor, 'untyped_storage') and hasattr(moved, 'untyped_storage'):
+            shared = moved.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
+        else:
+            shared = moved.data_ptr() == tensor.data_ptr()
+        return moved.clone() if shared else moved
+    return transform_tree(inputs, independent)
 
 
 def synchronize(device):
@@ -120,64 +133,88 @@ def restore_rng(state):
 
 
 def diagnose(torch_model, cuda_model, fixture, inputs, input_seed, device):
-    if not callable(getattr(cuda_model, 'debug_forward', None)):
-        return {'status': 'unavailable', 'reason': 'ModelNew.debug_forward is missing'}
-    matched = 0
+    from .checkpoint_trust import checkpoint_mapping, metadata_compatible
+    from .diagnostics import describe, read_json
+    directory = fixture_directory()
+    reference_contract = read_json(directory / 'task_contract.json', {})
+    contract = read_json(directory / 'custom_ops_contract.json', {})
+    mapping = checkpoint_mapping(inspect.getsource(type(cuda_model)), reference_contract, contract,
+                                 '\n'.join(p.read_text() for p in Path('kernels').glob('*') if p.suffix in {'.cpp', '.cu'}))
+    evidence = {'status': 'unavailable', 'input_seed': input_seed, 'matched_checkpoints': 0,
+                'fixture_id': hashlib.sha256((str(directory) + str(fixture.get('seed')) + json.dumps(reference_contract, sort_keys=True)).encode()).hexdigest(),
+                'reference_sequence': [(x['id'], x['source']) for x in reference_contract.get('checkpoints', [])],
+                'checkpoints': [], 'mapping': mapping, 'evidence_policy': 'Observed values are facts; semantic mapping is conservative correspondence, not a proof of CUDA mathematics. Large special-function outputs do not establish input magnitude.'}
+    if any(row.get('trustworthy') is not True for row in mapping):
+        evidence['failure_type'] = 'diagnostic_unreliable'
     stage = None
     try:
+        if not callable(getattr(cuda_model, 'debug_forward', None)):
+            raise ValueError('ModelNew.debug_forward is missing')
         ref_fn, stages = reference_trace(torch_model)
         torch_model.load_state_dict(fixture['state_dict'], strict=True)
         cuda_model.load_state_dict(fixture['state_dict'], strict=True)
         seed_all(input_seed)
-        initial_rng = rng_state()
+        ref_rng = rng_state()
         reference = ref_fn(*device_inputs(inputs, device))
         with block_torch_functional():
             actual = iter(cuda_model.debug_forward(*device_inputs(inputs, device)))
-        ref_rng = initial_rng
         actual_rng = rng_state()
-        matched = 0
         previous = []
-        sensitive = ('sign', 'median', 'ne(', 'rsqrt', 'softmax')
-        for stage_index, stage in enumerate(stages):
+        for index, stage in enumerate(stages):
             restore_rng(ref_rng)
+            evidence['execution_stage'] = 'reference'
             expected_id, expected = next(reference)
+            synchronize(device)
             ref_rng = rng_state()
             restore_rng(actual_rng)
+            evidence['execution_stage'] = 'candidate'
             with block_torch_functional():
                 checkpoint, value = next(actual)
                 synchronize(device)
             actual_rng = rng_state()
-            if checkpoint != expected_id:
-                return {'status': 'failed', 'checkpoint': stage, 'kind': 'checkpoint_contract',
-                        'actual_id': str(checkpoint), 'matched_checkpoints': matched, 'input_seed': input_seed}
+            row = dict(mapping[index]) if index < len(mapping) else {'id': expected_id, 'trustworthy': False, 'reason': 'mapping absent'}
+            row.update(reference=describe(expected), candidate=describe(value), actual_id=str(checkpoint), matched=False, mismatch=None)
+            if checkpoint != expected_id or not metadata_compatible(row['candidate'], row['reference']):
+                row.update(trustworthy=False, reason='ID/container/shape/dtype differs from live reference')
+            evidence['checkpoints'].append(row)
             try:
                 check_equal(value, expected, expected_id)
             except ComparisonFailure as exc:
-                diagnostic = {'status': 'failed', 'checkpoint': stage, 'error': exc.detail,
-                              'matched_checkpoints': matched, 'input_seed': input_seed}
-                if any(token in stage['source'] for token in sensitive):
-                    diagnostic['boundary_context'] = previous
-                return diagnostic
-            matched += 1
-            # Record small summaries before subsequent in-place operations can
-            # change the tensors. No whole-tensor clones or retained references.
-            upcoming = stages[stage_index + 1:stage_index + 3]
-            if any(token in item['source'] for item in upcoming for token in sensitive):
-                previous.append({'checkpoint': expected_id, 'actual': boundary_context(value),
-                                 'expected': boundary_context(expected)})
-            previous = previous[-2:]
+                row['mismatch'] = exc.detail
+                evidence.update(status='failed', checkpoint=stage, error=exc.detail, boundary_context=previous)
+                break
+            row['matched'] = True
+            if row['trustworthy'] and evidence['matched_checkpoints'] == index:
+                evidence['matched_checkpoints'] += 1
+            if checkpoint != expected_id:
+                evidence.update(status='failed', checkpoint=stage, kind='checkpoint_contract')
+                break
+            upcoming = stages[index + 1:index + 3]
+            if any(token in item['source'] for item in upcoming for token in ('sign', 'median', 'ne(', 'rsqrt', 'softmax', 'digamma')):
+                previous.append({'checkpoint': expected_id, 'actual': boundary_context(value), 'expected': boundary_context(expected)})
+                previous = previous[-2:]
             del expected, value
-        sentinel = object()
-        with block_torch_functional():
-            if next(actual, sentinel) is not sentinel:
-                return {'status': 'failed', 'kind': 'extra_checkpoint', 'matched_checkpoints': matched,
-                        'input_seed': input_seed}
-        return {'status': 'matched', 'matched_checkpoints': matched, 'input_seed': input_seed,
-                'note': 'Debug checkpoints match; normal forward still failed and remains rejected'}
+        else:
+            sentinel = object()
+            with block_torch_functional():
+                extra = next(actual, sentinel)
+            evidence.update(status='matched' if extra is sentinel else 'failed')
+            if extra is not sentinel:
+                evidence['kind'] = 'extra_checkpoint'
+                evidence['checkpoints'].append({'id': str(extra[0]) if isinstance(extra, (tuple, list)) and extra else None,
+                                                'trustworthy': False, 'matched': None, 'reason': 'extra checkpoint'})
+                evidence['failure_type'] = 'diagnostic_unreliable'
+        if any(x.get('trustworthy') is not True for x in evidence['checkpoints']):
+            evidence['failure_type'] = 'diagnostic_unreliable'
+        return evidence
     except Exception as exc:
-        return {'status': 'unavailable', 'reason': f'{type(exc).__name__}: {exc}',
-                'input_seed': input_seed, 'checkpoint': stage, 'matched_checkpoints': matched,
-                'traceback': traceback.format_exc()}
+        if isinstance(exc, StopIteration):
+            evidence['failure_type'] = 'diagnostic_unreliable'
+        if evidence.get('execution_stage') == 'reference':
+            evidence['failure_type'] = 'reference'
+        evidence.update(status='unavailable', reason=f'{type(exc).__name__}: {exc}', checkpoint=stage,
+                        traceback=traceback.format_exc())
+        return evidence
 
 
 def main(argv=None):

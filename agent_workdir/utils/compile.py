@@ -11,15 +11,15 @@ from pathlib import Path
 
 # 必须在导入 torch CUDA extension 之前固定工具链，
 # 否则 PyTorch 可能会缓存 PATH 中的其他 CUDA 版本。
-CUDA_HOME = "/public/app/cuda/12.6"
-HOST_CC = "/usr/bin/gcc"
-HOST_CXX = "/usr/bin/g++"
+CUDA_HOME = os.environ.get("CUDA_HOME", "/public/app/cuda/12.6")
+HOST_CC = os.environ.get("CC", "/usr/bin/gcc")
+HOST_CXX = os.environ.get("CXX", "/usr/bin/g++")
 
 os.environ["CUDA_HOME"] = CUDA_HOME
-os.environ["CUDACXX"] = f"{CUDA_HOME}/bin/nvcc"
+os.environ.setdefault("CUDACXX", f"{CUDA_HOME}/bin/nvcc")
 os.environ["CC"] = HOST_CC
 os.environ["CXX"] = HOST_CXX
-os.environ["CUDAHOSTCXX"] = HOST_CXX
+os.environ.setdefault("CUDAHOSTCXX", HOST_CXX)
 os.environ["PATH"] = f"{CUDA_HOME}/bin{os.pathsep}{os.environ.get('PATH', '')}"
 os.environ["LD_LIBRARY_PATH"] = (
     f"{CUDA_HOME}/lib64{os.pathsep}{os.environ.get('LD_LIBRARY_PATH', '')}"
@@ -54,9 +54,11 @@ def build_fingerprint(sources, cuda_flags, libraries, arch_flags):
         'cuda_flags': cuda_flags, 'libraries': libraries, 'arch_flags': arch_flags,
         'torch': cpp_ext.torch.__version__, 'python': sys.version,
         'env': {key: os.environ.get(key) for key in (
-            'TORCH_CUDA_ARCH_LIST', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'CUDA_AGENT_FAST_MATH')},
+            'TORCH_CUDA_ARCH_LIST', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'CUDA_AGENT_FAST_MATH',
+            'CUDA_HOME', 'CUDACXX', 'CC', 'CXX', 'CUDAHOSTCXX', 'CPATH', 'LIBRARY_PATH',
+            'LD_LIBRARY_PATH', 'CUDA_AGENT_DEPENDENCY_FINGERPRINT')},
         'toolchain': [(name, Path(name).stat().st_mtime_ns, Path(name).stat().st_size)
-                      for name in (HOST_CXX, f'{CUDA_HOME}/bin/nvcc')],
+                      for name in (shutil.which(HOST_CXX) or HOST_CXX, shutil.which(os.environ['CUDACXX']) or os.environ['CUDACXX'])],
     }
     digest.update(json.dumps(settings, sort_keys=True).encode())
     return digest.hexdigest()
@@ -78,7 +80,7 @@ def compile_kernels() -> int:
     built_so = build_dir / 'cuda_extension.so'
 
     # Correctness-first builds do not enable approximate math by default.
-    cuda_flags = ['-O3', f'-ccbin={HOST_CXX}']
+    cuda_flags = ['-O3', f'-ccbin={os.environ.get("CUDAHOSTCXX", HOST_CXX)}']
     if os.environ.get('CUDA_AGENT_FAST_MATH') == '1':
         cuda_flags.append('--use_fast_math')
     source_text = '\n'.join(Path(source).read_text(encoding='utf-8') for source in sources)
@@ -87,7 +89,16 @@ def compile_kernels() -> int:
     if re.search(r'#\s*include\s*[<"]cublas|\bcublas[A-Z]\w*\s*\(', source_text):
         libraries.append('-lcublas')
     if re.search(r'#\s*include\s*[<"]cudnn|\bcudnn[A-Z]\w*\s*\(', source_text):
-        libraries.append('-lcudnn')
+        from .dependencies import discover_cudnn, configure_dependency
+        from .diagnostics import write_json
+        dependency = discover_cudnn()
+        write_json(Path(os.environ.get('CUDA_AGENT_RUN_DIR', '.correctness')) / 'dependencies.json', dependency)
+        if dependency['status'] != 'passed':
+            output_so.unlink(missing_ok=True)
+            print(dependency['reason'])
+            return 1
+        configure_dependency(dependency, os.environ)
+        libraries.extend(dependency['libraries'])
 
     try:
         arch_flags = cpp_ext._get_cuda_arch_flags()
@@ -114,6 +125,7 @@ def compile_kernels() -> int:
             extra_cflags=['-O3', '-std=c++20'],
             extra_cuda_cflags=cuda_flags + arch_flags,
             extra_ldflags=libraries,
+            extra_include_paths=[p for p in os.environ.get('CPATH', '').split(os.pathsep) if p],
         )
     except Exception as exc:
         output_so.unlink(missing_ok=True)

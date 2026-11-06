@@ -2,7 +2,7 @@
 
 START_TIME=$(date +%s.%N)
 
-python3 -m utils.compile
+"${CUDA_AGENT_PYTHON:-python3}" -m utils.compile
 EXIT_CODE=$?
 
 END_TIME=$(date +%s.%N)

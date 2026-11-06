@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+import json
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,9 @@ class WorkflowReport:
     repair_budget: int = 3
     repairs_used: int = 0
     candidates_evaluated: int = 0
+    failure_type: str = ""
+    correctness_passed: bool = False
+    profiling_failed: bool = False
 
     def add_stage(
         self, name: str, success: bool, duration_seconds: float, details: str = ""
@@ -77,6 +81,17 @@ class WorkflowReport:
 python main.py --task-start {self.task_id} --task-end {self.task_id}
 ```
 """
+        from .metrics import candidate_metrics
+        directory = self.log_path.parent / 'correctness'
+        records = [json.loads(p.read_text()) for p in sorted((directory / 'candidates').glob('*/record.json'))]
+        effect_path = directory / 'repair_effects.jsonl'
+        effects = [json.loads(line) for line in effect_path.read_text().splitlines()] if effect_path.exists() else []
+        metrics = candidate_metrics(records, effects, complete=True)
+        metrics.update(task_id=self.task_id, workflow_success=success, correctness_success=self.correctness_passed or metrics['correctness_success'],
+                       profiling_failed=self.profiling_failed, failure_type=self.failure_type,
+                       repairs_used=self.repairs_used, duration_seconds=duration)
+        (self.log_path.parent / 'workflow_report.json').write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')
+        content += '\n## Machine-readable metrics\n\nSee `workflow_report.json`; unknown historical metrics are null.\n'
         report_path = self.log_path.parent / "workflow_report.md"
         report_path.write_text(content, encoding="utf-8")
         return report_path

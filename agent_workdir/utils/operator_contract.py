@@ -37,6 +37,10 @@ def validate_contract(contract, reference=None):
                 raise ValueError(op['name'] + ': parameter kind must be tensor/int/float/bool')
             if not isinstance(parameter.get('optional', False), bool) or not isinstance(parameter.get('nullable', False), bool):
                 raise ValueError(op['name'] + ': optional and nullable must be booleans')
+            if 'required' in parameter and (not isinstance(parameter['required'], bool) or parameter['required'] == parameter.get('optional', False)):
+                raise ValueError(op['name'] + ': required must be the inverse of optional')
+            if not parameter.get('optional', False) and 'default' in parameter:
+                raise ValueError(op['name'] + ': required parameters cannot have a default')
             if parameter.get('optional'):
                 if 'default' not in parameter:
                     raise ValueError(op['name'] + ': optional parameters need an explicit default')
@@ -165,7 +169,7 @@ def binding_contract_errors(extension, contract):
                     return False
                 name, annotation = native.split(':', 1)
                 name = name.strip()
-                if not re.fullmatch(r'arg\d+', name) and name != parameter['name']:
+                if name != parameter['name']:
                     return False
                 if ('=' in annotation) != parameter.get('optional', False):
                     return False
@@ -188,9 +192,98 @@ def binding_contract_errors(extension, contract):
                     return False
                 if not checks[kind]:
                     return False
-                if parameter.get('nullable') and not any(x in annotation for x in ('None', 'Optional')):
+                if bool(parameter.get('nullable')) != any(x in annotation for x in ('None', 'Optional')):
                     return False
             return True
         if not any(compatible(x) for x in signatures):
             errors.append(op['name'] + ': compiled signatures differ from operator_contract: ' + repr(signatures))
+    return errors
+
+
+def cpp_parameter_type(parameter):
+    base = {'tensor': 'torch::Tensor', 'int': 'int64_t', 'float': 'double', 'bool': 'bool'}[parameter['kind']]
+    return f'c10::optional<{base}>' if parameter.get('nullable') else base
+
+
+def pybind_argument(parameter):
+    argument = 'py::arg(' + repr(parameter['name']).replace("'", '"') + ')'
+    if parameter.get('optional'):
+        default = parameter['default']
+        argument += ' = ' + ('py::none()' if default is None else 'true' if default is True else 'false' if default is False else repr(default))
+    return argument
+
+
+def binding_fragments(contract):
+    return {op['name']: {'parameters': ', '.join(cpp_parameter_type(p) + ' ' + p['name'] for p in op['parameters']),
+                         'arguments': ', '.join(pybind_argument(p) for p in op['parameters'])}
+            for op in contract['operators']}
+
+
+def source_binding_checks(source, contract):
+    """Parse common direct m.def registrations; unknown syntax remains pending."""
+    errors, pending = [], []
+    source = re.sub(r'/\*.*?\*/|//[^\n]*', '', source, flags=re.S)
+    for op in contract['operators']:
+        name = op['name']
+        match = re.search(r'\.\s*def\s*\(\s*"' + re.escape(name) + r'"\s*,\s*&?([\w:]+)\s*([,)]).*?;', source, re.S)
+        if not match:
+            pending.append(name + ': registration requires compiled check')
+            continue
+        fn = match.group(1).split('::')[-1]
+        declaration = re.search(r'\b' + re.escape(fn) + r'\s*\(([^{};]*)\)\s*(?:\{|;)', source, re.S)
+        if not declaration:
+            pending.append(name + ': C++ signature requires compiled check')
+            continue
+        params = _split_parameters(declaration.group(1))
+        if len(params) != len(op['parameters']):
+            errors.append(name + ': C++ parameter count differs')
+            continue
+        for native, parameter in zip(params, op['parameters']):
+            nullable = bool(re.search(r'(?:optional\s*<|Optional\s*<)', native))
+            kind_ok = {'tensor': bool(re.search(r'\bTensor\b', native)),
+                       'int': bool(re.search(r'\b(?:int64_t|int|long)\b', native)),
+                       'float': bool(re.search(r'\b(?:double|float)\b', native)),
+                       'bool': bool(re.search(r'\bbool\b', native))}[parameter['kind']]
+            if nullable != bool(parameter.get('nullable')) or not kind_ok:
+                errors.append(name + '.' + parameter['name'] + ': C++ type/nullable differs')
+        registration = match.group(0)
+        arguments = []
+        registration_args = _split_parameters(registration[registration.find('(') + 1:registration.rfind(')')])
+        for argument in registration_args[2:]:
+            parsed = re.fullmatch(r'(?:py|pybind11)::arg\s*\(\s*"([^"]+)"\s*\)\s*(?:=\s*(.+))?', argument, re.S)
+            if parsed:
+                arguments.append((parsed.group(1), parsed.group(2) or ''))
+        if len(arguments) != len(op['parameters']):
+            pending.append(name + ': argument names/defaults require compiled check')
+            continue
+        for (arg, default), parameter in zip(arguments, op['parameters']):
+            if arg != parameter['name'] or bool(default) != bool(parameter.get('optional')):
+                errors.append(name + ': py::arg order/name/default differs')
+            elif default:
+                normalized = default.strip().replace('py::none()', 'None').replace('pybind11::none()', 'None').replace('true', 'True').replace('false', 'False')
+                try:
+                    if ast.literal_eval(normalized) != parameter['default']:
+                        errors.append(name + '.' + arg + ': default value differs')
+                except (ValueError, SyntaxError):
+                    pending.append(name + '.' + arg + ': default requires compiled check')
+    return {'errors': errors, 'pending': pending, 'status': 'failed' if errors else 'pending' if pending else 'passed'}
+
+
+def model_interface_errors(reference, candidate):
+    """Check metadata only; never invoke either forward."""
+    import inspect
+    errors = []
+    def parameters(fn):
+        return [(p.name, str(p.kind), repr(p.default)) for p in inspect.signature(fn).parameters.values()]
+    for method in ('__init__', 'forward'):
+        if parameters(getattr(type(reference), method)) != parameters(getattr(type(candidate), method)):
+            errors.append('ModelNew.' + method + ' signature differs from the reference')
+    expected, actual = reference.state_dict(), candidate.state_dict()
+    if expected.keys() != actual.keys():
+        errors.append('state_dict keys differ from the reference')
+    for key in expected.keys() & actual.keys():
+        if getattr(expected[key], 'shape', None) != getattr(actual[key], 'shape', None):
+            errors.append('state_dict shape differs: ' + key)
+        if getattr(expected[key], 'dtype', None) != getattr(actual[key], 'dtype', None):
+            errors.append('state_dict dtype differs: ' + key)
     return errors

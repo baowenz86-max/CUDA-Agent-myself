@@ -85,6 +85,7 @@ class IncrementalBuildTests(unittest.TestCase):
                 (root / 'bin/nvcc').write_text('nvcc')
                 compiler.HOST_CXX = str(root / 'gcc')
                 compiler.CUDA_HOME = str(root)
+                os.environ['CUDACXX'] = str(root / 'bin/nvcc')
                 previous = Path.cwd()
                 try:
                     os.chdir(root)
@@ -105,6 +106,10 @@ class IncrementalBuildTests(unittest.TestCase):
                     (root / 'build/forced_compile/cuda_extension.so').write_bytes(b'corrupt')
                     self.assertEqual(compiler.compile_kernels(), 0)
                     self.assertEqual(len(builds), 7)
+                    for dependency_id in ('installation-a', 'installation-b'):
+                        with patch.dict(os.environ, {'CUDA_AGENT_DEPENDENCY_FINGERPRINT': dependency_id}):
+                            self.assertEqual(compiler.compile_kernels(), 0)
+                    self.assertEqual(len(builds), 9)
                     self.assertTrue((root / 'build/forced_compile/cached.o').exists())
                     (root / 'kernels/custom_ops.cu').write_text('broken')
                     with patch.object(fake, 'load', side_effect=RuntimeError('compile error')):

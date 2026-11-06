@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 
-from agent_workdir.utils.operator_contract import RETURN_CONSTRUCTORS, contract_call_errors
+from agent_workdir.utils.operator_contract import RETURN_CONSTRUCTORS, contract_call_errors, source_binding_checks
 
 
 def native_structure_errors(name: str, text: str) -> list[str]:
@@ -27,9 +27,10 @@ def native_structure_errors(name: str, text: str) -> list[str]:
 class SourceChecks:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
 
     def as_dict(self):
-        return {'status': 'failed' if self.errors else 'passed', 'errors': self.errors, 'warnings': self.warnings}
+        return {'status': 'failed' if self.errors else 'passed', 'errors': self.errors, 'warnings': self.warnings, 'pending': self.pending}
 
 
 def check_sources(workdir: Path, contract=None) -> SourceChecks:
@@ -61,8 +62,7 @@ def check_sources(workdir: Path, contract=None) -> SourceChecks:
         text = source.read_text(encoding='utf-8')
         result.errors.extend(native_structure_errors(source.name, text))
         registrations.update(re.findall(r'\b\w+\s*\.\s*def\s*\(\s*"([^"]+)"', text))
-        if re.search(r'grid\w*\s*>\s*65535', text) and not re.search(r'\b(?:for|while)\s*\(', text):
-            result.warnings.append(f'{source.name}: grid is capped at 65535 without a visible loop; check complete output coverage')
+        result.warnings.extend(f'{source.name}: {warning}' for warning in coverage_warnings(text))
         if '__half' in text and 'cuda_fp16.h' not in text:
             result.warnings.append(f'{source.name}: __half used without a direct cuda_fp16.h include')
         if 'tanh' in text and 'torch.tan(' in (workdir / 'model.py').read_text(encoding='utf-8'):
@@ -85,6 +85,80 @@ def check_sources(workdir: Path, contract=None) -> SourceChecks:
                 result.errors.append(f'{method.name}: prohibited torch computation {name}')
     if contract is not None:
         result.errors.extend(contract_call_errors(path.read_text(encoding='utf-8'), contract))
+        binding = source_binding_checks('\n'.join(p.read_text() for p in sources if p.suffix == '.cpp'), contract)
+        result.errors.extend(binding['errors'])
+        result.pending.extend(binding['pending'])
     # Source heuristics cannot prove correct math or memory safety. Actual imports,
     # strict state loading and normal-forward tests remain authoritative.
     return result
+
+
+def _body(text, start):
+    depth = 1
+    for i in range(start, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+    return text[start:]
+
+
+def coverage_warnings(text):
+    text = re.sub(r'/\*.*?\*/|//[^\n]*', '', text, flags=re.S)
+    warnings = []
+    kernels = {m.group(1): _body(text, m.end()) for m in re.finditer(
+        r'__global__\s+(?:void|[\w:<>]+)\s+(\w+)\s*\([^{}]*\)\s*\{', text)}
+    launches = list(re.finditer(r'\b(\w+)\s*<<<([^>]+)>>>\s*\(([^;]*)\)', text))
+    for launch in launches:
+        name = launch.group(1)
+        body = kernels.get(name, '')
+        # Restrict grid configuration to the containing launcher body.
+        start = text.rfind('{', 0, launch.start())
+        local = text[start + 1:launch.start()]
+        config = launch.group(2).split(',')
+        if len(config) < 2:
+            continue
+        def constant(expression):
+            expression = expression.strip()
+            if expression.isdigit():
+                return int(expression)
+            values = re.findall(r'\b' + re.escape(expression) + r'\s*=\s*(\d+)\b', local)
+            return int(values[-1]) if values else None
+        grid, block = constant(config[0]), constant(config[1])
+        cap = re.search(r'\b' + re.escape(config[0].strip()) + r'\s*(?:>|=\s*(?:std::)?min\s*\([^,]+,)\s*(\d+)', local)
+        if cap:
+            grid = int(cap.group(1))
+        # Recognize the increment in this kernel's loop, not any unrelated loop.
+        products = r'(?:blockDim\.x\s*\*\s*gridDim\.x|gridDim\.x\s*\*\s*blockDim\.x)'
+        stride_names = re.findall(r'\b(\w+)\s*=\s*' + products, body)
+        increments = products + (r'|\b(?:' + '|'.join(map(re.escape, stride_names)) + r')\b' if stride_names else '')
+        stride = bool(re.search(r'\bfor\s*\([^;]*;[^;]*;[^)]*\+=\s*(?:' + increments + r')\s*\)', body))
+        if not stride:
+            for loop in re.finditer(r'\bwhile\s*\(\s*(\w+)\s*<[^)]*\)\s*\{', body):
+                loop_body = _body(body, loop.end())
+                if re.search(r'\b' + re.escape(loop.group(1)) + r'\s*\+=\s*(?:' + increments + r')\s*;', loop_body):
+                    stride = True
+        if stride:
+            continue
+        # A numeric extent is evidence only when the bounded kernel parameter
+        # can be mapped to its actual launcher argument.
+        signature = re.search(r'__global__\s+\w+\s+' + re.escape(name) + r'\s*\(([^{}]*)\)\s*\{', text)
+        numel = None
+        if signature:
+            parameters = signature.group(1).split(',')
+            arguments = launch.group(3).split(',')
+            for parameter, argument in zip(parameters, arguments):
+                identifiers = re.findall(r'\b\w+\b', parameter)
+                bound = identifiers[-1] if identifiers else ''
+                if bound in {'n', 'count', 'numel'} and re.search(r'<\s*' + bound + r'\b', body):
+                    numel = constant(argument)
+                    break
+        if grid is not None and block is not None and numel is not None and numel > grid * block:
+            warnings.append(f'{name}: numel={numel} > grid={grid} × block={block}; no recognized grid-stride loop')
+        elif cap or grid == 65535:
+            warnings.append(f'{name}: possible incomplete coverage: grid={grid}, block={block}; no recognized grid-stride loop')
+    if not launches and re.search(r'grid\w*\s*>\s*65535', text):
+        warnings.append('possible incomplete coverage: grid capped at 65535; launcher mapping unavailable')
+    return warnings
