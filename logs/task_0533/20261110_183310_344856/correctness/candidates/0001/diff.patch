@@ -1,0 +1,279 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,142 @@
++// CUDA kernels for max_reduce_forward and softmax_forward
++// Pure CUDA implementations, no torch/ATen/pybind dependencies
++#include <cuda_runtime.h>
++#include <float.h>
++#include <stdint.h>
++
++// Kernel: reduce max along dimension 1 of a 3D tensor [B, D, W]
++// Output shape [B, W]
++// Strategy: each block handles one (batch, column) pair, threads reduce over D
++__global__ void max_reduce_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t batch_size,
++    int64_t dim_size,
++    int64_t width
++) {
++    int64_t b = blockIdx.x;
++    int64_t w = blockIdx.y;
++    if (b >= batch_size || w >= width) return;
++
++    const float* base = input + b * dim_size * width + w;
++    float max_val = -FLT_MAX;
++
++    for (int64_t d = threadIdx.x; d < dim_size; d += blockDim.x) {
++        float val = base[d * width];
++        if (val > max_val) max_val = val;
++    }
++
++    // Warp reduction to combine partial maxes within block
++    __shared__ float smem[1024]; // max 1024 threads, but we use 256
++    int tid = threadIdx.x;
++    smem[tid] = max_val;
++    __syncthreads();
++
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            float other = smem[tid + stride];
++            if (other > smem[tid]) smem[tid] = other;
++        }
++        __syncthreads();
++    }
++
++    if (tid == 0) {
++        output[b * width + w] = smem[0];
++    }
++}
++
++// Kernel: softmax along dimension 1 of a 2D tensor [B, W]
++// Two-pass algorithm: max subtraction then exp and normalize
++__global__ void softmax_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t batch_size,
++    int64_t width
++) {
++    int64_t b = blockIdx.x;
++    if (b >= batch_size) return;
++
++    const float* row = input + b * width;
++    float* out_row = output + b * width;
++
++    // Pass 1: find max
++    float max_val = -FLT_MAX;
++    for (int64_t i = threadIdx.x; i < width; i += blockDim.x) {
++        float val = row[i];
++        if (val > max_val) max_val = val;
++    }
++
++    __shared__ float smem_max[256];
++    int tid = threadIdx.x;
++    smem_max[tid] = max_val;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            if (smem_max[tid + stride] > smem_max[tid]) smem_max[tid] = smem_max[tid + stride];
++        }
++        __syncthreads();
++    }
++    float row_max = smem_max[0];
++    __syncthreads();
++
++    // Pass 2: compute exp and sum
++    float sum = 0.0f;
++    for (int64_t i = threadIdx.x; i < width; i += blockDim.x) {
++        float e = expf(row[i] - row_max);
++        out_row[i] = e;
++        sum += e;
++    }
++
++    __shared__ float smem_sum[256];
++    smem_sum[tid] = sum;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            smem_sum[tid] += smem_sum[tid + stride];
++        }
++        __syncthreads();
++    }
++    float total = smem_sum[0];
++    __syncthreads();
++
++    // Pass 3: normalize
++    for (int64_t i = threadIdx.x; i < width; i += blockDim.x) {
++        out_row[i] = out_row[i] / total;
++    }
++}
++
++// Host launcher for max_reduce_forward
++// Parameters: input pointer, output pointer, batch_size, dim_size, width, stream
++extern "C" void max_reduce_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t batch_size,
++    int64_t dim_size,
++    int64_t width,
++    cudaStream_t stream
++) {
++    // Grid dimensions: (batch_size, width) blocks
++    dim3 grid((unsigned int)batch_size, (unsigned int)width);
++    // Threads per block: 256, enough for most dim_size; grid-stride loop handles larger
++    int threads = 256;
++    max_reduce_kernel<<<grid, threads, 0, stream>>>(
++        input, output, batch_size, dim_size, width
++    );
++}
++
++// Host launcher for softmax_forward
++// Parameters: input pointer, output pointer, batch_size, width, stream
++extern "C" void softmax_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t batch_size,
++    int64_t width,
++    cudaStream_t stream
++) {
++    // One block per batch row
++    dim3 grid((unsigned int)batch_size);
++    int threads = 256;
++    softmax_kernel<<<grid, threads, 0, stream>>>(
++        input, output, batch_size, width
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,106 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void max_reduce_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t batch_size,
++    int64_t dim_size,
++    int64_t width,
++    cudaStream_t stream
++);
++
++extern "C" void softmax_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t batch_size,
++    int64_t width,
++    cudaStream_t stream
++);
++
++// Wrapper for max_reduce_forward: reduces max along dimension 1 of a 3D tensor
++torch::Tensor max_reduce_forward(torch::Tensor x, int64_t dim) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dim() == 3, "Input must be a 3D tensor");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported for max_reduce_forward");
++
++    int64_t batch_size = x.size(0);
++    int64_t dim_size = x.size(1);
++    int64_t width = x.size(2);
++
++    // Allocate output tensor [batch_size, width]
++    auto output = torch::empty({batch_size, width}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    max_reduce_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch_size,
++        dim_size,
++        width,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "max_reduce_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for softmax_forward: softmax along dimension 1 of a 2D tensor
++torch::Tensor softmax_forward(torch::Tensor x, int64_t dim) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dim() == 2, "Input must be a 2D tensor");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported for softmax_forward");
++
++    int64_t batch_size = x.size(0);
++    int64_t width = x.size(1);
++
++    // Allocate output tensor same shape
++    auto output = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    softmax_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch_size,
++        width,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "softmax_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("max_reduce_forward", &max_reduce_forward,
++          "Max reduce along dimension 1",
++          py::arg("x"), py::arg("dim"));
++    m.def("softmax_forward", &softmax_forward,
++          "Softmax along dimension 1",
++          py::arg("x"), py::arg("dim"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.max_reduce_forward(x, dim=1)
++        x = cuda_extension.softmax_forward(x, dim=1)
++        return x
++
++    def debug_forward(self, x: torch.Tensor):
++        max_out = cuda_extension.max_reduce_forward(x, dim=1)
++        yield "step_001", max_out
++
++        softmax_out = cuda_extension.softmax_forward(max_out, dim=1)
++        yield "step_002", softmax_out
++
++        yield "step_003", softmax_out

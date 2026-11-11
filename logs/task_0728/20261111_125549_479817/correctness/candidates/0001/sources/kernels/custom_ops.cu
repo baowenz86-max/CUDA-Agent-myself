@@ -1,0 +1,113 @@
+#include <cuda_runtime.h>
+
+// Kernel to concatenate two contiguous float tensors along a given dimension.
+// Each block handles a linear output index range using grid-stride loop.
+// Output is assumed contiguous; inputs are assumed contiguous (binding will ensure).
+// The concatenation is done as a flat copy: compute source tensor and offset based on output linear index.
+__global__ void concat_copy_kernel(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int64_t a_numel,
+    int64_t b_numel,
+    int64_t dim_size_a,
+    int64_t dim_size_b,
+    int64_t inner_size,
+    int64_t outer_size
+) {
+    int64_t total = (a_numel + b_numel);
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
+
+    for (int64_t i = idx; i < total; i += stride) {
+        // Determine if i falls within first tensor
+        if (i < a_numel) {
+            // Copy from a directly, since a occupies first a_numel elements in output for contiguous concatenation along dim
+            // For concatenation along dim with outer and inner, output ordering is:
+            // for each outer index o, the entire inner block for all dim values is contiguous.
+            // But if inputs are contiguous, output contiguous, and we concat along dim,
+            // the memory layout of output is: for each outer o, first all elements from tensor a for that outer (dim_size_a * inner_size), then b.
+            // That is exactly equivalent to copying a entirely, then b entirely, as long as both inputs contiguous and output contiguous with same other dims.
+            // However, if dim is not the last dimension, a's elements for different outer are not contiguous as a whole, but a is contiguous.
+            // Let's verify: output flat index of element (o, d, i) = ((o * dim_total + d) * inner_size + i).
+            // a occupies d < dim_size_a. For a, flat index in a = ((o * dim_size_a + d) * inner_size + i).
+            // This is not a simple prefix sum because inner_size and outer patterns differ.
+            // So a simple copy of entire a into output does not work if inner_size > 1 and outer_size > 0.
+            // Correct approach: iterate over output flat index and compute source flat index.
+            int64_t o = i / (dim_size_a + dim_size_b) / inner_size; // outer index
+            int64_t rem = i % ((dim_size_a + dim_size_b) * inner_size);
+            int64_t d = rem / inner_size;
+            int64_t inner = rem % inner_size;
+            if (d < dim_size_a) {
+                // from a
+                int64_t src = (o * dim_size_a + d) * inner_size + inner;
+                // bounds: src < a_numel
+                out[i] = a[src];
+            } else {
+                // from b, d_b = d - dim_size_a
+                int64_t d_b = d - dim_size_a;
+                int64_t src = (o * dim_size_b + d_b) * inner_size + inner;
+                out[i] = b[src];
+            }
+        } else {
+            // This branch is unreachable because total = a_numel + b_numel and i < total
+        }
+    }
+}
+
+// Launcher for squeeze_dim: Since in this task no dimension is squeezed, we can simply return success.
+// The binding should return the same tensor view (no allocation).
+// To avoid any kernel launch, launcher does nothing.
+extern "C" void squeeze_dim_launcher(
+    const float* input,
+    float* output,
+    int64_t dim,
+    int64_t input_ndim,
+    const int64_t* input_sizes,
+    const int64_t* input_strides,
+    cudaStream_t stream
+) {
+    // No operation needed; output will be an as_strided view handled by binding.
+    (void)input;
+    (void)output;
+    (void)dim;
+    (void)input_ndim;
+    (void)input_sizes;
+    (void)input_strides;
+    (void)stream;
+}
+
+// Launcher for concatenation of two tensors along a dimension.
+extern "C" void concat_two_launcher(
+    const float* a,
+    const float* b,
+    float* out,
+    int64_t a_sizes[8],  // max 8 dims, but we'll use actual ndim
+    int64_t b_sizes[8],
+    int64_t ndim,
+    int64_t dim,
+    cudaStream_t stream
+) {
+    // Compute sizes along each dimension, assuming all except dim equal.
+    int64_t inner_size = 1;
+    for (int64_t d = dim + 1; d < ndim; ++d) {
+        inner_size *= a_sizes[d];
+    }
+    int64_t outer_size = 1;
+    for (int64_t d = 0; d < dim; ++d) {
+        outer_size *= a_sizes[d];
+    }
+    int64_t dim_size_a = a_sizes[dim];
+    int64_t dim_size_b = b_sizes[dim];
+    int64_t a_numel = outer_size * dim_size_a * inner_size;
+    int64_t b_numel = outer_size * dim_size_b * inner_size;
+    int64_t total = a_numel + b_numel;
+
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    if (blocks > 65535) blocks = 65535; // grid limit; but total likely fits
+    // Use grid-stride loop to cover all elements even if total > blocks*threads
+    concat_copy_kernel<<<blocks, threads, 0, stream>>>(
+        a, b, out, a_numel, b_numel, dim_size_a, dim_size_b, inner_size, outer_size
+    );
+}

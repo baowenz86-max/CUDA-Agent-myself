@@ -1,0 +1,218 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,106 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// CUDA kernel for embedding lookup (forward)
++// indices: int64_t array of shape [total_indices]
++// weight: float array of shape [num_embeddings, embedding_dim], row-major
++// output: float array of shape [total_indices, embedding_dim]
++// For each i in [0,total_indices): row_idx = indices[i];
++// if row_idx == padding_idx: fill output row with 0
++// else copy weight[row_idx, :] to output row
++// Supports arbitrary weight strides: weight_row_stride is number of elements between rows (usually embedding_dim),
++// weight_col_stride is number of elements between columns (usually 1).
++// For contiguous weight (col_stride=1), we can use vectorized loads (float4) if alignment permits.
++// Otherwise, fallback to scalar copy.
++__global__ void embedding_lookup_forward_kernel(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int64_t total_indices,
++    int embedding_dim,
++    int weight_row_stride,
++    int weight_col_stride,
++    int64_t padding_idx)
++{
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    // Vectorized path: uses float4 when possible and col stride 1 and alignment
++    bool can_vectorize = (weight_col_stride == 1) &&
++                         (embedding_dim % 4 == 0) &&
++                         (reinterpret_cast<uintptr_t>(output) % 16 == 0) &&
++                         (reinterpret_cast<uintptr_t>(weight) % 16 == 0) &&
++                         (padding_idx < 0); // placeholder: vectorization does not change padding handling, but we keep simple
++
++    for (; idx < total_indices; idx += stride) {
++        int64_t row_idx = indices[idx];
++        float* out_row = output + idx * embedding_dim;
++
++        if (row_idx == padding_idx) {
++            // Zero this row
++            for (int j = 0; j < embedding_dim; ++j) {
++                out_row[j] = 0.0f;
++            }
++        } else {
++            // Valid row: copy from weight
++            const float* weight_row = weight + row_idx * weight_row_stride;
++            if (weight_col_stride == 1) {
++                // Contiguous row in weight, can copy directly; use loop with unrolling hint
++                #pragma unroll 4
++                for (int j = 0; j < embedding_dim; ++j) {
++                    out_row[j] = weight_row[j];
++                }
++            } else {
++                // Non-contiguous columns: use stride
++                for (int j = 0; j < embedding_dim; ++j) {
++                    out_row[j] = weight_row[j * weight_col_stride];
++                }
++            }
++        }
++    }
++}
++
++// Host launcher for embedding lookup forward
++// Parameters:
++//   indices: pointer to int64 indices on device, shape [total_indices]
++//   weight: pointer to float weight on device, shape [num_embeddings, embedding_dim]
++//   output: pointer to float output on device, shape [total_indices, embedding_dim]
++//   total_indices: number of indices = batch_size * seq_length
++//   embedding_dim: dimension of each embedding vector
++//   weight_row_stride: stride between consecutive rows in weight (elements), usually embedding_dim
++//   weight_col_stride: stride between consecutive columns in weight (elements), usually 1
++//   padding_idx: index to treat as padding; output rows for this index will be zero
++//   stream: CUDA stream to execute on
++//   num_embeddings: used for bounds check? Not needed for correctness but could be used; ignore for now.
++extern "C" void embedding_lookup_forward_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int64_t total_indices,
++    int embedding_dim,
++    int weight_row_stride,
++    int weight_col_stride,
++    int64_t padding_idx,
++    cudaStream_t stream)
++{
++    // Determine block size and grid size
++    int block_size = 256;
++    int64_t grid_size = (total_indices + block_size - 1) / block_size;
++    // Cap grid size if needed (avoid exceeding max grid dimension)
++    // Actually gridDim.x can be up to 2^31-1 for CUDA 10+, but keep within int.
++    if (grid_size > 1048576) { // arbitrary large cap to avoid issues
++        grid_size = 1048576;
++    }
++
++    embedding_lookup_forward_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
++        indices, weight, output, total_indices, embedding_dim,
++        weight_row_stride, weight_col_stride, padding_idx);
++
++    // Check for launch errors (optional but useful)
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In binding layer, we can't throw, but we can avoid silent failure.
++        // Since this .cu cannot include torch, we just log? Actually no logging.
++        // Just ignore; binding should check via synchronize.
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,84 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void embedding_lookup_forward_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int64_t total_indices,
++    int embedding_dim,
++    int weight_row_stride,
++    int weight_col_stride,
++    int64_t padding_idx,
++    cudaStream_t stream);
++
++// PyTorch wrapper for embedding lookup forward
++torch::Tensor embedding_lookup_forward(
++    torch::Tensor indices,
++    torch::Tensor weight,
++    int64_t padding_idx = 0) {
++    // Input validation
++    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(indices.dim() >= 1, "indices must have at least 1 dimension");
++    TORCH_CHECK(weight.dim() == 2, "weight must be a 2D tensor");
++
++    // Ensure indices and weight are on same device (output will be on same as indices)
++    TORCH_CHECK(indices.device() == weight.device(), "indices and weight must be on same device");
++
++    const int64_t total_indices = indices.numel();
++    const int embedding_dim = weight.size(1);
++    const int num_embeddings = weight.size(0);
++
++    // Compute weight strides (number of elements between rows and columns)
++    // weight is 2D, ensure strides are < INT_MAX and positive
++    TORCH_CHECK(weight.stride(0) > 0 && weight.stride(1) > 0, "weight strides must be positive");
++    TORCH_CHECK(weight.stride(0) < INT_MAX && weight.stride(1) < INT_MAX, "weight strides too large");
++    int weight_row_stride = static_cast<int>(weight.stride(0));
++    int weight_col_stride = static_cast<int>(weight.stride(1));
++
++    // Output shape: indices shape + [embedding_dim]
++    std::vector<int64_t> output_sizes = indices.sizes().vec();
++    output_sizes.push_back(embedding_dim);
++    auto output = torch::empty(output_sizes, indices.options().dtype(torch::kFloat32));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    embedding_lookup_forward_launcher(
++        indices.data_ptr<int64_t>(),
++        weight.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total_indices,
++        embedding_dim,
++        weight_row_stride,
++        weight_col_stride,
++        padding_idx,
++        stream);
++
++    // Check for launch error (optional, but recommended)
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_embedding_lookup_forward(pybind11::module& m) {
++    m.def("embedding_lookup_forward", &embedding_lookup_forward,
++          "Embedding lookup forward (CUDA)",
++          pybind11::arg("indices"),
++          pybind11::arg("weight"),
++          pybind11::arg("padding_idx") = 0);
++}
++
++// Auto-register
++REGISTER_BINDING(embedding_lookup_forward, register_embedding_lookup_forward)
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,19 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim, padding_idx):
++        super().__init__()
++        self.embedding = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
++
++    def forward(self, x):
++        return cuda_extension.embedding_lookup_forward(
++            x, self.embedding.weight, self.embedding.padding_idx
++        )
++
++    def debug_forward(self, *inputs):
++        x = inputs[0] if inputs else self._debug_x
++        out = self.forward(x)
++        yield 'step_001', out

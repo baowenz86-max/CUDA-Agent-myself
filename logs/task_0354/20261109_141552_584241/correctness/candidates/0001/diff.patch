@@ -1,0 +1,210 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,96 @@
++#include <cuda_runtime.h>
++
++// CUDA kernel for ReplicationPad2d on NCHW layout.
++// Input may have arbitrary strides; output is assumed contiguous with standard NCHW strides.
++// Each thread computes one output element; grid-stride loop handles arbitrary size.
++__global__ void replication_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t N,
++    int64_t C,
++    int64_t H_in,
++    int64_t W_in,
++    int64_t H_out,
++    int64_t W_out,
++    int64_t pad_left,
++    int64_t pad_top,
++    int64_t stride_batch,
++    int64_t stride_channel,
++    int64_t stride_height,
++    int64_t stride_width,
++    int64_t total_elements)
++{
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t step = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += step) {
++        // Decompose linear index into output NCHW coordinates.
++        int64_t w_out = i % W_out;
++        int64_t tmp = i / W_out;
++        int64_t h_out = tmp % H_out;
++        tmp /= H_out;
++        int64_t c = tmp % C;
++        int64_t n = tmp / C;
++
++        // Replication source coordinates (clamped to input boundaries).
++        int64_t w_in = w_out - pad_left;
++        if (w_in < 0) w_in = 0;
++        if (w_in >= W_in) w_in = W_in - 1;
++
++        int64_t h_in = h_out - pad_top;
++        if (h_in < 0) h_in = 0;
++        if (h_in >= H_in) h_in = H_in - 1;
++
++        // Gather from input using provided strides.
++        int64_t src_idx = n * stride_batch + c * stride_channel
++                        + h_in * stride_height + w_in * stride_width;
++        output[i] = input[src_idx];
++    }
++}
++
++// Launcher for replication_pad2d_forward.
++// All parameters are passed as raw pointers or integers, no torch dependencies.
++extern "C" void replication_pad2d_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N,
++    int64_t C,
++    int64_t H_in,
++    int64_t W_in,
++    int64_t H_out,
++    int64_t W_out,
++    int64_t pad_left,
++    int64_t pad_top,
++    int64_t stride_batch,
++    int64_t stride_channel,
++    int64_t stride_height,
++    int64_t stride_width,
++    cudaStream_t stream)
++{
++    int64_t total_elements = N * C * H_out * W_out;
++    if (total_elements == 0) return;
++
++    const int block_size = 256;
++    int64_t grid_size = (total_elements + block_size - 1) / block_size;
++    // Cap grid size to avoid exceeding max grid dimension, use grid-stride loop.
++    const int64_t max_grid_y = 65535;
++    if (grid_size > max_grid_y) {
++        grid_size = max_grid_y;
++    }
++
++    replication_pad2d_kernel<<<(int)grid_size, block_size, 0, stream>>>(
++        input,
++        output,
++        N,
++        C,
++        H_in,
++        W_in,
++        H_out,
++        W_out,
++        pad_left,
++        pad_top,
++        stride_batch,
++        stride_channel,
++        stride_height,
++        stride_width,
++        total_elements);
++}
+--- before/kernels/replication_pad2d_binding.cpp
++++ after/kernels/replication_pad2d_binding.cpp
+@@ -0,0 +1,84 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declaration matching custom_ops.cu
++extern "C" void replication_pad2d_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N,
++    int64_t C,
++    int64_t H_in,
++    int64_t W_in,
++    int64_t H_out,
++    int64_t W_out,
++    int64_t pad_left,
++    int64_t pad_top,
++    int64_t stride_batch,
++    int64_t stride_channel,
++    int64_t stride_height,
++    int64_t stride_width,
++    cudaStream_t stream);
++
++torch::Tensor replication_pad2d_forward(
++    torch::Tensor x,
++    int64_t pad_left,
++    int64_t pad_right,
++    int64_t pad_top,
++    int64_t pad_bottom)
++{
++    // Validate tensor properties
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4D (NCHW)");
++
++    // Optional contiguous check not required because launcher supports strides
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H_in = x.size(2);
++    int64_t W_in = x.size(3);
++
++    int64_t H_out = H_in + pad_top + pad_bottom;
++    int64_t W_out = W_in + pad_left + pad_right;
++
++    // Allocate contiguous output tensor on same device
++    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher with strides from input (which may be non-contiguous)
++    replication_pad2d_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N,
++        C,
++        H_in,
++        W_in,
++        H_out,
++        W_out,
++        pad_left,
++        pad_top,
++        x.stride(0),
++        x.stride(1),
++        x.stride(2),
++        x.stride(3),
++        stream);
++
++    return output;
++}
++
++void register_replication_pad2d(pybind11::module& m) {
++    m.def("replication_pad2d_forward", &replication_pad2d_forward,
++          "ReplicationPad2d forward (CUDA)",
++          py::arg("x"),
++          py::arg("pad_left"),
++          py::arg("pad_right"),
++          py::arg("pad_top"),
++          py::arg("pad_bottom"));
++}
++
++REGISTER_BINDING(replication_pad2d, register_replication_pad2d);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, pad_size_h, pad_size_w):
++        super().__init__()
++        self.pad_size_h = int(pad_size_h)
++        self.pad_size_w = int(pad_size_w)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.replication_pad2d_forward(
++            x, self.pad_size_h, self.pad_size_h, self.pad_size_w, self.pad_size_w
++        )
++
++    def debug_forward(self, x: torch.Tensor):
++        y = cuda_extension.replication_pad2d_forward(
++            x, self.pad_size_h, self.pad_size_h, self.pad_size_w, self.pad_size_w
++        )
++        yield "step_001", y

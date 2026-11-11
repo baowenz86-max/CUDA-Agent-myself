@@ -1,0 +1,246 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,58 @@
++#include <cuda_runtime.h>
++
++// CUDA kernel for one RNN layer with tanh activation.
++// Each thread computes one hidden unit for a given batch element and time step.
++// The kernel iterates over all time steps sequentially, writing output for each time step.
++// Inputs:
++//   input: input activations for this layer, shape [seq_length, batch, input_size]
++//   output: output activations, shape [seq_length, batch, hidden_size]
++//   weight_ih: shape [hidden_size, input_size]
++//   weight_hh: shape [hidden_size, hidden_size]
++//   bias_ih: optional, shape [hidden_size]
++//   bias_hh: optional, shape [hidden_size]
++//   h_last: final hidden state for this layer, shape [batch, hidden_size]
++//   seq_length, batch, input_size, hidden_size
++__global__ void rnn_cell_forward_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    const float* __restrict__ weight_ih,
++    const float* __restrict__ weight_hh,
++    const float* __restrict__ bias_ih,
++    const float* __restrict__ bias_hh,
++    float* __restrict__ h_last,
++    int seq_length,
++    int batch,
++    int input_size,
++    int hidden_size
++) {
++    int hidden_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (hidden_idx >= hidden_size) return;
++    int batch_idx = blockIdx.y; // batch dimension in grid y
++
++    // initial hidden state is zero
++    float h = 0.0f;
++
++    // base precomputation: bias_ih[hidden_idx] + bias_hh[hidden_idx]
++    float total_bias = 0.0f;
++    if (bias_ih != nullptr) total_bias += bias_ih[hidden_idx];
++    if (bias_hh != nullptr) total_bias += bias_hh[hidden_idx];
++
++    for (int t = 0; t < seq_length; ++t) {
++        // gate = bias + sum_i input[t,batch,i] * weight_ih[hidden_idx,i] + sum_j h_prev[j] * weight_hh[hidden_idx,j]
++        float gate = total_bias;
++
++        const float* x_t = input + (size_t)t * batch * input_size + (size_t)batch_idx * input_size;
++        for (int i = 0; i < input_size; ++i) {
++            gate += x_t[i] * weight_ih[hidden_idx * input_size + i];
++        }
++
++        // For recurrence, we need the previous hidden state vector h_prev.
++        // Since each thread only maintains its own h scalar, we need access to all h_j from previous time step.
++        // We cannot simply use a local scalar. We need to store h_prev for all hidden units in a shared or global buffer.
++        // Solution: store hidden state for all units in a global buffer per batch and time step.
++        // For simplicity, we can maintain a global array h_state of shape [batch, hidden] updated each time step.
++        // However, inside this kernel we need communication between threads of different hidden_idx.
++        // Use shared memory to store previous hidden state for the whole block.
++        // Each block handles one batch element and all hidden units. hidden_size is 64, so one block with 64 threads is enough.
++    }
++}
+--- before/kernels/rnn_forward_binding.cpp
++++ after/kernels/rnn_forward_binding.cpp
+@@ -0,0 +1,133 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declaration of the CUDA launcher from custom_ops.cu.
++// Signature matches the implementation expected in the .cu file.
++extern "C" void rnn_forward_launcher(
++    const float* x,            // input sequence [seq_length, batch, input_size]
++    float* output,             // output [seq_length, batch, hidden_size]
++    const float* weight_ih_l0, // [hidden_size, input_size]
++    const float* weight_hh_l0, // [hidden_size, hidden_size]
++    const float* bias_ih_l0,   // [hidden_size] or nullptr
++    const float* bias_hh_l0,   // [hidden_size] or nullptr
++    const float* weight_ih_l1, // [hidden_size, hidden_size]
++    const float* weight_hh_l1, // [hidden_size, hidden_size]
++    const float* bias_ih_l1,   // [hidden_size] or nullptr
++    const float* bias_hh_l1,   // [hidden_size] or nullptr
++    float* h_n,                // [num_layers, batch, hidden_size]
++    int seq_length,
++    int batch_size,
++    int input_size,
++    int hidden_size,
++    int num_layers,
++    bool bias,
++    cudaStream_t stream
++);
++
++// PyTorch binding function
++std::tuple<torch::Tensor, torch::Tensor> rnn_forward(
++    torch::Tensor x,
++    torch::Tensor weight_ih_l0,
++    torch::Tensor weight_hh_l0,
++    c10::optional<torch::Tensor> bias_ih_l0_opt,
++    c10::optional<torch::Tensor> bias_hh_l0_opt,
++    torch::Tensor weight_ih_l1,
++    torch::Tensor weight_hh_l1,
++    c10::optional<torch::Tensor> bias_ih_l1_opt,
++    c10::optional<torch::Tensor> bias_hh_l1_opt,
++    int64_t input_size,
++    int64_t hidden_size,
++    int64_t num_layers,
++    bool bias
++) {
++    // input validation
++    TORCH_CHECK(x.dim() == 3, "x must be 3D tensor [seq_length, batch, input_size]");
++    int64_t seq_length = x.size(0);
++    int64_t batch_size = x.size(1);
++    TORCH_CHECK(x.size(2) == input_size, "x.size(2) must equal input_size");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
++
++    // Ensure all tensors are on CUDA and float32; move them if necessary
++    auto ensure_cuda_float = [](const torch::Tensor& t, const char* name) -> torch::Tensor {
++        TORCH_CHECK(t.scalar_type() == torch::kFloat32, name, " must be float32");
++        if (!t.is_cuda()) {
++            return t.to(torch::kCUDA);
++        }
++        return t;
++    };
++
++    x = ensure_cuda_float(x, "x");
++    weight_ih_l0 = ensure_cuda_float(weight_ih_l0, "weight_ih_l0");
++    weight_hh_l0 = ensure_cuda_float(weight_hh_l0, "weight_hh_l0");
++    weight_ih_l1 = ensure_cuda_float(weight_ih_l1, "weight_ih_l1");
++    weight_hh_l1 = ensure_cuda_float(weight_hh_l1, "weight_hh_l1");
++
++    torch::Tensor bias_ih_l0, bias_hh_l0, bias_ih_l1, bias_hh_l1;
++    if (bias) {
++        TORCH_CHECK(bias_ih_l0_opt.has_value() && bias_hh_l0_opt.has_value() &&
++                    bias_ih_l1_opt.has_value() && bias_hh_l1_opt.has_value(),
++                    "bias tensors must be provided when bias=True");
++        bias_ih_l0 = ensure_cuda_float(bias_ih_l0_opt.value(), "bias_ih_l0");
++        bias_hh_l0 = ensure_cuda_float(bias_hh_l0_opt.value(), "bias_hh_l0");
++        bias_ih_l1 = ensure_cuda_float(bias_ih_l1_opt.value(), "bias_ih_l1");
++        bias_hh_l1 = ensure_cuda_float(bias_hh_l1_opt.value(), "bias_hh_l1");
++    }
++
++    // allocate outputs on CUDA
++    auto output = torch::empty({seq_length, batch_size, hidden_size}, x.options());
++    auto h_n = torch::empty({num_layers, batch_size, hidden_size}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // call launcher
++    rnn_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        weight_ih_l0.data_ptr<float>(),
++        weight_hh_l0.data_ptr<float>(),
++        bias ? bias_ih_l0.data_ptr<float>() : nullptr,
++        bias ? bias_hh_l0.data_ptr<float>() : nullptr,
++        weight_ih_l1.data_ptr<float>(),
++        weight_hh_l1.data_ptr<float>(),
++        bias ? bias_ih_l1.data_ptr<float>() : nullptr,
++        bias ? bias_hh_l1.data_ptr<float>() : nullptr,
++        h_n.data_ptr<float>(),
++        static_cast<int>(seq_length),
++        static_cast<int>(batch_size),
++        static_cast<int>(input_size),
++        static_cast<int>(hidden_size),
++        static_cast<int>(num_layers),
++        bias,
++        stream
++    );
++
++    // Check for CUDA errors after kernel launch
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return std::make_tuple(output, h_n);
++}
++
++// Registration function
++void register_rnn_forward(pybind11::module& m) {
++    m.def("rnn_forward", &rnn_forward,
++          "RNN forward using custom CUDA kernels",
++          py::arg("x"),
++          py::arg("weight_ih_l0"),
++          py::arg("weight_hh_l0"),
++          py::arg("bias_ih_l0"),
++          py::arg("bias_hh_l0"),
++          py::arg("weight_ih_l1"),
++          py::arg("weight_hh_l1"),
++          py::arg("bias_ih_l1"),
++          py::arg("bias_hh_l1"),
++          py::arg("input_size"),
++          py::arg("hidden_size"),
++          py::arg("num_layers"),
++          py::arg("bias"));
++}
++
++REGISTER_BINDING(rnn_forward, register_rnn_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,46 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, hidden_size, num_layers, bias):
++        super().__init__()
++        self.input_size = input_size
++        self.hidden_size = hidden_size
++        self.num_layers = num_layers
++        self.bias = bias
++
++        # 创建与参考 nn.RNN 相同的参数，保证 state_dict 键一致
++        self.rnn = nn.Module()
++        for layer in range(num_layers):
++            layer_input_size = input_size if layer == 0 else hidden_size
++            setattr(self.rnn, f'weight_ih_l{layer}', nn.Parameter(torch.empty(hidden_size, layer_input_size)))
++            setattr(self.rnn, f'weight_hh_l{layer}', nn.Parameter(torch.empty(hidden_size, hidden_size)))
++            if bias:
++                setattr(self.rnn, f'bias_ih_l{layer}', nn.Parameter(torch.empty(hidden_size)))
++                setattr(self.rnn, f'bias_hh_l{layer}', nn.Parameter(torch.empty(hidden_size)))
++            else:
++                setattr(self.rnn, f'bias_ih_l{layer}', None)
++                setattr(self.rnn, f'bias_hh_l{layer}', None)
++
++    def forward(self, x: torch.Tensor):
++        return cuda_extension.rnn_forward(
++            x,
++            self.rnn.weight_ih_l0,
++            self.rnn.weight_hh_l0,
++            self.rnn.bias_ih_l0,
++            self.rnn.bias_hh_l0,
++            self.rnn.weight_ih_l1,
++            self.rnn.weight_hh_l1,
++            self.rnn.bias_ih_l1,
++            self.rnn.bias_hh_l1,
++            self.input_size,
++            self.hidden_size,
++            self.num_layers,
++            self.bias
++        )
++
++    def debug_forward(self, x: torch.Tensor):
++        out = self.forward(x)
++        yield "step_001", out

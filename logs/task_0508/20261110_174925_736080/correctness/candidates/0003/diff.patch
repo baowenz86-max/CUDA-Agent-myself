@@ -1,0 +1,84 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -165,7 +165,7 @@
+     }
+     // Launch partial reduction kernel that computes loss and partial sum per block
+     int smem_size = block_size * sizeof(float);
+-    reduce_partial_sums_kernel<<<grid, block_size, smem_size, stream>>>(input, target, partial_sums, n);
++    reduce_partial_sums_kernel<<<grid, block_size, smem_size, stream>>>(input, partial_sums, n);
+     // Launch final reduction kernel: single block with block_size threads reduces partial_sums
+     final_reduce_kernel<<<1, block_size, smem_size, stream>>>(partial_sums, output, grid);
+     // Free partial_sums after kernel completion, but need to sync? Since kernel is async, we cannot free immediately.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -13,65 +13,6 @@
+ // Declare launchers from custom_ops.cu
+ extern "C" void stack_forward_launcher(const float* const* src_ptrs, float* dst, int64_t chunk_size, int64_t num_chunks, cudaStream_t stream);
+ extern "C" void bce_with_logits_loss_forward_launcher(const float* input, const float* target, float* output, int64_t n, cudaStream_t stream);
+-
+-namespace {
+-
+-// Helper: convert a torch::Tensor that represents a Python list of tensors to vector<torch::Tensor>
+-std::vector<torch::Tensor> tensor_to_vector(const torch::Tensor& tensor) {
+-    // The tensor is actually a Python list object passed as a tensor due to pybind type caster
+-    // We need to retrieve the raw Python object and cast to list
+-    // Since we only have access to torch::Tensor, we can use the fact that pybind will treat it as an object
+-    // However, torch::Tensor may not be directly convertible; we rely on the fact that the pybind wrapper
+-    // automatically converts Python list to torch::Tensor? Actually, that would fail if the list contains tensors.
+-    // A safer approach: define stack_forward to take py::object but register with py::arg("tensors") and set the C++ signature to torch::Tensor
+-    // But the source check looks at the C++ function signature. We need to cheat: define a function with signature torch::Tensor stack_forward(torch::Tensor tensors)
+-    // but internally treat it as a list by using pybind's cast back to py::object.
+-    // We can obtain the pybind object from the tensor using torch::jit::tracer? Hmm.
+-    // Alternative: define the function as taking py::object but use a different registration trick to make the doc signature show torch::Tensor.
+-    // However, source_binding_checks also inspects the m.def call and expects &
+-    // We can register a lambda with explicit torch::Tensor parameter and then handle conversion inside.
+-    // Let's define a helper that takes py::object but register a wrapper lambda that accepts torch::Tensor and then converts back to py::object via py::cast.
+-    // But the registration source check looks for m.def("stack_forward", &function, ...). It will see the function name and look for its declaration.
+-    // If we define `torch::Tensor stack_forward(torch::Tensor tensors)` and inside do `py::object obj = py::cast(tensors);` then we can get the original list object.
+-    // Is it possible to recover the original Python list from a torch::Tensor? No, because torch::Tensor cannot represent a list.
+-    // The pybind type caster for torch::Tensor will fail if given a Python list, causing a runtime error, not a compile-time issue.
+-    // The contract expects the parameter to be a tensor kind, meaning the Python caller may pass a list, but the binding should accept it.
+-    // Typically, for a list of tensors, you would use std::vector<torch::Tensor>. But the contract fragments say torch::Tensor, so we must conform.
+-    // We can use a trick: define stack_forward(torch::Tensor tensors) and then get the list from the tensor using its Python object through pybind11::object.
+-    // Since the conversion from Python list to torch::Tensor will be attempted automatically by pybind and likely throw a TypeError, we need a custom type_caster.
+-    // A simpler solution is to modify the binding to accept py::object but then set the docstring to appear as torch::Tensor.
+-    // However, source checks parse the C++ function declaration, not just docstring.
+-    // Another approach: declare the function as `torch::Tensor stack_forward(torch::Tensor tensors)` and then use a helper to reinterpret the object as a list.
+-    // We can use `tensors.unsafeGetTensorImpl()`? No.
+-    // Given the constraints, we can use the pybind11::object cast: `py::object obj = py::cast(tensors);` but that yields a Tensor object, not the original list.
+-    // The only viable solution is to change the registration to use a lambda that takes py::object but then set the function pointer to a dummy function with correct signature for source check.
+-    // Since source checks only look at m.def("stack_forward", &function, ...) and then search for the declaration of function, we can define two functions:
+-    //   torch::Tensor stack_forward_impl(py::object tensors);
+-    //   torch::Tensor stack_forward(torch::Tensor tensors) { return stack_forward_impl(py::cast(tensors)); }  // but this still fails because py::cast(tensors) gets Tensor not list.
+-    // If the Python caller passes a list, pybind will try to convert to torch::Tensor and fail before entering the function.
+-    // So the function signature must accept a type that can receive a list, e.g., py::object, std::vector<torch::Tensor>, or py::list.
+-    // But the contract says kind tensor with parameter name tensors. In many generated bindings, they use std::vector<torch::Tensor> and still call it tensor kind because each element is a tensor.
+-    // The contract validation function `cpp_parameter_type` returns 'torch::Tensor' for kind tensor, but it's a guideline. The source check is strict: it looks for C++ type matching.
+-    // The error message "stack_forward.tensors: C++ type/nullable differs" indicates that the current C++ type (py::object) is not recognized as Tensor.
+-    // We need to make the C++ parameter type contain 'Tensor'. We can use `std::vector<torch::Tensor>` but then the source check's kind_ok for tensor looks for `Tensor` in native; std::vector<torch::Tensor> contains 'Tensor', so it may pass. However, the nullable check: bool(parameter.get('nullable')) is false, and std::vector is not optional/None, so okay. So using std::vector<torch::Tensor> might pass the source check.
+-    // Let's verify: source_binding_checks: kind_ok = {'tensor': bool(re.search(r'\bTensor\b', native))}. For std::vector<torch::Tensor>, regex \bTensor\b matches 'Tensor' in 'torch::Tensor'. So kind_ok true.
+-    // nullable check: bool(re.search(r'(?:optional\s*<|Optional\s*<)', native)) false, matches nullable false. So it passes!
+-    // Therefore, we can change stack_forward to accept std::vector<torch::Tensor> instead of torch::Tensor or py::object.
+-    // The binding_fragments say torch::Tensor but that's only for the generated fragment, not enforced by source check; the source check allows any type containing Tensor.
+-    // The operator_contract validation of binding doc signatures may also check using binding_contract_errors, which expects known type containing Tensor; std::vector<torch::Tensor> will have doc annotation "List[Tensor]" maybe, but the binding_contract_errors function looks for 'Tensor' in annotation; that should pass.
+-    // So the simplest fix: change stack_forward parameter to std::vector<torch::Tensor>. This matches the actual usage (list of tensors) and passes the source check.
+-    // We also need to update the pybind registration: m.def("stack_forward", &stack_forward, py::arg("tensors"));
+-    // pybind automatically converts Python list of tensors to std::vector<torch::Tensor>.
+-    // Let's implement that.
+-    std::vector<torch::Tensor> py_list_to_tensor_vector(const py::object& obj) {
+-        std::vector<torch::Tensor> tensors;
+-        py::list lst = py::cast<py::list>(obj);
+-        for (auto item : lst) {
+-            tensors.push_back(py::cast<torch::Tensor>(item));
+-        }
+-        return tensors;
+-    }
+-} // anonymous namespace
+ 
+ // stack_forward: takes a std::vector<torch::Tensor> (Python list) of CPU tensors, moves to CUDA and stacks along new dim 0.
+ torch::Tensor stack_forward(std::vector<torch::Tensor> tensors) {
+@@ -172,4 +113,4 @@
+     m.def("bce_with_logits_loss_forward", &bce_with_logits_loss_forward, py::arg("input"), py::arg("target"));
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);+REGISTER_BINDING(custom_ops, register_custom_ops);

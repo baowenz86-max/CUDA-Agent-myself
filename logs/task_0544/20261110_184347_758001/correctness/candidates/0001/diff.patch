@@ -1,0 +1,263 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,97 @@
++// kernels/custom_ops.cu
++// 纯 CUDA kernel 实现 relu_forward 和 batch_norm1d_eval_forward
++// 不包含 torch/ATen/pybind，只提供 extern "C" launcher 供 binding.cpp 调用
++
++#include <cuda_runtime.h>
++
++// ReLU 逐元素 kernel
++__global__ void relu_kernel(float* out, const float* in, int64_t N) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < N; i += stride) {
++        float v = in[i];
++        out[i] = (v > 0.0f) ? v : 0.0f;
++    }
++}
++
++// BatchNorm1d eval kernel
++// 输入形状 [N, C, L]，按通道归一化
++__global__ void batch_norm1d_eval_kernel(
++    float* out,
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    int64_t N,
++    int64_t C,
++    int64_t L) {
++
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    int64_t total = N * C * L;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        // 计算当前元素所属的通道索引
++        int64_t c = (i / L) % C;
++
++        float mean = running_mean[c];
++        float var = running_var[c];
++        float scale = weight[c] / sqrtf(var + eps);
++        float shift = bias[c] - mean * scale;
++
++        out[i] = x[i] * scale + shift;
++    }
++}
++
++// 外部 C launcher：relu
++// 输出张量已由 binding 层分配，这里只写入
++// numel: 总元素数
++// stream: 当前 CUDA stream
++extern "C" void relu_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream) {
++
++    if (numel <= 0) return;
++
++    int block_size = 256;
++    // 网格数量限制在 65535 以内，但随 numel 调整；使用 grid-stride loop 处理更大数据
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++
++    relu_kernel<<<(unsigned int)grid_size, (unsigned int)block_size, 0, stream>>>(
++        output, input, numel);
++}
++
++// 外部 C launcher：batch_norm1d_eval
++// output, x, weight, bias, running_mean, running_var 都是 GPU 指针
++// N, C, L 为维度；eps 为 double，kernel 内转为 float 以匹配运行精度
++extern "C" void batch_norm1d_eval_launcher(
++    float* output,
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    double eps,
++    int64_t N,
++    int64_t C,
++    int64_t L,
++    cudaStream_t stream) {
++
++    int64_t total = N * C * L;
++    if (total <= 0) return;
++
++    int block_size = 256;
++    int64_t grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++
++    // 将 eps 转为 float，避免 kernel 中隐式转换
++    float eps_f = static_cast<float>(eps);
++
++    batch_norm1d_eval_kernel<<<(unsigned int)grid_size, (unsigned int)block_size, 0, stream>>>(
++        output, x, weight, bias, running_mean, running_var, eps_f, N, C, L);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,121 @@
++// kernels/custom_ops_binding.cpp
++// PyTorch binding for custom CUDA ops: relu_forward and batch_norm1d_eval_forward
++// Contains only tensor validation, launcher invocation, and pybind registration.
++
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void relu_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void batch_norm1d_eval_launcher(
++    float* output,
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    double eps,
++    int64_t N,
++    int64_t C,
++    int64_t L,
++    cudaStream_t stream);
++
++// ReLU forward wrapper
++torch::Tensor relu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "relu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "relu_forward: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "relu_forward: input must be contiguous");
++
++    auto output = torch::empty_like(x);
++    int64_t numel = x.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    relu_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        numel,
++        stream);
++
++    return output;
++}
++
++// BatchNorm1d eval forward wrapper
++torch::Tensor batch_norm1d_eval_forward(
++    torch::Tensor x,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    torch::Tensor running_mean,
++    torch::Tensor running_var,
++    double eps) {
++
++    TORCH_CHECK(x.is_cuda(), "batch_norm1d_eval_forward: x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "batch_norm1d_eval_forward: x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "batch_norm1d_eval_forward: x must be contiguous");
++
++    // Check other tensors
++    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be CUDA tensor");
++    TORCH_CHECK(running_mean.is_cuda(), "running_mean must be CUDA tensor");
++    TORCH_CHECK(running_var.is_cuda(), "running_var must be CUDA tensor");
++
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(running_mean.dtype() == torch::kFloat32, "running_mean must be float32");
++    TORCH_CHECK(running_var.dtype() == torch::kFloat32, "running_var must be float32");
++
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++    TORCH_CHECK(running_mean.is_contiguous(), "running_mean must be contiguous");
++    TORCH_CHECK(running_var.is_contiguous(), "running_var must be contiguous");
++
++    // Shape checks: x must be 3D [N, C, L]; other tensors must be [C]
++    TORCH_CHECK(x.dim() == 3, "x must be 3D (N, C, L)");
++    int64_t C = x.size(1);
++    TORCH_CHECK(weight.numel() == C, "weight shape must match C");
++    TORCH_CHECK(bias.numel() == C, "bias shape must match C");
++    TORCH_CHECK(running_mean.numel() == C, "running_mean shape must match C");
++    TORCH_CHECK(running_var.numel() == C, "running_var shape must match C");
++
++    auto output = torch::empty_like(x);
++    int64_t N = x.size(0);
++    int64_t L = x.size(2);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    batch_norm1d_eval_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        running_mean.data_ptr<float>(),
++        running_var.data_ptr<float>(),
++        eps,
++        N,
++        C,
++        L,
++        stream);
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("relu_forward", &relu_forward, "ReLU forward", py::arg("x"));
++    m.def("batch_norm1d_eval_forward", &batch_norm1d_eval_forward,
++          "BatchNorm1d eval forward",
++          py::arg("x"),
++          py::arg("weight"),
++          py::arg("bias"),
++          py::arg("running_mean"),
++          py::arg("running_var"),
++          py::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,36 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features, eps):
++        super().__init__()
++        self.batch_norm = nn.BatchNorm1d(num_features, eps)
++
++    def forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        x = cuda_extension.batch_norm1d_eval_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.batch_norm.eps,
++        )
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.relu_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.batch_norm1d_eval_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.batch_norm.eps,
++        )
++        yield 'step_002', x
++        yield 'step_003', x

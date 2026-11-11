@@ -1,0 +1,313 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1 @@
++完整文件内容见下方字符串--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,215 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <ATen/cuda/CUDAContext.h>
++#include "../binding_registry.h"
++
++// 声明 .cu 中导出的 launcher 函数
++extern "C" void randn_launcher(float* output, int64_t numel, cudaStream_t stream);
++extern "C" void relu_launcher(float* output, const float* input, int64_t numel, cudaStream_t stream);
++extern "C" void adaptive_log_softmax_with_loss_launcher(
++    float* output, float* loss,
++    const float* input, const int64_t* target,
++    const float* head_weight, const float* tail0_weight0, const float* tail0_weight1,
++    const float* tail1_weight0, const float* tail1_weight1,
++    int64_t N, int64_t in_features,
++    int64_t head_size, int64_t hsz0, int64_t hsz1,
++    int64_t cutoff0, int64_t cutoff1, double div_value,
++    cudaStream_t stream);
++extern "C" void adaptive_log_softmax_log_prob_launcher(
++    float* output,
++    const float* input,
++    const float* head_weight, const float* tail0_weight0, const float* tail0_weight1,
++    const float* tail1_weight0, const float* tail1_weight1,
++    int64_t N, int64_t in_features,
++    int64_t head_size, int64_t hsz0, int64_t hsz1,
++    int64_t cutoff0, int64_t cutoff1, double div_value,
++    cudaStream_t stream);
++
++// randn_forward: shape 参数为 int64_t，表示元素总数
++// 实际调用时由 Python 传入 shape tuple，但契约中参数类型是 int，
++// 这里使用 int64_t 接收元素个数，由 Python 侧计算好。
++torch::Tensor randn_forward(int64_t shape) {
++    TORCH_CHECK(shape > 0, "shape must be positive");
++    auto output = torch::empty({shape}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    randn_launcher(output.data_ptr<float>(), shape, stream);
++    return output;
++}
++
++// relu_forward: 输入可以是任意 stride，但 launcher 要求连续，因此先转为 contiguous
++torch::Tensor relu_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Input must be float32");
++    if (!input.is_contiguous()) {
++        input = input.contiguous();
++    }
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    relu_launcher(output.data_ptr<float>(), input.data_ptr<float>(), input.numel(), stream);
++    return output;
++}
++
++// adaptive_log_softmax_with_loss_forward 返回值类型为 torch.return_types.max，
++// 但无法直接构造命名元组，因此这里返回 std::tuple<torch::Tensor, torch::Tensor>，
++// Python 侧会通过 pybind 自动转换为 tuple。
++std::tuple<torch::Tensor, torch::Tensor> adaptive_log_softmax_with_loss_forward(
++    torch::Tensor input,
++    torch::Tensor target,
++    torch::Tensor head_weight,
++    torch::Tensor tail0_weight0,
++    torch::Tensor tail0_weight1,
++    torch::Tensor tail1_weight0,
++    torch::Tensor tail1_weight1,
++    int64_t cutoff0,
++    int64_t cutoff1,
++    double div_value) {
++
++    // 输入检查
++    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
++    TORCH_CHECK(target.is_cuda(), "target must be CUDA");
++    TORCH_CHECK(head_weight.is_cuda(), "head_weight must be CUDA");
++    TORCH_CHECK(tail0_weight0.is_cuda(), "tail0_weight0 must be CUDA");
++    TORCH_CHECK(tail0_weight1.is_cuda(), "tail0_weight1 must be CUDA");
++    TORCH_CHECK(tail1_weight0.is_cuda(), "tail1_weight0 must be CUDA");
++    TORCH_CHECK(tail1_weight1.is_cuda(), "tail1_weight1 must be CUDA");
++
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(target.scalar_type() == torch::kInt64, "target must be int64");
++    TORCH_CHECK(head_weight.scalar_type() == torch::kFloat32, "weights must be float32");
++    TORCH_CHECK(tail0_weight0.scalar_type() == torch::kFloat32, "weights must be float32");
++    TORCH_CHECK(tail0_weight1.scalar_type() == torch::kFloat32, "weights must be float32");
++    TORCH_CHECK(tail1_weight0.scalar_type() == torch::kFloat32, "weights must be float32");
++    TORCH_CHECK(tail1_weight1.scalar_type() == torch::kFloat32, "weights must be float32");
++
++    // 维度检查
++    TORCH_CHECK(input.dim() == 2, "input must be 2D [N, in_features]");
++    TORCH_CHECK(target.dim() == 1, "target must be 1D [N]");
++    int64_t N = input.size(0);
++    int64_t in_features = input.size(1);
++    TORCH_CHECK(target.size(0) == N, "target size mismatch");
++    TORCH_CHECK(head_weight.dim() == 2 && head_weight.size(1) == in_features, "head_weight shape mismatch");
++    TORCH_CHECK(tail0_weight0.dim() == 2 && tail0_weight0.size(1) == in_features, "tail0_weight0 shape mismatch");
++    TORCH_CHECK(tail0_weight1.dim() == 2 && tail0_weight1.size(0) == (cutoff1 - cutoff0) && tail0_weight1.size(1) == tail0_weight0.size(0),
++                "tail0_weight1 shape mismatch");
++    TORCH_CHECK(tail1_weight0.dim() == 2 && tail1_weight0.size(1) == in_features, "tail1_weight0 shape mismatch");
++    TORCH_CHECK(tail1_weight1.dim() == 2 && tail1_weight1.size(0) == cutoff0 && tail1_weight1.size(1) == tail1_weight0.size(0),
++                "tail1_weight1 shape mismatch");
++
++    // 确保张量连续
++    auto input_contig = input.contiguous();
++    auto target_contig = target.contiguous();
++    auto head_weight_contig = head_weight.contiguous();
++    auto tail0_weight0_contig = tail0_weight0.contiguous();
++    auto tail0_weight1_contig = tail0_weight1.contiguous();
++    auto tail1_weight0_contig = tail1_weight0.contiguous();
++    auto tail1_weight1_contig = tail1_weight1.contiguous();
++
++    // 输出分配
++    auto output = torch::empty({N}, input_contig.options());
++    auto loss = torch::empty({}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    adaptive_log_softmax_with_loss_launcher(
++        output.data_ptr<float>(),
++        loss.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        target_contig.data_ptr<int64_t>(),
++        head_weight_contig.data_ptr<float>(),
++        tail0_weight0_contig.data_ptr<float>(),
++        tail0_weight1_contig.data_ptr<float>(),
++        tail1_weight0_contig.data_ptr<float>(),
++        tail1_weight1_contig.data_ptr<float>(),
++        N, in_features,
++        head_weight_contig.size(0),
++        tail0_weight0_contig.size(0),
++        tail1_weight0_contig.size(0),
++        cutoff0, cutoff1, div_value,
++        stream);
++
++    return std::make_tuple(output, loss);
++}
++
++// adaptive_log_softmax_log_prob_forward
++torch::Tensor adaptive_log_softmax_log_prob_forward(
++    torch::Tensor input,
++    torch::Tensor head_weight,
++    torch::Tensor tail0_weight0,
++    torch::Tensor tail0_weight1,
++    torch::Tensor tail1_weight0,
++    torch::Tensor tail1_weight1,
++    int64_t cutoff0,
++    int64_t cutoff1,
++    double div_value) {
++
++    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
++    TORCH_CHECK(head_weight.is_cuda(), "head_weight must be CUDA");
++    TORCH_CHECK(tail0_weight0.is_cuda(), "tail0_weight0 must be CUDA");
++    TORCH_CHECK(tail0_weight1.is_cuda(), "tail0_weight1 must be CUDA");
++    TORCH_CHECK(tail1_weight0.is_cuda(), "tail1_weight0 must be CUDA");
++    TORCH_CHECK(tail1_weight1.is_cuda(), "tail1_weight1 must be CUDA");
++
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(head_weight.scalar_type() == torch::kFloat32, "weights must be float32");
++    TORCH_CHECK(tail0_weight0.scalar_type() == torch::kFloat32, "weights must be float32");
++    TORCH_CHECK(tail0_weight1.scalar_type() == torch::kFloat32, "weights must be float32");
++    TORCH_CHECK(tail1_weight0.scalar_type() == torch::kFloat32, "weights must be float32");
++    TORCH_CHECK(tail1_weight1.scalar_type() == torch::kFloat32, "weights must be float32");
++
++    TORCH_CHECK(input.dim() == 2, "input must be 2D [N, in_features]");
++    int64_t N = input.size(0);
++    int64_t in_features = input.size(1);
++    TORCH_CHECK(head_weight.dim() == 2 && head_weight.size(1) == in_features, "head_weight shape mismatch");
++    TORCH_CHECK(tail0_weight0.dim() == 2 && tail0_weight0.size(1) == in_features, "tail0_weight0 shape mismatch");
++    TORCH_CHECK(tail0_weight1.dim() == 2 && tail0_weight1.size(0) == (cutoff1 - cutoff0) && tail0_weight1.size(1) == tail0_weight0.size(0),
++                "tail0_weight1 shape mismatch");
++    TORCH_CHECK(tail1_weight0.dim() == 2 && tail1_weight0.size(1) == in_features, "tail1_weight0 shape mismatch");
++    TORCH_CHECK(tail1_weight1.dim() == 2 && tail1_weight1.size(0) == cutoff0 && tail1_weight1.size(1) == tail1_weight0.size(0),
++                "tail1_weight1 shape mismatch");
++
++    auto input_contig = input.contiguous();
++    auto head_weight_contig = head_weight.contiguous();
++    auto tail0_weight0_contig = tail0_weight0.contiguous();
++    auto tail0_weight1_contig = tail0_weight1.contiguous();
++    auto tail1_weight0_contig = tail1_weight0.contiguous();
++    auto tail1_weight1_contig = tail1_weight1.contiguous();
++
++    auto output = torch::empty({N}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    adaptive_log_softmax_log_prob_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        head_weight_contig.data_ptr<float>(),
++        tail0_weight0_contig.data_ptr<float>(),
++        tail0_weight1_contig.data_ptr<float>(),
++        tail1_weight0_contig.data_ptr<float>(),
++        tail1_weight1_contig.data_ptr<float>(),
++        N, in_features,
++        head_weight_contig.size(0),
++        tail0_weight0_contig.size(0),
++        tail1_weight0_contig.size(0),
++        cutoff0, cutoff1, div_value,
++        stream);
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("randn_forward", &randn_forward, "randn forward", py::arg("shape"));
++    m.def("relu_forward", &relu_forward, "relu forward", py::arg("input"));
++    m.def("adaptive_log_softmax_with_loss_forward", &adaptive_log_softmax_with_loss_forward,
++          "adaptive log softmax with loss forward",
++          py::arg("input"), py::arg("target"), py::arg("head_weight"), py::arg("tail0_weight0"),
++          py::arg("tail0_weight1"), py::arg("tail1_weight0"), py::arg("tail1_weight1"),
++          py::arg("cutoff0"), py::arg("cutoff1"), py::arg("div_value"));
++    m.def("adaptive_log_softmax_log_prob_forward", &adaptive_log_softmax_log_prob_forward,
++          "adaptive log softmax log prob forward",
++          py::arg("input"), py::arg("head_weight"), py::arg("tail0_weight0"),
++          py::arg("tail0_weight1"), py::arg("tail1_weight0"), py::arg("tail1_weight1"),
++          py::arg("cutoff0"), py::arg("cutoff1"), py::arg("div_value"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,89 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features, n_classes, cutoffs, div_value, head_bias, relu_input_shape):
++        super().__init__()
++        self.adaptive_log_softmax = nn.AdaptiveLogSoftmaxWithLoss(
++            in_features, n_classes, cutoffs, div_value, head_bias
++        )
++        self.relu_input_shape = relu_input_shape
++
++    def forward(self, x, target=None, relu_input=None):
++        if relu_input is None:
++            relu_input = cuda_extension.randn_forward(self.relu_input_shape)
++        relu_output = cuda_extension.relu_forward(relu_input)
++
++        if target is not None:
++            adaptive_result = cuda_extension.adaptive_log_softmax_with_loss_forward(
++                x,
++                target,
++                self.adaptive_log_softmax.head.weight,
++                self.adaptive_log_softmax.tail[0][0].weight,
++                self.adaptive_log_softmax.tail[0][1].weight,
++                self.adaptive_log_softmax.tail[1][0].weight,
++                self.adaptive_log_softmax.tail[1][1].weight,
++                self.adaptive_log_softmax.cutoffs[0],
++                self.adaptive_log_softmax.cutoffs[1],
++                self.adaptive_log_softmax.div_value,
++            )
++            return adaptive_result, relu_output
++        else:
++            log_prob_result = cuda_extension.adaptive_log_softmax_log_prob_forward(
++                x,
++                self.adaptive_log_softmax.head.weight,
++                self.adaptive_log_softmax.tail[0][0].weight,
++                self.adaptive_log_softmax.tail[0][1].weight,
++                self.adaptive_log_softmax.tail[1][0].weight,
++                self.adaptive_log_softmax.tail[1][1].weight,
++                self.adaptive_log_softmax.cutoffs[0],
++                self.adaptive_log_softmax.cutoffs[1],
++                self.adaptive_log_softmax.div_value,
++            )
++            return log_prob_result, relu_output
++
++    def debug_forward(self, *inputs):
++        x, target, relu_input = inputs
++
++        yielded_relu_input = (
++            cuda_extension.randn_forward(self.relu_input_shape)
++            if relu_input is None
++            else relu_input
++        )
++        yield ("checkpoint_000", yielded_relu_input)
++
++        relu_output = cuda_extension.relu_forward(yielded_relu_input)
++        yield ("checkpoint_001", relu_output)
++
++        if target is not None:
++            asm_output = cuda_extension.adaptive_log_softmax_with_loss_forward(
++                x,
++                target,
++                self.adaptive_log_softmax.head.weight,
++                self.adaptive_log_softmax.tail[0][0].weight,
++                self.adaptive_log_softmax.tail[0][1].weight,
++                self.adaptive_log_softmax.tail[1][0].weight,
++                self.adaptive_log_softmax.tail[1][1].weight,
++                self.adaptive_log_softmax.cutoffs[0],
++                self.adaptive_log_softmax.cutoffs[1],
++                self.adaptive_log_softmax.div_value,
++            )
++            yield ("checkpoint_002", asm_output)
++            result = (asm_output, relu_output)
++        else:
++            log_prob_output = cuda_extension.adaptive_log_softmax_log_prob_forward(
++                x,
++                self.adaptive_log_softmax.head.weight,
++                self.adaptive_log_softmax.tail[0][0].weight,
++                self.adaptive_log_softmax.tail[0][1].weight,
++                self.adaptive_log_softmax.tail[1][0].weight,
++                self.adaptive_log_softmax.tail[1][1].weight,
++                self.adaptive_log_softmax.cutoffs[0],
++                self.adaptive_log_softmax.cutoffs[1],
++                self.adaptive_log_softmax.div_value,
++            )
++            yield ("checkpoint_002", log_prob_output)
++            result = (log_prob_output, relu_output)
++
++        yield ("checkpoint_003", result)

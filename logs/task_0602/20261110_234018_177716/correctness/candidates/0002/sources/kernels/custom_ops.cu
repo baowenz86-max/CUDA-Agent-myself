@@ -1,0 +1,177 @@
+#include <cuda_runtime.h>
+#include <cstdint>
+
+// -----------------------------------------------------------------------------
+// softplus_forward
+// -----------------------------------------------------------------------------
+// Elementwise softplus: if x * beta > threshold, y = x; else y = log1p(exp(x * beta)) / beta.
+// Supports arbitrary strides for input and output (usually same shape).
+// All indices are int64_t to match PyTorch tensor sizes.
+// -----------------------------------------------------------------------------
+__global__ void softplus_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ input,
+    int64_t numel,
+    const int64_t* __restrict__ out_strides,
+    const int64_t* __restrict__ in_strides,
+    const int64_t* __restrict__ shape,
+    int ndims,
+    float beta,
+    float threshold)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    for (int64_t i = idx; i < numel; i += stride) {
+        // Compute multi-dimensional index from linear index i (row-major order)
+        int64_t remaining = i;
+        int64_t in_offset = 0;
+        int64_t out_offset = 0;
+        // Iterate dimensions from last to first or first to last? We need to match contiguous linearization.
+        // PyTorch tensors are stored in row-major (C-order) with strides. Linear index i corresponds to
+        // coordinates where the last dimension varies fastest. To compute coordinates from i,
+        // we can use the following: for d from ndims-1 down to 0: coord[d] = remaining % shape[d]; remaining /= shape[d].
+        // Then offset = sum(coord[d] * stride[d]).
+        // However, doing modulo per element is expensive. Since inputs are likely contiguous, we could optimize,
+        // but for correctness we implement generic indexing.
+        // We'll compute offsets in a loop with modulo.
+        int64_t rem = i;
+        for (int d = ndims - 1; d >= 0; --d) {
+            int64_t coord = rem % shape[d];
+            rem /= shape[d];
+            in_offset += coord * in_strides[d];
+            out_offset += coord * out_strides[d];
+        }
+        float x = input[in_offset];
+        float val = x * beta;
+        float y;
+        if (val > threshold) {
+            y = x;
+        } else {
+            y = log1pf(expf(val)) / beta;
+        }
+        output[out_offset] = y;
+    }
+}
+
+extern "C" void softplus_forward_launcher(
+    float* output,
+    const float* input,
+    int64_t* output_strides,
+    int64_t* input_strides,
+    int64_t* shape,
+    int ndims,
+    int64_t numel,
+    float beta,
+    float threshold,
+    cudaStream_t stream)
+{
+    int block_size = 256;
+    int grid_size = (int)((numel + block_size - 1) / block_size);
+    if (grid_size > 65535) grid_size = 65535;
+
+    softplus_kernel<<<grid_size, block_size, 0, stream>>>(
+        output,
+        input,
+        numel,
+        output_strides,
+        input_strides,
+        shape,
+        ndims,
+        beta,
+        threshold);
+}
+
+// -----------------------------------------------------------------------------
+// concat_forward
+// -----------------------------------------------------------------------------
+// Given two input tensors with same shape except along dim, and output tensor with
+// concatenated shape along dim. We copy elements preserving order.
+// Inputs may be non-contiguous; we assume output is contiguous (PyTorch empty creates contiguous).
+// We need to compute source offset from output linear index and source strides.
+// Since output is contiguous, we can compute output multidimensional index from linear index,
+// then map to source index by adjusting coordinate at dim.
+__global__ void concat_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ input1,
+    const float* __restrict__ input2,
+    int64_t out_numel,
+    const int64_t* __restrict__ out_shape,
+    const int64_t* __restrict__ in1_strides,
+    const int64_t* __restrict__ in2_strides,
+    int ndims,
+    int64_t concat_dim,
+    int64_t input1_concat_size,
+    int64_t input2_concat_size)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    for (int64_t i = idx; i < out_numel; i += stride) {
+        // Compute multi-dimensional index for output (contiguous row-major)
+        int64_t rem = i;
+        int64_t out_coord[8]; // assume ndims <= 8; for general, can use shared or local array with dynamic size, but here use fixed max for simplicity
+        // In CUDA, dynamic array on stack is not allowed unless constant size. We'll use a local array of size 16 maybe.
+        int64_t coords[16];
+        if (ndims > 16) {
+            // Should not happen for this task (4D)
+            return;
+        }
+        for (int d = ndims - 1; d >= 0; --d) {
+            coords[d] = rem % out_shape[d];
+            rem /= out_shape[d];
+        }
+        // Determine which input and the source coordinate in that input
+        int64_t source_coord_dim = coords[concat_dim];
+        float value;
+        if (source_coord_dim < input1_concat_size) {
+            // from input1, adjust concat_dim coordinate same
+            // compute source offset using input1 strides and coords, with coords[concat_dim] as is
+            int64_t src_offset = 0;
+            for (int d = 0; d < ndims; ++d) {
+                src_offset += coords[d] * in1_strides[d];
+            }
+            value = input1[src_offset];
+        } else {
+            // from input2, adjust concat_dim coordinate: coords[concat_dim] - input1_concat_size
+            coords[concat_dim] -= input1_concat_size;
+            int64_t src_offset = 0;
+            for (int d = 0; d < ndims; ++d) {
+                src_offset += coords[d] * in2_strides[d];
+            }
+            value = input2[src_offset];
+        }
+        output[i] = value;
+    }
+}
+
+extern "C" void concat_forward_launcher(
+    float* output,
+    const float* input1,
+    const float* input2,
+    int64_t* out_shape,
+    int64_t* in1_strides,
+    int64_t* in2_strides,
+    int ndims,
+    int64_t concat_dim,
+    int64_t input1_concat_size,
+    int64_t input2_concat_size,
+    cudaStream_t stream)
+{
+    int block_size = 256;
+    // compute out_numel from out_shape (host side? launcher lacks shape on host). We need out_numel.
+    // Binding passes out_numel? Current launcher signature does not include out_numel!
+    // We need to compute out_numel in kernel from out_shape? Or pass as parameter.
+    // Better: modify launcher to accept out_numel. But current signature has no out_numel.
+    // The binding currently does not pass out_numel. We can modify binding and launcher to include out_numel.
+    // Since we are editing both files, we can change the signature.
+    // We'll add out_numel as parameter. Update binding accordingly.
+    // But in user's current file, binding already computes out_numel and stores in local variable but doesn't pass.
+    // We'll modify both.
+    // For now, we assume launcher receives out_numel as an extra argument.
+    // We'll update binding to pass out_numel.
+    // However, the user's current binding has concat_forward_launcher declared with 10 args, and called with 10 args (no out_numel).
+    // We'll modify both .cu and binding.cpp.
+    // For kernel, we need out_numel to compute grid.
+    // We'll pass out_numel from binding.
+}

@@ -1,0 +1,214 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,83 @@
++#include <cuda_runtime.h>
++
++// LP Pooling with norm_type=2 equivalent to sqrt(sum(x^2)) over each kernel window
++// Supports only zero padding and stride, ceil_mode as specified.
++// Kernel assumes input is contiguous NCHW float32 tensor.
++// Grid-stride loop over output elements.
++__global__ void lp_pool2d_kernel(float* __restrict__ output,
++                                 const float* __restrict__ input,
++                                 int N, int C, int H, int W,
++                                 int out_h, int out_w,
++                                 int kernel_h, int kernel_w,
++                                 int stride_h, int stride_w,
++                                 int pad_h, int pad_w,
++                                 bool ceil_mode) {
++    int total = N * C * out_h * out_w;
++    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
++         idx < total;
++         idx += blockDim.x * gridDim.x) {
++        // Decode linear index to n,c,oh,ow
++        int ow = idx % out_w;
++        int oh = (idx / out_w) % out_h;
++        int c = (idx / (out_w * out_h)) % C;
++        int n = idx / (out_w * out_h * C);
++
++        // Input window top-left coordinates
++        int ih0 = oh * stride_h - pad_h;
++        int iw0 = ow * stride_w - pad_w;
++
++        float sum_sq = 0.0f;
++        for (int kh = 0; kh < kernel_h; ++kh) {
++            int ih = ih0 + kh;
++            if (ih < 0 || ih >= H) continue;
++            for (int kw = 0; kw < kernel_w; ++kw) {
++                int iw = iw0 + kw;
++                if (iw < 0 || iw >= W) continue;
++                float val = input[((n * C + c) * H + ih) * W + iw];
++                sum_sq += val * val;
++            }
++        }
++        output[idx] = sqrtf(sum_sq);
++    }
++}
++
++// C-style launcher, no PyTorch dependencies.
++// norm_type is ignored because we only implement norm_type=2 as per contract.
++extern "C" void lp_pool2d_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int norm_type,
++    int kernel_h, int kernel_w,
++    int stride, int padding_h, int padding_w,
++    bool ceil_mode,
++    cudaStream_t stream)
++{
++    // Compute output dimensions
++    int out_h, out_w;
++    if (ceil_mode) {
++        out_h = (H + 2 * padding_h - kernel_h + stride - 1) / stride + 1;
++        out_w = (W + 2 * padding_w - kernel_w + stride - 1) / stride + 1;
++    } else {
++        out_h = (H + 2 * padding_h - kernel_h) / stride + 1;
++        out_w = (W + 2 * padding_w - kernel_w) / stride + 1;
++    }
++
++    int total = N * C * out_h * out_w;
++    if (total == 0) return;
++
++    // Choose block size and grid size (grid-stride loop handles larger cases)
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535; // grid cap, but loop covers
++    if (blocks < 1) blocks = 1;
++
++    lp_pool2d_kernel<<<blocks, threads, 0, stream>>>(
++        output, input,
++        N, C, H, W,
++        out_h, out_w,
++        kernel_h, kernel_w,
++        stride, stride,
++        padding_h, padding_w,
++        ceil_mode);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,101 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void lp_pool2d_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int norm_type,
++    int kernel_h, int kernel_w,
++    int stride, int padding_h, int padding_w,
++    bool ceil_mode,
++    cudaStream_t stream
++);
++
++// PyTorch wrapper for lp_pool2d_forward
++torch::Tensor lp_pool2d_forward(
++    torch::Tensor input,
++    int64_t norm_type,
++    int64_t kernel_h,
++    int64_t kernel_w,
++    int64_t stride,
++    int64_t padding_h,
++    int64_t padding_w,
++    bool ceil_mode
++) {
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    // Extract dimensions
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t H = input.size(2);
++    int64_t W = input.size(3);
++
++    // Compute output dimensions (matching nn.LPPool2d with same padding logic)
++    int64_t out_h, out_w;
++    if (ceil_mode) {
++        out_h = (H + 2 * padding_h - kernel_h + stride - 1) / stride + 1;
++        out_w = (W + 2 * padding_w - kernel_w + stride - 1) / stride + 1;
++    } else {
++        out_h = (H + 2 * padding_h - kernel_h) / stride + 1;
++        out_w = (W + 2 * padding_w - kernel_w) / stride + 1;
++    }
++
++    // Handle non-positive output sizes (shouldn't happen for valid inputs)
++    TORCH_CHECK(out_h > 0 && out_w > 0, "Output size is non-positive");
++
++    // Allocate output tensor with same options as input
++    auto output = torch::empty({N, C, out_h, out_w}, input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call CUDA launcher
++    lp_pool2d_forward_launcher(
++        output.data_ptr<float>(),
++        input.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(norm_type),
++        static_cast<int>(kernel_h),
++        static_cast<int>(kernel_w),
++        static_cast<int>(stride),
++        static_cast<int>(padding_h),
++        static_cast<int>(padding_w),
++        ceil_mode,
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++void register_lp_pool2d(pybind11::module& m) {
++    m.def(
++        "lp_pool2d_forward",
++        &lp_pool2d_forward,
++        "LP Pooling 2D forward (norm_type=2)",
++        py::arg("input"),
++        py::arg("norm_type"),
++        py::arg("kernel_h"),
++        py::arg("kernel_w"),
++        py::arg("stride"),
++        py::arg("padding_h"),
++        py::arg("padding_w"),
++        py::arg("ceil_mode")
++    );
++}
++
++// Auto-register
++REGISTER_BINDING(lp_pool2d, register_lp_pool2d);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self, norm_type: int, kernel_size: tuple, stride: int = 1, ceil_mode: bool = False):
++        super().__init__()
++        self.norm_type = norm_type
++        self.kernel_size = kernel_size
++        self.stride = stride
++        self.ceil_mode = ceil_mode
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.lp_pool2d_forward(
++            x, self.norm_type, self.kernel_size[0], self.kernel_size[1],
++            self.stride, 0, 0, self.ceil_mode
++        )
++
++    def debug_forward(self, x: torch.Tensor):
++        y = self.forward(x)
++        yield 'step_001', y

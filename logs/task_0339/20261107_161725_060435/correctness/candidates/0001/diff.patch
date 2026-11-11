@@ -1,0 +1,582 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,460 @@
++// kernels/custom_ops.cu
++#include <cuda_runtime.h>
++#include <math.h>
++#include <stdint.h>
++
++// Use CUDA's erff for float precision. It is accurate and fast.
++__global__ void erf_kernel(float* __restrict__ out, const float* __restrict__ in,
++                           int64_t total_elements, int64_t in_stride0, int64_t in_stride1) {
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        // generic stride handling: input is 2D with shape (rows, cols), strides given
++        // Note: total_elements = rows*cols, but we need to map linear index to row/col
++        // The output is contiguous with same shape and presumably contiguous layout (or we can write using same stride)
++        // The contract says output shape same as x, and binding will allocate contiguous output (torch::empty_like)
++        // For arbitrary input strides, we assume output is contiguous; we can also pass output strides if needed but empty_like preserves strides of a non-contiguous input? Actually torch::empty_like(x) yields same strides as x, not necessarily contiguous.
++        // However, we can choose to allocate contiguous output in binding. The contract just says same shape/dtype/device, not necessarily same strides? It says "strides semantics" but likely output can be contiguous.
++        // We can pass output as contiguous from binding, so we just write out[i] sequentially.
++        // To handle arbitrary input strides, we need to decode i into row/col using contiguous row-major? But input might be non-contiguous. We need to calculate row = i / cols, col = i % cols, then read in[row*in_stride0 + col*in_stride1].
++        // However, we do not know cols here. We can pass cols as parameter.
++        // So we'll pass N rows and C cols and input strides and output strides (assume output contiguous for simplicity, but can also handle output strides if provided).
++        // To keep simple, we can make kernel specialized for 2D and pass rows, cols, in_stride0, in_stride1, out_stride0, out_stride1.
++        // But total_elements approach with decoding is fine.
++        // Let's assume binding will pass rows and cols. In launcher we can compute based on shape? We cannot use torch in .cu, so binding must pass dims explicitly.
++        // For erf_forward, the binding can get shape and pass rows and cols, and strides.
++        // So launcher signature should include rows, cols, in_stride0, in_stride1, out_stride0, out_stride1.
++    }
++}
++
++// Actually, we need to design proper launchers based on what binding will call.
++// Since we cannot see binding yet, we must define stable C-style functions that binding will call.
++// We'll define:
++// extern "C" void erf_forward_launcher(const float* input, float* output, int64_t rows, int64_t cols, int64_t in_stride0, int64_t in_stride1, int64_t out_stride0, int64_t out_stride1, cudaStream_t stream);
++// and similar for median.
++
++// But wait, the task says "全部 CUDA kernel 和 launcher 放入该文件；修复时也不得新增其他 .cu。.cu 只能包含 CUDA kernel 与使用原始指针、标量、cudaStream_t 的 launcher，禁止 torch/ATen/c10/pybind 依赖、Tensor 包装与注册。Tensor 检查、分配、当前 stream 获取与 pybind 注册统一放在 kernels/*_binding.cpp；.cpp 不得包含 CUDA kernel 或 launch 语法。"
++// So we just need to implement kernels and launchers without any torch. Good.
++
++// Let's write complete code with clear launchers.
++
++// ---------------------------------------------------------------------
++// Elementwise erf kernel for 2D tensor with arbitrary strides.
++// Input and output are float32.
++// Grid-stride loop over total elements.
++// ---------------------------------------------------------------------
++__global__ void erf_forward_kernel(const float* __restrict__ input, float* __restrict__ output,
++                                   int64_t rows, int64_t cols,
++                                   int64_t in_stride0, int64_t in_stride1,
++                                   int64_t out_stride0, int64_t out_stride1) {
++    int64_t total = rows * cols;
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < total; i += stride) {
++        int64_t r = i / cols;
++        int64_t c = i - r * cols;
++        const float* in_ptr = input + r * in_stride0 + c * in_stride1;
++        float* out_ptr = output + r * out_stride0 + c * out_stride1;
++        *out_ptr = erff(*in_ptr);
++    }
++}
++
++// Launcher for erf
++void erf_forward_launcher(const float* input, float* output,
++                          int64_t rows, int64_t cols,
++                          int64_t in_stride0, int64_t in_stride1,
++                          int64_t out_stride0, int64_t out_stride1,
++                          cudaStream_t stream) {
++    int64_t total = rows * cols;
++    if (total == 0) return;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    // Cap blocks to reasonable number (e.g., 65535) and use grid-stride loop
++    if (blocks > 65535) blocks = 65535;
++    erf_forward_kernel<<<blocks, threads, 0, stream>>>(input, output, rows, cols,
++                                                       in_stride0, in_stride1,
++                                                       out_stride0, out_stride1);
++}
++
++// ---------------------------------------------------------------------
++// Median along dimension 0 for a 2D tensor: each column independently.
++// Input shape [rows, cols], rows is reduction dimension, cols is number of columns.
++// For each column j, compute median (lower median for even rows) and the index of that median value in original column.
++// torch.median returns the index of the median element in the sorted order? Actually torch.median with dim returns values and indices, where indices are the position of the median value in the original tensor along that dimension. For even number, torch returns the lower median (index of element that would be at position n//2 - 1 in sorted order). For ties, the index returned is the first occurrence (or some deterministic rule). The contract says "Indices are computed as the position of the median value in the sorted order (stable order)". We need to match PyTorch behavior.
++// PyTorch's median implementation: it sorts the data and then picks the element at index floor((n-1)/2) in sorted order. The returned index is the original index of that element. If there are duplicates, it may return the first or last? The contract says stable order, so we need to ensure consistent behavior.
++// Reference PyTorch: torch.median on CUDA likely sorts pairs and returns the index of the lower median. We should mimic that.
++// We'll implement a per-column selection algorithm: each column is processed by one warp or block.
++// Since rows can be large (16384), and cols = 1024, we have many columns.
++// Approach: one block per column, using shared memory to sort the column. 16384 floats = 64 KB, too large for shared memory (max 48KB). So we need a block-level or warp-level algorithm that doesn't require all data in shared memory at once.
++// Alternative: use a selection algorithm like quickselect per column, but doing that with one block per column and many columns may be okay.
++// Or use a two-phase approach: each block handles one column, performs a sort using registers and shared memory chunks, perhaps using merge sort or bitonic sort with multiple passes, but 16384 elements per column is large.
++// Since we are allowed to use CUDA only, we can use dynamic parallelism? No, better use a simple approach: for each column, launch one thread per element to compute the median using a segmented sort? That would be expensive.
++// Another idea: use thrust? Not allowed (third-party? Thrust is part of CUDA but maybe not allowed? The instructions say no third-party libraries except cuBLAS and cuDNN, Thrust may be considered part of CUDA? But it's a template library, could be used? However to be safe, implement our own.
++// We can implement a radix select or bitonic sort per column using a single block with multiple iterations, using shared memory as cache and global memory for passes.
++// Given the constraints and performance, perhaps a simpler method: each block handles one column, but we can process multiple columns per block to increase occupancy.
++// Let's design: for median, we need both value and index. We can use a key-value sort where keys are the float values and values are the original indices.
++// We'll implement a per-column selection using a variant of quickselect with a fixed number of iterations? That may be nondeterministic.
++// A robust method: use a sorting network that works on the whole column in global memory, but that would be slow.
++// Since we have 16384 rows, we can use a block of 256 threads and each thread handles 64 elements. We can perform a counting-based selection? But we need the actual median value, not just rank.
++// Maybe we can use the following: because the median is the element at rank floor((n-1)/2), we can use a selection algorithm based on radix select: for float, we can use a bitwise radix select with multiple passes, each pass counts bits in the column. That would require per-column histograms, which can be done with one block per column using shared memory. 16384 elements, we can do a 32-bit radix select with 8-bit digits, 4 passes. Each pass counts occurrences of each 256 bucket across all elements, then we determine which bucket contains the target rank, then refine. This can be done in shared memory: each block has 256 threads, each thread processes a subset of elements and updates histogram in shared memory. This is feasible.
++// Let's implement radix select for median and also need to return index. We can either keep track of original index mapping or after finding the median value, do a separate pass to find the first index with that value (but ties need to match PyTorch). PyTorch's median returns the first occurrence after sorting stable. If we find the lower median value, we can then find the first index in original order? Actually sorted order is not original order. The index returned is the original index of the element that would be at position rank in sorted order. If multiple equal values, the one that appears first in original order among those equal to median value? That depends on stable sort. PyTorch likely does a stable sort by (value, index) or just returns the index from the sorting algorithm. To mimic, we can sort pairs (value, index) stably, and pick the pair at rank. Instead of radix select, we can sort the entire column with a parallel sort, but that's heavy.
++// Another approach: use per-column bitonic sort with one block, but 16384 elements per block is too many threads (max 1024). We can use a block of 1024 threads and each thread handles 16 elements, using shared memory for 16384 floats = 64KB, exceeding shared memory limit (often 48KB). We can use 512 threads and 32 elements each, still 64KB. We can use dynamic shared memory? Max shared memory per block on modern GPUs is 48KB (or more with opt-in). 16384 floats = 65536 bytes > 48KB, so cannot fit.
++// Could use a merge sort with global memory and multiple blocks per column, but launching many blocks per column complicates synchronization.
++// Given the huge size, maybe the simplest correct approach is to use a per-column sort by calling a library? Not allowed.
++// Perhaps we can use thrust's sort_by_key? The restriction says "NO third-party libraries: Except cuBLAS (GEMM only) and cuDNN (Conv only)". Thrust is part of CUDA toolkit, but is it considered third-party? It might be allowed implicitly? But the instruction says only cuBLAS and cuDNN allowed, so Thrust likely not allowed.
++// We need to implement our own. Let's think about performance: radix select is O(n) per column and may be efficient. To get the index, we can either:
++// - Run radix select to find the median value, then do a second pass to find the first index with that value in original order. But PyTorch's index may not be the first original index; it's the index that ends up at position rank after a stable sort. For a stable sort on (value, original index), the median index would be the original index of the element that is ranked at lower median in sorted order, but among equal values, the ones with smaller original index come first. So the index returned is the smallest original index among elements equal to the median value? Actually, if we sort stably by value only, the relative order of equal elements is preserved as in original order (which is ascending index since original order is along dim=0). So sorted by value, equal values maintain original index order. Then the element at rank floor((n-1)/2) would have some index. If there are duplicates, the chosen element is the one among the duplicates that appears first in original order, but with rank constrained. So the index is not necessarily the smallest original index among all equal values; it's the original index of the element that would be at that rank. Since equal values are in original order, and the rank falls somewhere within a group of equal values, the index would be the smallest original index in that group? Let's analyze: suppose n=10, values with duplicates. Sorted stable order: [0.1 (idx0), 0.1 (idx5), 0.2 (idx2), ...]. Lower median rank = (10//2 -1) =4 (0-based index 4). If value at rank 4 is 0.2, its original index is 2. That is not the smallest among 0.2? If there are multiple 0.2, they are in original order, so the one at rank 4 is the first 0.2 in original order. So the index is the smallest original index among elements equal to the median value if the rank is the first occurrence of that value. But if the rank lands on a later occurrence due to previous duplicates, it's the occurrence with that specific cumulative position. In any case, the index is determined by the stable sorted order.
++// To get that index, we need to either sort pairs or simulate stable order. We can perform radix select on the values while also tracking something? Or we can do two passes: find median value, then find the index of the element at that rank by counting how many elements are less than median value, then among equal values, select the (rank - less_count)-th occurrence in original order. Because stable sort means equal values are ordered by original index, so the (k)-th occurrence among equal values is the element with the k-th smallest original index among those equal values.
++// So algorithm for each column:
++// 1. Find the lower median rank = (rows-1)/2 (integer floor).
++// 2. Use radix select to find the median value (float).
++// 3. Count number of elements strictly less than median value.
++// 4. The target occurrence among elements equal to median value is (rank - less_count) (0-based).
++// 5. Find the index of the (target_occurrence)-th element equal to median value in original order.
++// This avoids sorting and gives deterministic index.
++// This radix select can be implemented per column in one block using shared memory for histogram, but 16384 elements per column and 1024 columns => total massive parallelism.
++// We can assign one block per column. Each block has e.g. 256 threads.
++// For radix select, we need to perform multiple passes, each pass counts occurrences of each byte (256 buckets) and then select the bucket containing the target rank, then narrow down.
++// For float, we can use the bit representation with a monotonic mapping to handle sign. We'll transform float to sortable uint32: if sign bit 0, flip all bits; else flip sign bit only. This gives monotonic order for radix sort.
++// Then do 4 passes of 8-bit radix select.
++// In each pass, each thread processes multiple elements, incrementing a shared memory histogram. Then we compute prefix sums to find bucket.
++// After 4 passes, we have the exact bit pattern of the median value. Then convert back to float.
++// Then count less-than and find index.
++// This is quite involved but doable.
++// Alternatively, we could use a simpler per-column approach using a bitonic sort with one block per column and using iterative passes with global memory, but with 1024 columns and 16384 rows, total elements 16M, sorting all would be huge overhead.
++// Radix select is O(n) per column and likely faster.
++// Let's implement radix select per column.
++
++// We need to be careful with shared memory usage and synchronization.
++// Block size: 256 threads.
++// Each thread processes elements in a strided manner.
++// Histogram: 256 bins of int32, so 256*4 = 1KB, fits in shared memory.
++// We need to reset histogram each pass (8 passes? Actually 4 bytes for 32-bit -> 4 passes, but each pass we do count for one byte position.
++// For simplicity, we can process 4 bytes one by one, each time doing a full scan of elements and updating histogram for that byte.
++// Number of passes = 4, each pass we read all 16384 elements and count byte frequencies. That's 16384*4 = 65536 memory reads per column per pass? Actually 4 passes => 65536 reads total per column, times 1024 columns => 67M reads, which is okay.
++// But we also need to keep track of the original values for later steps? We can just read from global memory each time.
++// Steps:
++// For each column j:
++//   rank = (rows - 1) / 2;
++//   start with all elements considered (mask = ones? We can maintain a bit mask of elements that are still candidates, but for radix select, we start with all elements and after each byte, select a subset whose prefix matches the selected bytes. That subset can be identified by comparing the already selected prefix bits. But for efficiency, we can simply re-scan all elements each byte and count those whose prefix matches the selected bytes.
++//   This is like: maintain a prefix value (selected bits so far) and we count elements that match that prefix? Actually radix select works by sorting most significant byte first. We process bytes from most significant to least. For the first byte (bits 31-24), we compute histogram of that byte across all elements. Then we find the bucket b such that the cumulative count up to b-1 <= rank < cumulative up to b. That bucket becomes the prefix. Then for the second byte (bits 23-16), we only consider elements whose first byte equals b, and compute histogram of second byte among them. Continue.
++// To avoid re-scanning all elements with condition each time, we can maintain a list of candidate indices, but that would require dynamic memory. Simpler: each pass, each thread loops over elements and if the prefix matches, count the next byte. The prefix check involves comparing the already selected bits of the element's key to the prefix value (with a mask). This adds overhead but acceptable.
++// Alternatively, we can use a single pass per byte with all elements and count buckets for that byte position, but then selection is based on the full 32-bit sorted order? No, you must process MSB first and restrict.
++// Let's implement per-byte selection with prefix mask.
++// We'll need a function to convert float to sortable uint32.
++
++// After obtaining the median value as float, we need to find the index. We'll do two more passes:
++// Pass A: count elements with value < median_val (strictly less).
++// Pass B: find the (rank - less_count)-th occurrence of elements with value == median_val in original index order. We can do this by each thread scanning and using a block-level counter. Since we need the global (within column) occurrence index, we can use atomicAdd on a shared variable to record the current count of equal values seen so far. Each thread processes a set of elements (strided over the column) and when it sees an equal value, it increments the counter and if the counter matches the target occurrence, records the original index. Need to be careful with concurrency. We can have each thread process elements sequentially and use a shared counter with atomicAdd in shared memory. Since we are within one block, shared atomic operations are supported (compute capability 3.5+). We'll use atomicAdd on shared int. When the counter reaches target (rank - less_count), we store the index.
++// To ensure we find the target occurrence in original order, we must process elements in increasing index order. We can assign each thread a contiguous chunk of the column: thread t processes indices [t*chunk, (t+1)*chunk). Then within each thread, it goes in order. But threads are independent, so order across threads is not guaranteed. To preserve original order for counting occurrences, we need to process indices in order globally. This can be done by having threads cooperate in a sequential scan of chunks? Alternatively, we can organize threads to process elements in a strided manner but then we lose order. However, we only need to find the target occurrence in original order; we can do a prefix sum over counts of equal values per thread chunk, then determine which chunk contains the target, and then scan that chunk sequentially.
++// Simpler: we can compute the index by counting occurrences of equal value in each chunk using per-thread counts, then do a block-level prefix sum, then the chunk containing the target can be identified, and then within that chunk, the thread finds the exact index by scanning its elements in order and adding the offset. This avoids global order issue.
++// This is a bit complex but doable.
++// Alternatively, we could avoid the index finding by using a stable sort of pairs using a better algorithm? Given time, maybe radix select is overkill; perhaps we can use a simpler selection based on nth_element using CUDA's own? Not available.
++// Let's consider using a bitonic sort per column with a block of 256 threads and each thread holding 64 elements in registers? That would require 64 floats per thread = 256 bytes, 256 threads => 64KB registers? Not feasible.
++// Another approach: because rows=16384 is exactly 2^14, we could use a reduction-style median using a selection network? No.
++// Maybe we can use a combination: each column is processed by one block; the block reads the column in chunks, and we use a parallel selection algorithm that doesn't need all data in memory simultaneously. One such algorithm is based on median-of-medians? But that's for exact median.
++// Given the large rows, perhaps the torch.median implementation itself uses a sort or selection. We need to be correct first, performance second.
++// Could we use a simple per-column approach with one thread per column? That would be 1024 threads only, each thread sorts its column in global memory (16384 floats) using e.g. heap select or quickselect. A quickselect on CPU-like algorithm per thread would be slow but might be faster than launching many blocks? 1024 threads, each doing O(n) average for selection? Could be okay? But a single CUDA thread doing sequential quickselect on 16384 elements might be slow, but we have 1024 threads, each on separate SM maybe, total work 1024*16384 = 16M operations, but sequential per thread. That might be acceptable? 16M operations is not huge; but memory access patterns might be poor (each thread reads a column from global memory, which is strided with stride 1024 floats, so uncoalesced). That would be very slow.
++// Better to use a block per column to allow coalesced access. But even with a block, we can read column elements coalesced if threads within a block read consecutive rows? Wait, the column elements are at addresses input[row, col] where col is fixed, row varies. The stride between elements of the same column is cols * sizeof(float) = 1024*4 = 4096 bytes, so each thread accessing a different row for the same column gives stride 4096, which is not coalesced. Actually, if we have one block per column, threads within that block will access elements at different rows for that column, so consecutive threads access row+1, which is 4096 bytes apart, poor coalescing. To get coalescing, we need threads to access consecutive columns for the same row. So a block should process multiple columns? This is a common problem: reduction along an axis with non-contiguous memory.
++// To handle this, we can transpose the data or process columns in a way that coalesces. Since we cannot use torch transpose, we could have each block process a set of columns, and threads within a block read consecutive columns for a given row. For median, we need per-column reductions, so we can have threads cooperate on transposing data into shared memory in tiles, then perform per-column operations in shared memory.
++// Given the complexity, maybe the performance requirement is secondary; correctness is key. The input size is 16384x1024, so total 16M floats = 64MB. torch.compile baseline probably uses optimized kernels. We need to be at least 5% faster overall. But the erf part is also part of the model. We can gain from fusing two erfs? The model calls erf twice separately, but they are two kernels; maybe not much gain. The median is the expensive part.
++// Perhaps we can use a simpler median algorithm leveraging the fact that we only need lower median, and we can use a histogram-based selection? For float data, we can do a two-pass approximate median using bins and then exact within a bin. But still need index.
++// Let's check the actual torch.median CUDA implementation: It likely uses a segmented sort or selection per column, maybe uses thrust. But we can't rely on that.
++// Given the constraints and time, I'll implement a radix select per column with one block per column, using shared memory for histogram, and parallelize the counting. To improve memory coalescing, I'll have each block process one column, but threads will read elements in a strided manner that is still coalesced? Actually, if threads read elements at indices blockDim.x * k + threadIdx.x within the column, consecutive threads read consecutive elements? No, the elements of the column are at memory addresses separated by cols*4 bytes. So even strided access for a single column is uncoalesced. The only way to get coalesced access is to have consecutive threads access consecutive columns for the same row. So we need a block to process a tile of columns, not one column. We can design a kernel where each block processes multiple columns simultaneously, using shared memory to hold a tile of data (e.g., 32 rows x 32 columns), perform partial reductions or selections within shared memory, then combine across tiles.
++// For median, we could do a two-phase approach: first, each block processes a chunk of rows for a set of columns, and computes something? Not straightforward.
++// Another idea: use a global sort on the entire tensor along columns? That would be overkill.
++// Maybe we can use a per-column selection using a single block per column but with coalesced loads by having each thread load multiple columns? Not possible if block per column.
++// Perhaps we can use a warp per column, and warps are scheduled such that they can coalesce? No, each warp handles one column, so memory access is strided.
++// Given time, I'll implement a straightforward but correct median: assign one thread per column (1024 threads total, maybe one block or multiple blocks), each thread does a sequential quickselect or nth_element on its column in global memory. This will be correct but may be slow due to uncoalesced access. However, each thread will read 16384 floats sequentially with stride 4096, which might still be okay because each thread is independent and the memory system can handle strided access if enough parallelism. 1024 threads, each doing 16K reads = 16M reads total, similar to a full pass. But the read pattern is uncoalesced, so bandwidth utilization will be low. Might be slower than torch's optimized kernel. But maybe still acceptable? The model includes two erf calls which are cheap, the median is the bottleneck. We need overall 5% faster than torch.compile. If torch.compile's median is very optimized, our naive median may be much slower.
++// We must aim for a reasonably efficient median. Let's think of a better algorithm.
++// PyTorch's median on dim=0 for a large matrix likely uses a library like cub or thrust's segmented sort. We cannot use those. We could implement a segmented sort ourselves but that's complex.
++// Maybe we can leverage the fact that the input is the result of two erf operations, and values are between -1 and 1, and maybe distribution is known? Not helpful.
++// Let's consider using a bitonic sort on the whole tensor with a custom comparator that sorts each column independently? That would be like sorting each column simultaneously. But bitonic sort per column would require many passes and synchronization across blocks if we use multiple blocks per column. If we use one block per column, we can sort in shared memory if we can fit the column. But 16384 floats > 48KB, can't fit. If we use one block per column and sort in registers, we would need 16384 elements per block divided among threads: if block has 1024 threads, each thread holds 16 elements => 16 registers per thread for values plus maybe indices => 32 registers, feasible. But then we need to sort across threads using a bitonic network that can handle 16384 elements across 1024 threads. That is a known pattern: bitonic sort with multiple elements per thread. Each step involves compare-exchange between elements held by threads, using shared memory for communication. This can be done without storing all data in shared memory simultaneously, but requires many synchronization steps. Complexity: log2(16384) = 14 stages, each stage has multiple sub-steps. Total compare-exchange operations per column = O(n log^2 n) ~ 16384*196 = 3.2M operations per column, times 1024 columns = 3.3B operations, likely too slow.
++// Radix select is O(n) per column, much better. The uncoalesced access issue can be mitigated by processing multiple columns per block and using shared memory to reorganize data. Let's design a radix select that processes a tile of columns per block.
++// Suppose we have block of 256 threads. We can process, say, 32 columns at a time. For each column, we maintain a prefix bit pattern and a target rank. We'll iterate over rows in chunks, loading a tile of data (rows_chunk x cols_tile) into shared memory in a coalesced manner. Then we compute histograms for each column using shared memory. But we need to do this for each radix pass (4 passes) and then counting passes. The shared memory needed: for a tile of 32 columns and maybe 64 rows, that's 2048 floats = 8KB, plus histograms for 32 columns * 256 buckets = 32*256 ints = 32KB, total 40KB, fits within 48KB. We can process rows in chunks of 64. For each chunk, threads cooperatively load the tile from global memory: threads read consecutive elements (row, col) to coalesce. Then each thread updates the histograms for its assigned columns? That could be done by having each thread responsible for a subgroup of elements.
++// This is becoming complex but doable.
++// Alternatively, we can implement a global selection using a two-level approach: first, reduce each column to a set of candidate values using a coarse histogram, then refine. But still need coalescing.
++// Given the limited time and the need to produce a working file, I'll implement a simpler but perhaps acceptable approach:
++// - For erf: straightforward elementwise kernel, efficient.
++// - For median: use a per-column approach with one warp per column, and use a deterministic selection based on a parallel reduction of a sorted small sample? Not exact.
++// We must be exact.
++// Let's step back. The binding layer will call our launchers. We need to provide launchers that produce correct results. The binding layer will allocate output tensors. We can choose to implement median in a way that is correct, even if not the fastest. The verification will check correctness. Performance requirement is 5% faster than torch.compile. If our implementation is much slower, it will fail performance, but that's a separate check. However, the instruction says to aim for best performance. We should try to make median efficient.
++// Perhaps torch.compile's median is not that optimized for large tensors? It might be using a sort-based approach, which is O(n log n), while our radix select is O(n), potentially faster. Even with uncoalesced access, if we can achieve reasonable bandwidth, O(n) vs O(n log n) may win. The input is 16M elements, sort-based would be around 16M * 14 = 224M compare/exchange operations, while radix select would be 16M * (few passes) ~ 4*16M = 64M memory reads plus some overhead. So radix select could potentially be faster if implemented well.
++// So I'll implement radix select with a coalesced memory access pattern using tile-based processing.
++// Let's design the kernel for median:
++// - We launch a grid of blocks, each block processes a group of columns.
++// - Let's choose block size 256 threads.
++// - We process columns in groups of COLS_PER_BLOCK = 32.
++// - For each group, we set up shared memory to hold histograms and temporary data.
++// - We need to process each radix pass (4 passes) for all columns in the group simultaneously.
++// - For each pass, we need to scan all rows for those columns and build histograms for that byte.
++// - To coalesce, we'll have threads iterate over rows in chunks of ROWS_PER_TILE = 32 or 64.
++// - For each tile, we load the values for the 32 columns and 64 rows into shared memory as a tile (float[64][32]). Then we process the tile to update histograms for each column and the current byte.
++// - After all tiles processed, we have histograms for the pass. Then we use block-level reduction to determine the selected bucket for each column, update prefix bits, and proceed to next pass.
++// - After 4 passes, we have exact median value for each column.
++// - Then we need to find the index: we do similar scans to count less-than and find the particular occurrence. This can also be done in a tile-based manner with coalesced loads.
++// This is a substantial kernel. Let's outline the implementation steps.
++
++// We need to track per-column state across passes: prefix bits selected so far (uint32), and maybe the target rank (fixed). We can store per-column state in shared memory or registers.
++// Since each block handles COLS_PER_BLOCK columns, we can have one thread per column for state management? Or store state in shared arrays of size COLS_PER_BLOCK.
++// In the kernel, we can have threads specialized: some threads handle column state, others do data loading/processing.
++// Simpler: Use a single thread per column? But then we lose parallelism within block for histogramming. Better: use all threads for histogramming, and have a separate phase to update prefixes using a few threads.
++// We can organize as follows:
++// Shared memory:
++//   float tile[ROWS_PER_TILE][COLS_PER_BLOCK]; // values tile, for current processing for a pass
++//   int hist[COLS_PER_BLOCK][256]; // histograms for current pass, reset each pass
++//   uint32_t prefixes[COLS_PER_BLOCK]; // selected bits so far
++//   int ranks[COLS_PER_BLOCK]; // fixed target rank (lower median)
++//   int less_counts[COLS_PER_BLOCK]; // used in final step
++//   int equal_counts[COLS_PER_BLOCK]; // to find target occurrence
++//   int result_indices[COLS_PER_BLOCK]; // final index per column
++//   float result_values[COLS_PER_BLOCK]; // final value per column
++// We also need to handle the fact that COLS_PER_BLOCK may not divide total cols exactly; we can handle remainder by launching a grid with enough blocks, and each block processes a contiguous group, maybe with a remainder block that processes fewer columns (or we can pad). For simplicity, we can assume cols is divisible by COLS_PER_BLOCK? In the contract, cols=1024, which is divisible by 32. But we should handle general case. We can have each block process a variable number of columns, but easier: choose COLS_PER_BLOCK=32, and total blocks = ceil(cols/32). For blocks where group_start + COLS_PER_BLOCK > cols, we simply process cols - group_start columns. The shared arrays are still sized for 32, but we only use the first ncols_this_block entries.
++// That's fine.
++
++// Kernel algorithm:
++// 1. Initialize prefixes to 0, ranks = (rows-1)/2 for each column in block.
++// 2. For byte_pos from 3 down to 0:
++//    a. Reset hist to 0.
++//    b. For each tile of rows (tile_start = 0; tile_start < rows; tile_start += ROWS_PER_TILE):
++//       - Load tile data: threads cooperatively load elements from input into shared tile[][].
++//         We need to know input tensor pointer and strides. Input is 2D with strides: in_stride0 (row stride), in_stride1 (col stride). Typically in_stride0 = cols, in_stride1 = 1. But contract says supports strides, so we must handle arbitrary strides. So when loading tile, we compute address = input + (tile_start + r) * in_stride0 + (col_global + c) * in_stride1.
++//         To coalesce, we want consecutive threads to access consecutive memory addresses. With row-major and col_stride=1, if we assign threads to columns first, then rows, we get coalescing along columns. So for a tile of ROWS_PER_TILE rows and COLS_PER_BLOCK columns, we can have threads arranged in 2D: threadIdx.x across columns, threadIdx.y across rows. But total threads = ROWS_PER_TILE * COLS_PER_BLOCK may not equal blockDim. We can just use a 1D block of 256 threads and map linear thread index to (r,c) within the tile. For example, tile size 64x32 = 2048 elements > 256 threads, so each thread loads multiple elements. We can use a grid-stride loop over tile elements: for (idx = threadIdx.x; idx < tile_elems; idx += blockDim.x). This gives coalesced access if we map linear index to column-major within tile: c = idx % COLS_PER_BLOCK, r = idx / COLS_PER_BLOCK. Then consecutive idx correspond to c increments, which correspond to consecutive columns in memory (if col_stride=1), so coalesced. Good.
++//       After loading, __syncthreads().
++//       - Process tile to update histograms: For each column, we need to compute the value's byte at byte_pos, but only for elements whose prefix matches the current prefix for that column. Since prefix is per column, we need to test for each element: for column c, if (curr_prefix matches upper bits of element's sortable key) then increment hist[c][byte]. This test involves bit operations.
++//       We can have each thread process a subset of tile elements again, but this time we need to update shared hist, which requires atomic adds or careful per-column per-bucket accumulation to avoid collisions. Since many threads may update same bucket for same column, we need atomicAdd on shared memory. Shared atomicAdd on int is supported. We can use atomicAdd(&hist[c][bucket], 1). That will be fast enough.
++//       Alternatively, we can have each thread update a private histogram in registers and then combine, but shared atomics are simpler.
++//       After processing, __syncthreads().
++//    c. After all tiles, we have hist for this byte for all columns.
++//       Now for each column, determine the bucket b such that cumulative count up to b-1 <= rank < cumulative up to b.
++//       We can assign one thread per column (or a few threads) to compute prefix sums and find bucket, then update prefix for that column: prefix = (prefix << 8) | bucket. Actually, we process from MSB to LSB, so we need to set the byte in the appropriate position. We'll maintain prefix as a 32-bit value where already processed bytes are set, and the rest are 0. For byte_pos from 3 to 0, the shift amount is byte_pos*8. After selecting bucket, we set the bits at that byte position: prefix |= (bucket << (byte_pos*8)).
++//       Also, we need to update rank? No, rank stays the same (we are finding the element at that rank in sorted order). The rank is the same global rank, but as we restrict, we need to adjust rank within the bucket: rank = rank - (cumulative count before bucket). However, we can compute the new rank for the next pass: new_rank = rank - less_count_before_bucket. So we need to store per-column rank as well. Initially rank = (rows-1)/2. After each pass, update rank to rank - less_count_before_bucket. We can store ranks in shared array.
++//       We'll have a separate loop over columns for this reduction, maybe one thread per column (up to 32 threads) while others wait. That's fine.
++//    d. __syncthreads() before next pass.
++// 3. After 4 passes, prefix holds the exact sortable key of the median value. Convert to float: undo the float-to-sortable mapping.
++// 4. Now compute the median values and indices:
++//    - For each column, median_value = undo(prefix).
++//    - We need to count elements strictly less than median_value, and then find the (rank)-th occurrence among equal elements.
++//    Let's store target_rank_per_col = rank (the updated rank after all passes, which should be the rank within the equal group). Actually, after the final pass, the rank is the position within the bucket of the final byte, but since we've narrowed to exact value, the final rank should be 0? Let's think: When we process the last byte, we select a bucket that contains the target rank. After updating rank to rank within that bucket, if there are multiple elements with exactly that value, the remaining rank (call it k) indicates that we need the (k)-th occurrence of that exact value among all elements with that value, in sorted order (which is original index order). So the index we need is the original index of the (k)-th occurrence of median_value in the column (0-based). Note: because all elements with the same value are equal, their relative order is original index order, so the (k)-th occurrence in original order is the same as the (k)-th in sorted order.
++//    - So we can do two passes over the data:
++//      Pass 1 (count less): count elements with value < median_value for each column.
++//      Pass 2 (find occurrence): for each column, we need to find the (k)-th element with value == median_value in original index order, where k = target_rank (state after all radix passes). Is that correct? The rank stored after all passes should be the rank within the final bucket. For example, if we have 10 elements, lower median rank = 4. After radix select, suppose we find median value V. The number of elements < V is L, and number of elements == V is E, and L <= 4 < L+E. The rank within equal group is r = 4 - L. So we need the r-th occurrence of V in original order (0-based). So we need to compute L and then r.
++//      However, we already have the rank variable from radix select; after the final pass, we have updated rank to be the rank within the final bucket. Since the final bucket may contain elements with different values? Actually the final bucket after 32 bits is exact value, so all elements in that bucket have exactly the same sortable key, i.e., same value. So the rank stored should be between 0 and (number of elements with that value - 1). So yes, we can use that rank directly as the occurrence index among equal values.
++//    - So we can skip counting less-than; we just need to find the r-th occurrence of median_value. But we need to know r, which is already stored in ranks array after radix select. Great.
++//    - So algorithm:
++//      For each column, after obtaining median_value and r (rank within equal group), we need to scan the column to find the index of the r-th occurrence of median_value.
++//      We can do this in a tile-based manner: for each tile of rows, load data as before, then for each column, we need to count occurrences and find the one at position r. Since r is per column, we can use a shared counter per column that accumulates occurrences as we scan tiles in increasing row order.
++//      We'll maintain a shared int equal_count[COLS_PER_BLOCK] initialized to 0, and shared int found_indices[COLS_PER_BLOCK] initialized to -1.
++//      For each tile (in row order), after loading tile data, each thread processes some elements in the tile. For each element (row, col), if the value == median_value[col] (or more precisely, sortable key == prefix[col]), then we need to check if this occurrence's order matches r. Since we process rows in order, we can assign a per-column counter that is incremented for each occurrence. However, multiple threads may encounter occurrences for the same column within the same tile, potentially out of order. To maintain correct order, we need to process occurrences sequentially per column. To avoid race, we can assign each column to a single thread within the block to handle all its occurrences? But we have 32 columns and 256 threads, so we can have 8 threads per column, but that would still have concurrency. Alternative: use atomicAdd on shared counters to get a sequence number for each occurrence. Since atomicAdd returns the old value, we can determine the occurrence index: if atomicAdd(&equal_count[col], 1) == r, then this thread found the target occurrence and can store its global row index. Because atomicAdd is atomic, the sequence of returned values is the order of execution, which may not correspond to original row order if different threads process different rows concurrently. That's a problem: the order of atomicAdd returns is not deterministic and may not reflect row order. So we cannot rely on atomicAdd to assign occurrence indices in original order.
++//      Therefore, we must process occurrences in a strictly ordered manner. The simplest is to have one thread per column sequentially scan all rows and count occurrences, which is O(rows) per column with a single thread for that column. That would be slow but maybe acceptable? Since we only do this once after finding median value, and we have 1024 columns, one thread per column would be 1024 threads total, each scanning 16384 rows, total 16M reads again, but uncoalesced. However, we can make this final index-finding pass coalesced by having each block handle a group of columns, and within the block, we process tiles in order and use a single thread per column to count occurrences within each tile sequentially, while other threads help load the tile in a coalesced manner. In other words, for index finding, we can use the same tile-loading scheme, but for processing occurrences, we assign one thread per column to scan the tile elements for that column in row order. Since each thread handles one column, it can iterate over the rows in the tile sequentially, checking equality and incrementing a private counter until it reaches r. This ensures order because the single thread processes rows in increasing order.
++//      So for index finding:
++//      - Load tile data into shared memory (coalesced).
++//      - __syncthreads();
++//      - For each column c, thread c (or a designated thread) loops over rows in the tile from 0 to ROWS_PER_TILE-1, and if shared_tile[r][c] == median_value[c], increment its local count. When local count reaches r (the target occurrence), record the global row index (tile_start + r) into result_indices[c], and set a flag to stop processing further for that column (but still need to finish loading all tiles? Actually we can break out of the loop for that column and perhaps skip subsequent tiles, but since the kernel is running a fixed number of iterations, we can just let the thread continue but skip further scanning for that column if found. We can have a per-column boolean found shared array. That's fine. At the end, result_indices holds the correct indices.
++//      - This approach uses one thread per column within a block. With 32 columns per block, we use 32 threads for scanning, the rest are idle during scanning but can help with loading. That's acceptable. The scanning is done after each tile load, and threads that are not scanning wait at __syncthreads().
++//      - This is efficient enough: the index-finding phase does the same number of tile loads as the radix passes, but now only 32 threads do scanning per block, each scanning 64 rows per tile, giving good performance.
++//   - After all tiles processed, we have median values and indices in shared memory. We then write them to output arrays (values and indices) using the global column indices.
++//   - Output arrays: values float* of length cols, indices int64_t* of length cols. We need to write result from each thread responsible for a column.
++
++// This kernel is quite long but feasible.
++
++// Let's define constants: COLS_PER_BLOCK = 32, ROWS_PER_TILE = 64, BLOCK_SIZE = 256.
++// Shared memory size:
++//   tile: ROWS_PER_TILE * COLS_PER_BLOCK * sizeof(float) = 64*32*4 = 8KB
++//   hist: COLS_PER_BLOCK * 256 * sizeof(int) = 32*256*4 = 32KB
++//   prefixes: COLS_PER_BLOCK * sizeof(uint32_t) = 32*4 = 128B
++//   ranks: COLS_PER_BLOCK * sizeof(int) = 128B
++//   equal_counts: COLS_PER_BLOCK * sizeof(int) = 128B
++//   found_flags: COLS_PER_BLOCK * sizeof(bool) = 32B
++//   result_indices: COLS_PER_BLOCK * sizeof(int64_t) = 256B
++//   result_values: COLS_PER_BLOCK * sizeof(float) = 128B
++// Total ~ 40.7KB, fits in 48KB static shared memory. Good.
++
++// But wait, we also need a per-column counter for index-finding that counts occurrences across tiles. We can store that in shared memory as well: occ_count[COLS_PER_BLOCK], reset to 0 before index-finding. That's another 128B.
++// So total shared ~40.9KB, still okay.
++
++// For float-to-sortable mapping, we need a function that returns uint32_t sortable key.
++// __device__ uint32_t float_to_sortable(float f) {
++//     uint32_t u = __float_as_uint(f);
++//     if (u & 0x80000000) {
++//         // negative: flip all bits? Actually for radix sort, we want monotonic mapping so that negative floats sort correctly. Common conversion: if sign bit set, flip all bits; else, set sign bit.
++//         return ~u;
++//     } else {
++//         return u | 0x80000000;
++//     }
++// }
++// Then inverse mapping: uint32_t k -> float: if (k & 0x80000000) { u = k & 0x7fffffff; } else { u = ~k; } return __uint_as_float(u).
++// Check: for positive floats, sign bit 0, we set sign bit to 1, so all positive keys have MSB=1. Negative floats have sign bit 1, we flip all bits, so MSB becomes 0. This yields monotonic order: negative floats smaller than positive, and within negatives, the ordering is correct because flipping all bits reverses the magnitude order? Let's test: For negative numbers, bigger magnitude (more negative) should be smaller. In IEEE, negative numbers have sign bit 1, and exponent and mantissa are in normal order, so as a uint32, more negative numbers have larger magnitude but sign bit makes them larger unsigned? Actually, unsigned comparison of raw float bits: negative numbers have sign bit 1, so they appear greater than positives. Among negatives, larger magnitude (smaller exponent) yields larger unsigned? Let's test: -1.0 raw bits = 0xBF800000, -2.0 = 0xC0000000. 0xBF800000 < 0xC0000000, so -1.0 appears smaller unsigned than -2.0. But we want -2.0 < -1.0. So we need to flip all bits for negatives: ~0xBF800000 = 0x407FFFFF, ~0xC0000000 = 0x3FFFFFFF. Now 0x3FFFFFFF < 0x407FFFFF, so -2.0 sorts before -1.0. Good. For positives, setting sign bit: 1.0 raw=0x3F800000 -> 0xBF800000, 2.0 raw=0x40000000 -> 0xC0000000, and 0xBF800000 < 0xC0000000 so order preserved. And all positive keys (MSB=1) are greater than all negative keys (MSB=0). Correct.
++
++// We'll use these functions.
++
++// Now, the kernel will be templated? We can just write a monolithic kernel.
++
++// Let's outline the kernel code with phases.
++// We'll have a kernel that takes:
++//   const float* input, float* values_out, int64_t* indices_out,
++//   int rows, int cols,
++//   int64_t in_stride0, int64_t in_stride1,
++//   // output arrays are contiguous of length cols, so no strides needed, but we could pass if needed.
++// We'll use gridDim.x = number of column groups = ceil(cols / COLS_PER_BLOCK).
++// blockDim.x = BLOCK_SIZE (256).
++
++// Shared memory declarations:
++__shared__ float tile[ROWS_PER_TILE][COLS_PER_BLOCK];
++__shared__ int hist[COLS_PER_BLOCK][256];
++__shared__ uint32_t prefixes[COLS_PER_BLOCK];
++__shared__ int ranks[COLS_PER_BLOCK]; // target rank within current candidate set
++__shared__ int occ_count[COLS_PER_BLOCK]; // for index finding
++__shared__ bool found[COLS_PER_BLOCK];
++__shared__ int64_t result_indices[COLS_PER_BLOCK];
++__shared__ float result_values[COLS_PER_BLOCK];
++
++// Need to know number of columns in this block: int ncols = min(COLS_PER_BLOCK, cols - blockIdx.x * COLS_PER_BLOCK);
++// We can store ncols_this_block in a register.
++
++// First, initialize prefixes to 0, ranks to (rows-1)/2, occ_count to 0, found to false, result_indices to -1.
++// Only initialize for columns < ncols.
++// We'll use threads 0..ncols-1 to initialize these arrays, then __syncthreads().
++
++// Radix select loop:
++for (int byte_pos = 3; byte_pos >= 0; --byte_pos) {
++    // Reset hist for all columns and buckets used.
++    // Use threads to zero hist. Since hist is 32*256 ints = 8192 elements, we can have each thread zero a portion.
++    for (int i = threadIdx.x; i < ncols * 256; i += blockDim.x) {
++        int c = i / 256;
++        int b = i % 256;
++        hist[c][b] = 0;
++    }
++    __syncthreads();
++
++    // Loop over tiles
++    for (int tile_start = 0; tile_start < rows; tile_start += ROWS_PER_TILE) {
++        int tile_rows = min(ROWS_PER_TILE, rows - tile_start);
++        // Load tile data into shared memory using coalesced reads.
++        // We have to handle boundary: tile_rows may be less than ROWS_PER_TILE, but we load only valid rows.
++        // For loading, we use a loop over all (r,c) in tile, mapping linear index to (c, r) for coalescing.
++        int tile_elems = tile_rows * ncols; // we only need to load ncols columns (not all 32 if remainder block)
++        // However, our shared tile is dimensions [ROWS_PER_TILE][COLS_PER_BLOCK], but we only use first ncols columns and tile_rows rows. We'll still index using c and r.
++        for (int idx = threadIdx.x; idx < tile_elems; idx += blockDim.x) {
++            int c = idx % ncols; // column within block
++            int r = idx / ncols; // row within tile
++            int global_col = blockIdx.x * COLS_PER_BLOCK + c;
++            int global_row = tile_start + r;
++            // Load using strides
++            tile[r][c] = input[global_row * in_stride0 + global_col * in_stride1];
++        }
++        __syncthreads();
++
++        // Process tile to update hist for current byte.
++        // For each element (r,c) in valid tile, we check if the element's prefix matches current prefixes[c].
++        // But note: prefix changes after each pass, so during a pass, the prefix for all elements should be the same as at start of pass (for that column). We must not update prefixes until after the pass completes.
++        // We load prefixes from shared, which are stable during the pass.
++        // For each element, compute sortable key, check if (key >> ((byte_pos+1)*8))?? Actually prefix holds bits from MSB down to byte_pos+1. The lower bytes (byte_pos and below) are zero. So to check if element belongs to the current candidate set, we need to compare the upper bits with prefix. We can use a mask: uint32_t mask = 0xFFFFFFFF << ((byte_pos+1)*8); But that's not exactly; for byte_pos=3, no upper bits processed, mask=0, so all elements match. For byte_pos=2, we have processed one byte (bits 31-24), so mask = 0xFF000000. The prefix should have those bits set. So condition: (key & mask) == prefixes[c].
++        // However, prefixes[c] may have lower bits zero, but mask ensures we only compare upper bits. So condition works.
++        // Then we extract the byte at byte_pos: uint8_t byte_val = (key >> (byte_pos*8)) & 0xFF;
++        // Then atomicAdd(&hist[c][byte_val], 1);
++        // We need to do this for all valid elements. We can use a loop similar to loading, but this time over all elements in tile. Use same mapping.
++        for (int idx = threadIdx.x; idx < tile_elems; idx += blockDim.x) {
++            int c = idx % ncols;
++            int r = idx / ncols;
++            float val = tile[r][c];
++            uint32_t key = float_to_sortable(val);
++            uint32_t mask = (byte_pos == 3) ? 0 : (0xFFFFFFFF << ((byte_pos+1)*8)); // for byte_pos=3, mask=0
++            if ((key & mask) == prefixes[c]) {
++                uint8_t byte_val = (key >> (byte_pos*8)) & 0xFF;
++                atomicAdd(&hist[c][byte_val], 1);
++            }
++        }
++        __syncthreads();
++    }
++
++    // After all tiles, compute new ranks and prefixes for each column.
++    // We can assign one thread per column to process hist and update.
++    // For each column c, we have hist[c][256].
++    // Find bucket b such that cumulative count up to b-1 <= ranks[c] < cumulative up to b.
++    // Then new_rank = ranks[c] - cumulative_before_bucket.
++    // Update prefixes[c] = prefixes[c] | (b << (byte_pos*8));
++    // Update ranks[c] = new_rank;
++    // We need to do this for c < ncols. We can use threads 0..ncols-1.
++    // But after this, we need __syncthreads() before next byte.
++    // We'll do:
++    if (threadIdx.x < ncols) {
++        int c = threadIdx.x;
++        int cumul = 0;
++        int target_rank = ranks[c];
++        int selected_bucket = 0;
++        int less_before = 0;
++        for (int b = 0; b < 256; ++b) {
++            int count = hist[c][b];
++            if (target_rank < cumul + count) {
++                selected_bucket = b;
++                less_before = cumul;
++                break;
++            }
++            cumul += count;
++        }
++        ranks[c] = target_rank - less_before;
++        prefixes[c] |= (selected_bucket << (byte_pos*8));
++    }
++    __syncthreads();
++}
++
++// After radix select, prefixes hold the sortable key of median value.
++// Convert to float and store in result_values.
++// Also, ranks now hold the occurrence index among equal values (0-based).
++// We'll now find the index.
++// First, store median values and reset occ_count to 0 and found to false.
++if (threadIdx.x < ncols) {
++    int c = threadIdx.x;
++    result_values[c] = sortable_to_float(prefixes[c]);
++    occ_count[c] = 0;
++    found[c] = false;
++    result_indices[c] = -1;
++}
++__syncthreads();
++
++// Now loop over tiles again to find indices.
++for (int tile_start = 0; tile_start < rows; tile_start += ROWS_PER_TILE) {
++    int tile_rows = min(ROWS_PER_TILE, rows - tile_start);
++    int tile_elems = tile_rows * ncols;
++    // Load tile as before.
++    for (int idx = threadIdx.x; idx < tile_elems; idx += blockDim.x) {
++        int c = idx % ncols;
++        int r = idx / ncols;
++        int global_col = blockIdx.x * COLS_PER_BLOCK + c;
++        int global_row = tile_start + r;
++        tile[r][c] = input[global_row * in_stride0 + global_col * in_stride1];
++    }
++    __syncthreads();
++
++    // Now process using one thread per column to scan rows in order.
++    if (threadIdx.x < ncols) {
++        int c = threadIdx.x;
++        if (!found[c]) {
++            float median_val = result_values[c];
++            int target_occ = ranks[c]; // the occurrence index we need (0-based)
++            int local_count = occ_count[c]; // occurrences seen so far in previous tiles
++            for (int r = 0; r < tile_rows; ++r) {
++                if (tile[r][c] == median_val) {
++                    if (local_count == target_occ) {
++                        // found it
++                        result_indices[c] = tile_start + r;
++                        found[c] = true;
++                        break;
++                    }
++                    local_count++;
++                }
++            }
++            occ_count[c] = local_count; // update for next tile if not found
++        }
++    }
++    __syncthreads();
++}
++
++// After processing all tiles, write results to global memory.
++if (threadIdx.x < ncols) {
++    int c = threadIdx.x;
++    int global_col = blockIdx.x * COLS_PER_BLOCK + c;
++    values_out[global_col] = result_values[c];
++    indices_out[global_col] = result_indices[c];
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,91 @@
++// kernels/custom_ops_binding.cpp
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void erf_forward_launcher(
++    const float* input, float* output,
++    int64_t rows, int64_t cols,
++    int64_t in_stride0, int64_t in_stride1,
++    int64_t out_stride0, int64_t out_stride1,
++    cudaStream_t stream);
++
++extern "C" void median_dim0_forward_launcher(
++    const float* input, float* values_out, int64_t* indices_out,
++    int rows, int cols,
++    int64_t in_stride0, int64_t in_stride1,
++    cudaStream_t stream);
++
++// Elementwise erf forward
++static torch::Tensor erf_forward(torch::Tensor x) {
++    // Check tensor properties
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 2, "Input must be 2D");
++
++    // For arbitrary strides, we will allocate a contiguous output of same shape.
++    // The erf launcher supports non-contiguous input and output.
++    auto output = torch::empty_like(x, x.options().memory_format(torch::MemoryFormat::Contiguous));
++
++    const int64_t rows = x.size(0);
++    const int64_t cols = x.size(1);
++    const int64_t in_stride0 = x.stride(0);
++    const int64_t in_stride1 = x.stride(1);
++    const int64_t out_stride0 = output.stride(0);
++    const int64_t out_stride1 = output.stride(1);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    erf_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        rows, cols,
++        in_stride0, in_stride1,
++        out_stride0, out_stride1,
++        stream
++    );
++
++    return output;
++}
++
++// Median along dim 0, returns a torch.return_types.median container
++static torch::return_types::median median_dim0_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 2, "Input must be 2D");
++
++    const int rows = static_cast<int>(x.size(0));
++    const int cols = static_cast<int>(x.size(1));
++    const int64_t in_stride0 = x.stride(0);
++    const int64_t in_stride1 = x.stride(1);
++
++    // Allocate output tensors: values (float32) and indices (int64)
++    auto values = torch::empty({cols}, x.options().dtype(torch::kFloat32));
++    auto indices = torch::empty({cols}, x.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    median_dim0_forward_launcher(
++        x.data_ptr<float>(),
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        rows, cols,
++        in_stride0, in_stride1,
++        stream
++    );
++
++    return torch::return_types::median(values, indices);
++}
++
++// Registration function
++static void register_custom_ops(pybind11::module& m) {
++    m.def("erf_forward", &erf_forward, "Elementwise erf forward",
++          py::arg("x"));
++    m.def("median_dim0_forward", &median_dim0_forward, "Median along dimension 0",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        x = cuda_extension.erf_forward(x)
++        x = cuda_extension.erf_forward(x)
++        x = cuda_extension.median_dim0_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.erf_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.erf_forward(x)
++        yield 'step_002', x
++        x = cuda_extension.median_dim0_forward(x)
++        yield 'step_003', x
++        yield 'step_004', x

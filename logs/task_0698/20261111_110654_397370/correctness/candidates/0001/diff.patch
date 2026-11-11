@@ -1,0 +1,212 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,81 @@
++#include <cuda_runtime.h>
++
++// mean_dim1_keepdim: reduces over dim=1 (C) and keeps dimension
++// Input: x of shape [N, C, H, W], arbitrary strides
++// Output: y of shape [N, 1, H, W]
++// Each thread computes one output element at (n, 0, h, w)
++__global__ void mean_dim1_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    int N, int C, int H, int W,
++    long long input_stride_n, long long input_stride_c,
++    long long input_stride_h, long long input_stride_w,
++    long long output_stride_n, long long output_stride_0,
++    long long output_stride_h, long long output_stride_w)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * H * W;
++    if (idx >= total) return;
++
++    int w = idx % W;
++    int h = (idx / W) % H;
++    int n = idx / (H * W);
++
++    const float* x_base = x + n * input_stride_n + h * input_stride_h + w * input_stride_w;
++    float sum = 0.0f;
++    for (int c = 0; c < C; ++c) {
++        sum += x_base[c * input_stride_c];
++    }
++    float mean = sum / static_cast<float>(C);
++
++    float* y_ptr = y + n * output_stride_n + 0 * output_stride_0 + h * output_stride_h + w * output_stride_w;
++    *y_ptr = mean;
++}
++
++// relu: element-wise max(0, x), same shape and strides as input
++__global__ void relu_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    long long numel)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < numel) {
++        float val = x[idx];
++        y[idx] = val > 0.0f ? val : 0.0f;
++    }
++}
++
++// Launcher for mean_dim1_keepdim, accepts raw pointers and tensor metadata.
++// The binding layer will allocate output tensor and pass strides.
++extern "C" void mean_dim1_keepdim_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    long long input_stride_n, long long input_stride_c,
++    long long input_stride_h, long long input_stride_w,
++    long long output_stride_n, long long output_stride_0,
++    long long output_stride_h, long long output_stride_w,
++    cudaStream_t stream)
++{
++    if (N <= 0 || H <= 0 || W <= 0) return;
++    int total = N * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    mean_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        x, y, N, C, H, W,
++        input_stride_n, input_stride_c, input_stride_h, input_stride_w,
++        output_stride_n, output_stride_0, output_stride_h, output_stride_w);
++}
++
++// Launcher for relu, just element-wise on flat arrays
++extern "C" void relu_launcher(
++    const float* x,
++    float* y,
++    long long numel,
++    cudaStream_t stream)
++{
++    if (numel <= 0) return;
++    int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++    relu_kernel<<<blocks, threads, 0, stream>>>(x, y, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,92 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void mean_dim1_keepdim_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    long long input_stride_n, long long input_stride_c,
++    long long input_stride_h, long long input_stride_w,
++    long long output_stride_n, long long output_stride_0,
++    long long output_stride_h, long long output_stride_w,
++    cudaStream_t stream);
++
++extern "C" void relu_launcher(
++    const float* x,
++    float* y,
++    long long numel,
++    cudaStream_t stream);
++
++// Binding for mean_dim1_keepdim
++torch::Tensor mean_dim1_keepdim_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D [N, C, H, W]");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Output shape [N, 1, H, W] contiguous
++    auto y = torch::empty({N, 1, H, W}, x.options());
++
++    // Get strides (long long as expected by launcher)
++    long long input_stride_n = x.stride(0);
++    long long input_stride_c = x.stride(1);
++    long long input_stride_h = x.stride(2);
++    long long input_stride_w = x.stride(3);
++    long long output_stride_n = y.stride(0);
++    long long output_stride_0 = y.stride(1);
++    long long output_stride_h = y.stride(2);
++    long long output_stride_w = y.stride(3);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    mean_dim1_keepdim_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        N, C, H, W,
++        input_stride_n, input_stride_c, input_stride_h, input_stride_w,
++        output_stride_n, output_stride_0, output_stride_h, output_stride_w,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "mean_dim1_keepdim kernel launch failed: ", cudaGetErrorString(err));
++
++    return y;
++}
++
++// Binding for relu
++torch::Tensor relu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto y = torch::empty_like(x);
++    long long numel = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    relu_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        numel,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "relu kernel launch failed: ", cudaGetErrorString(err));
++
++    return y;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("mean_dim1_keepdim", &mean_dim1_keepdim_forward, "Mean over dim 1 keeping dimension", py::arg("x"));
++    m.def("relu", &relu_forward, "ReLU activation", py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,30 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features):
++        super().__init__()
++        # 参考模型没有可学习参数，state_dict 应为空
++
++    def forward(self, x):
++        # 输入可能位于 CPU（验证时 task_contract 中 device 为 cpu），但执行需要 CUDA
++        # 自定义算子要求输入为 CUDA tensor，因此如果非 CUDA 则先转移到 cuda
++        if not x.is_cuda:
++            x = x.to('cuda')
++        x = cuda_extension.mean_dim1_keepdim(x)
++        x = cuda_extension.relu(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        if len(inputs) != 1:
++            raise ValueError('debug_forward expects exactly one input tensor')
++        x = inputs[0]
++        if not x.is_cuda:
++            x = x.to('cuda')
++        x = cuda_extension.mean_dim1_keepdim(x)
++        yield 'step_001', x
++        x = cuda_extension.relu(x)
++        yield 'step_002', x
++        yield 'step_003', x

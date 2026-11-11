@@ -1,0 +1,867 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,549 @@
++// CUDA kernels for LSTM model optimization
++#include <cuda_runtime.h>
++#include <cmath>
++
++// ---------------------------------------------------------------------------
++// Helper: sigmoid and tanh
++__device__ __forceinline__ float sigmoidf(float x) {
++    return 1.0f / (1.0f + expf(-x));
++}
++
++__device__ __forceinline__ float tanhf(float x) {
++    return tanhf(x);
++}
++
++// ---------------------------------------------------------------------------
++// Kernel: zeros_like_alloc
++// Fills a contiguous float array with zeros.
++// total_elements = num_layers * batch_size * hidden_size
++__global__ void zeros_kernel(float* data, int64_t total_elements) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        data[i] = 0.0f;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Kernel: linear_fc
++// Computes y = input @ weight.T + bias
++// input: [batch_size, in_features] contiguous
++// weight: [out_features, in_features] contiguous
++// bias: [out_features] contiguous
++// output: [batch_size, out_features] contiguous
++// We use one thread per output element.
++// grid: (out_features, batch_size) blocks? Actually use 2D grid.
++__global__ void linear_fc_kernel(const float* input, const float* weight, const float* bias,
++                                 float* output, int batch_size, int in_features, int out_features) {
++    int row = blockIdx.y; // batch index
++    int col = blockIdx.x * blockDim.x + threadIdx.x; // out feature index
++    if (row >= batch_size || col >= out_features) return;
++
++    const float* input_row = input + row * in_features;
++    const float* weight_row = weight + col * in_features;
++    float sum = bias ? bias[col] : 0.0f;
++    for (int k = 0; k < in_features; ++k) {
++        sum += input_row[k] * weight_row[k];
++    }
++    output[row * out_features + col] = sum;
++}
++
++// ---------------------------------------------------------------------------
++// LSTM kernel design:
++// We implement a two-layer LSTM for time-major input x: [seq_len, batch_size, input_size]
++// hidden_size H, input_size D (layer0 input), layer1 input is hidden size H.
++// We assume num_layers = 2 only (as contract).
++// We will use one block per batch element for each layer, and loop over time steps sequentially
++// inside the kernel. This avoids global synchronization between time steps, because each block
++// processes one batch element independently across all time steps and layers.
++// However, for LSTM, each time step depends on the previous hidden state and cell state,
++// which can be kept in registers/shared memory within the block. This is efficient.
++// We launch a grid of batch_size blocks, each block has hidden_size threads.
++// Shared memory per block: store current h and c for all hidden units for both layers,
++// plus weights for layer0 and layer1 (transposed? we load as needed).
++// Actually, we need to compute gates: i_t, f_t, g_t, o_t, and update c, h.
++// For each layer, input for layer0 is x_t (D), for layer1 is h_t from layer0.
++// We process layers sequentially within each block.
++// Steps for each block (batch b):
++//   Init h0[0:H]=0, c0[0:H]=0 (from h0 and c0 tensors, which are zero, but we read them).
++//   For t in 0..seq_len-1:
++//       Compute layer0: input x_t (D) -> gates pre-activations = W_ih_l0 @ x_t + b_ih_l0 + W_hh_l0 @ h_{t-1} + b_hh_l0
++//       Then apply activations, update h_t^0, c_t^0.
++//       Store output for layer0 at output[t,b,:] (for later use) but also use h_t^0 as input to layer1.
++//       Compute layer1 similarly using h_t^0 as input.
++//       Store final output for layer1 at output[t,b,:].
++//       Also update hidden/cell states for next time step.
++//   After loop, write final h_n and c_n for both layers to output_h and output_c.
++// We need to load weights into shared memory once per block, but weights are large:
++// For layer0: W_ih [4H, D] = 4*200*10=8000 floats, W_hh [4H, H] = 4*200*200=160000 floats.
++// Total weight floats for layer0: 168000, too large for shared memory (max ~48KB).
++// We could load in tiles, but simpler: read from global memory directly, but that may be slow.
++// Alternative: use one warp per hidden unit? Or use matrix multiplication via cuBLAS? But contract
++// requires custom kernels, no cuBLAS except for GEMM? The SKILL allows cuBLAS for GEMM, but we
++// are not allowed to use torch, but we can use cuBLAS? However, the restriction says cuBLAS allowed
++// for GEMM. We could use cuBLAS for the matrix multiplications inside LSTM. But that would require
++// implementing the entire LSTM using multiple kernel launches, which is complex; the reference
++// implementation likely uses cuDNN for LSTM if available, but we are asked to implement custom kernels.
++// The SKILL says "cuBLAS (GEMM only) and cuDNN (Conv only)" - but LSTM is not conv, so cuDNN not
++// applicable. cuBLAS could be used for GEMM, but the LSTM gates involve GEMMs; however, we'd need to
++// orchestrate them. But the .cu file should only contain CUDA kernels, not cuBLAS calls? The .cu can
++// include cuBLAS if needed? The task says "全部 CUDA kernel 和 launcher 放入该文件；修复时也不得新增其他 .cu"
++// and "cuDNN (Conv only)". cuBLAS is allowed for GEMM. But we can choose to implement GEMM manually
++// or use cuBLAS. However, binding.cpp will call our launcher, and we can call cuBLAS inside the launcher
++// if we include cublas_v2.h. That would be efficient. But for simplicity and to avoid interop issues,
++// we could implement a simple matvec kernel for the gates. Since hidden_size=200, and batch_size=512,
++// the total computations are not huge; a naive kernel may be acceptable. The requirement is 5% faster
++// than torch.compile, which for LSTM may be tough. But we'll implement a reasonably optimized kernel.
++
++// Let's design a kernel that uses one thread per batch element for a single hidden unit? That would be
++// slow. Better: use one block per batch element with 256 threads, and within each block compute all
++// gates for a single time step and layer using a loop over hidden units. Since H=200, we can assign
++// each thread to compute one hidden unit's gate pre-activations for all four gates, then sync, then
++// update states. That uses 200 threads per block (or 256 with some idle). This is simple and coalesced
++// if we organize memory well.
++
++// Actually, we can unroll the four gates: each thread computes for a single hidden index j:
++// pre_i = b_ih[j] + b_hh[j] + sum_k W_ih[j, k] * x_t[k] + sum_k W_hh[j, k] * h_prev[k]
++// similarly for f, g, o. Then we store four pre-activations, sync, and then each thread updates c and h.
++// This requires each thread to read many weights (D + H per gate, total 4*(D+H) reads per thread).
++// With 200 threads, total reads per time step per layer per batch ~ 4*(D+H)*H, which is similar to
++// total operations. This is okay.
++// We can improve by loading x_t and h_prev into shared memory first, then each thread loops over k.
++// For D=10 (small), x_t loading is trivial. For H=200, h_prev is 200 floats, can be shared.
++// We also need W_ih and W_hh; we could store them in shared memory if they fit. For layer0:
++// W_ih: 4H*D = 4*200*10 = 8000 floats (32KB), W_hh: 4H*H = 160000 floats (640KB) too large.
++// So we cannot fit W_hh in shared memory. We'll read from global, but we can tile and use shared memory
++// for portions? Or just rely on L2 cache. Since batch_size=512 and each block processes a different batch
++// element, same weights are reused across blocks, so L2 cache helps.
++// In this design, each block has H threads, each thread computes four gates for its hidden unit.
++// We'll launch one block per batch element, with blockDim.x = 256 (to cover H=200). Grid = batch_size.
++// Inside block, we loop over time steps sequentially, and for each time step we compute layer0 then layer1.
++// We'll need shared memory for h_prev, c_prev, and current activations, plus x_t for layer0 input.
++// We can store h_prev for layer0 and layer1 in shared arrays of size H. Also x_t of size D, and intermediate
++// h_t^0 of size H used as input to layer1.
++
++// But computing layer1 uses different weights (W_ih_l1 and W_hh_l1) and input size H.
++
++// We'll implement two separate kernel invocations? One kernel for both layers with the same block
++// processing both layers sequentially, using different weights and shared states.
++
++// Pseudo-code for kernel per block:
++/*
++__global__ void lstm_forward_kernel(
++    const float* x,       // [seq_len, batch_size, input_size]
++    const float* h0,       // [num_layers, batch_size, hidden_size]
++    const float* c0,       // [num_layers, batch_size, hidden_size]
++    const float* w_ih_l0,  // [4*H, D]
++    const float* w_hh_l0,  // [4*H, H]
++    const float* b_ih_l0,  // [4*H]
++    const float* b_hh_l0,  // [4*H]
++    const float* w_ih_l1,  // [4*H, H]
++    const float* w_hh_l1,  // [4*H, H]
++    const float* b_ih_l1,  // [4*H]
++    const float* b_hh_l1,  // [4*H]
++    float* output,        // [seq_len, batch_size, H]
++    float* h_n,           // [num_layers, batch_size, H]
++    float* c_n,           // [num_layers, batch_size, H]
++    int seq_len, int batch_size, int input_size, int hidden_size, int num_layers
++) {
++    extern __shared__ float smem[];
++    // Layout: 
++    // smem[0:H]           : h_prev for current processing (layer0 or layer1)
++    // smem[H:2H]          : c_prev
++    // smem[2H:2H+D]       : input vector (x_t for layer0, h_t^0 for layer1)
++    // smem[2H+D:2H+D+H]   : h_t output for layer0, used as input for layer1
++    // ... maybe more
++
++    int b = blockIdx.x;
++    int tid = threadIdx.x;
++    int H = hidden_size;
++    int D = input_size;
++    int T = seq_len;
++
++    float* h_cur = smem;
++    float* c_cur = smem + H;
++    float* input_vec = smem + 2*H;
++    float* h_layer0 = smem + 2*H + D;  // size H, but D <= H, allocate enough
++
++    // Initialize h_cur and c_cur for layer0 from h0[0,b,:] and c0[0,b,:]
++    // All threads cooperate to load from global (h0 and c0 are zero, but read anyway)
++    for (int i = tid; i < H; i += blockDim.x) {
++        h_cur[i] = h0[0 * batch_size * H + b * H + i];
++        c_cur[i] = c0[0 * batch_size * H + b * H + i];
++    }
++    __syncthreads();
++
++    for (int t = 0; t < T; ++t) {
++        // ---- Layer 0 ----
++        // Load input x_t for this batch: x[t, b, :] into input_vec (size D)
++        for (int i = tid; i < D; i += blockDim.x) {
++            input_vec[i] = x[t * batch_size * D + b * D + i];
++        }
++        __syncthreads();
++
++        // Compute four gates for each hidden unit j (each thread handles one j if tid < H)
++        // Use a loop over k for each gate, but to reduce reads, we can compute all four gates
++        // inside one loop over k, accumulating four sums.
++        if (tid < H) {
++            int j = tid;
++            // Gate indices: i=0, f=H, g=2H, o=3H
++            float sum_i = b_ih_l0[j] + b_hh_l0[j];
++            float sum_f = b_ih_l0[H + j] + b_hh_l0[H + j];
++            float sum_g = b_ih_l0[2*H + j] + b_hh_l0[2*H + j];
++            float sum_o = b_ih_l0[3*H + j] + b_hh_l0[3*H + j];
++
++            // Input contribution: sum_k W_ih[j,k]*x_t[k] for all four gates
++            // W_ih_l0 layout: [4*H, D], so rows: gate_index*H + j
++            for (int k = 0; k < D; ++k) {
++                float xk = input_vec[k];
++                sum_i += w_ih_l0[j * D + k] * xk;
++                sum_f += w_ih_l0[(H + j) * D + k] * xk;
++                sum_g += w_ih_l0[(2*H + j) * D + k] * xk;
++                sum_o += w_ih_l0[(3*H + j) * D + k] * xk;
++            }
++            // Hidden contribution: sum_k W_hh[j,k]*h_prev[k]
++            for (int k = 0; k < H; ++k) {
++                float hk = h_cur[k];
++                sum_i += w_hh_l0[j * H + k] * hk;
++                sum_f += w_hh_l0[(H + j) * H + k] * hk;
++                sum_g += w_hh_l0[(2*H + j) * H + k] * hk;
++                sum_o += w_hh_l0[(3*H + j) * H + k] * hk;
++            }
++
++            // Apply activations
++            float i_gate = sigmoidf(sum_i);
++            float f_gate = sigmoidf(sum_f);
++            float g_gate = tanhf(sum_g);
++            float o_gate = sigmoidf(sum_o);
++            float c_new = f_gate * c_cur[j] + i_gate * g_gate;
++            float h_new = o_gate * tanhf(c_new);
++
++            // Store new h and c in shared for next step and for output
++            // But careful: we cannot overwrite h_cur and c_cur until all threads have read them.
++            // We'll write to separate arrays: h_next and c_next, then swap.
++            // We can use smem offsets for h_next and c_next.
++            // For simplicity, we'll temporarily store h_new and c_new in registers and then after
++            // all threads compute, use __syncthreads and then copy to h_cur and c_cur.
++            // But we need to store h_layer0 for layer1 input.
++            // So we need additional shared arrays: h_next, c_next, and h_layer0_output.
++        }
++        __syncthreads();
++
++        // After computing layer0, we need to store h_t^0 to output at this time step for all batches.
++        // But we can write to global output directly from each thread.
++        // output[t, b, j] = h_new for tid<H.
++        // Also store h_t^0 in shared for use as input to layer1.
++        // Then proceed to layer1.
++
++        // Layer 1 similar but input is h_layer0 (H) and weights w_ih_l1, w_hh_l1, biases b_ih_l1,b_hh_l1.
++        // After layer1, output[t,b,j] = h_new1.
++        // Update h_cur and c_cur for next time step using layer1 states.
++    }
++
++    // After all time steps, write final h_n and c_n for both layers.
++}
++*/
++
++// The above design is possible but requires careful shared memory management and synchronization.
++// We'll implement it step by step with a reasonable shared memory layout.
++// Since hidden_size=200, D=10, we need shared memory for:
++// - h_prev, c_prev for current layer (H each)
++// - h_next, c_next for new states (H each)
++// - input vector (D)
++// - h_layer0_output (H) to be used as input to layer1
++// Total shared ~ 4*H + 2*D + small. For H=200: 800+20=820 floats, about 3.3KB. Fine.
++// But we also need to store layer0's h and c temporarily while processing layer1 or next time step.
++// We'll allocate separate arrays for layer0 states across time? Actually after layer0 at time t,
++// we need to keep its h_t and c_t for the next time step of layer0 (t+1). So we need separate storage
++// per layer. We can maintain h_l0, c_l0 for layer0, and h_l1, c_l1 for layer1.
++// At each time step, we compute both layers and update each layer's states.
++// So shared arrays: h_l0, c_l0, h_l1, c_l1, each H floats => 4*H=800 floats.
++// Plus temporary for input vectors and h_layer0 output (could reuse).
++// For computing layer1, input is h_l0_new, which we can store in a temporary array h_l0_new,
++// but we also need h_l0_new as the updated h_l0 for next time step, so we can compute into
++// h_l0_new and then copy to h_l0 after use? We'll use double buffering per layer:
++// h_l0_cur, c_l0_cur, h_l0_next, c_l0_next, similarly for layer1.
++// That would be 8*H = 1600 floats ~ 6.4KB. Fine.
++
++// We'll implement a kernel with shared memory size dynamically set.
++
++// Define a struct for LSTM parameters in constant memory? We'll pass as arguments.
++
++// We'll create a launcher function `lstm_forward_launcher` that does no allocation;
++// it assumes output, h_n, c_n are allocated by binding.cpp.
++
++// We'll also handle non-contiguous input? The binding should ensure contiguous. We'll add a check
++// in launcher? The launcher only receives pointers; binding will pass contiguous tensors after calling
++// .contiguous() if needed.
++
++// Let's write the actual kernel code.
++
++__global__ void lstm_forward_kernel(
++    const float* __restrict__ x,          // [seq_len, batch_size, input_size]
++    const float* __restrict__ h0,         // [num_layers, batch_size, hidden_size]
++    const float* __restrict__ c0,         // [num_layers, batch_size, hidden_size]
++    const float* __restrict__ w_ih_l0,    // [4*H, D]
++    const float* __restrict__ w_hh_l0,    // [4*H, H]
++    const float* __restrict__ b_ih_l0,    // [4*H]
++    const float* __restrict__ b_hh_l0,    // [4*H]
++    const float* __restrict__ w_ih_l1,    // [4*H, H]
++    const float* __restrict__ w_hh_l1,    // [4*H, H]
++    const float* __restrict__ b_ih_l1,    // [4*H]
++    const float* __restrict__ b_hh_l1,    // [4*H]
++    float* __restrict__ output,           // [seq_len, batch_size, H]
++    float* __restrict__ h_n,              // [num_layers, batch_size, H]
++    float* __restrict__ c_n,              // [num_layers, batch_size, H]
++    int seq_len,
++    int batch_size,
++    int input_size,
++    int hidden_size,
++    int num_layers
++) {
++    extern __shared__ float smem[];
++
++    const int H = hidden_size;
++    const int D = input_size;
++    const int T = seq_len;
++    const int b = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int num_threads = blockDim.x;
++
++    // Shared memory layout:
++    // We need arrays for current and next states for both layers.
++    // Let's assign offsets:
++    float* h_l0_cur = smem;                       // H
++    float* c_l0_cur = h_l0_cur + H;               // H
++    float* h_l0_next = c_l0_cur + H;              // H
++    float* c_l0_next = h_l0_next + H;             // H
++    float* h_l1_cur = c_l0_next + H;              // H
++    float* c_l1_cur = h_l1_cur + H;               // H
++    float* h_l1_next = c_l1_cur + H;              // H
++    float* c_l1_next = h_l1_next + H;             // H
++    float* x_t = c_l1_next + H;                   // D (small)
++    float* h_l0_output = x_t + D;                 // H (temporary for layer1 input)
++
++    // Total shared: 8*H + D + H = 9*H + D floats. For H=200, D=10 => 1810 floats, ~7.24KB.
++
++    // Initialize layer0 states from h0[0,b,:] and c0[0,b,:]
++    for (int i = tid; i < H; i += num_threads) {
++        h_l0_cur[i] = h0[0 * batch_size * H + b * H + i];
++        c_l0_cur[i] = c0[0 * batch_size * H + b * H + i];
++    }
++    // Initialize layer1 states from h0[1,b,:] and c0[1,b,:] (if num_layers > 1)
++    if (num_layers > 1) {
++        for (int i = tid; i < H; i += num_threads) {
++            h_l1_cur[i] = h0[1 * batch_size * H + b * H + i];
++            c_l1_cur[i] = c0[1 * batch_size * H + b * H + i];
++        }
++    }
++    __syncthreads();
++
++    for (int t = 0; t < T; ++t) {
++        // ========== Layer 0 ==========
++        // Load x_t for this batch and time step
++        for (int i = tid; i < D; i += num_threads) {
++            x_t[i] = x[t * batch_size * D + b * D + i];
++        }
++        __syncthreads();
++
++        // Compute gates and new states for layer0
++        if (tid < H) {
++            int j = tid;
++            float sum_i = b_ih_l0[j] + b_hh_l0[j];
++            float sum_f = b_ih_l0[H + j] + b_hh_l0[H + j];
++            float sum_g = b_ih_l0[2*H + j] + b_hh_l0[2*H + j];
++            float sum_o = b_ih_l0[3*H + j] + b_hh_l0[3*H + j];
++
++            // input contribution
++            for (int k = 0; k < D; ++k) {
++                float xk = x_t[k];
++                sum_i += w_ih_l0[j * D + k] * xk;
++                sum_f += w_ih_l0[(H + j) * D + k] * xk;
++                sum_g += w_ih_l0[(2*H + j) * D + k] * xk;
++                sum_o += w_ih_l0[(3*H + j) * D + k] * xk;
++            }
++            // hidden contribution
++            for (int k = 0; k < H; ++k) {
++                float hk = h_l0_cur[k];
++                sum_i += w_hh_l0[j * H + k] * hk;
++                sum_f += w_hh_l0[(H + j) * H + k] * hk;
++                sum_g += w_hh_l0[(2*H + j) * H + k] * hk;
++                sum_o += w_hh_l0[(3*H + j) * H + k] * hk;
++            }
++
++            float i_gate = sigmoidf(sum_i);
++            float f_gate = sigmoidf(sum_f);
++            float g_gate = tanhf(sum_g);
++            float o_gate = sigmoidf(sum_o);
++            float c_new = f_gate * c_l0_cur[j] + i_gate * g_gate;
++            float h_new = o_gate * tanhf(c_new);
++
++            h_l0_next[j] = h_new;
++            c_l0_next[j] = c_new;
++            // Store h_new for layer1 input
++            h_l0_output[j] = h_new;
++            // Write output for layer0? The final output should be from layer1, but we
++            // still need to store the layer0 output? PyTorch LSTM returns output of all layers
++            // when num_layers > 1, it returns output of the last layer only. Actually torch LSTM
++            // returns output of last layer. So we only need to write output after layer1.
++            // But we might store layer0 output for debugging? No.
++        }
++        __syncthreads();
++
++        // Swap layer0 current and next: we can copy or use pointer swap (not easy in shared).
++        // We'll copy next to cur.
++        for (int i = tid; i < H; i += num_threads) {
++            h_l0_cur[i] = h_l0_next[i];
++            c_l0_cur[i] = c_l0_next[i];
++        }
++        __syncthreads();
++
++        // ========== Layer 1 (if num_layers >= 2) ==========
++        if (num_layers >= 2) {
++            // Now x_t for layer1 is h_l0_output, already in shared.
++            // Compute gates using w_ih_l1, w_hh_l1, b_ih_l1, b_hh_l1.
++            if (tid < H) {
++                int j = tid;
++                float sum_i = b_ih_l1[j] + b_hh_l1[j];
++                float sum_f = b_ih_l1[H + j] + b_hh_l1[H + j];
++                float sum_g = b_ih_l1[2*H + j] + b_hh_l1[2*H + j];
++                float sum_o = b_ih_l1[3*H + j] + b_hh_l1[3*H + j];
++
++                // input contribution: input is h_l0_output (size H)
++                for (int k = 0; k < H; ++k) {
++                    float xk = h_l0_output[k];
++                    sum_i += w_ih_l1[j * H + k] * xk;
++                    sum_f += w_ih_l1[(H + j) * H + k] * xk;
++                    sum_g += w_ih_l1[(2*H + j) * H + k] * xk;
++                    sum_o += w_ih_l1[(3*H + j) * H + k] * xk;
++                }
++                // hidden contribution: h_l1_cur
++                for (int k = 0; k < H; ++k) {
++                    float hk = h_l1_cur[k];
++                    sum_i += w_hh_l1[j * H + k] * hk;
++                    sum_f += w_hh_l1[(H + j) * H + k] * hk;
++                    sum_g += w_hh_l1[(2*H + j) * H + k] * hk;
++                    sum_o += w_hh_l1[(3*H + j) * H + k] * hk;
++                }
++
++                float i_gate = sigmoidf(sum_i);
++                float f_gate = sigmoidf(sum_f);
++                float g_gate = tanhf(sum_g);
++                float o_gate = sigmoidf(sum_o);
++                float c_new = f_gate * c_l1_cur[j] + i_gate * g_gate;
++                float h_new = o_gate * tanhf(c_new);
++
++                h_l1_next[j] = h_new;
++                c_l1_next[j] = c_new;
++                // Write final output for this layer (time t, batch b, unit j)
++                output[t * batch_size * H + b * H + j] = h_new;
++            }
++            __syncthreads();
++
++            // Swap layer1 current and next
++            for (int i = tid; i < H; i += num_threads) {
++                h_l1_cur[i] = h_l1_next[i];
++                c_l1_cur[i] = c_l1_next[i];
++            }
++            __syncthreads();
++        } else {
++            // If num_layers == 1, output from layer0
++            if (tid < H) {
++                output[t * batch_size * H + b * H + tid] = h_l0_next[tid];
++            }
++            __syncthreads();
++        }
++    }
++
++    // Write final h_n and c_n for both layers.
++    // For layer0:
++    for (int i = tid; i < H; i += num_threads) {
++        h_n[0 * batch_size * H + b * H + i] = h_l0_cur[i];
++        c_n[0 * batch_size * H + b * H + i] = c_l0_cur[i];
++    }
++    if (num_layers > 1) {
++        for (int i = tid; i < H; i += num_threads) {
++            h_n[1 * batch_size * H + b * H + i] = h_l1_cur[i];
++            c_n[1 * batch_size * H + b * H + i] = c_l1_cur[i];
++        }
++    }
++    // If num_layers > 2, we would need additional layers, but contract says exactly 2.
++    // For generality, we could loop over layers, but we'll assume num_layers <= 2.
++    // The launcher will check num_layers.
++}
++
++// ---------------------------------------------------------------------------
++// Launcher functions (extern "C")
++
++extern "C" void zeros_like_alloc_launcher(
++    float* output,
++    int64_t num_layers,
++    int64_t batch_size,
++    int64_t hidden_size,
++    cudaStream_t stream
++) {
++    int64_t total = num_layers * batch_size * hidden_size;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid limit, will use grid-stride loop
++    zeros_kernel<<<blocks, threads, 0, stream>>>(output, total);
++}
++
++extern "C" void linear_fc_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch_size,
++    int in_features,
++    int out_features,
++    cudaStream_t stream
++) {
++    dim3 threads(16, 16); // 256 threads
++    dim3 blocks((out_features + threads.x - 1) / threads.x,
++                (batch_size + threads.y - 1) / threads.y);
++    linear_fc_kernel<<<blocks, threads, 0, stream>>>(
++        input, weight, bias, output, batch_size, in_features, out_features);
++}
++
++extern "C" void lstm_forward_launcher(
++    const float* x,
++    const float* h0,
++    const float* c0,
++    const float* w_ih_l0,
++    const float* w_hh_l0,
++    const float* b_ih_l0,
++    const float* b_hh_l0,
++    const float* w_ih_l1,
++    const float* w_hh_l1,
++    const float* b_ih_l1,
++    const float* b_hh_l1,
++    float* output,
++    float* h_n,
++    float* c_n,
++    int seq_len,
++    int batch_size,
++    int input_size,
++    int hidden_size,
++    int num_layers,
++    cudaStream_t stream
++) {
++    // Check that num_layers == 2 (or 1) as we only implemented up to 2 layers.
++    // Contract always passes 2, but be safe.
++    if (num_layers != 2 && num_layers != 1) {
++        // Not supported, but binding should prevent this.
++        // We'll still launch for 1 or 2; for >2, kernel won't compute correctly.
++        // For now, assume valid.
++    }
++
++    int threads = 256; // enough for hidden_size up to 256.
++    int blocks = batch_size;
++    int shared_mem = (9 * hidden_size + input_size) * sizeof(float);
++    lstm_forward_kernel<<<blocks, threads, shared_mem, stream>>>(
++        x, h0, c0, w_ih_l0, w_hh_l0, b_ih_l0, b_hh_l0,
++        w_ih_l1, w_hh_l1, b_ih_l1, b_hh_l1,
++        output, h_n, c_n, seq_len, batch_size, input_size, hidden_size, num_layers);
++}
++
++// Note: The binding.cpp will call these launchers after allocating output tensors.
++// The .cu file contains no PyTorch dependencies, as required.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,236 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void zeros_like_alloc_launcher(
++    float* output,
++    int64_t num_layers,
++    int64_t batch_size,
++    int64_t hidden_size,
++    cudaStream_t stream
++);
++
++extern "C" void linear_fc_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int batch_size,
++    int in_features,
++    int out_features,
++    cudaStream_t stream
++);
++
++extern "C" void lstm_forward_launcher(
++    const float* x,
++    const float* h0,
++    const float* c0,
++    const float* w_ih_l0,
++    const float* w_hh_l0,
++    const float* b_ih_l0,
++    const float* b_hh_l0,
++    const float* w_ih_l1,
++    const float* w_hh_l1,
++    const float* b_ih_l1,
++    const float* b_hh_l1,
++    float* output,
++    float* h_n,
++    float* c_n,
++    int seq_len,
++    int batch_size,
++    int input_size,
++    int hidden_size,
++    int num_layers,
++    cudaStream_t stream
++);
++
++// Helper: ensure tensor is contiguous float32 CUDA
++torch::Tensor ensure_contiguous_float32_cuda(torch::Tensor tensor, const std::string& name) {
++    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(tensor.dtype() == torch::kFloat32, name, " must have dtype torch.float32");
++    if (!tensor.is_contiguous()) {
++        tensor = tensor.contiguous();
++    }
++    return tensor;
++}
++
++// Operator 1: zeros_like_alloc
++torch::Tensor zeros_like_alloc_forward(int64_t num_layers, int64_t batch_size, int64_t hidden_size, int64_t device) {
++    TORCH_CHECK(num_layers > 0, "num_layers must be positive");
++    TORCH_CHECK(batch_size > 0, "batch_size must be positive");
++    TORCH_CHECK(hidden_size > 0, "hidden_size must be positive");
++    TORCH_CHECK(device >= 0, "device index must be non-negative");
++
++    auto options = torch::TensorOptions()
++        .dtype(torch::kFloat32)
++        .device(torch::Device(torch::kCUDA, device));
++
++    auto output = torch::empty({num_layers, batch_size, hidden_size}, options);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    zeros_like_alloc_launcher(
++        output.data_ptr<float>(),
++        num_layers,
++        batch_size,
++        hidden_size,
++        stream
++    );
++
++    return output;
++}
++
++// Operator 2: linear_fc
++torch::Tensor linear_fc_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
++    input = ensure_contiguous_float32_cuda(input, "input");
++    weight = ensure_contiguous_float32_cuda(weight, "weight");
++    bias = ensure_contiguous_float32_cuda(bias, "bias");
++
++    // Check dimensions
++    TORCH_CHECK(input.dim() == 2, "input must be 2D [batch_size, hidden_size]");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [out_features, hidden_size]");
++    TORCH_CHECK(bias.dim() == 1, "bias must be 1D [out_features]");
++
++    int64_t batch_size = input.size(0);
++    int64_t in_features = input.size(1);
++    int64_t out_features = weight.size(0);
++
++    TORCH_CHECK(weight.size(1) == in_features, "weight second dimension must match input hidden size");
++    TORCH_CHECK(bias.size(0) == out_features, "bias size must match out_features");
++
++    auto output = torch::empty({batch_size, out_features}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    linear_fc_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
++        (int)batch_size,
++        (int)in_features,
++        (int)out_features,
++        stream
++    );
++
++    return output;
++}
++
++// Operator 3: lstm_forward
++std::tuple<torch::Tensor, std::tuple<torch::Tensor, torch::Tensor>> lstm_forward_forward(
++    torch::Tensor x,
++    torch::Tensor h0,
++    torch::Tensor c0,
++    torch::Tensor weight_ih_l0,
++    torch::Tensor weight_hh_l0,
++    torch::Tensor bias_ih_l0,
++    torch::Tensor bias_hh_l0,
++    torch::Tensor weight_ih_l1,
++    torch::Tensor weight_hh_l1,
++    torch::Tensor bias_ih_l1,
++    torch::Tensor bias_hh_l1,
++    int64_t num_layers,
++    int64_t hidden_size
++) {
++    // Ensure all tensors are contiguous float32 CUDA
++    x = ensure_contiguous_float32_cuda(x, "x");
++    h0 = ensure_contiguous_float32_cuda(h0, "h0");
++    c0 = ensure_contiguous_float32_cuda(c0, "c0");
++    weight_ih_l0 = ensure_contiguous_float32_cuda(weight_ih_l0, "weight_ih_l0");
++    weight_hh_l0 = ensure_contiguous_float32_cuda(weight_hh_l0, "weight_hh_l0");
++    bias_ih_l0 = ensure_contiguous_float32_cuda(bias_ih_l0, "bias_ih_l0");
++    bias_hh_l0 = ensure_contiguous_float32_cuda(bias_hh_l0, "bias_hh_l0");
++    weight_ih_l1 = ensure_contiguous_float32_cuda(weight_ih_l1, "weight_ih_l1");
++    weight_hh_l1 = ensure_contiguous_float32_cuda(weight_hh_l1, "weight_hh_l1");
++    bias_ih_l1 = ensure_contiguous_float32_cuda(bias_ih_l1, "bias_ih_l1");
++    bias_hh_l1 = ensure_contiguous_float32_cuda(bias_hh_l1, "bias_hh_l1");
++
++    // Validate shapes
++    TORCH_CHECK(x.dim() == 3, "x must be 3D [seq_len, batch_size, input_size]");
++    TORCH_CHECK(h0.dim() == 3, "h0 must be 3D [num_layers, batch_size, hidden_size]");
++    TORCH_CHECK(c0.dim() == 3, "c0 must be 3D [num_layers, batch_size, hidden_size]");
++
++    int64_t seq_len = x.size(0);
++    int64_t batch_size = x.size(1);
++    int64_t input_size = x.size(2);
++
++    TORCH_CHECK(h0.size(0) == num_layers, "h0 layer dimension must match num_layers");
++    TORCH_CHECK(h0.size(1) == batch_size, "h0 batch dimension must match x batch size");
++    TORCH_CHECK(h0.size(2) == hidden_size, "h0 hidden dimension must match hidden_size");
++    TORCH_CHECK(c0.size(0) == num_layers, "c0 layer dimension must match num_layers");
++    TORCH_CHECK(c0.size(1) == batch_size, "c0 batch dimension must match x batch size");
++    TORCH_CHECK(c0.size(2) == hidden_size, "c0 hidden dimension must match hidden_size");
++
++    // Check weight shapes (assuming PyTorch LSTM convention: [4*hidden_size, input_size] for layer0, [4*hidden_size, hidden_size] for layer1)
++    TORCH_CHECK(weight_ih_l0.dim() == 2, "weight_ih_l0 must be 2D");
++    TORCH_CHECK(weight_ih_l0.size(0) == 4 * hidden_size, "weight_ih_l0 first dim must be 4*hidden_size");
++    TORCH_CHECK(weight_ih_l0.size(1) == input_size, "weight_ih_l0 second dim must be input_size");
++    TORCH_CHECK(weight_hh_l0.dim() == 2, "weight_hh_l0 must be 2D");
++    TORCH_CHECK(weight_hh_l0.size(0) == 4 * hidden_size, "weight_hh_l0 first dim must be 4*hidden_size");
++    TORCH_CHECK(weight_hh_l0.size(1) == hidden_size, "weight_hh_l0 second dim must be hidden_size");
++    TORCH_CHECK(bias_ih_l0.dim() == 1 && bias_ih_l0.size(0) == 4 * hidden_size, "bias_ih_l0 size must be 4*hidden_size");
++    TORCH_CHECK(bias_hh_l0.dim() == 1 && bias_hh_l0.size(0) == 4 * hidden_size, "bias_hh_l0 size must be 4*hidden_size");
++
++    // For num_layers >= 2, check layer1 weights, but launcher only supports 1 or 2 layers.
++    if (num_layers >= 2) {
++        TORCH_CHECK(weight_ih_l1.dim() == 2, "weight_ih_l1 must be 2D");
++        TORCH_CHECK(weight_ih_l1.size(0) == 4 * hidden_size, "weight_ih_l1 first dim must be 4*hidden_size");
++        TORCH_CHECK(weight_ih_l1.size(1) == hidden_size, "weight_ih_l1 second dim must be hidden_size");
++        TORCH_CHECK(weight_hh_l1.dim() == 2, "weight_hh_l1 must be 2D");
++        TORCH_CHECK(weight_hh_l1.size(0) == 4 * hidden_size, "weight_hh_l1 first dim must be 4*hidden_size");
++        TORCH_CHECK(weight_hh_l1.size(1) == hidden_size, "weight_hh_l1 second dim must be hidden_size");
++        TORCH_CHECK(bias_ih_l1.dim() == 1 && bias_ih_l1.size(0) == 4 * hidden_size, "bias_ih_l1 size must be 4*hidden_size");
++        TORCH_CHECK(bias_hh_l1.dim() == 1 && bias_hh_l1.size(0) == 4 * hidden_size, "bias_hh_l1 size must be 4*hidden_size");
++    } else {
++        // For num_layers < 2, we can ignore or check that the layer1 tensors are still provided but unused.
++        // We'll still require them to be valid CUDA tensors but not validate their shapes strictly.
++    }
++
++    // Allocate output and final states
++    auto output = torch::empty({seq_len, batch_size, hidden_size}, x.options());
++    auto h_n = torch::empty({num_layers, batch_size, hidden_size}, h0.options());
++    auto c_n = torch::empty({num_layers, batch_size, hidden_size}, c0.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    lstm_forward_launcher(
++        x.data_ptr<float>(),
++        h0.data_ptr<float>(),
++        c0.data_ptr<float>(),
++        weight_ih_l0.data_ptr<float>(),
++        weight_hh_l0.data_ptr<float>(),
++        bias_ih_l0.data_ptr<float>(),
++        bias_hh_l0.data_ptr<float>(),
++        weight_ih_l1.data_ptr<float>(),
++        weight_hh_l1.data_ptr<float>(),
++        bias_ih_l1.data_ptr<float>(),
++        bias_hh_l1.data_ptr<float>(),
++        output.data_ptr<float>(),
++        h_n.data_ptr<float>(),
++        c_n.data_ptr<float>(),
++        (int)seq_len,
++        (int)batch_size,
++        (int)input_size,
++        (int)hidden_size,
++        (int)num_layers,
++        stream
++    );
++
++    return std::make_tuple(output, std::make_tuple(h_n, c_n));
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("zeros_like_alloc", &zeros_like_alloc_forward,
++          py::arg("num_layers"), py::arg("batch_size"), py::arg("hidden_size"), py::arg("device"));
++
++    m.def("lstm_forward", &lstm_forward_forward,
++          py::arg("x"), py::arg("h0"), py::arg("c0"),
++          py::arg("weight_ih_l0"), py::arg("weight_hh_l0"), py::arg("bias_ih_l0"), py::arg("bias_hh_l0"),
++          py::arg("weight_ih_l1"), py::arg("weight_hh_l1"), py::arg("bias_ih_l1"), py::arg("bias_hh_l1"),
++          py::arg("num_layers"), py::arg("hidden_size"));
++
++    m.def("linear_fc", &linear_fc_forward,
++          py::arg("input"), py::arg("weight"), py::arg("bias"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,73 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_size, hidden_size, out_size, num_layers):
++        super(ModelNew, self).__init__()
++        self.hidden_size = hidden_size
++        self.num_layers = num_layers
++        # Keep original submodules to preserve state_dict keys and initialization logic.
++        self.lstm = nn.LSTM(in_size, hidden_size, num_layers, batch_first=True)
++        self.fc = nn.Linear(hidden_size, out_size)
++
++    def forward(self, x):
++        # h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
++        h0 = cuda_extension.zeros_like_alloc(self.num_layers, x.size(0), self.hidden_size, x.device.index)
++        # c0 = ...
++        c0 = cuda_extension.zeros_like_alloc(self.num_layers, x.size(0), self.hidden_size, x.device.index)
++
++        # out, _ = self.lstm(x, (h0, c0))
++        lstm_out = cuda_extension.lstm_forward(
++            x,
++            h0,
++            c0,
++            self.lstm.weight_ih_l0,
++            self.lstm.weight_hh_l0,
++            self.lstm.bias_ih_l0,
++            self.lstm.bias_hh_l0,
++            self.lstm.weight_ih_l1,
++            self.lstm.weight_hh_l1,
++            self.lstm.bias_ih_l1,
++            self.lstm.bias_hh_l1,
++            self.num_layers,
++            self.hidden_size
++        )
++        out = lstm_out[0]
++
++        # out = self.fc(out[:, -1, :])
++        out = cuda_extension.linear_fc(out[:, -1, :], self.fc.weight, self.fc.bias)
++        return out
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        # step_001
++        h0 = cuda_extension.zeros_like_alloc(self.num_layers, x.size(0), self.hidden_size, x.device.index)
++        yield 'step_001', h0
++        # step_002
++        c0 = cuda_extension.zeros_like_alloc(self.num_layers, x.size(0), self.hidden_size, x.device.index)
++        yield 'step_002', c0
++        # step_003
++        lstm_out = cuda_extension.lstm_forward(
++            x,
++            h0,
++            c0,
++            self.lstm.weight_ih_l0,
++            self.lstm.weight_hh_l0,
++            self.lstm.bias_ih_l0,
++            self.lstm.bias_hh_l0,
++            self.lstm.weight_ih_l1,
++            self.lstm.weight_hh_l1,
++            self.lstm.bias_ih_l1,
++            self.lstm.bias_hh_l1,
++            self.num_layers,
++            self.hidden_size
++        )
++        out = lstm_out[0]
++        yield 'step_003', lstm_out
++        # step_004
++        out = cuda_extension.linear_fc(out[:, -1, :], self.fc.weight, self.fc.bias)
++        yield 'step_004', out
++        # step_005
++        yield 'step_005', out

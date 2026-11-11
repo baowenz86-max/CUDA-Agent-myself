@@ -1,0 +1,404 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,212 @@
++#include <cuda_runtime.h>
++
++// Helper to convert linear index to multidimensional coordinates given strides.
++// strides in elements, shape in elements.
++__device__ __forceinline__ void linear_to_coords(
++    long long linear,
++    const int ndim,
++    const long long* __restrict__ shape,
++    const long long* __restrict__ strides, // strides in elements (not bytes)
++    long long* __restrict__ coords)
++{
++    for (int d = ndim - 1; d >= 0; --d) {
++        coords[d] = linear % shape[d];
++        linear /= shape[d];
++    }
++}
++
++// Kernel for reduce_sum along dimension dim.
++// output_shape = shape with dim removed.
++// output linear index corresponds to all coords except coord[dim].
++// Each thread accumulates sum over all elements along dim for its output position.
++template <typename T>
++__global__ void reduce_sum_dim_kernel(
++    const T* __restrict__ input,
++    T* __restrict__ output,
++    const long long* __restrict__ shape,   // full input shape
++    const long long* __restrict__ strides, // input strides in elements
++    const long long* __restrict__ out_shape, // output shape (dim removed)
++    const long long* __restrict__ out_strides, // output strides in elements
++    int ndim,
++    int dim,
++    long long total_output)
++{
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++
++    for (; idx < total_output; idx += stride) {
++        // decompose output linear index into output coords
++        long long rem = idx;
++        long long out_coords[8];
++        int out_ndim = ndim - 1;
++        for (int d = out_ndim - 1; d >= 0; --d) {
++            out_coords[d] = rem % out_shape[d];
++            rem /= out_shape[d];
++        }
++
++        // construct full coords: insert 0 at dim initially
++        long long full_coords[8];
++        for (int d = 0, i = 0; d < ndim; ++d) {
++            if (d == dim) {
++                full_coords[d] = 0;
++            } else {
++                full_coords[d] = out_coords[i++];
++            }
++        }
++
++        // base linear index = sum(full_coords[d]*strides[d])
++        long long base = 0;
++        for (int d = 0; d < ndim; ++d) {
++            base += full_coords[d] * strides[d];
++        }
++
++        // sum over dim
++        T sum = 0;
++        long long dim_size = shape[dim];
++        long long dim_stride = strides[dim];
++        for (long long k = 0; k < dim_size; ++k) {
++            sum += input[base + k * dim_stride];
++        }
++        output[idx] = sum;
++    }
++}
++
++// Kernel for count_nonzero along dimension dim.
++template <typename T>
++__global__ void count_nonzero_dim_kernel(
++    const T* __restrict__ input,
++    long long* __restrict__ output,
++    const long long* __restrict__ shape,
++    const long long* __restrict__ strides,
++    const long long* __restrict__ out_shape,
++    const long long* __restrict__ out_strides,
++    int ndim,
++    int dim,
++    long long total_output)
++{
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++
++    for (; idx < total_output; idx += stride) {
++        long long rem = idx;
++        long long out_coords[8];
++        int out_ndim = ndim - 1;
++        for (int d = out_ndim - 1; d >= 0; --d) {
++            out_coords[d] = rem % out_shape[d];
++            rem /= out_shape[d];
++        }
++
++        long long full_coords[8];
++        for (int d = 0, i = 0; d < ndim; ++d) {
++            if (d == dim) {
++                full_coords[d] = 0;
++            } else {
++                full_coords[d] = out_coords[i++];
++            }
++        }
++
++        long long base = 0;
++        for (int d = 0; d < ndim; ++d) {
++            base += full_coords[d] * strides[d];
++        }
++
++        long long count = 0;
++        long long dim_size = shape[dim];
++        long long dim_stride = strides[dim];
++        for (long long k = 0; k < dim_size; ++k) {
++            T val = input[base + k * dim_stride];
++            if (val != static_cast<T>(0)) {
++                ++count;
++            }
++        }
++        output[idx] = count;
++    }
++}
++
++// Launcher for sum reduction.
++// input and output must be valid device pointers.
++// shape, strides, out_shape, out_strides are device arrays? We can pass host arrays and copy to device if needed.
++// For simplicity and to avoid extra allocations, we pass host arrays to kernel? Not possible.
++// We'll allocate device memory in launcher for shape/strides, copy, then free.
++// Alternatively, pass scalar values; but kernel needs arrays. We'll create device arrays in launcher.
++extern "C" void reduce_sum_dim_launcher(
++    const float* input,
++    float* output,
++    const long long* shape,
++    const long long* strides, // in elements, assuming contiguous? We'll use actual strides from binding (maybe in elements)
++    const long long* out_shape,
++    const long long* out_strides,
++    int ndim,
++    int dim,
++    long long total_output,
++    cudaStream_t stream)
++{
++    // Copy shape/strides to device
++    long long* d_shape;
++    long long* d_strides;
++    long long* d_out_shape;
++    long long* d_out_strides;
++    cudaMalloc(&d_shape, ndim * sizeof(long long));
++    cudaMalloc(&d_strides, ndim * sizeof(long long));
++    cudaMalloc(&d_out_shape, (ndim-1) * sizeof(long long));
++    cudaMalloc(&d_out_strides, (ndim-1) * sizeof(long long));
++    cudaMemcpyAsync(d_shape, shape, ndim * sizeof(long long), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_strides, strides, ndim * sizeof(long long), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_out_shape, out_shape, (ndim-1) * sizeof(long long), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_out_strides, out_strides, (ndim-1) * sizeof(long long), cudaMemcpyHostToDevice, stream);
++
++    int threads = 256;
++    long long blocks_ll = (total_output + threads - 1) / threads;
++    int blocks = (int)min((long long)blocks_ll, (long long)2147483647);
++    if (blocks == 0) blocks = 1;
++
++    reduce_sum_dim_kernel<float><<<blocks, threads, 0, stream>>>(
++        input, output, d_shape, d_strides, d_out_shape, d_out_strides,
++        ndim, dim, total_output);
++
++    cudaFree(d_shape);
++    cudaFree(d_strides);
++    cudaFree(d_out_shape);
++    cudaFree(d_out_strides);
++}
++
++// Launcher for count_nonzero reduction.
++extern "C" void count_nonzero_dim_launcher(
++    const float* input,
++    long long* output,
++    const long long* shape,
++    const long long* strides,
++    const long long* out_shape,
++    const long long* out_strides,
++    int ndim,
++    int dim,
++    long long total_output,
++    cudaStream_t stream)
++{
++    long long* d_shape;
++    long long* d_strides;
++    long long* d_out_shape;
++    long long* d_out_strides;
++    cudaMalloc(&d_shape, ndim * sizeof(long long));
++    cudaMalloc(&d_strides, ndim * sizeof(long long));
++    cudaMalloc(&d_out_shape, (ndim-1) * sizeof(long long));
++    cudaMalloc(&d_out_strides, (ndim-1) * sizeof(long long));
++    cudaMemcpyAsync(d_shape, shape, ndim * sizeof(long long), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_strides, strides, ndim * sizeof(long long), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_out_shape, out_shape, (ndim-1) * sizeof(long long), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_out_strides, out_strides, (ndim-1) * sizeof(long long), cudaMemcpyHostToDevice, stream);
++
++    int threads = 256;
++    long long blocks_ll = (total_output + threads - 1) / threads;
++    int blocks = (int)min((long long)blocks_ll, (long long)2147483647);
++    if (blocks == 0) blocks = 1;
++
++    count_nonzero_dim_kernel<float><<<blocks, threads, 0, stream>>>(
++        input, output, d_shape, d_strides, d_out_shape, d_out_strides,
++        ndim, dim, total_output);
++
++    cudaFree(d_shape);
++    cudaFree(d_strides);
++    cudaFree(d_out_shape);
++    cudaFree(d_out_strides);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,161 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void reduce_sum_dim_launcher(
++    const float* input,
++    float* output,
++    const long long* shape,
++    const long long* strides,
++    const long long* out_shape,
++    const long long* out_strides,
++    int ndim,
++    int dim,
++    long long total_output,
++    cudaStream_t stream);
++
++extern "C" void count_nonzero_dim_launcher(
++    const float* input,
++    long long* output,
++    const long long* shape,
++    const long long* strides,
++    const long long* out_shape,
++    const long long* out_strides,
++    int ndim,
++    int dim,
++    long long total_output,
++    cudaStream_t stream);
++
++static inline void check_cuda_error(const char* msg) {
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(err));
++    }
++}
++
++static torch::Tensor reduce_sum_dim_forward(torch::Tensor x, int64_t dim) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() > 0, "Input must have at least 1 dimension");
++    TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
++
++    // Ensure contiguous for simple stride computation
++    x = x.contiguous();
++
++    auto sizes = x.sizes();
++    int ndim = x.dim();
++    std::vector<long long> shape(ndim);
++    std::vector<long long> strides(ndim);
++    for (int i = 0; i < ndim; ++i) {
++        shape[i] = sizes[i];
++        strides[i] = x.strides()[i]; // strides in elements (since contiguous, but this is safe)
++    }
++
++    // Compute output shape and strides (remove dim)
++    std::vector<long long> out_shape;
++    out_shape.reserve(ndim - 1);
++    for (int i = 0; i < ndim; ++i) {
++        if (i != dim) {
++            out_shape.push_back(sizes[i]);
++        }
++    }
++
++    // Allocate output tensor
++    auto output = torch::empty(out_shape, x.options());
++
++    // Compute output strides (contiguous)
++    long long total_output = output.numel();
++    std::vector<long long> out_strides(ndim - 1);
++    if (ndim - 1 > 0) {
++        out_strides[ndim - 2] = 1;
++        for (int i = ndim - 3; i >= 0; --i) {
++            out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
++        }
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    reduce_sum_dim_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        shape.data(),
++        strides.data(),
++        out_shape.data(),
++        out_strides.data(),
++        ndim,
++        static_cast<int>(dim),
++        total_output,
++        stream
++    );
++
++    check_cuda_error("reduce_sum_dim_launcher failed");
++    return output;
++}
++
++static torch::Tensor count_nonzero_dim_forward(torch::Tensor x, int64_t dim) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() > 0, "Input must have at least 1 dimension");
++    TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
++
++    x = x.contiguous();
++
++    auto sizes = x.sizes();
++    int ndim = x.dim();
++    std::vector<long long> shape(ndim);
++    std::vector<long long> strides(ndim);
++    for (int i = 0; i < ndim; ++i) {
++        shape[i] = sizes[i];
++        strides[i] = x.strides()[i];
++    }
++
++    std::vector<long long> out_shape;
++    out_shape.reserve(ndim - 1);
++    for (int i = 0; i < ndim; ++i) {
++        if (i != dim) {
++            out_shape.push_back(sizes[i]);
++        }
++    }
++
++    auto output = torch::empty(out_shape, x.options().dtype(torch::kInt64));
++
++    long long total_output = output.numel();
++    std::vector<long long> out_strides(ndim - 1);
++    if (ndim - 1 > 0) {
++        out_strides[ndim - 2] = 1;
++        for (int i = ndim - 3; i >= 0; --i) {
++            out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
++        }
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    count_nonzero_dim_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<int64_t>(),
++        shape.data(),
++        strides.data(),
++        out_shape.data(),
++        out_strides.data(),
++        ndim,
++        static_cast<int>(dim),
++        total_output,
++        stream
++    );
++
++    check_cuda_error("count_nonzero_dim_launcher failed");
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("reduce_sum_dim", &reduce_sum_dim_forward, "Reduce sum along a dimension",
++          py::arg("x"), py::arg("dim"));
++    m.def("count_nonzero_dim", &count_nonzero_dim_forward, "Count non-zero along a dimension",
++          py::arg("x"), py::arg("dim"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, dim):
++        super().__init__()
++        self.dim = dim
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x_sum = cuda_extension.reduce_sum_dim(x, self.dim)
++        x_nonzero_count = cuda_extension.count_nonzero_dim(x, self.dim)
++        return x_sum, x_nonzero_count
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x_sum = cuda_extension.reduce_sum_dim(x, self.dim)
++        yield 'step_001', x_sum
++        x_nonzero_count = cuda_extension.count_nonzero_dim(x, self.dim)
++        yield 'step_002', x_nonzero_count
++        yield 'step_003', (x_sum, x_nonzero_count)

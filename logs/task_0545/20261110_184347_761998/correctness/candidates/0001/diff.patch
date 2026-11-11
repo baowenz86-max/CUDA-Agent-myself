@@ -1,0 +1,223 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,102 @@
++#include <cuda_runtime.h>
++
++// Fused kernel: computes max over dim=1 (channels) with keepdim=True,
++// then converts the result to complex64 via view_as_complex semantics.
++// Input x: [batch, channels, height, width, 2] float32, contiguous
++//   channels = 2 (always, per contract)
++// Output complex_out: [batch, height, width] complex64 (stored as float2)
++// Output indices: [batch, 1, height, width, 2] int64, each element is 0 or 1
++//   indicating which channel contributed the max for that real/imag component.
++__global__ void custom_max_view_as_complex_kernel(
++    const float* __restrict__ x,
++    float2* __restrict__ complex_out,
++    long long* __restrict__ indices,
++    int batch,
++    int height,
++    int width,
++    int channels)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = batch * height * width;
++    if (idx >= total) return;
++
++    // Decode flat index to (b, h, w)
++    int w = idx % width;
++    int tmp = idx / width;
++    int h = tmp % height;
++    int b = tmp / height;
++
++    // Input layout: x[b][c][h][w][0/1]
++    // Strides:
++    //   b: channels * height * width * 2
++    //   c: height * width * 2
++    //   h: width * 2
++    //   w: 2
++    //   last dim: 1
++    // Since input is contiguous per contract.
++    const float* base = x + ((long long)b * channels * height * width * 2 +
++                             (long long)h * width * 2 +
++                             (long long)w * 2);
++
++    // For channels=2, compare directly.
++    // channel 0 values:
++    float val0_real = base[0];
++    float val0_imag = base[1];
++    // channel 1 values (stride channels*height*width*2)
++    const float* base1 = base + (long long)height * width * 2; // c=1 stride
++    float val1_real = base1[0];
++    float val1_imag = base1[1];
++
++    // Determine max for real and imag independently.
++    // For tie-breaking, torch.max returns the first index (channel 0), so use > not >=.
++    int idx_real = (val1_real > val0_real) ? 1 : 0;
++    int idx_imag = (val1_imag > val0_imag) ? 1 : 0;
++    float max_real = (idx_real == 1) ? val1_real : val0_real;
++    float max_imag = (idx_imag == 1) ? val1_imag : val0_imag;
++
++    // Write complex output (real, imag)
++    float2 val;
++    val.x = max_real;
++    val.y = max_imag;
++    complex_out[idx] = val;
++
++    // Write indices output: shape [batch,1,height,width,2]
++    // The index tensor has the same spatial strides but with an extra dim of size 1.
++    // Flattened index in indices: ((b*1 + 0)*height*width + h*width + w) * 2 + component
++    long long indices_flat = ((long long)b * height * width + (long long)h * width + w) * 2;
++    indices[indices_flat] = (long long)idx_real;
++    indices[indices_flat + 1] = (long long)idx_imag;
++}
++
++extern "C" void custom_max_view_as_complex_launcher(
++    const float* x,
++    float2* complex_out,
++    long long* indices,
++    int batch,
++    int height,
++    int width,
++    int channels,
++    cudaStream_t stream)
++{
++    if (x == nullptr || complex_out == nullptr || indices == nullptr ||
++        batch <= 0 || height <= 0 || width <= 0 || channels <= 0) {
++        return;
++    }
++    // channels must be 2 per contract, but if not, we fallback to naive loop later.
++    if (channels != 2) {
++        // Not expected, but handle as error by not launching.
++        // In real binding, should check and maybe throw. We just return.
++        return;
++    }
++
++    int total = batch * height * width;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    custom_max_view_as_complex_kernel<<<blocks, threads, 0, stream>>>(
++        x, complex_out, indices, batch, height, width, channels);
++
++    // Optional: check for launch errors (binding may also check)
++    // cudaError_t err = cudaGetLastError();
++    // if (err != cudaSuccess) return;
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,72 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declared in custom_ops.cu
++extern "C" void custom_max_view_as_complex_launcher(
++    const float* x,
++    float2* complex_out,
++    long long* indices,
++    int batch,
++    int height,
++    int width,
++    int channels,
++    cudaStream_t stream);
++
++static std::tuple<torch::Tensor, torch::Tensor> custom_max_view_as_complex(
++    torch::Tensor x)
++{
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "custom_max_view_as_complex: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_max_view_as_complex: input must be float32");
++    TORCH_CHECK(x.dim() == 5, "custom_max_view_as_complex: input must have 5 dimensions [batch, channels, height, width, 2]");
++
++    int batch = x.size(0);
++    int channels = x.size(1);
++    int height = x.size(2);
++    int width = x.size(3);
++    int last = x.size(4);
++
++    TORCH_CHECK(channels == 2, "custom_max_view_as_complex: channel dimension must be 2");
++    TORCH_CHECK(last == 2, "custom_max_view_as_complex: last dimension must be 2");
++    TORCH_CHECK(batch > 0 && height > 0 && width > 0, "custom_max_view_as_complex: batch, height, width must be positive");
++
++    // Ensure contiguous input (the kernel assumes contiguous layout)
++    auto x_contig = x.contiguous();
++
++    // Allocate outputs
++    auto complex_out = torch::empty({batch, height, width},
++                                    torch::dtype(torch::kComplexFloat).device(x.device()));
++    auto indices = torch::empty({batch, 1, height, width, 2},
++                                torch::dtype(torch::kLong).device(x.device()));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_max_view_as_complex_launcher(
++        x_contig.data_ptr<float>(),
++        reinterpret_cast<float2*>(complex_out.data_ptr<c10::complex<float>>()),
++        indices.data_ptr<int64_t>(),
++        batch,
++        height,
++        width,
++        channels,
++        stream);
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_max_view_as_complex: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return std::make_tuple(complex_out, indices);
++}
++
++static void register_custom_max_view_as_complex(pybind11::module& m) {
++    m.def("custom_max_view_as_complex", &custom_max_view_as_complex,
++          "Fused max over dim=1 and view_as_complex",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_max_view_as_complex, register_custom_max_view_as_complex);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,40 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, height, width):
++        super().__init__()
++        # No parameters or buffers in reference model
++
++    def forward(self, x):
++        # Custom op performs max over dim=1 and view_as_complex
++        result, _ = cuda_extension.custom_max_view_as_complex(x)
++        return result
++
++    def debug_forward(self, x):
++        # Yield each checkpoint in order, matching reference_steps
++        max_result, indices = cuda_extension.custom_max_view_as_complex(x)
++        # step_001: tuple of max values (float32) and indices (int64), keepdim=True shape [128,1,512,512,2]
++        yield "step_001", (max_result.unsqueeze(1), indices.unsqueeze(1))
++        # step_002 and step_003: complex output after squeeze and view_as_complex
++        complex_result = max_result.squeeze(1)
++        yield "step_002", complex_result
++        yield "step_003", complex_result
++
++
++batch_size = 128
++in_channels = 2
++height, width = 512, 512
++
++
++def get_inputs():
++    real_part = torch.randn(batch_size, in_channels, height, width)
++    imag_part = torch.randn(batch_size, in_channels, height, width)
++    x = torch.stack((real_part, imag_part), dim=-1)
++    return [x]
++
++
++def get_init_inputs():
++    return [in_channels, height, width]

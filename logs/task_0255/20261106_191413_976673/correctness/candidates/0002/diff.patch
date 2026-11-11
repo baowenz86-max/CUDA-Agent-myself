@@ -1,0 +1,251 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -116,45 +116,6 @@
+ // 输出与输入具有相同的 shape 与 strides（binding 层分配相同 strides）。
+ // -----------------------------------------------------------------------------
+ 
+-__global__ void add_bias_kernel(
+-    const float* __restrict__ input,
+-    const float* __restrict__ bias,
+-    float* __restrict__ output,
+-    int64_t total_elements,
+-    int64_t channels,
+-    int64_t spatial_size,
+-    int64_t in_stride_batch,
+-    int64_t in_stride_channel,
+-    int64_t in_stride_height,
+-    int64_t in_stride_width)
+-{
+-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+-
+-    for (int64_t linear = idx; linear < total_elements; linear += stride) {
+-        // 从线性索引解析出 n, c, h, w（基于输入 strides，假设输入形状为 [N, C, H, W]）
+-        // 这里输入可能非连续，使用与输入相同的 strides
+-        int64_t rem = linear;
+-        int64_t w = rem % in_stride_width; // 注意：in_stride_width 可能不为 1，需要谨慎
+-        // 上述方法仅在 strides 为常规时有效：in_stride_width = 1, in_stride_height = W, in_stride_channel = H*W, in_stride_batch = C*H*W
+-        // 但为了通用性，我们使用逐维除法，基于实际 strides。
+-        // 因为 binding 层会确保 strides 正确，此处采用公式。
+-        // 假设 in_stride_width = 1, in_stride_height = W, in_stride_channel = H*W, in_stride_batch = C*H*W
+-        // 更通用的做法是传递 width, height, batch 等，此处简化假设输入是连续的（在 binding 层保证）。
+-        // 实际上 custom_ops_contract 表示 add_bias 输入 supports strides，因此需要正确解析索引。
+-        // 我们传递 total_elements 表示按连续视图的长度，但输入可能非连续，因此需要谨慎。
+-        // 这里采用从线性索引映射到多维坐标，但需要 shape 信息。我们没有传递 shape，只传了 channels 和 spatial_size。
+-        // 为安全，假设输入是连续存储的 NCHW（binding 层会先做 contiguous），因此 strides 为 W, H*W, C*H*W。
+-        // 此实现目前按连续假设。
+-        int64_t w = linear % in_stride_height; // 因为 in_stride_height 是 W，in_stride_width=1
+-        int64_t h = (linear / in_stride_height) % (spatial_size / in_stride_height);
+-        // 更简单：binding 层确保传入连续张量和正确 strides，但此处我们可能忽略。
+-        // 为简化，我们传递必要的维度信息。
+-    }
+-}
+-
+-// 上述 add_bias_kernel 不完整，需要修正。重新实现正确的内核。
+-
+ __global__ void add_bias_kernel_v2(
+     const float* __restrict__ input,
+     const float* __restrict__ bias,
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,7 +2,6 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include "../binding_registry.h"
+ 
+@@ -36,23 +35,6 @@
+     int64_t in_stride_width,
+     cudaStream_t stream);
+ 
+-// cuDNN 错误检查辅助函数
+-#define CUDNN_CHECK(condition) \
+-    do { \
+-        cudnnStatus_t status = condition; \
+-        TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, \
+-            "cuDNN error at ", __FILE__, ":", __LINE__, ": ", cudnnGetErrorString(status)); \
+-    } while (0)
+-
+-// 获取当前 cuDNN handle（每个线程一个）
+-static cudnnHandle_t get_cudnn_handle() {
+-    static thread_local cudnnHandle_t handle = nullptr;
+-    if (!handle) {
+-        CUDNN_CHECK(cudnnCreate(&handle));
+-    }
+-    return handle;
+-}
+-
+ // -----------------------------------------------------------------------------
+ // avgpool2d_forward 包装
+ // -----------------------------------------------------------------------------
+@@ -78,18 +60,12 @@
+     // 获取当前 CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // 如果输入非连续，需要处理 strides；平均池化 kernel 支持任意 strides，
+-    // 但 launcher 接受 stride 参数。
+-    // 为了简化并确保正确性，我们直接将输入视为可能非连续，但需要传递 strides。
+-    // 然而如果 strides 不是正值，可能会有问题。实际 PyTorch 中大多数情况下输入是连续的，
+-    // 但契约允许非连续，因此我们使用 input.strides() 传递。
+-    // 注意：input.strides() 返回 IntArrayRef，单位为元素数。
++    // 传递 strides（元素数）
+     int64_t in_stride_batch = input.stride(0);
+     int64_t in_stride_channel = input.stride(1);
+     int64_t in_stride_height = input.stride(2);
+     int64_t in_stride_width = input.stride(3);
+ 
+-    // 调用 launcher
+     avgpool2d_forward_launcher(
+         input.data_ptr<float>(),
+         output.data_ptr<float>(),
+@@ -106,131 +82,7 @@
+         stream
+     );
+ 
+-    // 检查 kernel 错误
+     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "avgpool2d_forward: kernel launch failed");
+-
+-    return output;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// conv_transpose2d_forward 包装（cuDNN）
+-// -----------------------------------------------------------------------------
+-torch::Tensor conv_transpose2d_forward(
+-    torch::Tensor input,
+-    torch::Tensor weight,
+-    int64_t stride,
+-    int64_t padding,
+-    int64_t output_padding) {
+-
+-    TORCH_CHECK(input.is_cuda(), "conv_transpose2d_forward: input must be CUDA");
+-    TORCH_CHECK(weight.is_cuda(), "conv_transpose2d_forward: weight must be CUDA");
+-    TORCH_CHECK(input.dtype() == torch::kFloat32, "conv_transpose2d_forward: input must be float32");
+-    TORCH_CHECK(weight.dtype() == torch::kFloat32, "conv_transpose2d_forward: weight must be float32");
+-    TORCH_CHECK(input.dim() == 4, "conv_transpose2d_forward: input must be 4D (N,C,H,W)");
+-    TORCH_CHECK(weight.dim() == 4, "conv_transpose2d_forward: weight must be 4D");
+-
+-    int64_t N = input.size(0);
+-    int64_t C_in = input.size(1);
+-    int64_t H_in = input.size(2);
+-    int64_t W_in = input.size(3);
+-
+-    int64_t C_out = weight.size(1);  // ConvTranspose2d weight shape: [in_channels, out_channels, kH, kW]
+-    int64_t kH = weight.size(2);
+-    int64_t kW = weight.size(3);
+-
+-    int64_t H_out = (H_in - 1) * stride - 2 * padding + kH + output_padding;
+-    int64_t W_out = (W_in - 1) * stride - 2 * padding + kW + output_padding;
+-
+-    TORCH_CHECK(C_in == weight.size(0), "conv_transpose2d_forward: weight in_channels mismatch");
+-
+-    // 输出形状
+-    auto output = torch::empty({N, C_out, H_out, W_out}, input.options());
+-
+-    // 获取当前 stream
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    cudnnHandle_t handle = get_cudnn_handle();
+-    CUDNN_CHECK(cudnnSetStream(handle, stream));
+-
+-    // 创建张量描述符
+-    cudnnTensorDescriptor_t x_desc, y_desc;
+-    cudnnFilterDescriptor_t w_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&x_desc));
+-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&y_desc));
+-    CUDNN_CHECK(cudnnCreateFilterDescriptor(&w_desc));
+-    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&conv_desc));
+-
+-    // 设置张量描述符：NCHW 格式
+-    CUDNN_CHECK(cudnnSetTensor4dDescriptor(x_desc,
+-        CUDNN_TENSOR_NCHW,
+-        CUDNN_DATA_FLOAT,
+-        (int)N, (int)C_in, (int)H_in, (int)W_in));
+-
+-    CUDNN_CHECK(cudnnSetTensor4dDescriptor(y_desc,
+-        CUDNN_TENSOR_NCHW,
+-        CUDNN_DATA_FLOAT,
+-        (int)N, (int)C_out, (int)H_out, (int)W_out));
+-
+-    CUDNN_CHECK(cudnnSetFilter4dDescriptor(w_desc,
+-        CUDNN_DATA_FLOAT,
+-        CUDNN_TENSOR_NCHW,
+-        (int)C_in, (int)C_out, (int)kH, (int)kW));
+-
+-    // 设置卷积描述符：注意对于转置卷积，cuDNN 使用 cudnnConvolutionBackwardData，
+-    // 需要设置 conv_desc 为对应前向卷积的参数。
+-    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(conv_desc,
+-        (int)padding, (int)padding,
+-        (int)stride, (int)stride,
+-        1, 1,  // dilation
+-        CUDNN_CROSS_CORRELATION,  // PyTorch 使用 cross-correlation
+-        CUDNN_DATA_FLOAT));
+-
+-    // 转置卷积相当于在前向卷积的 backward data，
+-    // 因此使用 cudnnConvolutionBackwardData。
+-    float alpha = 1.0f, beta = 0.0f;
+-
+-    // 需要 algo，可以使用 CUDNN_CONVOLUTION_BWD_DATA_ALGO_1 或通过 get 选择
+-    cudnnConvolutionBwdDataAlgo_t algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
+-
+-    // 可能需要工作空间
+-    size_t workspace_size = 0;
+-    void* workspace = nullptr;
+-    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+-        handle, w_desc, x_desc, conv_desc, y_desc, algo, &workspace_size));
+-
+-    if (workspace_size > 0) {
+-        // 使用 torch::empty 分配工作空间（仅分配，不计算）
+-        auto workspace_tensor = torch::empty({static_cast<int64_t>(workspace_size)}, input.options().dtype(torch::kUInt8));
+-        workspace = workspace_tensor.data_ptr();
+-        // 注意：workspace_tensor 需要保持存活直到 cuDNN 调用完成，但因为是异步，
+-        // 我们无法保证其生命周期，因此使用 cudaMalloc 分配更安全。
+-        // 这里改为 cudaMalloc。
+-        cudaMalloc(&workspace, workspace_size);
+-        TORCH_CHECK(workspace != nullptr, "conv_transpose2d_forward: failed to allocate workspace");
+-    }
+-
+-    CUDNN_CHECK(cudnnConvolutionBackwardData(
+-        handle,
+-        &alpha,
+-        w_desc, weight.data_ptr<float>(),
+-        x_desc, input.data_ptr<float>(),
+-        conv_desc, algo,
+-        workspace, workspace_size,
+-        &beta,
+-        y_desc, output.data_ptr<float>()));
+-
+-    if (workspace) {
+-        cudaFree(workspace);
+-    }
+-
+-    // 销毁描述符
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyFilterDescriptor(w_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-
+-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "conv_transpose2d_forward: CUDA error");
+ 
+     return output;
+ }
+@@ -257,7 +109,6 @@
+     // 输出与输入具有相同的 shape 和 strides
+     auto output = torch::empty_like(input);
+ 
+-    // 获取输入 strides（可能非连续）
+     int64_t in_stride_batch = input.stride(0);
+     int64_t in_stride_channel = input.stride(1);
+     int64_t in_stride_height = input.stride(2);
+@@ -290,8 +141,6 @@
+ // -----------------------------------------------------------------------------
+ void register_custom_ops(pybind11::module& m) {
+     m.def("avgpool2d_forward", &avgpool2d_forward, "Average pooling 2d forward (kernel_size=3, stride=3)");
+-    m.def("conv_transpose2d_forward", &conv_transpose2d_forward, "ConvTranspose2d forward (cuDNN)",
+-          py::arg("input"), py::arg("weight"), py::arg("stride"), py::arg("padding"), py::arg("output_padding"));
+     m.def("add_bias_forward", &add_bias_forward, "Add bias to input (broadcast along channels)");
+ }
+ 

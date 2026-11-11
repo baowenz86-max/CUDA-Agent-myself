@@ -1,0 +1,221 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,85 @@
++#include <cuda_runtime.h>
++
++// Element-wise absolute value kernel
++__global__ void abs_kernel(const float* __restrict__ input,
++                           float* __restrict__ output,
++                           int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float val = input[i];
++        output[i] = fabsf(val);
++    }
++}
++
++// Pixel shuffle kernel
++// Input: [N, C, H, W], C = out_channels * r^2
++// Output: [N, out_channels, H*r, W*r]
++// Each thread computes one output element.
++__global__ void pixel_shuffle_kernel(const float* __restrict__ input,
++                                     float* __restrict__ output,
++                                     int64_t N, int64_t C, int64_t H, int64_t W,
++                                     int64_t r, int64_t out_channels,
++                                     const int64_t* __restrict__ input_strides,
++                                     const int64_t* __restrict__ output_strides) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t total_output = N * out_channels * H * r * W * r;
++    int64_t grid_stride = blockDim.x * gridDim.x;
++
++    for (int64_t linear = idx; linear < total_output; linear += grid_stride) {
++        // Decode output linear index to (n, oc, oh, ow)
++        int64_t tmp = linear;
++        int64_t ow = tmp % (W * r);
++        tmp /= (W * r);
++        int64_t oh = tmp % (H * r);
++        tmp /= (H * r);
++        int64_t oc = tmp % out_channels;
++        tmp /= out_channels;
++        int64_t n = tmp;
++
++        // Compute input channel and spatial coordinates
++        int64_t ih = oh / r;
++        int64_t iw = ow / r;
++        int64_t ic = oc * r * r + (oh % r) * r + (ow % r);
++
++        // Calculate offset using strides for non-contiguous support
++        int64_t input_offset = n * input_strides[0] +
++                               ic * input_strides[1] +
++                               ih * input_strides[2] +
++                               iw * input_strides[3];
++        int64_t output_offset = n * output_strides[0] +
++                                oc * output_strides[1] +
++                                oh * output_strides[2] +
++                                ow * output_strides[3];
++
++        output[output_offset] = input[input_offset];
++    }
++}
++
++// Launcher for abs forward
++extern "C" void abs_forward_launcher(const float* input,
++                                     float* output,
++                                     int64_t numel,
++                                     cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    // Cap blocks to avoid excessive grid dimensions; kernel uses grid-stride loop
++    if (blocks > 65535) blocks = 65535;
++    abs_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++// Launcher for pixel shuffle forward
++extern "C" void pixel_shuffle_forward_launcher(const float* input,
++                                               float* output,
++                                               int64_t N, int64_t C, int64_t H, int64_t W,
++                                               int64_t r, int64_t out_channels,
++                                               const int64_t* input_strides,
++                                               const int64_t* output_strides,
++                                               cudaStream_t stream) {
++    int64_t total_output = N * out_channels * H * r * W * r;
++    int threads = 256;
++    int blocks = (int)((total_output + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    pixel_shuffle_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, r, out_channels, input_strides, output_strides);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,104 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void abs_forward_launcher(const float* input,
++                                     float* output,
++                                     int64_t numel,
++                                     cudaStream_t stream);
++
++extern "C" void pixel_shuffle_forward_launcher(const float* input,
++                                               float* output,
++                                               int64_t N, int64_t C, int64_t H, int64_t W,
++                                               int64_t r, int64_t out_channels,
++                                               const int64_t* input_strides,
++                                               const int64_t* output_strides,
++                                               cudaStream_t stream);
++
++// Helper function to get strides as int64_t array on device
++static inline std::vector<int64_t> get_strides(const torch::Tensor& t) {
++    std::vector<int64_t> s(t.dim());
++    for (int64_t i = 0; i < t.dim(); ++i) {
++        s[i] = t.stride(i);
++    }
++    return s;
++}
++
++// abs_forward: element-wise absolute value
++torch::Tensor abs_forward(torch::Tensor x) {
++    // Check device
++    TORCH_CHECK(x.is_cuda(), "abs_forward: input must be a CUDA tensor");
++    // Check dtype
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "abs_forward: input must be float32");
++    // The kernel supports non-contiguous strides via grid-stride loop; no need to enforce contiguity
++    // However, data_ptr must be valid. We will call with original strides not needed for abs.
++    auto output = torch::empty_like(x);
++    int64_t numel = x.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    abs_forward_launcher(x.data_ptr<float>(),
++                         output.data_ptr<float>(),
++                         numel,
++                         stream);
++    return output;
++}
++
++// pixel_shuffle_forward
++torch::Tensor pixel_shuffle_forward(torch::Tensor x, int64_t upscale_factor) {
++    TORCH_CHECK(x.is_cuda(), "pixel_shuffle_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "pixel_shuffle_forward: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "pixel_shuffle_forward: input must be 4D (N, C, H, W)");
++    TORCH_CHECK(upscale_factor > 0, "upscale_factor must be positive");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    int64_t r = upscale_factor;
++    TORCH_CHECK(C % (r * r) == 0, "C must be divisible by r^2");
++    int64_t out_channels = C / (r * r);
++
++    auto output = torch::empty({N, out_channels, H * r, W * r}, x.options());
++
++    // Get strides for input and output (support non-contiguous via kernel strides)
++    std::vector<int64_t> input_strides = get_strides(x);
++    std::vector<int64_t> output_strides = get_strides(output);
++
++    // Allocate device memory for strides and copy
++    int64_t* d_input_strides;
++    int64_t* d_output_strides;
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    cudaMalloc(&d_input_strides, 4 * sizeof(int64_t));
++    cudaMalloc(&d_output_strides, 4 * sizeof(int64_t));
++    cudaMemcpyAsync(d_input_strides, input_strides.data(), 4 * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_output_strides, output_strides.data(), 4 * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
++
++    pixel_shuffle_forward_launcher(x.data_ptr<float>(),
++                                   output.data_ptr<float>(),
++                                   N, C, H, W,
++                                   r, out_channels,
++                                   d_input_strides,
++                                   d_output_strides,
++                                   stream);
++
++    // Free device memory after launch (safe because kernel is async and copy is async on same stream)
++    cudaFree(d_input_strides);
++    cudaFree(d_output_strides);
++    // Note: cudaFree is synchronous but after kernel completes on default ordering; acceptable for correctness.
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("abs_forward", &abs_forward,
++          "Element-wise absolute value (float32 CUDA tensor)",
++          py::arg("x"));
++    m.def("pixel_shuffle_forward", &pixel_shuffle_forward,
++          "PixelShuffle forward (float32 CUDA tensor, upscale_factor)",
++          py::arg("x"),
++          py::arg("upscale_factor"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, upscale_factor, out_channels):
++        super().__init__()
++        self.upscale_factor = upscale_factor
++        self.out_channels = out_channels
++        # No learnable parameters, state_dict is empty like reference
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.abs_forward(x)
++        x = cuda_extension.pixel_shuffle_forward(x, self.upscale_factor)
++        return x
++
++    def debug_forward(self, x: torch.Tensor):
++        x_abs = cuda_extension.abs_forward(x)
++        yield 'step_001', x_abs
++        x_ps = cuda_extension.pixel_shuffle_forward(x_abs, self.upscale_factor)
++        yield 'step_002', x_ps
++        yield 'step_003', x_ps

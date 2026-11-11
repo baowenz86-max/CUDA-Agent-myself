@@ -1,0 +1,255 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,174 @@
++// Custom CUDA kernels for ELU and mean reduction
++#include <cuda_runtime.h>
++
++// ELU activation kernel: out[i] = x[i] > 0 ? x[i] : expf(x[i]) - 1.0f
++__global__ void elu_forward_kernel(const float* __restrict__ input,
++                                   float* __restrict__ output,
++                                   int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float x = input[i];
++        output[i] = (x > 0.0f) ? x : (expf(x) - 1.0f);
++    }
++}
++
++// Partial reduction kernel: each block computes sum of a chunk and writes to block_sums[blockIdx.x]
++__global__ void mean_partial_kernel(const float* __restrict__ input,
++                                    float* __restrict__ block_sums,
++                                    int64_t numel) {
++    extern __shared__ float sdata[];
++    int64_t tid = threadIdx.x;
++    int64_t i = blockIdx.x * blockDim.x + tid;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    float sum = 0.0f;
++    for (int64_t idx = i; idx < numel; idx += stride) {
++        sum += input[idx];
++    }
++
++    sdata[tid] = sum;
++    __syncthreads();
++
++    // Block reduction to thread 0
++    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++
++    if (tid == 0) {
++        block_sums[blockIdx.x] = sdata[0];
++    }
++}
++
++// Final reduction kernel: reduce block sums to a single scalar mean
++__global__ void mean_final_kernel(const float* __restrict__ block_sums,
++                                  float* __restrict__ output,
++                                  int num_blocks,
++                                  int64_t numel) {
++    extern __shared__ float sdata[];
++    int tid = threadIdx.x;
++    float sum = 0.0f;
++
++    // Each thread sums a subset of block_sums
++    for (int i = tid; i < num_blocks; i += blockDim.x) {
++        sum += block_sums[i];
++    }
++
++    sdata[tid] = sum;
++    __syncthreads();
++
++    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++
++    if (tid == 0) {
++        output[0] = sdata[0] / (float)numel;
++    }
++}
++
++// Launcher for ELU forward
++extern "C" void elu_forward_launcher(const float* input,
++                                     float* output,
++                                     int64_t numel,
++                                     cudaStream_t stream) {
++    if (numel <= 0) return; // no elements
++
++    const int threads = 256;
++    // Grid-stride loop, choose grid size to cover all SMs efficiently
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 1024) blocks = 1024; // cap grid to avoid excessive blocks
++    elu_forward_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++// Launcher for mean of all elements
++extern "C" void mean_all_forward_launcher(const float* input,
++                                          float* output,
++                                          int64_t numel,
++                                          cudaStream_t stream) {
++    if (numel <= 0) {
++        // Empty input? Output NaN or 0? PyTorch mean of empty is NaN, but contract may not have empty. Set to NaN.
++        float nan_val = __int_as_float(0x7fc00000);
++        cudaMemcpyAsync(output, &nan_val, sizeof(float), cudaMemcpyHostToDevice, stream);
++        return;
++    }
++
++    const int threads = 256;
++    // Determine number of blocks for partial reduction: enough to cover numel, but not too many.
++    // We'll use a grid-stride loop so number of blocks can be capped.
++    int max_blocks_per_sm = 32; // typical occupancy
++    int device;
++    cudaGetDevice(&device);
++    int sm_count;
++    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
++    int num_blocks = sm_count * max_blocks_per_sm;
++    if (num_blocks == 0) num_blocks = 1;
++
++    // Ensure num_blocks does not exceed needed blocks to cover numel? But grid-stride loop handles.
++    // Partial sum buffer on device
++    float* block_sums;
++    cudaMalloc(&block_sums, num_blocks * sizeof(float));
++
++    // Launch partial reduction
++    mean_partial_kernel<<<num_blocks, threads, threads * sizeof(float), stream>>>(
++        input, block_sums, numel);
++
++    // Launch final reduction with a single block
++    // Use threads = 256 or 512, shared memory accordingly
++    int final_threads = 256;
++    mean_final_kernel<<<1, final_threads, final_threads * sizeof(float), stream>>>(
++        block_sums, output, num_blocks, numel);
++
++    // Free temporary buffer after kernel completes (async free is not safe, but we can use cudaFree after stream sync? Better use cudaFree after kernel but before returning, stream may not have finished. We can use cudaFree after cudaStreamSynchronize? But that would block. Alternative: use cudaMallocAsync with pool? Simpler: use a fixed buffer allocated once? For simplicity, we can allocate block_sums with cudaMalloc and then free it after the stream has completed using cudaFreeAsync? Not available. We can use cudaFree after cudaStreamSynchronize(stream) but that adds sync overhead. For correctness, we must ensure the memory is not freed before kernels finish. Since launcher returns immediately, binding may expect kernel to be asynchronous. So we need to manage memory lifetime. Option: allocate block_sums inside launcher and schedule cudaFree after stream completion using cudaLaunchHostFunc? Or use cudaMallocAsync with pool and rely on stream-ordered semantics? We'll use a simple approach: allocate block_sums with cudaMalloc, then register a callback to free it after stream work is done. Use cudaStreamAddCallback (deprecated) or cudaLaunchHostFunc. Since we cannot include cuda_runtime.h? It is allowed. We'll use cudaLaunchHostFunc with a host function that frees the pointer. But that requires function pointer and may cause issues. Alternatively, allocate block_sums in pinned memory? No. Simpler: allocate block_sums with cudaMalloc, then launch kernels, then call cudaFree immediately. But this is unsafe because kernels may still be running. However, many examples do this incorrectly. To be correct, we should use cudaStreamSynchronize before cudaFree, but that blocks. The contract may not explicitly require non-blocking? It's expected that custom ops are asynchronous like PyTorch. So we need to ensure memory is valid until kernels complete. Use cudaMallocAsync from libcudart.so? We can include <cuda_malloc_async.h> but that may not be available. Better: use a temporary buffer allocated by the caller? But contract only passes input, output, numel, stream. So we must manage internally. We can use a static pool with a mutex, but overkill. We'll allocate block_sums using cudaMalloc, then call cudaStreamAddCallback with a callback that calls cudaFree. cudaStreamAddCallback is part of CUDA runtime API and works, though deprecated. We'll use cudaLaunchHostFunc which is more modern and doesn't block. Need to include <cuda_runtime.h>. The callback function must be a C function with signature void (*)(void*). We'll define a simple struct to hold pointer.
++    // We'll implement a host function that frees the pointer.
++    // But this adds complexity and potential issues. Alternatively, we can avoid temporary buffer by implementing a single-pass atomicAdd reduction. Since mean of up to 402M elements, atomicAdd of floats may lose precision but still within tolerance (1e-2 relative). That's simpler and avoids memory management. AtomicAdd on global memory is supported for float and is quite fast on modern GPUs. We can do:
++    // __global__ void mean_atomic_kernel(const float* input, float* output, int64_t numel) {
++    //   float sum = 0.0f;
++    //   for (i = threadIdx + blockIdx*blockDim; i < numel; i += gridDim*blockDim) sum += input[i];
++    //   atomicAdd(output, sum);
++    // }
++    // Then after kernel, we need to divide by numel, which could be done in a second tiny kernel or by the binding after sync? Binding can't do torch ops, but could read output and multiply? However, output is a scalar tensor, binding can't do arithmetic. So mean_atomic_kernel should also divide by numel. But atomicAdd and division in same kernel? We could have each block atomicAdd its sum to a global accumulator, then a final block or a separate kernel to divide. But we could also have the first block to finish do the division? That requires a lock. Simpler: use a two-kernel approach: first kernel does atomicAdd into a single float, second kernel divides by numel. But atomicAdd of 0.0 then we need to initialize output to 0 before first kernel. The launcher can cudaMemsetAsync(output, 0, sizeof(float), stream) then launch atomic kernel, then launch a small kernel to divide. This avoids dynamic memory. This is simpler and async-safe. We'll do that.
++    // So implement mean_all_forward as:
++    // 1. cudaMemsetAsync(output, 0, sizeof(float), stream)
++    // 2. mean_atomic_kernel <<<grid, block, 0, stream>>>(input, output, numel)
++    // 3. mean_div_kernel <<<1,1,0, stream>>>(output, numel)
++    // This works and is correct. Precision: atomicAdd of many partial sums may have slightly different order, but tolerance is 1e-2 and mean of 4e8 random values ~0, so error is fine.
++    // We'll implement this approach.
++
++    // Initialize output to zero
++    cudaMemsetAsync(output, 0, sizeof(float), stream);
++
++    // Launch atomic reduction kernel
++    const int threads_atomic = 256;
++    int blocks_atomic = (int)((numel + threads_atomic - 1) / threads_atomic);
++    if (blocks_atomic > 1024) blocks_atomic = 1024;
++    mean_atomic_kernel<<<blocks_atomic, threads_atomic, 0, stream>>>(input, output, numel);
++
++    // Launch division kernel
++    mean_div_kernel<<<1, 1, 0, stream>>>(output, numel);
++}
++
++// Atomic mean kernel
++__global__ void mean_atomic_kernel(const float* __restrict__ input,
++                                   float* __restrict__ output,
++                                   int64_t numel) {
++    float sum = 0.0f;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        sum += input[i];
++    }
++    atomicAdd(output, sum);
++}
++
++// Division kernel to compute mean
++__global__ void mean_div_kernel(float* __restrict__ output, int64_t numel) {
++    if (threadIdx.x == 0 && blockIdx.x == 0) {
++        *output /= (float)numel;
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,55 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++extern "C" void elu_forward_launcher(const float* input, float* output, int64_t numel, cudaStream_t stream);
++extern "C" void mean_all_forward_launcher(const float* input, float* output, int64_t numel, cudaStream_t stream);
++
++torch::Tensor elu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.numel() > 0, "Input must not be empty");
++
++    auto x_contig = x.contiguous();
++    auto output = torch::empty_like(x_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    elu_forward_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x_contig.numel(),
++        stream
++    );
++
++    return output;
++}
++
++torch::Tensor mean_all_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.numel() > 0, "Input must not be empty");
++
++    auto x_contig = x.contiguous();
++    auto output = torch::empty({}, x_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    mean_all_forward_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x_contig.numel(),
++        stream
++    );
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("elu_forward", &elu_forward, "ELU activation forward",
++          pybind11::arg("x"));
++    m.def("mean_all_forward", &mean_all_forward, "Mean of all elements forward",
++          pybind11::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,17 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def forward(self, x):
++        x = cuda_extension.elu_forward(x)
++        x = cuda_extension.mean_all_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.elu_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.mean_all_forward(x)
++        yield 'step_002', x
++        yield 'step_003', x

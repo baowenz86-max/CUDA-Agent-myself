@@ -1,0 +1,100 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,30 @@
++#include <cuda_runtime.h>
++
++// Fused elementwise operation: y = sign(abs(x))
++// For float32, sign returns -1.0 for negative, 0.0 for zero, 1.0 for positive.
++// After abs, input is non-negative, so -1.0 is never produced for finite values.
++// This kernel is equivalent to sign(x) for all finite x, and also maps -inf, NaN etc. as torch.sign would after abs.
++__global__ void fused_abs_sign_kernel(float* output, const float* input, int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float val = input[i];
++        float abs_val = fabsf(val);
++        // sign(abs_val): 0.0 if abs_val == 0.0, 1.0 otherwise (since abs_val >= 0)
++        // Use explicit comparison to handle -0.0 correctly (abs(-0.0)=0.0 -> sign 0.0)
++        output[i] = (abs_val == 0.0f) ? 0.0f : 1.0f;
++    }
++}
++
++// Launcher with C linkage, called from binding.cpp (not included here)
++extern "C" void fused_abs_sign_launcher(float* output, const float* input, int64_t numel, cudaStream_t stream) {
++    if (numel <= 0) return;
++    const int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    // Grid-stride loop allows handling arbitrary numel; cap blocks to avoid excessive launch configuration if needed.
++    // For large tensors, use a grid-stride loop with a reasonable number of blocks (e.g., 256 blocks or enough to cover).
++    // We choose blocks = min(blocks, 65535 * 4) but actually grid stride handles all, we can use a reasonable max.
++    // Simpler: use grid-stride but keep block count modest for occupancy.
++    if (blocks > 1024) blocks = 1024; // limit for grid-stride, handles up to 1024*256 = 262144 elements per iteration, loop covers rest.
++    fused_abs_sign_kernel<<<blocks, threads, 0, stream>>>(output, input, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,42 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void fused_abs_sign_launcher(float* output, const float* input, int64_t numel, cudaStream_t stream);
++
++// PyTorch wrapper for fused abs-sign operation
++torch::Tensor fused_abs_sign_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    // Ensure contiguous for direct data_ptr usage (preserves values and shape)
++    auto x_contig = x.contiguous();
++    auto output = torch::empty_like(x_contig);
++
++    int64_t numel = x_contig.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    fused_abs_sign_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        numel,
++        stream
++    );
++
++    // Check for CUDA errors after launch
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_fused_abs_sign(pybind11::module& m) {
++    m.def("fused_abs_sign_forward", &fused_abs_sign_forward,
++          "Fused elementwise abs then sign",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(fused_abs_sign, register_fused_abs_sign);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,19 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_shape):
++        super().__init__()
++        self.input_shape = input_shape
++
++    def forward(self, x):
++        return cuda_extension.fused_abs_sign_forward(x)
++
++    def debug_forward(self, x):
++        step_001 = cuda_extension.fused_abs_sign_forward(x)
++        yield 'step_001', step_001
++        step_002 = cuda_extension.fused_abs_sign_forward(step_001)
++        yield 'step_002', step_002
++        yield 'step_003', step_002

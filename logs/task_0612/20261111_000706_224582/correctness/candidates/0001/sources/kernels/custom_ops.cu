@@ -1,0 +1,191 @@
+#include <cuda_runtime.h>
+#include <cstdint>
+
+// -----------------------------------------------------------------------------
+// custom_sum_dim
+// Reduces over dimension `dim` of a 4D input tensor with shape [B,C,H,W].
+// In this task dim=1, C=3, B=512, H=512, W=512. Output shape [B,H,W].
+// The kernel supports arbitrary strides, but we optimize the contiguous case.
+// We use a grid over output elements, each thread sums over the reduction dim.
+// For small reduction sizes (C=3), one thread per output is efficient.
+// -----------------------------------------------------------------------------
+
+__global__ void custom_sum_dim_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int64_t B, int64_t C, int64_t H, int64_t W,
+    int dim,
+    int64_t input_stride[4],
+    int64_t output_stride[3],
+    int64_t total_output)
+{
+    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    // Precompute strides for reduction dim
+    // For dim=1: output index (b, h, w) -> input base (b, 0, h, w)
+    // We can compute output coordinates from flat idx.
+    // Since output shape is [B,H,W], we decode b,h,w.
+    // For general dim, we need mapping.
+    // But here we only support dim=0..3 for arbitrary strides.
+    // The contract says dim is self.in_channels which is 1 in this task.
+    // We'll implement for any dim but ensure correctness for dim=1.
+
+    for (int64_t i = idx; i < total_output; i += stride) {
+        // Decode output linear index to coordinates (b,h,w) for dim=1, or general 3D output coords (d0,d1,d2)
+        // We need to know output shape after removing dim.
+        // We'll derive coordinates based on dim.
+        int64_t out_idx = i;
+        int64_t coords[3];
+        int64_t output_sizes[3];
+        if (dim == 0) {
+            output_sizes[0] = C; output_sizes[1] = H; output_sizes[2] = W;
+        } else if (dim == 1) {
+            output_sizes[0] = B; output_sizes[1] = H; output_sizes[2] = W;
+        } else if (dim == 2) {
+            output_sizes[0] = B; output_sizes[1] = C; output_sizes[2] = W;
+        } else { // dim == 3
+            output_sizes[0] = B; output_sizes[1] = C; output_sizes[2] = H;
+        }
+
+        // Decode (row-major)
+        coords[2] = out_idx % output_sizes[2];
+        int64_t tmp = out_idx / output_sizes[2];
+        coords[1] = tmp % output_sizes[1];
+        coords[0] = tmp / output_sizes[1];
+
+        // Map to input coordinates
+        int64_t input_coords[4];
+        if (dim == 0) {
+            input_coords[1] = coords[0]; // C
+            input_coords[2] = coords[1]; // H
+            input_coords[3] = coords[2]; // W
+            input_coords[0] = 0; // placeholder, will loop
+        } else if (dim == 1) {
+            input_coords[0] = coords[0]; // B
+            input_coords[2] = coords[1]; // H
+            input_coords[3] = coords[2]; // W
+            input_coords[1] = 0;
+        } else if (dim == 2) {
+            input_coords[0] = coords[0]; // B
+            input_coords[1] = coords[1]; // C
+            input_coords[3] = coords[2]; // W
+            input_coords[2] = 0;
+        } else { // dim == 3
+            input_coords[0] = coords[0]; // B
+            input_coords[1] = coords[1]; // C
+            input_coords[2] = coords[2]; // H
+            input_coords[3] = 0;
+        }
+
+        // Base input offset without reduction coordinate
+        int64_t base_offset = 0;
+        for (int d = 0; d < 4; ++d) {
+            if (d != dim) {
+                base_offset += input_coords[d] * input_stride[d];
+            }
+        }
+
+        // Sum over reduction dim
+        float sum = 0.0f;
+        int64_t reduction_size;
+        if (dim == 0) reduction_size = B;
+        else if (dim == 1) reduction_size = C;
+        else if (dim == 2) reduction_size = H;
+        else reduction_size = W;
+
+        for (int64_t r = 0; r < reduction_size; ++r) {
+            int64_t offset = base_offset + r * input_stride[dim];
+            sum += input[offset];
+        }
+
+        output[out_idx] = sum;
+    }
+}
+
+// Launcher for custom_sum_dim
+// Input: float* input (raw pointer to CUDA tensor), int64_t* dims (shape[4]), int64_t* strides (shape[4]), int dim, output pointer, output strides (3), total_output
+// We assume input is 4D and output is 3D.
+extern "C" void custom_sum_dim_launcher(
+    const float* input,
+    float* output,
+    const int64_t* input_shape,   // [B,C,H,W]
+    const int64_t* input_strides, // [4]
+    int64_t dim,
+    const int64_t* output_strides, // [3]
+    int64_t total_output,
+    cudaStream_t stream)
+{
+    int64_t B = input_shape[0];
+    int64_t C = input_shape[1];
+    int64_t H = input_shape[2];
+    int64_t W = input_shape[3];
+
+    // Copy strides to local array (kernel expects int64_t[4] but can take pointer)
+    // We'll pass individually to avoid struct issues; but kernel expects int64_t input_stride[4], so can pass pointer but kernel uses bracket indexing.
+    // For simplicity, copy to local arrays.
+    int64_t in_stride[4] = {input_strides[0], input_strides[1], input_strides[2], input_strides[3]};
+    int64_t out_stride[3] = {output_strides[0], output_strides[1], output_strides[2]};
+
+    // Launch config: enough blocks for total_output, grid-stride loop handles rest.
+    int block_size = 256;
+    int64_t grid_size = (total_output + block_size - 1) / block_size;
+    // Cap grid to avoid too many blocks? For total_output=134M, grid = ~524k, okay.
+    if (grid_size > 2147483647LL) grid_size = 2147483647LL; // max grid dim
+    // Better: use grid-stride loop with moderate grid.
+    // Use e.g. 1024 blocks? But that may underutilize. We'll use natural size, capped.
+    if (grid_size > 65535) grid_size = 65535; // for older GPUs? but use 2^31-1 allowed.
+    // Use 1D grid, max 2^31-1 for x dimension in CUDA.
+    // We'll set grid_size = min(ceil(total_output/block_size), 2147483647)
+    // But if total_output > block_size*2147483647, grid-stride loop still works.
+    // For this task 134M/256 = 524k, well within limit.
+    // Use dynamic grid size based on total_output.
+    custom_sum_dim_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
+        input, output,
+        B, C, H, W,
+        (int)dim, // dim is int in kernel? kernel expects int dim. We'll cast.
+        in_stride,
+        out_stride,
+        total_output);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        // In a real binding we might throw, but here we just ignore? Better to have a way, but launcher cannot throw. We leave no handling as per restrictions? We can add fprintf? but forbidden? We'll just let sync catch.
+        // We'll do nothing; binding should check after calling and cudaDeviceSynchronize if needed.
+    }
+}
+
+// -----------------------------------------------------------------------------
+// custom_expm1
+// Elementwise expm1f on float32 tensor.
+// -----------------------------------------------------------------------------
+
+__global__ void custom_expm1_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int64_t total)
+{
+    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    for (int64_t i = idx; i < total; i += stride) {
+        output[i] = expm1f(input[i]);
+    }
+}
+
+extern "C" void custom_expm1_launcher(
+    const float* input,
+    float* output,
+    int64_t total,
+    cudaStream_t stream)
+{
+    int block_size = 256;
+    int64_t grid_size = (total + block_size - 1) / block_size;
+    if (grid_size > 2147483647LL) grid_size = 2147483647LL;
+    custom_expm1_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
+        input, output, total);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        // no-op
+    }
+}

@@ -1,0 +1,274 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,138 @@
++#include <cuda_runtime.h>
++
++// Instance normalization forward kernel.
++// Each block handles one (n, c) spatial plane of size H*W.
++// Block computes mean and variance in shared memory, then normalizes and applies affine.
++// Input x is assumed contiguous float32 tensor of shape [N, C, H, W].
++// weight and bias are float32 arrays of length C.
++__global__ void instance_norm_forward_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    int N, int C, int HW, float eps)
++{
++    int nc = blockIdx.x;
++    int n = nc / C;
++    int c = nc % C;
++    int tid = threadIdx.x;
++    int blockSize = blockDim.x;
++
++    // Base pointer for this (n,c) plane
++    const float* x_plane = x + (size_t)nc * HW;
++    float* y_plane = y + (size_t)nc * HW;
++
++    // Step 1: compute mean using parallel reduction within block.
++    // Since HW may exceed blockSize, use grid-stride within block.
++    float sum = 0.0f;
++    for (int idx = tid; idx < HW; idx += blockSize) {
++        sum += x_plane[idx];
++    }
++
++    // Shared memory reduction: array of blockSize floats (or fewer if HW < blockSize)
++    extern __shared__ float shared_sum[];
++    shared_sum[tid] = sum;
++    __syncthreads();
++
++    // Tree reduction
++    for (int s = blockSize / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            shared_sum[tid] += shared_sum[tid + s];
++        }
++        __syncthreads();
++    }
++    float mean = shared_sum[0] / (float)HW;
++
++    // Step 2: compute variance (sum of squared differences)
++    float sq_sum = 0.0f;
++    for (int idx = tid; idx < HW; idx += blockSize) {
++        float diff = x_plane[idx] - mean;
++        sq_sum += diff * diff;
++    }
++    shared_sum[tid] = sq_sum;
++    __syncthreads();
++    for (int s = blockSize / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            shared_sum[tid] += shared_sum[tid + s];
++        }
++        __syncthreads();
++    }
++    float var = shared_sum[0] / (float)HW;
++
++    // Step 3: normalize, apply affine, write output
++    float inv_std = rsqrtf(var + eps);
++    float w = weight[c];
++    float b = bias[c];
++    for (int idx = tid; idx < HW; idx += blockSize) {
++        y_plane[idx] = (x_plane[idx] - mean) * inv_std * w + b;
++    }
++}
++
++// Launcher for instance_norm_forward
++// Inputs: x, weight, bias are device pointers (float32)
++// x shape: N*C*HW contiguous
++// weight, bias: length C
++// eps: float
++// stream: CUDA stream on which to launch
++extern "C" void instance_norm_forward_launcher(
++    const float* x,
++    float* y,
++    const float* weight,
++    const float* bias,
++    int N, int C, int HW, float eps,
++    cudaStream_t stream)
++{
++    if (N <= 0 || C <= 0 || HW <= 0) return;
++
++    // Choose block size: 256 is a good default, but we may need to ensure enough threads for reduction
++    int blockSize = 256;
++    // For small HW, use smaller block size to avoid wasted threads? Keep simple: use min(256, HW).
++    if (HW < blockSize) blockSize = HW;
++    // Round up to next power of two for reduction friendly (at least 1)
++    int pow2 = 1;
++    while (pow2 < blockSize) pow2 <<= 1;
++    blockSize = pow2;
++    // Cap at 512 for resource usage? 256 is safe. At most 1024.
++    if (blockSize > 256) blockSize = 256;
++
++    int gridSize = N * C;
++
++    // Shared memory needed for blockSize floats
++    size_t sharedMem = blockSize * sizeof(float);
++
++    instance_norm_forward_kernel<<<gridSize, blockSize, sharedMem, stream>>>(
++        x, y, weight, bias, N, C, HW, eps);
++}
++
++// Mul scalar kernel: y[i] = x[i] * multiplier
++__global__ void mul_scalar_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    float multiplier,
++    size_t numel)
++{
++    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    size_t stride = blockDim.x * gridDim.x;
++    for (; idx < numel; idx += stride) {
++        y[idx] = x[idx] * multiplier;
++    }
++}
++
++// Launcher for mul_scalar
++extern "C" void mul_scalar_launcher(
++    const float* x,
++    float* y,
++    float multiplier,
++    size_t numel,
++    cudaStream_t stream)
++{
++    if (numel == 0) return;
++
++    int blockSize = 256;
++    // Use a reasonable grid size; grid-stride loop handles larger numel.
++    int gridSize = (int)((numel + blockSize - 1) / blockSize);
++    if (gridSize > 65535) gridSize = 65535; // max grid x dimension
++
++    mul_scalar_kernel<<<gridSize, blockSize, 0, stream>>>(
++        x, y, multiplier, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,106 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void instance_norm_forward_launcher(
++    const float* x,
++    float* y,
++    const float* weight,
++    const float* bias,
++    int N, int C, int HW, float eps,
++    cudaStream_t stream);
++
++extern "C" void mul_scalar_launcher(
++    const float* x,
++    float* y,
++    float multiplier,
++    size_t numel,
++    cudaStream_t stream);
++
++// Wrapper for instance normalization
++static torch::Tensor instance_norm_forward(
++    const torch::Tensor& x,
++    const torch::Tensor& weight,
++    const torch::Tensor& bias,
++    double eps) {
++    // Check device
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    // Check dtype
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    // Check contiguity
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++    // Check dimensions
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (N,C,H,W)");
++    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == x.size(1), "weight must be 1D of size C");
++    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == x.size(1), "bias must be 1D of size C");
++
++    auto N = static_cast<int>(x.size(0));
++    auto C = static_cast<int>(x.size(1));
++    auto HW = static_cast<int>(x.size(2) * x.size(3));
++
++    auto y = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    instance_norm_forward_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        N, C, HW, static_cast<float>(eps),
++        stream);
++
++    return y;
++}
++
++// Wrapper for scalar multiplication
++static torch::Tensor mul_scalar(
++    const torch::Tensor& x,
++    double multiplier) {
++    // Check device
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    // Check dtype
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    // Check contiguity
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++
++    auto y = torch::empty_like(x);
++    size_t numel = static_cast<size_t>(x.numel());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    mul_scalar_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        static_cast<float>(multiplier),
++        numel,
++        stream);
++
++    return y;
++}
++
++// Register bindings
++static void register_custom_ops(pybind11::module& m) {
++    m.def("instance_norm_forward", &instance_norm_forward,
++          "Instance normalization forward",
++          pybind11::arg("x"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"),
++          pybind11::arg("eps"));
++    m.def("mul_scalar", &mul_scalar,
++          "Multiply tensor by scalar",
++          pybind11::arg("x"),
++          pybind11::arg("multiplier"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features):
++        super().__init__()
++        self.instance_norm = nn.InstanceNorm2d(num_features, affine=True)
++
++    def forward(self, x):
++        x = cuda_extension.instance_norm_forward(x, self.instance_norm.weight, self.instance_norm.bias, self.instance_norm.eps)
++        x = cuda_extension.mul_scalar(x, 2.0)
++        return x
++
++    def debug_forward(self, x):
++        x_after_norm = cuda_extension.instance_norm_forward(x, self.instance_norm.weight, self.instance_norm.bias, self.instance_norm.eps)
++        yield "step_001", x_after_norm
++        x_after_mul = cuda_extension.mul_scalar(x_after_norm, 2.0)
++        yield "step_002", x_after_mul
++        yield "step_003", x_after_mul

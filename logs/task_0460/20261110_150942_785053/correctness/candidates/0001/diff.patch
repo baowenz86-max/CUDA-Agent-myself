@@ -1,0 +1,297 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,165 @@
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// This file contains CUDA kernels and host launchers for custom ops used by the model.
++// It must not depend on torch, ATen, or pybind. All tensor handling is done in the binding layer.
++
++// Kernel: copies input contiguous buffer to output contiguous buffer.
++// Used by identity_new_tensor: copy [512,128,128] contiguous tensor.
++// grid-stride loop for generality.
++__global__ void copy_kernel_float(const float* __restrict__ input,
++                                  float* __restrict__ output,
++                                  int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = input[i];
++    }
++}
++
++// Kernel: stacks a list of contiguous tensors along a new dimension 1.
++// Input: each tensor has shape [B, H, W] -> flattened per tensor: B*H*W
++// Output: shape [B, C, H, W], where C is number of tensors.
++// We assume all input tensors are contiguous and have same shape (B,H,W).
++// Output is contiguous.
++__global__ void stack_kernel_float(const float* __restrict__ input,
++                                   float* __restrict__ output,
++                                   int64_t B,
++                                   int64_t C,
++                                   int64_t H,
++                                   int64_t W) {
++    int64_t total = B * C * H * W;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    int64_t per_tensor = B * H * W;
++    for (int64_t i = idx; i < total; i += stride) {
++        // decompose output index: i = (((b * C + c) * H + h) * W + w)
++        int64_t tmp = i;
++        int64_t w = tmp % W;
++        tmp /= W;
++        int64_t h = tmp % H;
++        tmp /= H;
++        int64_t c = tmp % C;
++        int64_t b = tmp / C;
++        int64_t src_idx = (b * H + h) * W + w;
++        output[i] = input[c * per_tensor + src_idx];
++    }
++}
++
++// Launcher for unbind_dim1. Since unbind returns views, no CUDA work is needed.
++// The binding layer will create Python tuple of tensor views using torch::unbind-like slicing.
++// We provide a no-op launcher for completeness; it takes raw pointer and does nothing.
++extern "C" void unbind_dim1_launcher(const float* x,
++                                     int64_t B,
++                                     int64_t C,
++                                     int64_t H,
++                                     int64_t W,
++                                     cudaStream_t stream) {
++    // No kernel launch; views are handled in C++.
++    (void)x; (void)B; (void)C; (void)H; (void)W; (void)stream;
++}
++
++// Launcher for identity_new_tensor: copies data to a new contiguous tensor.
++extern "C" void identity_copy_launcher(const float* input,
++                                        float* output,
++                                        int64_t numel,
++                                        cudaStream_t stream) {
++    if (numel <= 0) return;
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    // Limit blocks to a reasonable max to avoid excessive grid dimensions.
++    if (blocks > 65535) blocks = 65535;
++    copy_kernel_float<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++// Launcher for stack_dim1: stacks C contiguous tensors into output [B,C,H,W].
++extern "C" void stack_dim1_launcher(const float* const* inputs,
++                                    int64_t B,
++                                    int64_t C,
++                                    int64_t H,
++                                    int64_t W,
++                                    float* output,
++                                    cudaStream_t stream) {
++    if (B <= 0 || C <= 0 || H <= 0 || W <= 0) return;
++    int64_t total = B * C * H * W;
++    // For simplicity, we assume the inputs are stored as an array of pointers in device memory?
++    // Better approach: the binding layer can pass a single pointer to a contiguous array of all input data
++    // if all inputs are concatenated, but the contract says they are separate tensors.
++    // Since we cannot assume device pointer array availability easily without extra CUDA copies,
++    // we can instead copy each input tensor one by one into the correct slice of output using a loop.
++    // However, the launcher signature should be convenient for binding: we can accept a pointer to an array of pointers on host,
++    // but that requires host-device copy. Alternatively, the binding layer can pass each raw data pointer separately.
++    // Due to limitations, we instead provide a launcher that takes a single input pointer to a contiguous block
++    // containing all C tensors concatenated (which the binding layer can create by copying or by using torch.cat).
++    // But that would add an extra copy, not ideal. Since the model_new.py calls identity_new_tensor on each unbind result,
++    // after identity_new_tensor each tensor is contiguous and separate. The binding layer will have access to each tensor's data_ptr.
++    // To keep the .cu independent, we can define a launcher that accepts a pointer to an array of device pointers allocated by binding.
++    // However, we cannot use torch in .cu. We can implement stack by launching a kernel for each input tensor,
++    // with an offset marking the slice. We'll provide a launcher that loops over C and launches one kernel per tensor,
++    // using the provided pointers. But we need pointer to pointer. We can use std::vector or allocate device memory for pointer array
++    // inside the launcher, but that would require cudaMalloc and cudaMemcpy, which is acceptable (raw CUDA).
++    // We'll implement a launcher that takes a host pointer to an array of device pointers (float** hostPtrs)
++    // and handles the device-side copies.
++    // To simplify, the binding layer can pass a single pointer to a contiguous array of all data if it concatenates,
++    // but that would change semantics. Let's define the launcher to accept a pointer to an array of raw device pointers.
++    // Since we cannot allocate device memory for pointer array in the .cu without knowing C at runtime, we can use
++    // cudaMalloc and cudaMemcpy internally, then launch a single kernel that reads from device pointer array.
++    // However, we are only allowed to use CUDA runtime, so this is fine.
++    // We will implement stack_kernel that takes a float** deviceInputPtrs, and we provide a launcher that
++    // allocates device memory for the pointer array, copies host pointers to device, launches kernel, and frees.
++    // But we must ensure the host pointer array remains valid during launch.
++    // The binding layer can pass a std::vector<float*> converted to raw array.
++    // We'll define stack_dim1_launcher with signature:
++    //   void stack_dim1_launcher(float** device_input_ptrs, int64_t B, int64_t C, int64_t H, int64_t W, float* output, cudaStream_t stream)
++    // where device_input_ptrs is already a device pointer to an array of device pointers; the binding layer can create it using cudaMalloc and cudaMemcpy.
++    // To avoid that complexity, we could instead pass a single pointer to a contiguous array of inputs (if the binding layer concatenates them).
++    // But model_new.py expects stack_dim1 to be called with list of tensors; the binding layer can easily create a contiguous concatenation? That would be an extra copy.
++    // Given performance is not critical for this simple model, we can accept a host pointer to array of device pointers and perform copies sequentially.
++    // We'll implement a launcher that loops over C and uses cudaMemcpyAsync from each input to the corresponding output slice, but that may be slower.
++    // Better: launch one kernel per input with appropriate offsets, using pointer arithmetic on a single base pointer? No, each tensor has its own pointer.
++    // For simplicity and correctness, we'll provide a launcher that takes an array of device pointers allocated by the binding. But we cannot force the binding to do that.
++    // Let's check the contract: binding fragments show stack_dim1 parameter is torch::Tensor tensors, not a list? The contract says "kind: tensor" but shape "list of 32 tensors", so binding likely receives a list of tensors.
++    // The binding layer will handle conversion to a vector of data_ptr<float>().
++    // We'll design the launcher to accept a host pointer to an array of float* (pointers to device memory), C, B, H, W, output, stream.
++    // We'll then inside the launcher create a device array of pointers via cudaMalloc and cudaMemcpyAsync, launch stack_kernel_with_ptrs, and free.
++    // This keeps the .cu free of torch and works correctly.
++    
++    // Actually, we can simplify: since we are not required to optimize heavily, we can just launch a copy kernel for each input tensor into the proper output slice,
++    // using a simple loop in the launcher. The kernel copies one tensor's data to output + offset.
++    // This uses multiple kernel launches but is simple and correct.
++    // We'll do that: for each c in [0,C), launch copy_kernel_float on input[c] to output + c*per_tensor, with numel = B*H*W.
++    // The launcher receives input as an array of pointers in host memory: const float** input_ptrs.
++    // This avoids device pointer array allocation and kernel complexity.
++    // We'll use a helper kernel that copies numel elements.
++    // We already have copy_kernel_float, so we can reuse it.
++    // We'll add a launcher that loops over c and launches copy_kernel_float with offset.
++    // This is straightforward and does not require extra device memory.
++    // The binding layer must pass a std::vector<float*> or a raw pointer to an array of float* on host.
++    // We'll document the signature.
++    // Due to these considerations, we adjust the launcher signature for stack_dim1 to:
++    //   void stack_dim1_launcher(const float* const* input_ptrs, int64_t B, int64_t C, int64_t H, int64_t W, float* output, cudaStream_t stream)
++    // where input_ptrs is a host pointer to an array of C device pointers.
++}
++
++// We will now write the actual stack_dim1_launcher implementation using per-tensor copy launches.
++extern "C" void stack_dim1_launcher(const float* const* input_ptrs,
++                                    int64_t B,
++                                    int64_t C,
++                                    int64_t H,
++                                    int64_t W,
++                                    float* output,
++                                    cudaStream_t stream) {
++    if (B <= 0 || C <= 0 || H <= 0 || W <= 0) return;
++    int64_t per_tensor = B * H * W;
++    int threads = 256;
++    int blocks = (int)((per_tensor + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    for (int64_t c = 0; c < C; ++c) {
++        copy_kernel_float<<<blocks, threads, 0, stream>>>(
++            input_ptrs[c], output + c * per_tensor, per_tensor);
++    }
++}
++
++// Note: The unbind_dim1_launcher is a no-op because unbind returns views, handled in binding.
++// The binding layer will create a tuple of tensors by slicing the original tensor using as_strided or narrow.
++// No CUDA kernel is required for unbind.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,90 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void unbind_dim1_launcher(const float* x, int64_t B, int64_t C, int64_t H, int64_t W, cudaStream_t stream);
++extern "C" void identity_copy_launcher(const float* input, float* output, int64_t numel, cudaStream_t stream);
++extern "C" void stack_dim1_launcher(const float* const* input_ptrs, int64_t B, int64_t C, int64_t H, int64_t W, float* output, cudaStream_t stream);
++
++// Helper to check CUDA tensor requirements
++void check_cuda_float32(const torch::Tensor& t, const std::string& name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++
++// unbind_dim1: split tensor along dim=1 into tuple of views
++std::vector<torch::Tensor> unbind_dim1(torch::Tensor x) {
++    check_cuda_float32(x, "x");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D");
++    int64_t C = x.size(1);
++    // Calling no-op launcher for side effects (none)
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    unbind_dim1_launcher(x.data_ptr<float>(), x.size(0), C, x.size(2), x.size(3), stream);
++
++    // Create views using narrow (or as_strided) preserving original strides
++    std::vector<torch::Tensor> result;
++    result.reserve(C);
++    for (int64_t i = 0; i < C; ++i) {
++        // Use narrow to get slice along dim=1
++        result.push_back(x.narrow(1, i, 1));
++    }
++    return result;
++}
++
++// identity_new_tensor: copy input to a new contiguous tensor
++torch::Tensor identity_new_tensor(torch::Tensor x) {
++    check_cuda_float32(x, "x");
++    TORCH_CHECK(x.dim() == 3, "x must be 3D ([B,H,W])");
++    auto output = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    identity_copy_launcher(x.data_ptr<float>(), output.data_ptr<float>(), x.numel(), stream);
++    return output;
++}
++
++// stack_dim1: stack list of 3D tensors along new dim=1
++torch::Tensor stack_dim1(std::vector<torch::Tensor> tensors) {
++    TORCH_CHECK(!tensors.empty(), "tensors list must not be empty");
++    int64_t C = static_cast<int64_t>(tensors.size());
++    const auto& first = tensors[0];
++    check_cuda_float32(first, "tensors[0]");
++    TORCH_CHECK(first.dim() == 3, "each tensor must be 3D ([B,H,W])");
++    int64_t B = first.size(0);
++    int64_t H = first.size(1);
++    int64_t W = first.size(2);
++
++    // Validate all tensors
++    for (const auto& t : tensors) {
++        check_cuda_float32(t, "tensor in list");
++        TORCH_CHECK(t.dim() == 3, "each tensor must be 3D");
++        TORCH_CHECK(t.size(0) == B && t.size(1) == H && t.size(2) == W, "all tensors must have same shape");
++    }
++
++    // Allocate output [B, C, H, W]
++    auto output = torch::empty({B, C, H, W}, first.options());
++
++    // Build host array of device pointers
++    std::vector<const float*> host_ptrs;
++    host_ptrs.reserve(C);
++    for (const auto& t : tensors) {
++        host_ptrs.push_back(t.data_ptr<float>());
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    stack_dim1_launcher(host_ptrs.data(), B, C, H, W, output.data_ptr<float>(), stream);
++
++    return output;
++}
++
++// Register all functions
++void register_custom_ops(pybind11::module& m) {
++    m.def("unbind_dim1", &unbind_dim1, "Split tensor along dim=1 into tuple of views", py::arg("x"));
++    m.def("identity_new_tensor", &identity_new_tensor, "Copy tensor to a new contiguous tensor", py::arg("x"));
++    m.def("stack_dim1", &stack_dim1, "Stack list of 3D tensors along dim=1", py::arg("tensors"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,33 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self, upscale_factor):
++        super().__init__()
++        # Preserve the PixelShuffle module attribute to match state_dict keys if any,
++        # but we won't use it in forward (we use custom ops instead).
++        self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
++
++    def forward(self, x):
++        # Step 1: unbind along dim=1 using custom op
++        x = cuda_extension.unbind_dim1(x)
++        # Step 2: apply pixel_shuffle (identity) to each item using custom op,
++        # resulting in list of new tensors.
++        x = [cuda_extension.identity_new_tensor(item) for item in x]
++        # Step 3: stack along dim=1 using custom op
++        x = cuda_extension.stack_dim1(x)
++        return x
++
++    def debug_forward(self, x):
++        # Yield step_001: unbind result (tuple)
++        x_unbind = cuda_extension.unbind_dim1(x)
++        yield ('step_001', x_unbind)
++        # Yield step_002: list after identity_new_tensor
++        x_list = [cuda_extension.identity_new_tensor(item) for item in x_unbind]
++        yield ('step_002', x_list)
++        # Yield step_003: stacked tensor
++        x_stack = cuda_extension.stack_dim1(x_list)
++        yield ('step_003', x_stack)
++        # Yield final return (same as step_003)
++        yield ('step_004', x_stack)

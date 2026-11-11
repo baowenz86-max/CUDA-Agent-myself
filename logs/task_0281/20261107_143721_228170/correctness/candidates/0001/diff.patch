@@ -1,0 +1,339 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,163 @@
++#include <cuda_runtime.h>
++
++// Relu forward kernel: output = max(0, input)
++// Supports arbitrary strides via input/output pointer arithmetic.
++__global__ void relu_forward_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int numel,
++    const int* __restrict__ in_strides,
++    const int* __restrict__ out_strides,
++    int ndim) {
++
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= numel) return;
++
++    // Compute linear index to multi-dimensional coordinates
++    int linear_idx = idx;
++    int in_offset = 0;
++    int out_offset = 0;
++    int remaining = linear_idx;
++
++    // Assume ndim <= 3 for this task (N,C,L)
++    for (int d = 0; d < ndim; ++d) {
++        int dim_size = 0;
++        // We need dimension sizes to compute coordinates. Since we only have strides, we cannot recover dim sizes directly.
++        // Instead, we can compute coordinates using the total size and strides if we know the shape. But we are not given shape in the kernel.
++        // The launcher should pass shape as well, or we can compute coordinates by assuming contiguous input for now? 
++        // However, contract requires supporting strides, so we need shape.
++        // Better approach: use the strides to map linear index to offsets without knowing shape by using the stride values directly.
++        // For a tensor with shape [d0,d1,d2] and strides [s0,s1,s2], linear index = i0*s0 + i1*s1 + i2*s2.
++        // But to compute i0,i1,i2 we need shape. So kernel must receive shape.
++    }
++
++    // The above loop is incomplete. We'll instead create a specialized kernel for 3D tensors (N,C,L) which is our known shape.
++    // But the contract says shape can be ([N, C, L]) but we don't know exact N,C,L values at compile time. So launcher will pass strides and also total elements. We can use a mapping that works generically if we know the number of elements along each stride dimension.
++    // For simplicity, since support for arbitrary strides is required, we'll pass shape as int array.
++    // We'll implement a generic indexing using shape and strides.
++}
++
++// Proper implementation: We'll use a generic kernel that takes shape, strides, and ndim.
++__global__ void relu_forward_kernel_generic(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int numel,
++    const int* __restrict__ shape,
++    const int* __restrict__ in_strides,
++    const int* __restrict__ out_strides,
++    int ndim) {
++
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= numel) return;
++
++    int linear = idx;
++    int in_offset = 0;
++    int out_offset = 0;
++    int rem = linear;
++
++    for (int d = ndim - 1; d >= 0; --d) {
++        int coord = rem % shape[d];
++        rem /= shape[d];
++        in_offset += coord * in_strides[d];
++        out_offset += coord * out_strides[d];
++    }
++
++    output[out_offset] = fmaxf(input[in_offset], 0.0f);
++}
++
++// AvgPool1d forward kernel: output along last dim
++// Supports arbitrary strides for batch and channel dims, last dim stride assumed contiguous? Not necessarily.
++// But avg_pool operates on last dimension, and input/output may have arbitrary strides for all dims.
++// For each output element (n,c,ow), compute mean over window [ow*stride - padding, ow*stride - padding + kernel_size)
++// with count_include_pad=True => divide by kernel_size always.
++__global__ void avg_pool1d_forward_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int N,
++    int C,
++    int L_in,
++    int L_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    const int* __restrict__ in_strides,
++    const int* __restrict__ out_strides) {
++
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * L_out;
++    if (idx >= total) return;
++
++    // Decode idx into n, c, ow
++    int ow = idx % L_out;
++    int tmp = idx / L_out;
++    int c = tmp % C;
++    int n = tmp / C;
++
++    // Compute input base offset for (n,c,0)
++    int in_base = n * in_strides[0] + c * in_strides[1];
++    int out_offset = n * out_strides[0] + c * out_strides[1] + ow * out_strides[2];
++
++    // Start position in input for the window
++    int start = ow * stride - padding;
++    float sum = 0.0f;
++
++    // Loop over kernel window
++    for (int k = 0; k < kernel_size; ++k) {
++        int pos = start + k;
++        if (pos >= 0 && pos < L_in) {
++            int in_offset = in_base + pos * in_strides[2];
++            sum += input[in_offset];
++        }
++        // else contribute 0 for padding
++    }
++
++    output[out_offset] = sum / static_cast<float>(kernel_size);
++}
++
++// Host launcher functions (extern "C")
++extern "C" void relu_forward_launcher(
++    float* output,
++    const float* input,
++    int numel,
++    const int* shape,
++    const int* in_strides,
++    const int* out_strides,
++    int ndim,
++    cudaStream_t stream) {
++
++    if (numel == 0) return;
++
++    int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++
++    relu_forward_kernel_generic<<<blocks, threads, 0, stream>>>(
++        output, input, numel, shape, in_strides, out_strides, ndim);
++}
++
++// For avg_pool1d, we also need to handle arbitrary strides, but we pass explicit strides arrays.
++// Since input and output are 3D, we can assume ndim=3, but contract says N,C,L.
++// We'll provide a launcher with fixed ndim=3, but pass shape and strides for 3 dims.
++extern "C" void avg_pool1d_forward_launcher(
++    float* output,
++    const float* input,
++    int N,
++    int C,
++    int L_in,
++    int L_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    const int* in_strides,
++    const int* out_strides,
++    cudaStream_t stream) {
++
++    if (N == 0 || C == 0 || L_out == 0) return;
++
++    int total = N * C * L_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    avg_pool1d_forward_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, N, C, L_in, L_out, kernel_size, stride, padding,
++        in_strides, out_strides);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,146 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++#include <vector>
++#include <cmath>
++
++// Declare launchers defined in custom_ops.cu
++extern "C" void relu_forward_launcher(
++    float* output,
++    const float* input,
++    int numel,
++    const int* shape,
++    const int* in_strides,
++    const int* out_strides,
++    int ndim,
++    cudaStream_t stream);
++
++extern "C" void avg_pool1d_forward_launcher(
++    float* output,
++    const float* input,
++    int N,
++    int C,
++    int L_in,
++    int L_out,
++    int kernel_size,
++    int stride,
++    int padding,
++    const int* in_strides,
++    const int* out_strides,
++    cudaStream_t stream);
++
++// Wrapper for relu_forward
++torch::Tensor relu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "relu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "relu_forward: input must be float32");
++    TORCH_CHECK(x.dim() >= 1 && x.dim() <= 3, "relu_forward: input must be 1D, 2D, or 3D");
++
++    // Allocate output with same sizes and strides as input to preserve stride semantics.
++    auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
++
++    int ndim = x.dim();
++    int numel = x.numel();
++
++    // Create small host arrays for shape, in_strides, out_strides; launcher will copy to device internally
++    // Actually launcher expects device pointers? The .cu launcher takes const int* pointers, which could be host or device.
++    // We'll allocate pinned/host arrays and pass them; but kernel launches need device data. Since the .cu launcher does not copy,
++    // it expects device pointers. We can pass host pointers if the kernel uses them directly? The kernel code accesses shape[], in_strides[], out_strides[] as if they are in global memory accessible by device, so they must be device pointers.
++    // We'll allocate small device tensors to hold these arrays, copy from host, and pass device pointers to launcher.
++    // This avoids modifying .cu.
++
++    std::vector<int> shape(ndim);
++    std::vector<int> in_strides(ndim);
++    std::vector<int> out_strides(ndim);
++    for (int i = 0; i < ndim; ++i) {
++        shape[i] = x.size(i);
++        in_strides[i] = x.stride(i);
++        out_strides[i] = output.stride(i);
++    }
++
++    // Allocate device memory for these arrays using torch::empty with int32 options on same device.
++    auto shape_t = torch::empty({ndim}, x.options().dtype(torch::kInt32));
++    auto in_strides_t = torch::empty({ndim}, x.options().dtype(torch::kInt32));
++    auto out_strides_t = torch::empty({ndim}, x.options().dtype(torch::kInt32));
++
++    // Copy host vectors to device tensors using memcpy via cudaMemcpy (since we can't use torch:: operations for compute).
++    cudaMemcpy(shape_t.data_ptr<int>(), shape.data(), ndim * sizeof(int), cudaMemcpyHostToDevice);
++    cudaMemcpy(in_strides_t.data_ptr<int>(), in_strides.data(), ndim * sizeof(int), cudaMemcpyHostToDevice);
++    cudaMemcpy(out_strides_t.data_ptr<int>(), out_strides.data(), ndim * sizeof(int), cudaMemcpyHostToDevice);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    relu_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        numel,
++        shape_t.data_ptr<int>(),
++        in_strides_t.data_ptr<int>(),
++        out_strides_t.data_ptr<int>(),
++        ndim,
++        stream);
++
++    return output;
++}
++
++// Wrapper for avg_pool1d_forward
++torch::Tensor avg_pool1d_forward(torch::Tensor x, int64_t kernel_size, int64_t stride, int64_t padding) {
++    TORCH_CHECK(x.is_cuda(), "avg_pool1d_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "avg_pool1d_forward: input must be float32");
++    TORCH_CHECK(x.dim() == 3, "avg_pool1d_forward: input must be 3D (N, C, L)");
++    TORCH_CHECK(kernel_size > 0 && stride > 0, "kernel_size and stride must be positive");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int L_in = x.size(2);
++
++    // Compute output length
++    int L_out = static_cast<int>(std::floor((L_in + 2 * padding - kernel_size) / static_cast<double>(stride))) + 1;
++
++    // Allocate contiguous output tensor [N, C, L_out]
++    auto output = torch::empty({N, C, L_out}, x.options());
++
++    // Prepare strides arrays (input may have arbitrary strides, output is contiguous)
++    std::vector<int> in_strides(3);
++    std::vector<int> out_strides(3);
++    for (int i = 0; i < 3; ++i) {
++        in_strides[i] = x.stride(i);
++        out_strides[i] = output.stride(i);
++    }
++
++    // Allocate device memory for strides
++    auto in_strides_t = torch::empty({3}, x.options().dtype(torch::kInt32));
++    auto out_strides_t = torch::empty({3}, x.options().dtype(torch::kInt32));
++
++    cudaMemcpy(in_strides_t.data_ptr<int>(), in_strides.data(), 3 * sizeof(int), cudaMemcpyHostToDevice);
++    cudaMemcpy(out_strides_t.data_ptr<int>(), out_strides.data(), 3 * sizeof(int), cudaMemcpyHostToDevice);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    avg_pool1d_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        N,
++        C,
++        L_in,
++        L_out,
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        in_strides_t.data_ptr<int>(),
++        out_strides_t.data_ptr<int>(),
++        stream);
++
++    return output;
++}
++
++// Register both functions
++void register_custom_ops(pybind11::module& m) {
++    m.def("relu_forward", &relu_forward, "ReLU forward", py::arg("x"));
++    m.def("avg_pool1d_forward", &avg_pool1d_forward, "AvgPool1d forward",
++          py::arg("x"), py::arg("kernel_size"), py::arg("stride"), py::arg("padding"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.relu = nn.ReLU()
++        self.avg_pool = nn.AvgPool1d(kernel_size=3, stride=2, padding=1)
++
++    def forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        x = cuda_extension.avg_pool1d_forward(x, kernel_size=3, stride=2, padding=1)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.avg_pool1d_forward(x, kernel_size=3, stride=2, padding=1)
++        yield 'step_002', x
++        yield 'step_003', x

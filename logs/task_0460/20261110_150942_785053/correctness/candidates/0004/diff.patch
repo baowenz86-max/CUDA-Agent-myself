@@ -1,0 +1,128 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -4,59 +4,19 @@
+ // This file contains CUDA kernels and host launchers for custom ops used by the model.
+ // It must not depend on torch, ATen, or pybind. All tensor handling is done in the binding layer.
+ 
+-// Kernel: copies input contiguous buffer to output contiguous buffer.
+-// Used by identity_new_tensor: copy [512,128,128] contiguous tensor.
+-// grid-stride loop for generality.
+-__global__ void copy_kernel_float(const float* __restrict__ input,
+-                                  float* __restrict__ output,
+-                                  int64_t numel) {
+-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int64_t stride = blockDim.x * gridDim.x;
+-    for (int64_t i = idx; i < numel; i += stride) {
+-        output[i] = input[i];
+-    }
+-}
+-
+-// Kernel: stacks a list of contiguous tensors along a new dimension 1.
+-// Input: each tensor has shape [B, H, W] -> flattened per tensor: B*H*W
+-// Output: shape [B, C, H, W], where C is number of tensors.
+-// We assume all input tensors are contiguous and have same shape (B,H,W).
+-// Output is contiguous.
+-__global__ void stack_kernel_float(const float* __restrict__ input,
+-                                   float* __restrict__ output,
+-                                   int64_t B,
+-                                   int64_t C,
+-                                   int64_t H,
+-                                   int64_t W) {
+-    int64_t total = B * C * H * W;
+-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int64_t stride = blockDim.x * gridDim.x;
+-    int64_t per_tensor = B * H * W;
+-    for (int64_t i = idx; i < total; i += stride) {
+-        // decompose output index: i = (((b * C + c) * H + h) * W + w)
+-        int64_t tmp = i;
+-        int64_t w = tmp % W;
+-        tmp /= W;
+-        int64_t h = tmp % H;
+-        tmp /= H;
+-        int64_t c = tmp % C;
+-        int64_t b = tmp / C;
+-        int64_t src_idx = (b * H + h) * W + w;
+-        output[i] = input[c * per_tensor + src_idx];
+-    }
+-}
++// We use cudaMemcpyAsync for simple contiguous copies to avoid any index errors.
+ 
+ // Launcher for unbind_dim1. Since unbind returns views, no CUDA work is needed.
+-// The binding layer will create Python tuple of tensor views using torch::unbind-like slicing.
+-// We provide a no-op launcher for completeness; it takes raw pointer and does nothing.
++// The binding layer will create Python tuple of tensor views using torch::select.
++// We provide a no-op launcher for completeness.
+ extern "C" void unbind_dim1_launcher(const float* x,
+                                      int64_t B,
+                                      int64_t C,
+                                      int64_t H,
+                                      int64_t W,
+                                      cudaStream_t stream) {
++    (void)x; (void)B; (void)C; (void)H; (void)W; (void)stream;
+     // No kernel launch; views are handled in C++.
+-    (void)x; (void)B; (void)C; (void)H; (void)W; (void)stream;
+ }
+ 
+ // Launcher for identity_new_tensor: copies data to a new contiguous tensor.
+@@ -65,16 +25,12 @@
+                                         int64_t numel,
+                                         cudaStream_t stream) {
+     if (numel <= 0) return;
+-    int threads = 256;
+-    int blocks = (int)((numel + threads - 1) / threads);
+-    // Limit blocks to a reasonable max to avoid excessive grid dimensions.
+-    if (blocks > 65535) blocks = 65535;
+-    copy_kernel_float<<<blocks, threads, 0, stream>>>(input, output, numel);
++    // Use cudaMemcpyAsync for reliable copy
++    cudaMemcpyAsync(output, input, numel * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+ }
+ 
+ // Launcher for stack_dim1: stacks C contiguous tensors into output [B,C,H,W].
+-// To keep the launcher simple and avoid device pointer array allocation,
+-// we launch one copy kernel per input tensor, writing its data to the correct output slice.
++// We launch one copy per input tensor using cudaMemcpyAsync.
+ // The binding layer passes a host pointer to an array of device pointers.
+ extern "C" void stack_dim1_launcher(const float* const* input_ptrs,
+                                     int64_t B,
+@@ -85,15 +41,11 @@
+                                     cudaStream_t stream) {
+     if (B <= 0 || C <= 0 || H <= 0 || W <= 0) return;
+     int64_t per_tensor = B * H * W;
+-    int threads = 256;
+-    int blocks = (int)((per_tensor + threads - 1) / threads);
+-    if (blocks > 65535) blocks = 65535;
+     for (int64_t c = 0; c < C; ++c) {
+-        copy_kernel_float<<<blocks, threads, 0, stream>>>(
+-            input_ptrs[c], output + c * per_tensor, per_tensor);
++        cudaMemcpyAsync(output + c * per_tensor,
++                        input_ptrs[c],
++                        per_tensor * sizeof(float),
++                        cudaMemcpyDeviceToDevice,
++                        stream);
+     }
+ }
+-
+-// Note: The unbind_dim1_launcher is a no-op because unbind returns views, handled in binding.
+-// The binding layer will create a tuple of tensors by slicing the original tensor using as_strided or narrow.
+-// No CUDA kernel is required for unbind.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -64,7 +64,6 @@
+         TORCH_CHECK(t.dim() == 3, "each tensor must be 3D");
+         TORCH_CHECK(t.size(0) == B && t.size(1) == H && t.size(2) == W, "all tensors must have same shape");
+         // Inputs to stack are expected to be contiguous (after identity_new_tensor).
+-        // We don't enforce contiguity here, but the launcher assumes contiguous.
+         TORCH_CHECK(t.is_contiguous(), "each tensor in stack must be contiguous");
+     }
+ 
+--- before/model_new.py
++++ after/model_new.py
+@@ -5,8 +5,6 @@
+ class ModelNew(nn.Module):
+     def __init__(self, upscale_factor):
+         super().__init__()
+-        # Preserve the PixelShuffle module attribute to match state_dict keys if any,
+-        # but we won't use it in forward (we use custom ops instead).
+         self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
+ 
+     def forward(self, x):

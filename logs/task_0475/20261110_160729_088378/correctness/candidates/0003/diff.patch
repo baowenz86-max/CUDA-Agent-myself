@@ -1,0 +1,126 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,36 +1,17 @@
+ #include <cuda_runtime.h>
+ #include <cmath>
+ 
+-// Identity copy kernel: writes output in row-major logical order,
+-// mapping each logical index through input/output strides.
++// Simple identity copy kernel: output[i] = input[i] for contiguous tensors.
+ __global__ void identity_copy_kernel(
+     float* __restrict__ output,
+     const float* __restrict__ input,
+-    long long total_elements,
+-    int ndim,
+-    const long long* __restrict__ shape,
+-    const long long* __restrict__ output_strides,
+-    const long long* __restrict__ input_strides
++    long long total_elements
+ ) {
+     long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+     long long stride = (long long)blockDim.x * gridDim.x;
+ 
+     for (; idx < total_elements; idx += stride) {
+-        long long linear = idx;
+-        long long out_offset = 0;
+-        long long in_offset = 0;
+-
+-        // Compute multi-index from row-major linear index and map to offsets.
+-        // This generic loop supports any ndim.
+-        for (int d = ndim - 1; d >= 0; --d) {
+-            long long dim_size = shape[d];
+-            long long coord = linear % dim_size;
+-            linear /= dim_size;
+-            out_offset += coord * output_strides[d];
+-            in_offset  += coord * input_strides[d];
+-        }
+-
+-        output[out_offset] = input[in_offset];
++        output[idx] = input[idx];
+     }
+ }
+ 
+@@ -53,10 +34,6 @@
+ extern "C" void custom_identity_launcher(
+     float* output,
+     const float* input,
+-    int ndim,
+-    const long long* shape,
+-    const long long* output_strides,
+-    const long long* input_strides,
+     long long total_elements,
+     cudaStream_t stream
+ ) {
+@@ -64,7 +41,7 @@
+     int blocks = (int)((total_elements + threads - 1) / threads);
+     if (blocks > 1048576) blocks = 1048576;
+     identity_copy_kernel<<<blocks, threads, 0, stream>>>(
+-        output, input, total_elements, ndim, shape, output_strides, input_strides);
++        output, input, total_elements);
+ }
+ 
+ extern "C" void custom_elu_launcher(
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,17 +2,12 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <vector>
+ #include "../binding_registry.h"
+ 
+ // External launcher declarations from custom_ops.cu
+ extern "C" void custom_identity_launcher(
+     float* output,
+     const float* input,
+-    int ndim,
+-    const long long* shape,
+-    const long long* output_strides,
+-    const long long* input_strides,
+     long long total_elements,
+     cudaStream_t stream
+ );
+@@ -32,43 +27,17 @@
+     TORCH_CHECK(t.numel() > 0, name, " must have at least one element");
+ }
+ 
+-// Copy strides to a std::vector<long long>
+-static std::vector<long long> get_strides(const torch::Tensor& t) {
+-    std::vector<long long> strides(t.dim());
+-    for (int i = 0; i < t.dim(); ++i) {
+-        strides[i] = static_cast<long long>(t.stride(i));
+-    }
+-    return strides;
+-}
+-
+-// Copy shape to a std::vector<long long>
+-static std::vector<long long> get_shape(const torch::Tensor& t) {
+-    std::vector<long long> shape(t.dim());
+-    for (int i = 0; i < t.dim(); ++i) {
+-        shape[i] = static_cast<long long>(t.size(i));
+-    }
+-    return shape;
+-}
+-
+ // custom_identity: returns a tensor identical to input (same strides, shape, values)
+ torch::Tensor custom_identity(torch::Tensor x) {
+     check_tensor(x, "x");
+     
+     auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
+     
+-    auto shape_vec = get_shape(x);
+-    auto out_strides_vec = get_strides(output);
+-    auto in_strides_vec = get_strides(x);
+-    
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     
+     custom_identity_launcher(
+         output.data_ptr<float>(),
+         x.data_ptr<float>(),
+-        static_cast<int>(x.dim()),
+-        shape_vec.data(),
+-        out_strides_vec.data(),
+-        in_strides_vec.data(),
+         static_cast<long long>(x.numel()),
+         stream
+     );

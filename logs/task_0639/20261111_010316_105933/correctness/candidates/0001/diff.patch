@@ -1,0 +1,297 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,149 @@
++// custom_ops.cu
++// CUDA kernels for max_reduce and layer_norm_forward
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// Compute maximum along dim and its index
++// Input: x (N, C, H, W) with strides sx0, sx1, sx2, sx3
++// Output: values (N, 1, H, W), indices (N, 1, H, W) int64
++// dim is always 1, keepdim always true, but verify in launcher
++__global__ void max_reduce_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ values,
++    int64_t* __restrict__ indices,
++    int N, int C, int H, int W,
++    int64_t sx0, int64_t sx1, int64_t sx2, int64_t sx3,
++    int64_t sv0, int64_t sv1, int64_t sv2, int64_t sv3,
++    int64_t si0, int64_t si1, int64_t si2, int64_t si3)
++{
++    int64_t total_outputs = (int64_t)N * H * W;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t grid_stride = (int64_t)gridDim.x * blockDim.x;
++    
++    for (int64_t out_idx = idx; out_idx < total_outputs; out_idx += grid_stride) {
++        int n = out_idx / ((int64_t)H * W);
++        int rem = out_idx % ((int64_t)H * W);
++        int h = rem / W;
++        int w = rem % W;
++        
++        const float* base_ptr = x + n * sx0 + h * sx2 + w * sx3;
++        float max_val = base_ptr[0];
++        int max_idx = 0;
++        for (int c = 1; c < C; ++c) {
++            float val = base_ptr[c * sx1];
++            if (val > max_val) {
++                max_val = val;
++                max_idx = c;
++            }
++        }
++        
++        float* val_out = values + n * sv0 + h * sv2 + w * sv3;
++        int64_t* idx_out = indices + n * si0 + h * si2 + w * si3;
++        *val_out = max_val;
++        *idx_out = (int64_t)max_idx;
++    }
++}
++
++// LayerNorm over last dimension (size D = W) per (N,H) position
++// Input: x (N, 1, H, D) with strides, weight (D), bias (D)
++// Output: y same shape as input (strides same as input)
++__global__ void layer_norm_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    float eps,
++    int N, int H, int D,
++    int64_t sx0, int64_t sx1, int64_t sx2, int64_t sx3,
++    int64_t sy0, int64_t sy1, int64_t sy2, int64_t sy3)
++{
++    int64_t total_positions = (int64_t)N * H;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t grid_stride = (int64_t)gridDim.x * blockDim.x;
++    
++    for (int64_t pos = idx; pos < total_positions; pos += grid_stride) {
++        int n = pos / H;
++        int h = pos % H;
++        
++        const float* row = input + n * sx0 + h * sx2; // row length D, stride sx3 between elements
++        // Compute mean and variance
++        float sum = 0.0f;
++        float sum_sq = 0.0f;
++        for (int d = 0; d < D; ++d) {
++            float val = row[d * sx3];
++            sum += val;
++            sum_sq += val * val;
++        }
++        float mean = sum / D;
++        float var = sum_sq / D - mean * mean;
++        float inv_std = rsqrtf(var + eps);
++        
++        float* out_row = output + n * sy0 + h * sy2;
++        for (int d = 0; d < D; ++d) {
++            float val = row[d * sx3];
++            float normalized = (val - mean) * inv_std;
++            float result = normalized * weight[d] + bias[d];
++            out_row[d * sy3] = result;
++        }
++    }
++}
++
++// Launcher for max_reduce
++// x: input tensor data pointer
++// N, C, H, W: dimensions
++// strides: array of 4 int64 for input, values, indices
++// values, indices: output pointers
++// stream: CUDA stream
++extern "C" void max_reduce_launcher(
++    const float* x,
++    float* values,
++    int64_t* indices,
++    int N, int C, int H, int W,
++    const int64_t* x_strides,
++    const int64_t* values_strides,
++    const int64_t* indices_strides,
++    cudaStream_t stream)
++{
++    int64_t total_outputs = (int64_t)N * H * W;
++    int block_size = 256;
++    int64_t grid_size = (total_outputs + block_size - 1) / block_size;
++    // Cap grid to avoid excessive launches
++    if (grid_size > 65535) grid_size = 65535;
++    
++    max_reduce_kernel<<<(int)grid_size, block_size, 0, stream>>>(
++        x, values, indices,
++        N, C, H, W,
++        x_strides[0], x_strides[1], x_strides[2], x_strides[3],
++        values_strides[0], values_strides[1], values_strides[2], values_strides[3],
++        indices_strides[0], indices_strides[1], indices_strides[2], indices_strides[3]);
++}
++
++// Launcher for layer_norm_forward
++// input: input tensor data pointer
++// weight, bias: parameter pointers (size D)
++// output: output tensor data pointer (same shape as input)
++// N, H, D: dimensions (input shape [N, 1, H, D])
++// strides: input and output strides arrays
++// eps: epsilon
++extern "C" void layer_norm_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    float eps,
++    int N, int H, int D,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    cudaStream_t stream)
++{
++    int64_t total_positions = (int64_t)N * H;
++    int block_size = 256;
++    int64_t grid_size = (total_positions + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    
++    layer_norm_kernel<<<(int)grid_size, block_size, 0, stream>>>(
++        input, weight, bias, output, eps,
++        N, H, D,
++        input_strides[0], input_strides[1], input_strides[2], input_strides[3],
++        output_strides[0], output_strides[1], output_strides[2], output_strides[3]);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,114 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++extern "C" void max_reduce_launcher(
++    const float* x,
++    float* values,
++    int64_t* indices,
++    int N, int C, int H, int W,
++    const int64_t* x_strides,
++    const int64_t* values_strides,
++    const int64_t* indices_strides,
++    cudaStream_t stream);
++
++extern "C" void layer_norm_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    float eps,
++    int N, int H, int D,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    cudaStream_t stream);
++
++std::tuple<torch::Tensor, torch::Tensor> max_reduce(torch::Tensor x, int64_t dim, bool keepdim) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported");
++    TORCH_CHECK(keepdim, "Only keepdim=true is supported");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    auto values = torch::empty({N, 1, H, W}, x.options());
++    auto indices = torch::empty({N, 1, H, W}, x.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    int64_t x_strides[4] = {x.stride(0), x.stride(1), x.stride(2), x.stride(3)};
++    int64_t values_strides[4] = {values.stride(0), values.stride(1), values.stride(2), values.stride(3)};
++    int64_t indices_strides[4] = {indices.stride(0), indices.stride(1), indices.stride(2), indices.stride(3)};
++
++    max_reduce_launcher(
++        x.data_ptr<float>(),
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        N, C, H, W,
++        x_strides,
++        values_strides,
++        indices_strides,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "max_reduce kernel launch failed: ", cudaGetErrorString(err));
++
++    return {values, indices};
++}
++
++torch::Tensor layer_norm_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, double eps) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D [N,1,H,W]");
++    TORCH_CHECK(input.size(1) == 1, "Input dim 1 must be 1");
++    TORCH_CHECK(weight.numel() == input.size(3), "Weight size must match last dim");
++    TORCH_CHECK(bias.numel() == input.size(3), "Bias size must match last dim");
++
++    int N = input.size(0);
++    int H = input.size(2);
++    int D = input.size(3);
++
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    int64_t input_strides[4] = {input.stride(0), input.stride(1), input.stride(2), input.stride(3)};
++    int64_t output_strides[4] = {output.stride(0), output.stride(1), output.stride(2), output.stride(3)};
++
++    layer_norm_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<float>(eps),
++        N, H, D,
++        input_strides,
++        output_strides,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "layer_norm kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("max_reduce", &max_reduce, "Max reduce along dim=1 with keepdim=true",
++          py::arg("x"), py::arg("dim"), py::arg("keepdim"));
++    m.def("layer_norm_forward", &layer_norm_forward, "LayerNorm forward over last dim",
++          py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,25 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_channels, eps):
++        super().__init__()
++        self.layer_norm = nn.LayerNorm(num_channels, eps=eps)
++
++    def forward(self, x):
++        x, _ = cuda_extension.max_reduce(x, dim=1, keepdim=True)
++        x = cuda_extension.layer_norm_forward(
++            x, self.layer_norm.weight, self.layer_norm.bias, self.layer_norm.eps
++        )
++        return x
++
++    def debug_forward(self, x):
++        max_values, max_indices = cuda_extension.max_reduce(x, dim=1, keepdim=True)
++        yield 'step_001', (max_values, max_indices)
++        normalized = cuda_extension.layer_norm_forward(
++            max_values, self.layer_norm.weight, self.layer_norm.bias, self.layer_norm.eps
++        )
++        yield 'step_002', normalized
++        yield 'step_003', normalized

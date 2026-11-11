@@ -1,0 +1,228 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,79 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// CUDA kernel for torch.triu(x, diagonal=1) on last two dimensions.
++// Supports arbitrary batch dimensions and strides.
++// x: input pointer, out: output pointer, total elements
++// dim0: height, dim1: width, diagonal: as in torch.triu
++template <typename scalar_t>
++__global__ void triu_kernel(const scalar_t* __restrict__ x,
++                            scalar_t* __restrict__ out,
++                            int total_elements,
++                            int dim0,
++                            int dim1,
++                            long long int stride0,
++                            long long int stride1,
++                            long long int batch_stride,
++                            int diagonal) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total_elements; i += stride) {
++        // Compute batch index, row, col
++        int flat = i;
++        int batch = flat / (dim0 * dim1);
++        int rem = flat - batch * (dim0 * dim1);
++        int row = rem / dim1;
++        int col = rem - row * dim1;
++
++        // Offset in memory
++        long long int offset = batch * batch_stride + row * stride0 + col * stride1;
++
++        // Condition: keep if col - row >= diagonal, else zero
++        if (col - row < diagonal) {
++            out[i] = scalar_t(0);
++        } else {
++            out[i] = x[offset];
++        }
++    }
++}
++
++// CUDA kernel for torch.abs(x)
++template <typename scalar_t>
++__global__ void abs_kernel(const scalar_t* __restrict__ x,
++                           scalar_t* __restrict__ out,
++                           int total_elements) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total_elements; i += stride) {
++        out[i] = fabsf(x[i]);
++    }
++}
++
++// Launcher for custom_triu
++extern "C" void custom_triu_launcher(const float* x,
++                                     float* out,
++                                     int total_elements,
++                                     int dim0,
++                                     int dim1,
++                                     long long int stride0,
++                                     long long int stride1,
++                                     long long int batch_stride,
++                                     int diagonal,
++                                     cudaStream_t stream) {
++    const int block = 256;
++    int grid = (total_elements + block - 1) / block;
++    if (grid > 65535) grid = 65535; // grid-stride loop handles rest
++    triu_kernel<float><<<grid, block, 0, stream>>>(
++        x, out, total_elements, dim0, dim1, stride0, stride1, batch_stride, diagonal);
++}
++
++// Launcher for custom_abs
++extern "C" void custom_abs_launcher(const float* x,
++                                    float* out,
++                                    int total_elements,
++                                    cudaStream_t stream) {
++    const int block = 256;
++    int grid = (total_elements + block - 1) / block;
++    if (grid > 65535) grid = 65535;
++    abs_kernel<float><<<grid, block, 0, stream>>>(x, out, total_elements);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,119 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_triu_launcher(
++    const float* x,
++    float* out,
++    int total_elements,
++    int dim0,
++    int dim1,
++    long long int stride0,
++    long long int stride1,
++    long long int batch_stride,
++    int diagonal,
++    cudaStream_t stream
++);
++
++extern "C" void custom_abs_launcher(
++    const float* x,
++    float* out,
++    int total_elements,
++    cudaStream_t stream
++);
++
++// Helper to get current CUDA stream
++static inline cudaStream_t getCurrentCUDAStream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// custom_triu forward
++torch::Tensor custom_triu_forward(torch::Tensor x, int64_t diagonal = 1) {
++    TORCH_CHECK(x.is_cuda(), "custom_triu: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_triu: input must be float32");
++    TORCH_CHECK(x.dim() >= 2, "custom_triu: input must have at least 2 dimensions");
++
++    // Shape parameters for last two dims
++    int64_t height = x.size(-2);
++    int64_t width = x.size(-1);
++    TORCH_CHECK(height > 0 && width > 0, "custom_triu: invalid last dimensions");
++
++    // Strides for last two dims (as long long to match launcher)
++    long long int stride0 = static_cast<long long int>(x.stride(-2));
++    long long int stride1 = static_cast<long long int>(x.stride(-1));
++
++    // Batch stride: distance between consecutive batches (if any)
++    // For non-batched case, batch_stride is 0 but unused.
++    long long int batch_stride = 0;
++    if (x.dim() > 2) {
++        // stride of the dimension just before the last two
++        batch_stride = static_cast<long long int>(x.stride(-3));
++    }
++
++    // Allocate output same shape, dtype, device
++    auto out = torch::empty_like(x);
++
++    int64_t total_elements = x.numel();
++    TORCH_CHECK(total_elements <= INT_MAX, "custom_triu: tensor too large for int indexing");
++
++    cudaStream_t stream = getCurrentCUDAStream();
++
++    custom_triu_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        static_cast<int>(total_elements),
++        static_cast<int>(height),
++        static_cast<int>(width),
++        stride0,
++        stride1,
++        batch_stride,
++        static_cast<int>(diagonal),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_triu: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// custom_abs forward
++torch::Tensor custom_abs_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "custom_abs: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_abs: input must be float32");
++
++    auto out = torch::empty_like(x);
++
++    int64_t total_elements = x.numel();
++    TORCH_CHECK(total_elements <= INT_MAX, "custom_abs: tensor too large for int indexing");
++
++    cudaStream_t stream = getCurrentCUDAStream();
++
++    custom_abs_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        static_cast<int>(total_elements),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_abs: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_triu", &custom_triu_forward,
++          "Apply upper triangular mask with given diagonal",
++          py::arg("x"), py::arg("diagonal") = 1);
++    m.def("custom_abs", &custom_abs_forward,
++          "Element-wise absolute value",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size):
++        super().__init__()
++        self.input_size = input_size
++
++    def forward(self, x):
++        x = cuda_extension.custom_triu(x, diagonal=1)
++        x = cuda_extension.custom_abs(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_triu(x, diagonal=1)
++        yield 'step_001', x
++        x = cuda_extension.custom_abs(x)
++        yield 'step_002', x
++        yield 'step_003', x

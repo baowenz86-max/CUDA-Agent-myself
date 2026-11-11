@@ -1,0 +1,146 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,45 @@
++#include <cuda_runtime.h>
++
++// Element-wise absolute value kernel
++__global__ void abs_kernel(const float* __restrict__ input, float* __restrict__ output, long long n) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (long long i = idx; i < n; i += stride) {
++        output[i] = fabsf(input[i]);
++    }
++}
++
++// Element-wise clamp kernel with min and max
++__global__ void clamp_kernel(const float* __restrict__ input, float* __restrict__ output,
++                             float min_val, float max_val, long long n) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (long long i = idx; i < n; i += stride) {
++        float val = input[i];
++        val = fminf(fmaxf(val, min_val), max_val);
++        output[i] = val;
++    }
++}
++
++// Launcher for custom_abs_forward
++extern "C" void custom_abs_forward_launcher(const float* input, float* output, long long n, cudaStream_t stream) {
++    const int block_size = 256;
++    long long grid_size = (n + block_size - 1) / block_size;
++    if (grid_size > 2147483647LL) {
++        grid_size = 2147483647LL;
++    }
++    abs_kernel<<<(int)grid_size, block_size, 0, stream>>>(input, output, n);
++}
++
++// Launcher for custom_clamp_forward
++extern "C" void custom_clamp_forward_launcher(const float* input, float* output,
++                                             double min_value, double max_value, long long n, cudaStream_t stream) {
++    const int block_size = 256;
++    long long grid_size = (n + block_size - 1) / block_size;
++    if (grid_size > 2147483647LL) {
++        grid_size = 2147483647LL;
++    }
++    float min_val = (float)min_value;
++    float max_val = (float)max_value;
++    clamp_kernel<<<(int)grid_size, block_size, 0, stream>>>(input, output, min_val, max_val, n);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,70 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_abs_forward_launcher(
++    const float* input,
++    float* output,
++    long long n,
++    cudaStream_t stream
++);
++
++extern "C" void custom_clamp_forward_launcher(
++    const float* input,
++    float* output,
++    double min_value,
++    double max_value,
++    long long n,
++    cudaStream_t stream
++);
++
++// Wrapper for custom_abs_forward
++torch::Tensor custom_abs_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_abs_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<long long>(x.numel()),
++        stream
++    );
++
++    return output;
++}
++
++// Wrapper for custom_clamp_forward
++torch::Tensor custom_clamp_forward(torch::Tensor x, double min_value, double max_value) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_clamp_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        min_value,
++        max_value,
++        static_cast<long long>(x.numel()),
++        stream
++    );
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_abs_forward", &custom_abs_forward, "Element-wise absolute value",
++          py::arg("x"));
++    m.def("custom_clamp_forward", &custom_clamp_forward, "Clamp tensor to [min_value, max_value]",
++          py::arg("x"), py::arg("min_value"), py::arg("max_value"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, min_value, max_value):
++        super().__init__()
++        self.min_value = min_value
++        self.max_value = max_value
++
++    def forward(self, x):
++        x = cuda_extension.custom_abs_forward(x)
++        x = cuda_extension.custom_clamp_forward(x, self.min_value, self.max_value)
++        return x
++
++    def debug_forward(self, x):
++        x_abs = cuda_extension.custom_abs_forward(x)
++        yield 'step_001', x_abs
++        x_clamp = cuda_extension.custom_clamp_forward(x_abs, self.min_value, self.max_value)
++        yield 'step_002', x_clamp
++        yield 'step_003', x_clamp

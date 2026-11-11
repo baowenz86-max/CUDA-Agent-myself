@@ -1,0 +1,118 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,31 @@
++#include <cuda_runtime.h>
++
++// Fused element-wise abs and threshold kernel.
++// Computes output = (abs(input) > threshold) ? abs(input) : 0.0f
++// Supports arbitrary strides by operating on linear indices.
++template <typename scalar_t>
++__global__ void threshold_abs_kernel(const scalar_t* __restrict__ input,
++                                     scalar_t* __restrict__ output,
++                                     int64_t total_elements,
++                                     scalar_t threshold) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        scalar_t val = input[i];
++        scalar_t abs_val = (val < 0) ? -val : val;
++        output[i] = (abs_val > threshold) ? abs_val : static_cast<scalar_t>(0.0f);
++    }
++}
++
++// Launcher for float32 only (contract requires float32).
++extern "C" void threshold_abs_forward_launcher(const float* input,
++                                                float* output,
++                                                int64_t total_elements,
++                                                double threshold,
++                                                cudaStream_t stream) {
++    const int threads = 256;
++    const int64_t blocks_64 = (total_elements + threads - 1) / threads;
++    const int blocks = static_cast<int>(blocks_64 > 2147483647 ? 2147483647 : blocks_64);
++    threshold_abs_kernel<float><<<blocks, threads, 0, stream>>>(
++        input, output, total_elements, static_cast<float>(threshold));
++}
+--- before/kernels/threshold_abs_forward_binding.cpp
++++ after/kernels/threshold_abs_forward_binding.cpp
+@@ -0,0 +1,45 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++extern "C" void threshold_abs_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    double threshold,
++    cudaStream_t stream);
++
++torch::Tensor threshold_abs_forward(torch::Tensor x, double threshold) {
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be on CUDA");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input tensor must be float32");
++
++    // Ensure contiguous layout to simplify kernel indexing
++    x = x.contiguous();
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    threshold_abs_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        threshold,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_threshold_abs_forward(pybind11::module& m) {
++    m.def("threshold_abs_forward", &threshold_abs_forward,
++          "Fused abs and threshold forward (CUDA)",
++          py::arg("x"), py::arg("threshold"));
++}
++
++REGISTER_BINDING(threshold_abs_forward, register_threshold_abs_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,33 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, binary_threshold):
++        super().__init__()
++        self.binary_threshold = binary_threshold
++
++    def forward(self, x):
++        # 参考代码在 CUDA 设备上执行，确保输入位于 CUDA
++        x = self._ensure_cuda(x)
++        return cuda_extension.threshold_abs_forward(x, self.binary_threshold)
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = self._ensure_cuda(x)
++        # 第一步：torch.abs(x)
++        abs_result = cuda_extension.threshold_abs_forward(x, 0.0)  # 阈值 0.0 使 abs 完全保留
++        yield ('step_001', abs_result)
++        # 第二步：torch.where(...)
++        thresholded_result = cuda_extension.threshold_abs_forward(x, self.binary_threshold)
++        yield ('step_002', thresholded_result)
++        # 第三步：return x
++        yield ('step_003', thresholded_result)
++
++    @staticmethod
++    def _ensure_cuda(tensor):
++        if tensor.device.type != 'cuda':
++            tensor = tensor.cuda()
++        return tensor
++

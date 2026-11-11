@@ -1,0 +1,266 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,140 @@
++// kernels/custom_ops.cu
++// CUDA kernels for custom_selu_forward and custom_identity_forward.
++// This file contains only CUDA kernels and launchers with raw pointers.
++
++#include <cuda_runtime.h>
++#include <cmath>
++
++// SELU constants (double precision as in PyTorch, converted to float in kernel)
++__constant__ float c_selu_alpha = 1.6732632423543772848170429916717f;
++__constant__ float c_selu_scale = 1.0507009873554804934193349852946f;
++
++// Kernel: elementwise SELU with arbitrary strides.
++// Computes: out = scale * x if x > 0 else scale * alpha * (exp(x) - 1)
++// Supports arbitrary strides via precomputed offset multipliers.
++__global__ void selu_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int numel,
++    int batch_stride_in, int height_stride_in, int width_stride_in,
++    int batch_stride_out, int height_stride_out, int width_stride_out)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < numel; i += stride) {
++        // 将一维索引映射到 (b, h, w) 坐标
++        int b = i / (height_stride_in * batch_stride_in == 0 ? 1 : height_stride_in * batch_stride_in); // 占位，实际使用下面的分解
++        // 使用除法和取模：假设输入是三维，且 dim0 的 stride 乘以其大小等于总 numel 的倍数？
++        // 更简单的方案：我们要求 binding 层传入的总 numel 和每个维度的 stride，并且假设输入是连续的或者至少是可以通过线性索引计算的。
++        // 实际上，为了支持任意 stride，我们需要维度大小。但这里只有 stride 信息不够，还需要 shape。
++        // 根据合同，shape 是固定的 [16, 5120, 5120]，所以我们可以从 numel 和 stride 推导 shape？
++        // 但为了通用性，我们添加参数 shape0, shape1, shape2。
++        // 我们将 launcher 设计为传入 shape 和 stride。
++    }
++}
++
++// 由于上述索引计算需要 shape，重新定义 kernel 参数包含 shape 信息。
++__global__ void selu_kernel_v2(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int numel,
++    int shape0, int shape1, int shape2,
++    long long stride0_in, long long stride1_in, long long stride2_in,
++    long long stride0_out, long long stride1_out, long long stride2_out)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < numel; i += stride) {
++        // 从一维索引重构 (b, h, w)
++        int b = i / (shape1 * shape2);
++        int rem = i - b * shape1 * shape2;
++        int h = rem / shape2;
++        int w = rem - h * shape2;
++
++        long long in_offset = b * stride0_in + h * stride1_in + w * stride2_in;
++        long long out_offset = b * stride0_out + h * stride1_out + w * stride2_out;
++
++        float x = input[in_offset];
++        float result;
++        if (x > 0.0f) {
++            result = c_selu_scale * x;
++        } else {
++            result = c_selu_scale * c_selu_alpha * (expf(x) - 1.0f);
++        }
++        output[out_offset] = result;
++    }
++}
++
++// Identity kernel: simply copies input to output with arbitrary strides.
++__global__ void identity_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int numel,
++    int shape0, int shape1, int shape2,
++    long long stride0_in, long long stride1_in, long long stride2_in,
++    long long stride0_out, long long stride1_out, long long stride2_out)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < numel; i += stride) {
++        int b = i / (shape1 * shape2);
++        int rem = i - b * shape1 * shape2;
++        int h = rem / shape2;
++        int w = rem - h * shape2;
++
++        long long in_offset = b * stride0_in + h * stride1_in + w * stride2_in;
++        long long out_offset = b * stride0_out + h * stride1_out + w * stride2_out;
++
++        output[out_offset] = input[in_offset];
++    }
++}
++
++// Launcher for SELU operation.
++extern "C" void custom_selu_forward_launcher(
++    float* output,
++    const float* input,
++    int numel,
++    int shape0, int shape1, int shape2,
++    long long stride0_in, long long stride1_in, long long stride2_in,
++    long long stride0_out, long long stride1_out, long long stride2_out,
++    cudaStream_t stream)
++{
++    const int threads = 256;
++    // 计算网格大小，限制最大网格尺寸。
++    int blocks = (numel + threads - 1) / threads;
++    const int max_blocks = 65535;
++    if (blocks > max_blocks) {
++        blocks = max_blocks;
++    }
++    selu_kernel_v2<<<blocks, threads, 0, stream>>>(
++        output, input, numel,
++        shape0, shape1, shape2,
++        stride0_in, stride1_in, stride2_in,
++        stride0_out, stride1_out, stride2_out);
++}
++
++// Launcher for identity operation.
++extern "C" void custom_identity_forward_launcher(
++    float* output,
++    const float* input,
++    int numel,
++    int shape0, int shape1, int shape2,
++    long long stride0_in, long long stride1_in, long long stride2_in,
++    long long stride0_out, long long stride1_out, long long stride2_out,
++    cudaStream_t stream)
++{
++    const int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++    const int max_blocks = 65535;
++    if (blocks > max_blocks) {
++        blocks = max_blocks;
++    }
++    identity_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, numel,
++        shape0, shape1, shape2,
++        stride0_in, stride1_in, stride2_in,
++        stride0_out, stride1_out, stride2_out);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,97 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_selu_forward_launcher(
++    float* output,
++    const float* input,
++    int numel,
++    int shape0, int shape1, int shape2,
++    long long stride0_in, long long stride1_in, long long stride2_in,
++    long long stride0_out, long long stride1_out, long long stride2_out,
++    cudaStream_t stream);
++
++extern "C" void custom_identity_forward_launcher(
++    float* output,
++    const float* input,
++    int numel,
++    int shape0, int shape1, int shape2,
++    long long stride0_in, long long stride1_in, long long stride2_in,
++    long long stride0_out, long long stride1_out, long long stride2_out,
++    cudaStream_t stream);
++
++// Helper to validate input tensor and return contiguous version if needed
++static torch::Tensor check_float_cuda_3d(const torch::Tensor& x, const char* op_name) {
++    TORCH_CHECK(x.is_cuda(), op_name, ": input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, op_name, ": input must be float32");
++    TORCH_CHECK(x.dim() == 3, op_name, ": input must have 3 dimensions");
++    return x.is_contiguous() ? x : x.contiguous();
++}
++
++torch::Tensor custom_selu_forward(torch::Tensor x) {
++    x = check_float_cuda_3d(x, "custom_selu_forward");
++    auto output = torch::empty_like(x);
++
++    int shape0 = static_cast<int>(x.size(0));
++    int shape1 = static_cast<int>(x.size(1));
++    int shape2 = static_cast<int>(x.size(2));
++    long long stride0_in = x.stride(0);
++    long long stride1_in = x.stride(1);
++    long long stride2_in = x.stride(2);
++    long long stride0_out = output.stride(0);
++    long long stride1_out = output.stride(1);
++    long long stride2_out = output.stride(2);
++    int numel = static_cast<int>(x.numel());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_selu_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        numel,
++        shape0, shape1, shape2,
++        stride0_in, stride1_in, stride2_in,
++        stride0_out, stride1_out, stride2_out,
++        stream);
++    return output;
++}
++
++torch::Tensor custom_identity_forward(torch::Tensor x) {
++    x = check_float_cuda_3d(x, "custom_identity_forward");
++    auto output = torch::empty_like(x);
++
++    int shape0 = static_cast<int>(x.size(0));
++    int shape1 = static_cast<int>(x.size(1));
++    int shape2 = static_cast<int>(x.size(2));
++    long long stride0_in = x.stride(0);
++    long long stride1_in = x.stride(1);
++    long long stride2_in = x.stride(2);
++    long long stride0_out = output.stride(0);
++    long long stride1_out = output.stride(1);
++    long long stride2_out = output.stride(2);
++    int numel = static_cast<int>(x.numel());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_identity_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        numel,
++        shape0, shape1, shape2,
++        stride0_in, stride1_in, stride2_in,
++        stride0_out, stride1_out, stride2_out,
++        stream);
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_selu_forward", &custom_selu_forward,
++          "Apply SELU activation elementwise",
++          py::arg("x"));
++    m.def("custom_identity_forward", &custom_identity_forward,
++          "Identity copy (einsum bwh->bwh)",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        x = cuda_extension.custom_selu_forward(x)
++        x = cuda_extension.custom_identity_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_selu_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.custom_identity_forward(x)
++        yield 'step_002', x
++        yield 'step_003', x

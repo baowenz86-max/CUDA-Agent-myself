@@ -1,0 +1,310 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,117 @@
++#include <cuda_runtime.h>
++
++// ReLU forward kernel: elementwise max(input, 0)
++// Supports arbitrary strides; each thread processes one element via grid-stride loop.
++__global__ void relu_forward_kernel(
++    float* output,
++    const float* input,
++    int64_t N,
++    int64_t input_offset,
++    int64_t output_offset)
++{
++    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < N; idx += blockDim.x * gridDim.x) {
++        int64_t in_idx = input_offset + idx;
++        int64_t out_idx = output_offset + idx;
++        float val = input[in_idx];
++        output[out_idx] = val > 0.0f ? val : 0.0f;
++    }
++}
++
++// BatchNorm eval kernel for input shape [N, C, W] (or any dims with channel at dim1).
++// Computes: out[n,c,w] = (in[n,c,w] - running_mean[c]) / sqrt(running_var[c] + eps) * weight[c] + bias[c]
++// Supports arbitrary strides via explicit indexing.
++__global__ void batch_norm_eval_kernel(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    int64_t outer_size,   // N (batches)
++    int64_t C,            // channels
++    int64_t inner_size,   // W (elements per channel per batch)
++    int64_t in_stride_outer,
++    int64_t in_stride_channel,
++    int64_t in_stride_inner,
++    int64_t out_stride_outer,
++    int64_t out_stride_channel,
++    int64_t out_stride_inner)
++{
++    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < outer_size * C * inner_size; idx += blockDim.x * gridDim.x) {
++        // decompose idx into outer, channel, inner
++        int64_t inner = idx % inner_size;
++        int64_t tmp = idx / inner_size;
++        int64_t channel = tmp % C;
++        int64_t outer = tmp / C;
++
++        int64_t in_idx = outer * in_stride_outer + channel * in_stride_channel + inner * in_stride_inner;
++        int64_t out_idx = outer * out_stride_outer + channel * out_stride_channel + inner * out_stride_inner;
++
++        float mean = running_mean[channel];
++        float var = running_var[channel];
++        float w = weight[channel];
++        float b = bias[channel];
++        float inv_std = rsqrtf(var + eps);
++
++        float val = (input[in_idx] - mean) * inv_std * w + b;
++        output[out_idx] = val;
++    }
++}
++
++// Host launcher for ReLU.
++// Accepts raw pointers, dimensions, strides, and CUDA stream.
++// output_ptr must be a valid allocated buffer with same number of elements as input.
++extern "C" void relu_forward_launcher(
++    float* output_ptr,
++    const float* input_ptr,
++    int64_t numel,
++    int64_t input_offset,
++    int64_t output_offset,
++    cudaStream_t stream)
++{
++    // Use 256 threads per block, enough blocks to cover the data with grid-stride loop.
++    int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++    // Cap blocks to avoid excessive grid size; grid-stride loop handles remainder.
++    if (blocks > 65535) blocks = 65535;
++
++    relu_forward_kernel<<<blocks, threads, 0, stream>>>(
++        output_ptr, input_ptr, numel, input_offset, output_offset);
++}
++
++// Host launcher for BatchNorm eval.
++// Expects input shape [outer_size, C, inner_size] (with outer possibly batch dims,
++// but here outer_size corresponds to N, C = num_features, inner_size = W).
++// output_ptr must be allocated with same shape.
++extern "C" void batch_norm_eval_launcher(
++    float* output_ptr,
++    const float* input_ptr,
++    const float* weight_ptr,
++    const float* bias_ptr,
++    const float* running_mean_ptr,
++    const float* running_var_ptr,
++    float eps,
++    int64_t outer_size,
++    int64_t C,
++    int64_t inner_size,
++    int64_t in_stride_outer,
++    int64_t in_stride_channel,
++    int64_t in_stride_inner,
++    int64_t out_stride_outer,
++    int64_t out_stride_channel,
++    int64_t out_stride_inner,
++    cudaStream_t stream)
++{
++    int64_t total_elements = outer_size * C * inner_size;
++    int threads = 256;
++    int blocks = (total_elements + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++
++    batch_norm_eval_kernel<<<blocks, threads, 0, stream>>>(
++        output_ptr, input_ptr, weight_ptr, bias_ptr,
++        running_mean_ptr, running_var_ptr, eps,
++        outer_size, C, inner_size,
++        in_stride_outer, in_stride_channel, in_stride_inner,
++        out_stride_outer, out_stride_channel, out_stride_inner);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,133 @@
++#include <torch/types.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include <pybind11/pybind11.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++// Declare launchers from custom_ops.cu
++extern "C" void relu_forward_launcher(
++    float* output_ptr,
++    const float* input_ptr,
++    int64_t numel,
++    int64_t input_offset,
++    int64_t output_offset,
++    cudaStream_t stream);
++
++extern "C" void batch_norm_eval_launcher(
++    float* output_ptr,
++    const float* input_ptr,
++    const float* weight_ptr,
++    const float* bias_ptr,
++    const float* running_mean_ptr,
++    const float* running_var_ptr,
++    float eps,
++    int64_t outer_size,
++    int64_t C,
++    int64_t inner_size,
++    int64_t in_stride_outer,
++    int64_t in_stride_channel,
++    int64_t in_stride_inner,
++    int64_t out_stride_outer,
++    int64_t out_stride_channel,
++    int64_t out_stride_inner,
++    cudaStream_t stream);
++
++// ReLU wrapper
++torch::Tensor relu_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "relu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "relu_forward: input must be float32");
++    // Ensure contiguous for simplified launcher; reference is contiguous, so no harm.
++    auto input_contig = input.contiguous();
++    auto output = torch::empty_like(input_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    relu_forward_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        input_contig.numel(),
++        0, // input_offset (contiguous index offset 0)
++        0, // output_offset
++        stream);
++    
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "relu_forward_launcher failed");
++    return output;
++}
++
++// BatchNorm eval wrapper
++torch::Tensor batch_norm_eval_forward(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    torch::Tensor running_mean,
++    torch::Tensor running_var,
++    double eps) {
++    TORCH_CHECK(input.is_cuda(), "batch_norm_eval_forward: input must be CUDA");
++    TORCH_CHECK(weight.is_cuda() && bias.is_cuda() && running_mean.is_cuda() && running_var.is_cuda(),
++                "batch_norm_eval_forward: all parameter tensors must be CUDA");
++    TORCH_CHECK(input.dtype() == torch::kFloat32 && weight.dtype() == torch::kFloat32 &&
++                bias.dtype() == torch::kFloat32 && running_mean.dtype() == torch::kFloat32 &&
++                running_var.dtype() == torch::kFloat32,
++                "batch_norm_eval_forward: all tensors must be float32");
++    TORCH_CHECK(weight.dim() == 1 && bias.dim() == 1 && running_mean.dim() == 1 && running_var.dim() == 1,
++                "batch_norm_eval_forward: parameter tensors must be 1D");
++    TORCH_CHECK(weight.size(0) == bias.size(0) && weight.size(0) == running_mean.size(0) &&
++                weight.size(0) == running_var.size(0),
++                "batch_norm_eval_forward: parameter tensor sizes must match");
++    TORCH_CHECK(input.dim() >= 2 && input.size(1) == weight.size(0),
++                "batch_norm_eval_forward: input channel dimension must match parameter size");
++
++    auto input_contig = input.contiguous();
++    auto weight_contig = weight.contiguous();
++    auto bias_contig = bias.contiguous();
++    auto running_mean_contig = running_mean.contiguous();
++    auto running_var_contig = running_var.contiguous();
++
++    auto output = torch::empty_like(input_contig);
++
++    int64_t outer_size = input_contig.size(0);
++    int64_t C = input_contig.size(1);
++    int64_t inner_size = input_contig.numel() / (outer_size * C);
++
++    // After contiguous, strides are in elements
++    int64_t in_stride_outer = C * inner_size;
++    int64_t in_stride_channel = inner_size;
++    int64_t in_stride_inner = 1;
++    int64_t out_stride_outer = C * inner_size;
++    int64_t out_stride_channel = inner_size;
++    int64_t out_stride_inner = 1;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    batch_norm_eval_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        weight_contig.data_ptr<float>(),
++        bias_contig.data_ptr<float>(),
++        running_mean_contig.data_ptr<float>(),
++        running_var_contig.data_ptr<float>(),
++        static_cast<float>(eps),
++        outer_size,
++        C,
++        inner_size,
++        in_stride_outer,
++        in_stride_channel,
++        in_stride_inner,
++        out_stride_outer,
++        out_stride_channel,
++        out_stride_inner,
++        stream);
++    
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "batch_norm_eval_launcher failed");
++    return output;
++}
++
++void register_custom_ops(py::module& m) {
++    m.def("relu_forward", &relu_forward, "ReLU forward kernel",
++          py::arg("input"));
++    m.def("batch_norm_eval_forward", &batch_norm_eval_forward, "BatchNorm eval forward kernel",
++          py::arg("input"), py::arg("weight"), py::arg("bias"),
++          py::arg("running_mean"), py::arg("running_var"), py::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,51 @@
++import torch
++import torch.nn as nn
++
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features, eps):
++        super().__init__()
++        self.num_features = num_features
++        self.eps = eps
++
++        # Preserve exact state_dict structure of reference BatchNorm1d
++        self.batch_norm = nn.Module()
++        self.batch_norm.weight = nn.Parameter(torch.ones(num_features))
++        self.batch_norm.bias = nn.Parameter(torch.zeros(num_features))
++        self.batch_norm.register_buffer('running_mean', torch.zeros(num_features))
++        self.batch_norm.register_buffer('running_var', torch.ones(num_features))
++        self.batch_norm.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
++
++    def forward(self, x):
++        # Step 1: ReLU
++        x = cuda_extension.relu_forward(x)
++        # Step 2: BatchNorm1d in eval mode using running stats
++        x = cuda_extension.batch_norm_eval_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.eps,
++        )
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        # checkpoint step_001
++        x = cuda_extension.relu_forward(x)
++        yield 'step_001', x
++        # checkpoint step_002
++        x = cuda_extension.batch_norm_eval_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.eps,
++        )
++        yield 'step_002', x
++        # checkpoint step_003
++        yield 'step_003', x

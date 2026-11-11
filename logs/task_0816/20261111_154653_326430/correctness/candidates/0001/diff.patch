@@ -1,0 +1,308 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,138 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++#include <cmath>
++
++// Bilinear upsampling kernel: output tensor layout NCHW, contiguous
++// input: NCHW (may be non-contiguous, use strides)
++// output: NCHW contiguous, computed as floor(in_h*scale), floor(in_w*scale)
++// scale: float scale factor (typically 2.0)
++__global__ void upsample_bilinear2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int in_h, int in_w,
++    int out_h, int out_w,
++    float scale_factor,
++    int in_n_stride, int in_c_stride, int in_h_stride, int in_w_stride,
++    int out_n_stride, int out_c_stride, int out_h_stride, int out_w_stride)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * out_h * out_w;
++    if (idx >= total) return;
++
++    // decompose linear index into n,c,oh,ow
++    int ow = idx % out_w;
++    int tmp = idx / out_w;
++    int oh = tmp % out_h;
++    tmp /= out_h;
++    int c = tmp % C;
++    int n = tmp / C;
++
++    // compute source coordinates (align_corners=False)
++    float src_h = (oh + 0.5f) / scale_factor - 0.5f;
++    float src_w = (ow + 0.5f) / scale_factor - 0.5f;
++
++    int h0 = (int)floorf(src_h);
++    int w0 = (int)floorf(src_w);
++    int h1 = h0 + 1;
++    int w1 = w0 + 1;
++
++    float h1_lambda = src_h - h0;
++    float w1_lambda = src_w - w0;
++    float h0_lambda = 1.0f - h1_lambda;
++    float w0_lambda = 1.0f - w1_lambda;
++
++    // clamp to valid range for edges
++    h0 = max(0, min(h0, in_h - 1));
++    h1 = max(0, min(h1, in_h - 1));
++    w0 = max(0, min(w0, in_w - 1));
++    w1 = max(0, min(w1, in_w - 1));
++
++    // gather four values
++    const float* base = input + n * in_n_stride + c * in_c_stride;
++    float v00 = base[h0 * in_h_stride + w0 * in_w_stride];
++    float v01 = base[h0 * in_h_stride + w1 * in_w_stride];
++    float v10 = base[h1 * in_h_stride + w0 * in_w_stride];
++    float v11 = base[h1 * in_h_stride + w1 * in_w_stride];
++
++    // bilinear interpolation
++    float val = h0_lambda * (w0_lambda * v00 + w1_lambda * v01) +
++                h1_lambda * (w0_lambda * v10 + w1_lambda * v11);
++
++    output[n * out_n_stride + c * out_c_stride + oh * out_h_stride + ow * out_w_stride] = val;
++}
++
++// Mean reduction over channel dimension, keepdim=True
++// input: NCHW (may be non-contiguous)
++// output: N x 1 x H x W (contiguous)
++__global__ void mean_dim1_keepdim_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int in_n_stride, int in_c_stride, int in_h_stride, int in_w_stride,
++    int out_n_stride, int out_c_stride, int out_h_stride, int out_w_stride)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * H * W;
++    if (idx >= total) return;
++
++    // decompose to n, h, w
++    int w = idx % W;
++    int tmp = idx / W;
++    int h = tmp % H;
++    int n = tmp / H;
++
++    float sum = 0.0f;
++    const float* base = input + n * in_n_stride;
++    for (int c = 0; c < C; ++c) {
++        sum += base[c * in_c_stride + h * in_h_stride + w * in_w_stride];
++    }
++    float mean = sum / (float)C;
++
++    output[n * out_n_stride + h * out_h_stride + w * out_w_stride] = mean;
++}
++
++// Host launcher for bilinear upsample
++// input: device pointer to input tensor (float32), contiguous or strided
++// output: device pointer to output tensor (float32), contiguous
++// N,C,in_h,in_w: input dims
++// out_h,out_w: output dims
++// scale_factor: float scale
++// in_strides: array of 4 ints (N,C,H,W strides in elements)
++// out_strides: array of 4 ints (N,C,H,W strides in elements, should be contiguous)
++extern "C" void upsample_bilinear2d_launcher(
++    const float* input, float* output,
++    int N, int C, int in_h, int in_w, int out_h, int out_w,
++    float scale_factor,
++    const int64_t* in_strides, const int64_t* out_strides,
++    cudaStream_t stream)
++{
++    int total = N * C * out_h * out_w;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    upsample_bilinear2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, in_h, in_w, out_h, out_w, scale_factor,
++        (int)in_strides[0], (int)in_strides[1], (int)in_strides[2], (int)in_strides[3],
++        (int)out_strides[0], (int)out_strides[1], (int)out_strides[2], (int)out_strides[3]);
++}
++
++// Host launcher for channel mean (keepdim)
++// input: device pointer to input tensor (float32), contiguous or strided
++// output: device pointer to output tensor (float32), contiguous, shape [N,1,H,W]
++// N,C,H,W: input dims
++// in_strides, out_strides: as above
++extern "C" void mean_dim1_keepdim_launcher(
++    const float* input, float* output,
++    int N, int C, int H, int W,
++    const int64_t* in_strides, const int64_t* out_strides,
++    cudaStream_t stream)
++{
++    int total = N * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    mean_dim1_keepdim_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W,
++        (int)in_strides[0], (int)in_strides[1], (int)in_strides[2], (int)in_strides[3],
++        (int)out_strides[0], (int)out_strides[1], (int)out_strides[2], (int)out_strides[3]);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,134 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Launcher declarations from custom_ops.cu
++extern "C" void upsample_bilinear2d_launcher(
++    const float* input, float* output,
++    int N, int C, int in_h, int in_w, int out_h, int out_w,
++    float scale_factor,
++    const int64_t* in_strides, const int64_t* out_strides,
++    cudaStream_t stream);
++
++extern "C" void mean_dim1_keepdim_launcher(
++    const float* input, float* output,
++    int N, int C, int H, int W,
++    const int64_t* in_strides, const int64_t* out_strides,
++    cudaStream_t stream);
++
++namespace {
++
++// 检查 CUDA 错误，失败时抛出异常
++void check_cuda_error(cudaError_t error, const char* message) {
++    if (error != cudaSuccess) {
++        throw std::runtime_error(std::string(message) + ": " + cudaGetErrorString(error));
++    }
++}
++
++// 确保输入 tensor 满足 requirements，必要时连续化
++// 返回是否已连续化（用于释放临时 tensor）
++bool ensure_cuda_float_4d(const torch::Tensor& input, const char* op_name) {
++    TORCH_CHECK(input.is_cuda(), op_name, ": input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, op_name, ": input must be float32");
++    TORCH_CHECK(input.dim() == 4, op_name, ": input must be 4D (N, C, H, W)");
++    return input.is_contiguous();
++}
++
++} // anonymous namespace
++
++// Upsample bilinear wrapper
++torch::Tensor upsample_bilinear2d(torch::Tensor input, double scale_factor = 2.0) {
++    // 检查输入
++    bool contiguous = ensure_cuda_float_4d(input, "upsample_bilinear2d");
++    TORCH_CHECK(scale_factor > 0.0, "upsample_bilinear2d: scale_factor must be positive");
++
++    // 获取原始尺寸（连续化后尺寸不变）
++    auto input_contig = contiguous ? input : input.contiguous();
++    int N = input_contig.size(0);
++    int C = input_contig.size(1);
++    int in_h = input_contig.size(2);
++    int in_w = input_contig.size(3);
++
++    // 计算输出尺寸
++    int out_h = static_cast<int>(std::floor(in_h * scale_factor));
++    int out_w = static_cast<int>(std::floor(in_w * scale_factor));
++
++    // 分配输出 tensor，连续布局
++    auto output = torch::empty({N, C, out_h, out_w}, input_contig.options());
++
++    // 获取当前 CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // 准备 strides（对于 contiguous tensor，可以使用默认 strides，但 launcher 期望数组）
++    // 我们直接使用 input_contig 和 output 的 strides（它们都是 contiguous，因此可直接使用）
++    int64_t in_strides[4] = {input_contig.stride(0), input_contig.stride(1), input_contig.stride(2), input_contig.stride(3)};
++    int64_t out_strides[4] = {output.stride(0), output.stride(1), output.stride(2), output.stride(3)};
++
++    // 调用 launcher
++    upsample_bilinear2d_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, in_h, in_w, out_h, out_w,
++        static_cast<float>(scale_factor),
++        in_strides,
++        out_strides,
++        stream
++    );
++
++    // 检查 CUDA 错误（同步点仅用于捕获错误，性能影响可接受）
++    check_cuda_error(cudaGetLastError(), "upsample_bilinear2d_launcher");
++
++    return output;
++}
++
++// Mean over channel dim (keepdim=True) wrapper
++torch::Tensor mean_dim1_keepdim(torch::Tensor input) {
++    // 检查输入
++    bool contiguous = ensure_cuda_float_4d(input, "mean_dim1_keepdim");
++
++    // 连续化
++    auto input_contig = contiguous ? input : input.contiguous();
++    int N = input_contig.size(0);
++    int C = input_contig.size(1);
++    int H = input_contig.size(2);
++    int W = input_contig.size(3);
++
++    // 输出形状 [N, 1, H, W]
++    auto output = torch::empty({N, 1, H, W}, input_contig.options());
++
++    // 获取 CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // strides（contiguous）
++    int64_t in_strides[4] = {input_contig.stride(0), input_contig.stride(1), input_contig.stride(2), input_contig.stride(3)};
++    int64_t out_strides[4] = {output.stride(0), output.stride(1), output.stride(2), output.stride(3)};
++
++    // 调用 launcher
++    mean_dim1_keepdim_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        in_strides,
++        out_strides,
++        stream
++    );
++
++    check_cuda_error(cudaGetLastError(), "mean_dim1_keepdim_launcher");
++
++    return output;
++}
++
++// 注册函数
++void register_custom_ops(pybind11::module& m) {
++    m.def("upsample_bilinear2d", &upsample_bilinear2d,
++          "Bilinear upsampling (align_corners=False)",
++          py::arg("input"), py::arg("scale_factor") = 2.0);
++    m.def("mean_dim1_keepdim", &mean_dim1_keepdim,
++          "Mean over channel dim with keepdim=True",
++          py::arg("input"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,27 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, scale_factor, mode):
++        super().__init__()
++        # 仅为接口兼容和属性记录；forward 中不使用 nn.Upsample 实例
++        self.scale_factor = float(scale_factor)
++        self.mode = mode
++
++    def forward(self, x):
++        # 第一步：上采样 bilinear，scale_factor 为构造时指定值
++        x = cuda_extension.upsample_bilinear2d(x, self.scale_factor)
++        # 第二步：通道均值，保持维度
++        x = cuda_extension.mean_dim1_keepdim(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        # 按照 task_contract 检查点顺序输出中间值
++        x = cuda_extension.upsample_bilinear2d(x, self.scale_factor)
++        yield 'step_001', x
++        x = cuda_extension.mean_dim1_keepdim(x)
++        yield 'step_002', x
++        yield 'step_003', x

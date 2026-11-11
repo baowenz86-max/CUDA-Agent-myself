@@ -1,0 +1,134 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,37 @@
++#include <cuda_runtime.h>
++
++// Simple elementwise ReLU kernel
++__global__ void relu_kernel(const float* input, float* output, long long numel) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (long long i = idx; i < numel; i += stride) {
++        float val = input[i];
++        output[i] = val > 0.0f ? val : 0.0f;
++    }
++}
++
++// Simple elementwise absolute value kernel
++__global__ void abs_kernel(const float* input, float* output, long long numel) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (long long i = idx; i < numel; i += stride) {
++        float val = input[i];
++        output[i] = val < 0.0f ? -val : val;
++    }
++}
++
++extern "C" void relu_forward_launcher(const float* input, float* output, long long numel, cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid cap, grid-stride loop handles rest
++    if (blocks == 0) return;
++    relu_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++extern "C" void abs_forward_launcher(const float* input, float* output, long long numel, cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    if (blocks == 0) return;
++    abs_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,56 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void relu_forward_launcher(const float* input, float* output, long long numel, cudaStream_t stream);
++extern "C" void abs_forward_launcher(const float* input, float* output, long long numel, cudaStream_t stream);
++
++static torch::Tensor relu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "relu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "relu_forward: input must be float32");
++    auto x_contig = x.contiguous();
++    auto y = torch::empty_like(x_contig);
++    long long numel = x_contig.numel();
++    if (numel == 0) {
++        return y;
++    }
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    relu_forward_launcher(
++        x_contig.data_ptr<float>(),
++        y.data_ptr<float>(),
++        numel,
++        stream
++    );
++    return y;
++}
++
++static torch::Tensor abs_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "abs_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "abs_forward: input must be float32");
++    auto x_contig = x.contiguous();
++    auto y = torch::empty_like(x_contig);
++    long long numel = x_contig.numel();
++    if (numel == 0) {
++        return y;
++    }
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    abs_forward_launcher(
++        x_contig.data_ptr<float>(),
++        y.data_ptr<float>(),
++        numel,
++        stream
++    );
++    return y;
++}
++
++static void register_custom_ops_binding(pybind11::module& m) {
++    m.def("relu_forward", &relu_forward, "ReLU forward (CUDA)",
++          py::arg("x"));
++    m.def("abs_forward", &abs_forward, "Abs forward (CUDA)",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops_binding, register_custom_ops_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,32 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        x = cuda_extension.abs_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.abs_forward(x)
++        yield 'step_002', x
++        yield 'step_003', x
++
++
++batch_size = 80
++height, width = 1024, 1024
++
++
++def get_inputs():
++    x = torch.randn(batch_size, 3, height, width)
++    return [x]
++
++
++def get_init_inputs():
++    return []

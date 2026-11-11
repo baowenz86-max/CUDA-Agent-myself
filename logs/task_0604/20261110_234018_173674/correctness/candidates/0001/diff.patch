@@ -1,0 +1,304 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,138 @@
++#include <cuda_runtime.h>
++
++// Helper to compute linear offset from multi-dimensional index given strides
++__device__ __forceinline__ int64_t compute_offset(
++    int64_t flat_idx,
++    const int64_t* strides,
++    const int64_t* dims,
++    int ndims)
++{
++    int64_t offset = 0;
++    int64_t idx = flat_idx;
++    for (int d = ndims - 1; d >= 0; --d) {
++        int64_t coord = idx % dims[d];
++        idx /= dims[d];
++        offset += coord * strides[d];
++    }
++    return offset;
++}
++
++// Element-wise absolute value kernel, stride-aware
++__global__ void abs_kernel(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        int64_t in_offset = compute_offset(i, input_strides, dims, ndims);
++        int64_t out_offset = compute_offset(i, output_strides, dims, ndims);
++        output[out_offset] = fabsf(input[in_offset]);
++    }
++}
++
++// Element-wise ReLU6 kernel, stride-aware
++__global__ void relu6_kernel(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        int64_t in_offset = compute_offset(i, input_strides, dims, ndims);
++        int64_t out_offset = compute_offset(i, output_strides, dims, ndims);
++        float v = input[in_offset];
++        v = fminf(fmaxf(v, 0.0f), 6.0f);
++        output[out_offset] = v;
++    }
++}
++
++// Fused abs then ReLU6 kernel, stride-aware
++__global__ void fused_abs_relu6_kernel(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        int64_t in_offset = compute_offset(i, input_strides, dims, ndims);
++        int64_t out_offset = compute_offset(i, output_strides, dims, ndims);
++        float v = fabsf(input[in_offset]);
++        v = fminf(v, 6.0f);
++        output[out_offset] = v;
++    }
++}
++
++// Launch configuration
++extern "C" void abs_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims,
++    cudaStream_t stream)
++{
++    if (total_elements <= 0) return;
++    const int blockSize = 256;
++    int64_t blocks = (total_elements + blockSize - 1) / blockSize;
++    // Cap grid size to avoid exceeding limits, grid-stride loop handles rest
++    const int64_t maxGridSize = 2147483647; // 2^31 - 1
++    blocks = (blocks > maxGridSize) ? maxGridSize : blocks;
++    abs_kernel<<<(unsigned int)blocks, blockSize, 0, stream>>>(
++        input, output, total_elements, input_strides, output_strides, dims, ndims);
++}
++
++extern "C" void relu6_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims,
++    cudaStream_t stream)
++{
++    if (total_elements <= 0) return;
++    const int blockSize = 256;
++    int64_t blocks = (total_elements + blockSize - 1) / blockSize;
++    const int64_t maxGridSize = 2147483647;
++    blocks = (blocks > maxGridSize) ? maxGridSize : blocks;
++    relu6_kernel<<<(unsigned int)blocks, blockSize, 0, stream>>>(
++        input, output, total_elements, input_strides, output_strides, dims, ndims);
++}
++
++extern "C" void abs_relu6_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims,
++    cudaStream_t stream)
++{
++    if (total_elements <= 0) return;
++    const int blockSize = 256;
++    int64_t blocks = (total_elements + blockSize - 1) / blockSize;
++    const int64_t maxGridSize = 2147483647;
++    blocks = (blocks > maxGridSize) ? maxGridSize : blocks;
++    fused_abs_relu6_kernel<<<(unsigned int)blocks, blockSize, 0, stream>>>(
++        input, output, total_elements, input_strides, output_strides, dims, ndims);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,138 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void abs_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims,
++    cudaStream_t stream);
++
++extern "C" void relu6_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims,
++    cudaStream_t stream);
++
++extern "C" void abs_relu6_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    const int64_t* dims,
++    int ndims,
++    cudaStream_t stream);
++
++namespace {
++
++// Helper to validate tensor and extract metadata for stride-aware kernel launch
++void validate_and_get_metadata(
++    const torch::Tensor& x,
++    torch::Tensor& output,
++    std::vector<int64_t>& input_strides,
++    std::vector<int64_t>& output_strides,
++    std::vector<int64_t>& dims,
++    int& ndims)
++{
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++
++    // Output same shape, dtype, device; stride matching input by default (empty_like preserves stride)
++    output = torch::empty_like(x);
++
++    ndims = static_cast<int>(x.dim());
++    TORCH_CHECK(ndims > 0, "Input tensor must have at least one dimension");
++
++    dims.resize(ndims);
++    input_strides.resize(ndims);
++    output_strides.resize(ndims);
++
++    for (int i = 0; i < ndims; ++i) {
++        dims[i] = x.size(i);
++        input_strides[i] = x.stride(i);
++        output_strides[i] = output.stride(i);
++    }
++}
++
++// Generic launch wrapper to reduce duplication
++template <typename Launcher>
++void launch_elementwise(
++    const torch::Tensor& x,
++    torch::Tensor& output,
++    Launcher launcher)
++{
++    if (x.numel() == 0) {
++        return;
++    }
++
++    std::vector<int64_t> input_strides, output_strides, dims;
++    int ndims = 0;
++    validate_and_get_metadata(x, output, input_strides, output_strides, dims, ndims);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        input_strides.data(),
++        output_strides.data(),
++        dims.data(),
++        ndims,
++        stream);
++
++    // Check for kernel launch errors (cudaGetLastError) and synchronize? Better not to sync for perf, but we can check async error immediately after launch.
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++}
++
++} // namespace
++
++// PyTorch wrapper functions
++
++torch::Tensor abs_forward(torch::Tensor x) {
++    torch::Tensor output;
++    launch_elementwise(x, output, [](const float* in, float* out, int64_t n, const int64_t* is, const int64_t* os, const int64_t* d, int nd, cudaStream_t s) {
++        abs_forward_launcher(in, out, n, is, os, d, nd, s);
++    });
++    return output;
++}
++
++torch::Tensor relu6_forward(torch::Tensor x) {
++    torch::Tensor output;
++    launch_elementwise(x, output, [](const float* in, float* out, int64_t n, const int64_t* is, const int64_t* os, const int64_t* d, int nd, cudaStream_t s) {
++        relu6_forward_launcher(in, out, n, is, os, d, nd, s);
++    });
++    return output;
++}
++
++torch::Tensor abs_relu6_forward(torch::Tensor x) {
++    torch::Tensor output;
++    launch_elementwise(x, output, [](const float* in, float* out, int64_t n, const int64_t* is, const int64_t* os, const int64_t* d, int nd, cudaStream_t s) {
++        abs_relu6_forward_launcher(in, out, n, is, os, d, nd, s);
++    });
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("abs_forward", &abs_forward, "Element-wise absolute value", py::arg("x"));
++    m.def("relu6_forward", &relu6_forward, "Element-wise ReLU6", py::arg("x"));
++    m.def("abs_relu6_forward", &abs_relu6_forward, "Fused abs then ReLU6", py::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,19 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        x = cuda_extension.abs_relu6_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        abs_x = cuda_extension.abs_forward(x)
++        yield 'step_001', abs_x
++        relu6_x = cuda_extension.relu6_forward(abs_x)
++        yield 'step_002', relu6_x
++        yield 'step_003', relu6_x

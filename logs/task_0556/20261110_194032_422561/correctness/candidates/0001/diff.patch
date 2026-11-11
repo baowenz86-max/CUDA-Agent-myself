@@ -1,0 +1,490 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,270 @@
++#include <cuda_runtime.h>
++
++// CUDA kernels for custom embedding and layer norm
++// All launchers use raw pointers and stream; no torch/ATen/pybind includes.
++
++// ---------------------------------------------------------------------------
++// Kernel: embedding lookup
++// Each thread handles multiple output elements via grid-stride loop.
++// Input indices (int64) and weight (float32) are assumed to be in device memory.
++// Output is float32 in device memory.
++// ---------------------------------------------------------------------------
++__global__ void embedding_kernel(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int64_t total_elements,   // batch * seq_len
++    int64_t embedding_dim)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t pos = idx; pos < total_elements; pos += stride) {
++        int64_t token = indices[pos];
++        // Safe if indices are valid; no bounds check for speed, but could add if needed.
++        const float* src_row = weight + token * embedding_dim;
++        float* dst_row = output + pos * embedding_dim;
++        for (int64_t d = 0; d < embedding_dim; ++d) {
++            dst_row[d] = src_row[d];
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Kernel: layer normalization over last dimension
++// Each block handles one or more rows; within a block, threads cooperate to
++// compute mean and variance for a row, then apply normalization and optionally
++// affine transformation. We use a 1D thread block with size >= dim (must be power of 2).
++// For dim=32, blockDim.x=32 is natural; we handle general dim up to 1024 with blockDim.x = next_pow2(dim).
++// ---------------------------------------------------------------------------
++template <int BLOCK_DIM>
++__global__ void layer_norm_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,   // may be nullptr
++    const float* __restrict__ bias,     // may be nullptr
++    float* __restrict__ output,
++    int64_t rows,
++    int64_t dim,
++    float eps,
++    bool elementwise_affine)
++{
++    // Each block handles one row.
++    int64_t row = blockIdx.x;
++    if (row >= rows) return;
++
++    const float* row_in = input + row * dim;
++    float* row_out = output + row * dim;
++
++    __shared__ float s_mean;
++    __shared__ float s_var;
++    __shared__ float s_weight[BLOCK_DIM];
++    __shared__ float s_bias[BLOCK_DIM];
++
++    // Load affine parameters into shared memory if needed.
++    if (elementwise_affine) {
++        if (weight != nullptr) {
++            for (int i = threadIdx.x; i < dim; i += BLOCK_DIM) {
++                s_weight[i] = weight[i];
++            }
++        } else {
++            for (int i = threadIdx.x; i < dim; i += BLOCK_DIM) {
++                s_weight[i] = 1.0f;
++            }
++        }
++        if (bias != nullptr) {
++            for (int i = threadIdx.x; i < dim; i += BLOCK_DIM) {
++                s_bias[i] = bias[i];
++            }
++        } else {
++            for (int i = threadIdx.x; i < dim; i += BLOCK_DIM) {
++                s_bias[i] = 0.0f;
++            }
++        }
++    }
++    __syncthreads();
++
++    // Compute sum and sum of squares using warp reductions.
++    float local_sum = 0.0f;
++    float local_sq_sum = 0.0f;
++    for (int i = threadIdx.x; i < dim; i += BLOCK_DIM) {
++        float v = row_in[i];
++        local_sum += v;
++        local_sq_sum += v * v;
++    }
++
++    // Block reduction
++    __shared__ float s_sum[BLOCK_DIM / 32];
++    __shared__ float s_sq_sum[BLOCK_DIM / 32];
++    int warp_id = threadIdx.x / 32;
++    int lane = threadIdx.x % 32;
++    // Warp reduce
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
++        local_sq_sum += __shfl_down_sync(0xffffffff, local_sq_sum, offset);
++    }
++    if (lane == 0) {
++        s_sum[warp_id] = local_sum;
++        s_sq_sum[warp_id] = local_sq_sum;
++    }
++    __syncthreads();
++
++    if (threadIdx.x == 0) {
++        float total_sum = 0.0f;
++        float total_sq_sum = 0.0f;
++        int num_warps = BLOCK_DIM / 32;
++        for (int i = 0; i < num_warps; ++i) {
++            total_sum += s_sum[i];
++            total_sq_sum += s_sq_sum[i];
++        }
++        float mean = total_sum / dim;
++        float var = total_sq_sum / dim - mean * mean;
++        s_mean = mean;
++        s_var = var;
++    }
++    __syncthreads();
++
++    float mean = s_mean;
++    float var = s_var;
++    float inv_std = rsqrtf(var + eps);
++
++    // Normalize and apply affine
++    for (int i = threadIdx.x; i < dim; i += BLOCK_DIM) {
++        float normalized = (row_in[i] - mean) * inv_std;
++        if (elementwise_affine) {
++            float w = s_weight[i];
++            float b = s_bias[i];
++            row_out[i] = normalized * w + b;
++        } else {
++            row_out[i] = normalized;
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Launcher: custom_embedding
++// indices: CPU int64 tensor pointer
++// weight: CPU float32 tensor pointer
++// output: GPU float32 tensor pointer (preallocated by caller)
++// batch, seq_len, vocab_size, embedding_dim: dimensions
++// stream: CUDA stream to use
++// ---------------------------------------------------------------------------
++extern "C" void custom_embedding_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int64_t batch,
++    int64_t seq_len,
++    int64_t vocab_size,
++    int64_t embedding_dim,
++    cudaStream_t stream)
++{
++    int64_t total_positions = batch * seq_len;
++    // Allocate temporary device arrays for indices and weight.
++    int64_t* d_indices = nullptr;
++    float* d_weight = nullptr;
++    cudaError_t err;
++
++    err = cudaMalloc(&d_indices, total_positions * sizeof(int64_t));
++    if (err != cudaSuccess) return; // caller will check error? We rely on cudaGetLastError later.
++    err = cudaMalloc(&d_weight, vocab_size * embedding_dim * sizeof(float));
++    if (err != cudaSuccess) {
++        cudaFree(d_indices);
++        return;
++    }
++
++    // Copy asynchronously on provided stream.
++    cudaMemcpyAsync(d_indices, indices, total_positions * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_weight, weight, vocab_size * embedding_dim * sizeof(float), cudaMemcpyHostToDevice, stream);
++
++    // Launch kernel.
++    int block_size = 256;
++    int grid_size = (int)((total_positions + block_size - 1) / block_size);
++    // Grid-stride loop handles larger sizes; cap grid if needed (already reasonable).
++    embedding_kernel<<<grid_size, block_size, 0, stream>>>(d_indices, d_weight, output, total_positions, embedding_dim);
++
++    // Free temporaries after kernel completes; using cudaFree is synchronous with stream.
++    cudaFree(d_indices);
++    cudaFree(d_weight);
++    // Note: cudaFree is safe after kernel uses memory because it defers until completion.
++    // However, to be safe we could use cudaStreamSynchronize(stream) before free, but cudaFree after launch is okay.
++}
++
++// ---------------------------------------------------------------------------
++// Launcher: custom_layer_norm
++// input: GPU float32 tensor pointer
++// weight: CPU float32 pointer (may be nullptr)
++// bias: CPU float32 pointer (may be nullptr)
++// output: GPU float32 tensor pointer (same shape as input)
++// rows: number of rows (batch*seq_len)
++// dim: normalized dimension (last dim)
++// eps: epsilon
++// elementwise_affine: bool
++// stream: CUDA stream
++// ---------------------------------------------------------------------------
++extern "C" void custom_layer_norm_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int64_t rows,
++    int64_t dim,
++    double eps,
++    bool elementwise_affine,
++    cudaStream_t stream)
++{
++    cudaError_t err;
++    float* d_weight = nullptr;
++    float* d_bias = nullptr;
++
++    if (elementwise_affine) {
++        if (weight != nullptr) {
++            err = cudaMalloc(&d_weight, dim * sizeof(float));
++            if (err != cudaSuccess) return;
++            cudaMemcpyAsync(d_weight, weight, dim * sizeof(float), cudaMemcpyHostToDevice, stream);
++        }
++        if (bias != nullptr) {
++            err = cudaMalloc(&d_bias, dim * sizeof(float));
++            if (err != cudaSuccess) {
++                cudaFree(d_weight);
++                return;
++            }
++            cudaMemcpyAsync(d_bias, bias, dim * sizeof(float), cudaMemcpyHostToDevice, stream);
++        }
++    }
++
++    // Determine block size: next power of two >= dim, but at least 32.
++    int block_dim = 32;
++    while (block_dim < dim) block_dim <<= 1;
++    // Cap at 1024 (max threads per block).
++    if (block_dim > 1024) block_dim = 1024;
++
++    // Launch templated kernel for common sizes; for generality we use a switch up to 1024.
++    // For dim=32, block_dim=32. For dim>1024, we would need a different approach, but contract uses 32.
++    dim3 grid(rows); // one block per row
++    switch (block_dim) {
++        case 32:
++            layer_norm_kernel<32><<<grid, 32, 0, stream>>>(input, d_weight, d_bias, output, rows, dim, (float)eps, elementwise_affine);
++            break;
++        case 64:
++            layer_norm_kernel<64><<<grid, 64, 0, stream>>>(input, d_weight, d_bias, output, rows, dim, (float)eps, elementwise_affine);
++            break;
++        case 128:
++            layer_norm_kernel<128><<<grid, 128, 0, stream>>>(input, d_weight, d_bias, output, rows, dim, (float)eps, elementwise_affine);
++            break;
++        case 256:
++            layer_norm_kernel<256><<<grid, 256, 0, stream>>>(input, d_weight, d_bias, output, rows, dim, (float)eps, elementwise_affine);
++            break;
++        case 512:
++            layer_norm_kernel<512><<<grid, 512, 0, stream>>>(input, d_weight, d_bias, output, rows, dim, (float)eps, elementwise_affine);
++            break;
++        case 1024:
++            layer_norm_kernel<1024><<<grid, 1024, 0, stream>>>(input, d_weight, d_bias, output, rows, dim, (float)eps, elementwise_affine);
++            break;
++        default:
++            // Should not happen for dim <= 1024; use 32 as fallback but may fail for larger dim.
++            layer_norm_kernel<32><<<grid, 32, 0, stream>>>(input, d_weight, d_bias, output, rows, dim, (float)eps, elementwise_affine);
++    }
++
++    // Free temporary memory after kernel uses it (cudaFree defers).
++    if (d_weight) cudaFree(d_weight);
++    if (d_bias) cudaFree(d_bias);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,177 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_embedding_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int64_t batch,
++    int64_t seq_len,
++    int64_t vocab_size,
++    int64_t embedding_dim,
++    cudaStream_t stream
++);
++
++extern "C" void custom_layer_norm_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int64_t rows,
++    int64_t dim,
++    double eps,
++    bool elementwise_affine,
++    cudaStream_t stream
++);
++
++// Custom embedding forward
++// indices: CPU int64 tensor [batch, seq_len]
++// weight: CPU float32 tensor [vocab_size, embedding_dim]
++// vocab_size: int
++// embedding_dim: int
++// Returns: CUDA float32 tensor [batch, seq_len, embedding_dim]
++torch::Tensor custom_embedding(
++    torch::Tensor indices,
++    torch::Tensor weight,
++    int64_t vocab_size,
++    int64_t embedding_dim
++) {
++    // Validate indices
++    TORCH_CHECK(indices.is_cpu(), "indices must be a CPU tensor");
++    TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must have dtype int64");
++    TORCH_CHECK(indices.dim() == 2, "indices must be 2D [batch, seq_len]");
++    // Validate weight
++    TORCH_CHECK(weight.is_cpu(), "weight must be a CPU tensor");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must have dtype float32");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [vocab_size, embedding_dim]");
++    TORCH_CHECK(weight.size(0) == vocab_size, "weight size(0) must equal vocab_size");
++    TORCH_CHECK(weight.size(1) == embedding_dim, "weight size(1) must equal embedding_dim");
++
++    // Make contiguous if needed (CPU tensors are often contiguous, but check)
++    auto indices_contig = indices.contiguous();
++    auto weight_contig = weight.contiguous();
++
++    int64_t batch = indices_contig.size(0);
++    int64_t seq_len = indices_contig.size(1);
++
++    // Allocate output CUDA float32 tensor [batch, seq_len, embedding_dim]
++    auto output = torch::empty({batch, seq_len, embedding_dim},
++                               indices_contig.options().dtype(torch::kFloat32).device(torch::kCUDA));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_embedding_launcher(
++        indices_contig.data_ptr<int64_t>(),
++        weight_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch,
++        seq_len,
++        vocab_size,
++        embedding_dim,
++        stream
++    );
++
++    return output;
++}
++
++// Custom layer norm forward
++// input: CUDA float32 tensor [batch, seq_len, normalized_dim]
++// weight: optional CPU float32 tensor [normalized_dim]
++// bias: optional CPU float32 tensor [normalized_dim]
++// eps: double
++// normalized_dim: int
++// elementwise_affine: bool
++// Returns: CUDA float32 tensor same shape as input
++torch::Tensor custom_layer_norm(
++    torch::Tensor input,
++    c10::optional<torch::Tensor> weight,
++    c10::optional<torch::Tensor> bias,
++    double eps,
++    int64_t normalized_dim,
++    bool elementwise_affine
++) {
++    // Validate input
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must have dtype float32");
++    TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dimension");
++    TORCH_CHECK(input.size(-1) == normalized_dim, "last dimension size must equal normalized_dim");
++
++    // Ensure input contiguous (if not, make contiguous)
++    auto input_contig = input.contiguous();
++
++    int64_t rows = input_contig.numel() / normalized_dim;
++
++    // Prepare optional CPU tensors
++    torch::Tensor weight_contig;
++    torch::Tensor bias_contig;
++    const float* d_weight_ptr = nullptr;
++    const float* d_bias_ptr = nullptr;
++
++    if (elementwise_affine) {
++        if (weight.has_value() && weight->defined()) {
++            TORCH_CHECK(weight->is_cpu(), "weight must be a CPU tensor");
++            TORCH_CHECK(weight->dtype() == torch::kFloat32, "weight must have dtype float32");
++            TORCH_CHECK(weight->dim() == 1 && weight->numel() == normalized_dim,
++                        "weight must be 1D with size normalized_dim");
++            weight_contig = weight->contiguous();
++            d_weight_ptr = weight_contig.data_ptr<float>();
++        }
++        if (bias.has_value() && bias->defined()) {
++            TORCH_CHECK(bias->is_cpu(), "bias must be a CPU tensor");
++            TORCH_CHECK(bias->dtype() == torch::kFloat32, "bias must have dtype float32");
++            TORCH_CHECK(bias->dim() == 1 && bias->numel() == normalized_dim,
++                        "bias must be 1D with size normalized_dim");
++            bias_contig = bias->contiguous();
++            d_bias_ptr = bias_contig.data_ptr<float>();
++        }
++    }
++
++    // Allocate output CUDA float32 tensor same shape as input
++    auto output = torch::empty_like(input_contig);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_layer_norm_launcher(
++        input_contig.data_ptr<float>(),
++        d_weight_ptr,
++        d_bias_ptr,
++        output.data_ptr<float>(),
++        rows,
++        normalized_dim,
++        eps,
++        elementwise_affine,
++        stream
++    );
++
++    return output;
++}
++
++// Register Python bindings
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_embedding", &custom_embedding,
++          "Custom embedding forward",
++          py::arg("indices"),
++          py::arg("weight"),
++          py::arg("vocab_size"),
++          py::arg("embedding_dim"));
++
++    m.def("custom_layer_norm", &custom_layer_norm,
++          "Custom layer norm forward",
++          py::arg("input"),
++          py::arg("weight"),
++          py::arg("bias"),
++          py::arg("eps"),
++          py::arg("normalized_dim"),
++          py::arg("elementwise_affine"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,34 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, vocab_size, embedding_dim, normalized_shape, eps=1e-05, elementwise_affine=True):
++        super().__init__()
++        # Preserve state_dict keys and CPU storage
++        self.embedding = nn.Embedding(vocab_size, embedding_dim)
++        self.norm = nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
++        # Create CUDA copies for custom kernels (non-parameter, not in state_dict)
++        self._embedding_weight_cuda = self.embedding.weight.detach().cuda()
++        if elementwise_affine:
++            self._norm_weight_cuda = self.norm.weight.detach().cuda()
++            self._norm_bias_cuda = self.norm.bias.detach().cuda()
++        else:
++            self._norm_weight_cuda = None
++            self._norm_bias_cuda = None
++
++    def forward(self, x):
++        # Custom embedding: indices on CPU, returns CUDA tensor
++        x = cuda_extension.custom_embedding(x, self.embedding.weight, self.embedding.num_embeddings, self.embedding.embedding_dim)
++        # Custom layer norm: input CUDA, weight/bias CPU (or None), eps, normalized_dim, elementwise_affine
++        x = cuda_extension.custom_layer_norm(x, self.norm.weight, self.norm.bias, self.norm.eps, self.norm.normalized_shape[0], self.norm.elementwise_affine)
++        return x
++
++    def debug_forward(self, x):
++        # Each checkpoint must match reference values and order
++        x = cuda_extension.custom_embedding(x, self.embedding.weight, self.embedding.num_embeddings, self.embedding.embedding_dim)
++        yield ('step_001', x)
++        x = cuda_extension.custom_layer_norm(x, self.norm.weight, self.norm.bias, self.norm.eps, self.norm.normalized_shape[0], self.norm.elementwise_affine)
++        yield ('step_002', x)
++        yield ('step_003', x)

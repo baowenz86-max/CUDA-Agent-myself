@@ -1,0 +1,148 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,52 @@
++#include <cuda_runtime.h>
++
++// Elementwise clamp: output = min(max(x, 0.0f), 1.0f)
++__global__ void clamp_kernel(const float* __restrict__ input,
++                             float* __restrict__ output,
++                             int64_t n) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < n; i += stride) {
++        float v = input[i];
++        v = fminf(fmaxf(v, 0.0f), 1.0f);
++        output[i] = v;
++    }
++}
++
++// Fused clamp + hardswish: y = clamp(x,0,1); out = y * (y + 3) / 6
++__global__ void clamp_hardswish_kernel(const float* __restrict__ input,
++                                       float* __restrict__ output,
++                                       int64_t n) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < n; i += stride) {
++        float v = input[i];
++        v = fminf(fmaxf(v, 0.0f), 1.0f);
++        output[i] = v * (v + 3.0f) * (1.0f / 6.0f);
++    }
++}
++
++static inline int compute_blocks(int64_t n, int block_size) {
++    int64_t blocks64 = (n + block_size - 1) / block_size;
++    // Cap at maximum grid dimension (2^31-1) for safety, but typical n won't hit it.
++    int max_blocks = 2147483647;
++    return (int)(blocks64 < max_blocks ? blocks64 : max_blocks);
++}
++
++extern "C" void clamp_forward_launcher(const float* input,
++                                       float* output,
++                                       int64_t n,
++                                       cudaStream_t stream) {
++    const int block_size = 256;
++    int blocks = compute_blocks(n, block_size);
++    clamp_kernel<<<blocks, block_size, 0, stream>>>(input, output, n);
++}
++
++extern "C" void clamp_hardswish_forward_launcher(const float* input,
++                                                 float* output,
++                                                 int64_t n,
++                                                 cudaStream_t stream) {
++    const int block_size = 256;
++    int blocks = compute_blocks(n, block_size);
++    clamp_hardswish_kernel<<<blocks, block_size, 0, stream>>>(input, output, n);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,65 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void clamp_forward_launcher(const float* input,
++                                       float* output,
++                                       int64_t n,
++                                       cudaStream_t stream);
++
++extern "C" void clamp_hardswish_forward_launcher(const float* input,
++                                                 float* output,
++                                                 int64_t n,
++                                                 cudaStream_t stream);
++
++// Helper to validate and get contiguous float32 CUDA tensor pointer
++static inline const float* check_input(const torch::Tensor& x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    return x.data_ptr<float>();
++}
++
++static inline torch::Tensor allocate_output_like(const torch::Tensor& x) {
++    return torch::empty_like(x);
++}
++
++static inline cudaStream_t current_stream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// Wrapper for clamp_forward
++torch::Tensor clamp_forward(torch::Tensor x) {
++    const float* input = check_input(x);
++    auto output = allocate_output_like(x);
++    float* out_ptr = output.data_ptr<float>();
++    int64_t n = x.numel();
++    cudaStream_t stream = current_stream();
++    clamp_forward_launcher(input, out_ptr, n, stream);
++    return output;
++}
++
++// Wrapper for clamp_hardswish_forward
++torch::Tensor clamp_hardswish_forward(torch::Tensor x) {
++    const float* input = check_input(x);
++    auto output = allocate_output_like(x);
++    float* out_ptr = output.data_ptr<float>();
++    int64_t n = x.numel();
++    cudaStream_t stream = current_stream();
++    clamp_hardswish_forward_launcher(input, out_ptr, n, stream);
++    return output;
++}
++
++// Register bindings
++void register_custom_ops(pybind11::module& m) {
++    m.def("clamp_forward", &clamp_forward, "Clamp tensor to [0,1]",
++          pybind11::arg("x"));
++    m.def("clamp_hardswish_forward", &clamp_hardswish_forward,
++          "Fused clamp and hardswish",
++          pybind11::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        x = cuda_extension.clamp_hardswish_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        # checkpoint 1: after clamp
++        clamped = cuda_extension.clamp_forward(x)
++        yield 'step_001', clamped
++        # checkpoint 2: after hardswish
++        final = cuda_extension.clamp_hardswish_forward(x)
++        yield 'step_002', final
++        # checkpoint 3: final return
++        yield 'step_003', final

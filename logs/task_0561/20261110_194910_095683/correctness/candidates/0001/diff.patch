@@ -1,0 +1,175 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,66 @@
++#include <cuda_runtime.h>
++#include <cmath>
++
++// Kernel: replace NaN with zero
++extern "C" __global__ void custom_nan_to_zero_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t numel)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = isnan(input[i]) ? 0.0f : input[i];
++    }
++}
++
++// Kernel: PReLU with per-channel weight
++extern "C" __global__ void custom_prelu_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    int64_t numel,
++    int64_t channels,
++    int64_t hw)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        int64_t c = (i / hw) % channels;
++        float val = input[i];
++        output[i] = (val > 0.0f) ? val : (weight[c] * val);
++    }
++}
++
++// Launcher for custom_nan_to_zero
++void custom_nan_to_zero_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    const int blockSize = 256;
++    int64_t gridSize = (numel + blockSize - 1) / blockSize;
++    if (gridSize > 0) {
++        custom_nan_to_zero_kernel<<<(unsigned int)gridSize, blockSize, 0, stream>>>(
++            output, input, numel);
++    }
++}
++
++// Launcher for custom_prelu
++void custom_prelu_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    int64_t numel,
++    int64_t channels,
++    int64_t hw,
++    cudaStream_t stream)
++{
++    const int blockSize = 256;
++    int64_t gridSize = (numel + blockSize - 1) / blockSize;
++    if (gridSize > 0) {
++        custom_prelu_kernel<<<(unsigned int)gridSize, blockSize, 0, stream>>>(
++            output, input, weight, numel, channels, hw);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,75 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu (C linkage)
++extern "C" void custom_nan_to_zero_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void custom_prelu_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    int64_t numel,
++    int64_t channels,
++    int64_t hw,
++    cudaStream_t stream);
++
++torch::Tensor custom_nan_to_zero(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input x must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input x must be float32");
++
++    auto output = torch::empty_like(x);
++    int64_t numel = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_nan_to_zero_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        numel,
++        stream);
++
++    return output;
++}
++
++torch::Tensor custom_prelu(torch::Tensor x, torch::Tensor weight) {
++    TORCH_CHECK(x.is_cuda(), "Input x must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input x must be float32");
++    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
++    TORCH_CHECK(weight.is_contiguous(), "Weight must be contiguous");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
++    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == x.size(1), "Weight must be 1-D with size equal to x's channel dimension");
++
++    auto output = torch::empty_like(x);
++    int64_t numel = x.numel();
++    int64_t channels = x.size(1);
++    int64_t hw = x.size(2) * x.size(3); // height * width
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_prelu_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        numel,
++        channels,
++        hw,
++        stream);
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_nan_to_zero", &custom_nan_to_zero, "Replace NaN with zero", py::arg("x"));
++    m.def("custom_prelu", &custom_prelu, "PReLU activation with per-channel weight", py::arg("x"), py::arg("weight"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,25 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, channels):
++        super().__init__()
++        # Preserve state_dict key 'prelu.weight' and shape [channels]
++        self.prelu = nn.PReLU(channels)
++
++    def forward(self, x):
++        # Custom op for step_001: replace NaN with zero
++        x = cuda_extension.custom_nan_to_zero(x)
++        # Custom op for step_002: PReLU with per-channel weight
++        x = cuda_extension.custom_prelu(x, self.prelu.weight)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.custom_nan_to_zero(x)
++        yield 'step_001', x
++        x = cuda_extension.custom_prelu(x, self.prelu.weight)
++        yield 'step_002', x
++        yield 'step_003', x

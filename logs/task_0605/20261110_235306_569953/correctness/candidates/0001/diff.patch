@@ -1,0 +1,310 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,103 @@
++// CUDA kernels for MaxPool2d and ReLU
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// MaxPool2d kernel: input is [N, C, H, W] contiguous float32.
++// kernel_size, stride, padding, dilation are scalar ints.
++// Output shape computed as H_out = floor((H + 2*padding - dilation*(kernel_size-1) - 1)/stride) + 1
++// W_out similarly.
++// Here we assume kernel size K = kernel_size (square) but the model actually uses (3,5).
++// However, the contract passes a single kernel_size int, so we use square kernel.
++// In model_new.py, self.maxpool.kernel_size is a tuple (3,5); passing it as int would cause error.
++// The contract seems inconsistent: it says kernel_size is int but model uses tuple. We need to handle both possible.
++// We will define launcher with int kernel_size, assuming caller passes the height component. But for actual correctness,
++// we should support tuple (kh,kw). The binding layer can pass two ints. However, contract says one int.
++// To be safe, we implement two launcher variants: one with single int (square) and one with two ints for height and width.
++// But only one signature can be registered. The model_new.py passes self.maxpool.kernel_size which is tuple (3,5) as argument; pybind will convert it to int? No, tuple is not int.
++// This is a problem. We must follow model_new.py: it passes tuple. But contract parameter list shows int. Likely the binding layer will extract first element? Not possible.
++// We need to inspect model_new.py more carefully: it passes self.maxpool.kernel_size directly. In Python, tuple. The C++ binding must accept tuple. But contract says int.
++// Since we cannot modify model_new.py, we must design launcher to handle tuple via pybind? But we are not allowed to use pybind in .cu.
++// The binding.cpp in next stage will handle Python arguments. We only provide C-style launcher. We can provide launcher taking individual ints: kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w.
++// Then binding stage can unpack tuple and call. The contract fragments show parameters: torch::Tensor input, int64_t kernel_size, int64_t stride, int64_t padding, int64_t dilation. That suggests binding will take ints, but model passes tuple. There is mismatch.
++// Given constraints, we implement launcher with int kernel_size (assume square) and also provide a version with explicit dims. The binding layer can choose. For now, implement both as extern "C" functions.
++
++extern "C" void maxpool2d_forward_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int kernel_h, int kernel_w,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    cudaStream_t stream
++) {
++    int H_out = (H + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
++    int W_out = (W + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    // Using grid-stride loop kernel
++    maxpool2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, H_out, W_out,
++        kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w, total);
++}
++
++// ReLU launcher
++extern "C" void relu_forward_launcher(
++    const float* input,
++    float* output,
++    int n,
++    cudaStream_t stream
++) {
++    int threads = 256;
++    int blocks = (n + threads - 1) / threads;
++    relu_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
++}
++
++// kernel implementations
++__global__ void maxpool2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int H_out, int W_out,
++    int kernel_h, int kernel_w,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    int total
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        int w_out = i % W_out;
++        int h_out = (i / W_out) % H_out;
++        int c = (i / (W_out * H_out)) % C;
++        int n = i / (W_out * H_out * C);
++        float max_val = -1e30f;
++        int h_start = h_out * stride_h - padding_h;
++        int w_start = w_out * stride_w - padding_w;
++        for (int kh = 0; kh < kernel_h; ++kh) {
++            int h_in = h_start + kh * dilation_h;
++            if (h_in < 0 || h_in >= H) continue;
++            for (int kw = 0; kw < kernel_w; ++kw) {
++                int w_in = w_start + kw * dilation_w;
++                if (w_in < 0 || w_in >= W) continue;
++                float val = input[((n * C + c) * H + h_in) * W + w_in];
++                if (val > max_val) max_val = val;
++            }
++        }
++        output[i] = max_val;
++    }
++}
++
++__global__ void relu_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int n
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < n; i += stride) {
++        output[i] = fmaxf(input[i], 0.0f);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,165 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <pybind11/pybind11.h>
++#include <pybind11/stl.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++// 声明 .cu 中的 launcher
++extern "C" void maxpool2d_forward_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int kernel_h, int kernel_w,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    cudaStream_t stream
++);
++
++extern "C" void relu_forward_launcher(
++    const float* input,
++    float* output,
++    int n,
++    cudaStream_t stream
++);
++
++// 内部实现：参数为 int64_t，符合契约
++static torch::Tensor maxpool2d_forward_impl(
++    torch::Tensor input,
++    int64_t kernel_size_h,
++    int64_t kernel_size_w,
++    int64_t stride,
++    int64_t padding_h,
++    int64_t padding_w,
++    int64_t dilation_h,
++    int64_t dilation_w
++) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N,C,H,W)");
++
++    int N = input.size(0);
++    int C = input.size(1);
++    int H = input.size(2);
++    int W = input.size(3);
++
++    int H_out = (H + 2 * padding_h - dilation_h * (kernel_size_h - 1) - 1) / stride + 1;
++    int W_out = (W + 2 * padding_w - dilation_w * (kernel_size_w - 1) - 1) / stride + 1;
++    TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid output dimensions");
++
++    auto output = torch::empty({N, C, H_out, W_out}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    maxpool2d_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        kernel_size_h, kernel_size_w,
++        stride, stride,
++        padding_h, padding_w,
++        dilation_h, dilation_w,
++        stream
++    );
++
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA kernel launch failed");
++    return output;
++}
++
++// 绑定函数：接收 py::object 处理 tuple kernel_size
++static torch::Tensor maxpool2d_forward(
++    torch::Tensor input,
++    py::object kernel_size,
++    int64_t stride,
++    int64_t padding,
++    int64_t dilation
++) {
++    // 从 py::object 提取 kernel_size 的 int 值
++    int64_t kernel_h, kernel_w;
++    if (py::isinstance<py::tuple>(kernel_size)) {
++        auto ks_tuple = kernel_size.cast<py::tuple>();
++        TORCH_CHECK(ks_tuple.size() == 2, "kernel_size tuple must have 2 elements");
++        kernel_h = ks_tuple[0].cast<int64_t>();
++        kernel_w = ks_tuple[1].cast<int64_t>();
++    } else if (py::isinstance<py::int_>(kernel_size)) {
++        int64_t k = kernel_size.cast<int64_t>();
++        kernel_h = k;
++        kernel_w = k;
++    } else {
++        TORCH_CHECK(false, "kernel_size must be int or tuple of 2 ints");
++    }
++
++    // padding 可能是 tuple 或 int，这里 model_new.py 传入 padding[0]（int），但为兼容也处理 tuple
++    int64_t padding_h, padding_w;
++    if (py::isinstance<py::tuple>(py::cast(padding))) {
++        auto pad_tuple = py::cast<py::tuple>(py::cast(padding));
++        TORCH_CHECK(pad_tuple.size() == 2, "padding tuple must have 2 elements");
++        padding_h = pad_tuple[0].cast<int64_t>();
++        padding_w = pad_tuple[1].cast<int64_t>();
++    } else {
++        padding_h = padding;
++        padding_w = padding;
++    }
++
++    // dilation 类似
++    int64_t dilation_h, dilation_w;
++    if (py::isinstance<py::tuple>(py::cast(dilation))) {
++        auto dil_tuple = py::cast<py::tuple>(py::cast(dilation));
++        TORCH_CHECK(dil_tuple.size() == 2, "dilation tuple must have 2 elements");
++        dilation_h = dil_tuple[0].cast<int64_t>();
++        dilation_w = dil_tuple[1].cast<int64_t>();
++    } else {
++        dilation_h = dilation;
++        dilation_w = dilation;
++    }
++
++    return maxpool2d_forward_impl(
++        input,
++        kernel_h, kernel_w,
++        stride,
++        padding_h, padding_w,
++        dilation_h, dilation_w
++    );
++}
++
++// relu 绑定函数
++static torch::Tensor relu_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto output = torch::empty_like(input);
++    int64_t n = input.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    relu_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        n,
++        stream
++    );
++
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA kernel launch failed");
++    return output;
++}
++
++// 注册函数
++void register_custom_ops(pybind11::module& m) {
++    m.def("maxpool2d_forward", &maxpool2d_forward,
++          "MaxPool2d forward",
++          py::arg("input"),
++          py::arg("kernel_size"),
++          py::arg("stride"),
++          py::arg("padding"),
++          py::arg("dilation"));
++    m.def("relu_forward", &relu_forward,
++          "ReLU forward",
++          py::arg("input"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,33 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(
++        self,
++        in_channels: int,
++        out_channels: int,
++        kernel_size: tuple,
++        stride: int = 1,
++        padding: tuple = (0, 0),
++        dilation: tuple = (1, 1),
++        bias: bool = True,
++    ):
++        super().__init__()
++        self.maxpool = nn.MaxPool2d(kernel_size, stride=stride, padding=padding, dilation=dilation)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.maxpool2d_forward(x, self.maxpool.kernel_size, self.maxpool.stride,
++                                             self.maxpool.padding[0], self.maxpool.dilation[0])
++        x = cuda_extension.relu_forward(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.maxpool2d_forward(x, self.maxpool.kernel_size, self.maxpool.stride,
++                                             self.maxpool.padding[0], self.maxpool.dilation[0])
++        yield "step_001", x
++        x = cuda_extension.relu_forward(x)
++        yield "step_002", x
++        yield "step_003", x

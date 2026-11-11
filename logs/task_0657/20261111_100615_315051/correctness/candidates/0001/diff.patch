@@ -1,0 +1,193 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,71 @@
++#include <cuda_runtime.h>
++
++// Kernel for mean over dim=1 (size 64) with keepdim=True
++// Input: x shape [B, C, H, W] (contiguous), output shape [B, 1, H, W]
++// Each block computes one output element (b, 0, h, w)
++__global__ void mean_dim1_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 int B, int C, int H, int W) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = B * H * W;
++    if (idx >= total) return;
++
++    int w = idx % W;
++    int tmp = idx / W;
++    int h = tmp % H;
++    int b = tmp / H;
++
++    float sum = 0.0f;
++    for (int c = 0; c < C; ++c) {
++        int in_idx = ((b * C + c) * H + h) * W + w;
++        sum += input[in_idx];
++    }
++    output[idx] = sum / (float)C;
++}
++
++// Kernel for mean over dim=2 (size H=256) with keepdim=True
++// Input: x shape [B, 1, H, W] (contiguous), output shape [B, 1, 1, W]
++// Each block computes one output element (b, 0, 0, w)
++__global__ void mean_dim2_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 int B, int H, int W) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = B * W;
++    if (idx >= total) return;
++
++    int w = idx % W;
++    int b = idx / W;
++
++    float sum = 0.0f;
++    for (int h = 0; h < H; ++h) {
++        int in_idx = (b * H + h) * W + w;
++        sum += input[in_idx];
++    }
++    output[idx] = sum / (float)H;
++}
++
++// Launcher for mean over dim=1
++// Expects input contiguous float32 tensor of shape [B, C, H, W]
++// Output shape [B, 1, H, W]
++extern "C" void mean_dim1_launcher(const float* input,
++                                   float* output,
++                                   int B, int C, int H, int W,
++                                   cudaStream_t stream) {
++    int total = B * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    mean_dim1_kernel<<<blocks, threads, 0, stream>>>(input, output, B, C, H, W);
++}
++
++// Launcher for mean over dim=2
++// Expects input contiguous float32 tensor of shape [B, 1, H, W]
++// Output shape [B, 1, 1, W]
++extern "C" void mean_dim2_launcher(const float* input,
++                                   float* output,
++                                   int B, int H, int W,
++                                   cudaStream_t stream) {
++    int total = B * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    mean_dim2_kernel<<<blocks, threads, 0, stream>>>(input, output, B, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,93 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void mean_dim1_launcher(const float* input,
++                                   float* output,
++                                   int B, int C, int H, int W,
++                                   cudaStream_t stream);
++
++extern "C" void mean_dim2_launcher(const float* input,
++                                   float* output,
++                                   int B, int H, int W,
++                                   cudaStream_t stream);
++
++// Wrapper for mean over dim=1
++torch::Tensor mean_dim1_forward(torch::Tensor x) {
++    // Check device
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    // Check dtype
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    // Check contiguous
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    // Check shape: must be 4D [B, C, H, W]
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D [B, C, H, W]");
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++    // Optional: check exact dims? contract says [32,64,256,2048], but kernel generic
++    // We'll keep generic but ensure C>0 etc.
++
++    // Allocate output shape [B, 1, H, W]
++    auto output = torch::empty({B, 1, H, W}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    mean_dim1_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B, C, H, W,
++        stream
++    );
++
++    return output;
++}
++
++// Wrapper for mean over dim=2
++torch::Tensor mean_dim2_forward(torch::Tensor x) {
++    // Check device
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    // Check dtype
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    // Check contiguous
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    // Check shape: must be 4D [B, 1, H, W]
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D [B, 1, H, W]");
++    // The second dim must be 1 as per contract
++    TORCH_CHECK(x.size(1) == 1, "Input dim 1 must be 1 for mean_dim2");
++    int B = x.size(0);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Allocate output shape [B, 1, 1, W]
++    auto output = torch::empty({B, 1, 1, W}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    mean_dim2_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B, H, W,
++        stream
++    );
++
++    return output;
++}
++
++// Register bindings
++void register_custom_ops(pybind11::module& m) {
++    m.def("mean_dim1", &mean_dim1_forward, "Mean over dim=1 with keepdim=True",
++          py::arg("x"));
++    m.def("mean_dim2", &mean_dim2_forward, "Mean over dim=2 with keepdim=True",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import cuda_extension
++
++
++class ModelNew(torch.nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        x = cuda_extension.mean_dim1(x)
++        x = cuda_extension.mean_dim2(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.mean_dim1(x)
++        yield ('step_001', x)
++        x = cuda_extension.mean_dim2(x)
++        yield ('step_002', x)
++        yield ('step_003', x)
++        return x

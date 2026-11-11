@@ -1,0 +1,238 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,82 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Helper function to get CUDA stream is defined in binding.cpp, but we only need cudaStream_t parameter in launcher
++
++// =========================== to_cuda ===========================
++// Copy tensor from CPU to GPU, preserving shape and stride.
++// Launcher signature: void to_cuda_launcher(const float* cpu_input, float* gpu_output, int64_t numel, cudaStream_t stream)
++extern "C" void to_cuda_launcher(const float* cpu_input, float* gpu_output, int64_t numel, cudaStream_t stream) {
++    cudaMemcpyAsync(gpu_output, cpu_input, numel * sizeof(float), cudaMemcpyHostToDevice, stream);
++}
++
++// =========================== mean_reduce_keepdim ===========================
++// Compute mean over dims 1,2,3 for each batch element. Output shape [batch,1,1,1].
++// Input: x (float*), batch_size (int), channels (int), height (int), width (int)
++// Output: mean (float*), length batch_size
++// Launcher signature: void mean_reduce_keepdim_launcher(const float* x, float* mean, int batch_size, int channels, int height, int width, cudaStream_t stream)
++extern "C" void mean_reduce_keepdim_launcher(const float* x, float* mean, int batch_size, int channels, int height, int width, cudaStream_t stream) {
++    // Each block handles one batch element, reducing over channels*height*width elements
++    // Block size: 256 threads
++    int block_size = 256;
++    int grid_size = batch_size;
++    
++    // Kernel launch
++    mean_reduce_kernel<<<grid_size, block_size, 0, stream>>>(x, mean, channels, height, width);
++}
++
++// Helper kernel for mean reduction: each block reduces all elements of one batch
++__global__ void mean_reduce_kernel(const float* __restrict__ x, float* __restrict__ mean, int channels, int height, int width) {
++    extern __shared__ float shared_sum[];
++    int batch_idx = blockIdx.x;
++    int tid = threadIdx.x;
++    int block_dim = blockDim.x;
++    
++    long long total_elems = (long long)channels * height * width;
++    const float* base = x + batch_idx * total_elems;
++    
++    // Grid-stride loop within the block for reduction
++    float local_sum = 0.0f;
++    for (long long i = tid; i < total_elems; i += block_dim) {
++        local_sum += base[i];
++    }
++    
++    // Shared memory reduction
++    shared_sum[tid] = local_sum;
++    __syncthreads();
++    
++    // Reduction tree
++    for (int stride = block_dim / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            shared_sum[tid] += shared_sum[tid + stride];
++        }
++        __syncthreads();
++    }
++    
++    if (tid == 0) {
++        mean[batch_idx] = shared_sum[0] / (float)total_elems;
++    }
++}
++
++// =========================== where_less_zero ===========================
++// For each element, if x[i] < mean[batch_index], output 0.0, else output x[i].
++// Input: x (float*), mean (float*), batch_size, channels, height, width
++// Output: output (float*), same shape as x
++// Launcher signature: void where_less_zero_launcher(const float* x, const float* mean, float* output, int batch_size, int channels, int height, int width, cudaStream_t stream)
++extern "C" void where_less_zero_launcher(const float* x, const float* mean, float* output, int batch_size, int channels, int height, int width, cudaStream_t stream) {
++    int total_elems = batch_size * channels * height * width;
++    int block_size = 256;
++    int grid_size = (total_elems + block_size - 1) / block_size;
++    where_less_zero_kernel<<<grid_size, block_size, 0, stream>>>(x, mean, output, batch_size, channels, height, width);
++}
++
++__global__ void where_less_zero_kernel(const float* __restrict__ x, const float* __restrict__ mean, float* __restrict__ output, int batch_size, int channels, int height, int width) {
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long total_elems = (long long)batch_size * channels * height * width;
++    if (idx >= total_elems) return;
++    
++    long long batch_idx = idx / ((long long)channels * height * width);
++    float threshold = mean[batch_idx];
++    float val = x[idx];
++    output[idx] = (val < threshold) ? 0.0f : val;
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,124 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// External launcher declarations from custom_ops.cu
++extern "C" void to_cuda_launcher(const float* cpu_input, float* gpu_output, int64_t numel, cudaStream_t stream);
++extern "C" void mean_reduce_keepdim_launcher(const float* x, float* mean, int batch_size, int channels, int height, int width, cudaStream_t stream);
++extern "C" void where_less_zero_launcher(const float* x, const float* mean, float* output, int batch_size, int channels, int height, int width, cudaStream_t stream);
++
++// Wrapper functions
++torch::Tensor to_cuda(torch::Tensor x) {
++    // Check input: should be CPU float32 tensor
++    TORCH_CHECK(x.device().is_cpu(), "to_cuda: input must be a CPU tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "to_cuda: input must be float32");
++
++    // Allocate output on current CUDA device with same sizes and strides as input
++    auto output = torch::empty_strided(x.sizes(), x.strides(), x.options().device(torch::kCUDA));
++    
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    
++    // Launch copy (uses cudaMemcpyAsync in .cu)
++    to_cuda_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++    
++    return output;
++}
++
++torch::Tensor mean_reduce_keepdim(torch::Tensor x, int64_t dim) {
++    // Check input
++    TORCH_CHECK(x.is_cuda(), "mean_reduce_keepdim: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "mean_reduce_keepdim: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "mean_reduce_keepdim: input must be 4D");
++    TORCH_CHECK(dim == 1 || dim == 2 || dim == 3, "mean_reduce_keepdim: dim must be one of [1,2,3], got ", dim);
++    // Contract expects dim passed as [1,2,3] list? Actually model_new.py calls mean_reduce_keepdim(x, dim=[1, 2, 3])
++    // But pybind cannot accept a list with int64_t parameter; contract fragment says "int64_t dim".
++    // However model_new.py uses dim=[1,2,3] (list). We need to adjust binding to accept a list, or change model_new.py (not allowed).
++    // Since we cannot modify model_new.py, we must accept a list/vector of ints.
++    // The contract fragment provided earlier is for int64_t dim, but the actual Python call passes a list.
++    // To be safe, we'll accept py::list and validate it contains 1,2,3 in order.
++    // But the task says "以实际参考语句为准" and model_new.py uses dim=[1,2,3].
++    // We'll overload the function to accept a list of ints (or any iterable) and extract dims.
++    // However, the contract fragment says int64_t dim. This is conflicting. Let's inspect model_new.py: it calls cuda_extension.mean_reduce_keepdim(x, dim=[1, 2, 3]).
++    // Therefore the binding must accept a sequence, not a scalar int. The contract fragment may be wrong.
++    // We will create a binding that accepts py::object for dim and parses it. But the spec says "不得暴露 c10::Scalar 作为 pybind 标量参数，使用 double/int64_t".
++    // We can accept std::vector<int64_t> dims and check.
++    // For simplicity, we'll accept py::list and validate. Registration with py::arg("dim").
++    // That should work with Python list.
++    // Let's define: torch::Tensor mean_reduce_keepdim(torch::Tensor x, std::vector<int64_t> dim) and check dim size 3 and values 1,2,3.
++    // Then call launcher with dimensions from x.
++    // But the contract fragment provided "int64_t dim" – we have to follow actual Python call.
++    // We'll need to adjust the launcher call accordingly: batch = x.size(0), channels = x.size(1), height = x.size(2), width = x.size(3).
++    
++    // Check that dim matches [1,2,3] exactly
++    TORCH_CHECK(dim.size() == 3, "mean_reduce_keepdim: dim must be a list of [1,2,3]");
++    TORCH_CHECK(dim[0] == 1 && dim[1] == 2 && dim[2] == 3, "mean_reduce_keepdim: dim must be [1,2,3]");
++    
++    int batch_size = x.size(0);
++    int channels = x.size(1);
++    int height = x.size(2);
++    int width = x.size(3);
++    
++    // Allocate output: shape [batch, 1, 1, 1], stride [1,1,1,1]
++    auto output = torch::empty({batch_size, 1, 1, 1}, x.options());
++    // Ensure stride is [1,1,1,1] (empty will produce that because contiguous)
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    mean_reduce_keepdim_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch_size,
++        channels,
++        height,
++        width,
++        stream
++    );
++    
++    return output;
++}
++
++torch::Tensor where_less_zero(torch::Tensor x, torch::Tensor mean) {
++    // Checks
++    TORCH_CHECK(x.is_cuda() && mean.is_cuda(), "where_less_zero: both inputs must be CUDA tensors");
++    TORCH_CHECK(x.dtype() == torch::kFloat32 && mean.dtype() == torch::kFloat32, "where_less_zero: inputs must be float32");
++    TORCH_CHECK(x.dim() == 4, "where_less_zero: x must be 4D");
++    TORCH_CHECK(mean.dim() == 4 && mean.size(0) == x.size(0) && mean.size(1) == 1 && mean.size(2) == 1 && mean.size(3) == 1,
++                "where_less_zero: mean must be of shape [batch,1,1,1]");
++    
++    // Allocate output with same sizes and strides as x
++    auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
++    
++    int batch_size = x.size(0);
++    int channels = x.size(1);
++    int height = x.size(2);
++    int width = x.size(3);
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    where_less_zero_launcher(
++        x.data_ptr<float>(),
++        mean.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch_size,
++        channels,
++        height,
++        width,
++        stream
++    );
++    
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("to_cuda", &to_cuda, "Copy CPU tensor to current CUDA device", py::arg("x"));
++    m.def("mean_reduce_keepdim", &mean_reduce_keepdim, "Compute mean over dims [1,2,3] with keepdim", py::arg("x"), py::arg("dim"));
++    m.def("where_less_zero", &where_less_zero, "Apply threshold: x < mean ? 0 : x", py::arg("x"), py::arg("mean"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, inplace):
++        super().__init__()
++        self.inplace = inplace
++
++    def forward(self, x):
++        x = cuda_extension.to_cuda(x)
++        mean = cuda_extension.mean_reduce_keepdim(x, dim=[1, 2, 3])
++        x = cuda_extension.where_less_zero(x, mean)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.to_cuda(x)
++        mean = cuda_extension.mean_reduce_keepdim(x, dim=[1, 2, 3])
++        yield 'step_001', mean
++        x = cuda_extension.where_less_zero(x, mean)
++        yield 'step_002', x
++        yield 'step_003', x

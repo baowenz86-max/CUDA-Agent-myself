@@ -1,0 +1,284 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,123 @@
++// custom_ops.cu
++// Element-wise absolute value and broadcast addition kernels.
++// All launchers use raw pointers and cudaStream_t; no PyTorch dependencies.
++
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel for element-wise absolute value on float32 tensors.
++// Supports arbitrary strides; index calculates each dimension's offset.
++__global__ void abs_kernel_float(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t numel,
++    int64_t ndim,
++    const int64_t* __restrict__ out_strides,
++    const int64_t* __restrict__ in_strides,
++    const int64_t* __restrict__ shape)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t linear = idx; linear < numel; linear += stride) {
++        // Compute multi-dimensional indices from linear index
++        int64_t rem = linear;
++        int64_t out_offset = 0;
++        int64_t in_offset = 0;
++        for (int64_t d = ndim - 1; d >= 0; --d) {
++            int64_t coord = rem % shape[d];
++            rem /= shape[d];
++            out_offset += coord * out_strides[d];
++            in_offset += coord * in_strides[d];
++        }
++        output[out_offset] = fabsf(input[in_offset]);
++    }
++}
++
++// Kernel for broadcast addition: output[i] = x[i] + param[i % param_shape]
++// Supports arbitrary strides for x and param. Param has fewer dims,
++// broadcast over leading dimensions (batch).
++__global__ void add_broadcast_kernel_float(
++    float* __restrict__ output,
++    const float* __restrict__ x,
++    const float* __restrict__ param,
++    int64_t numel,
++    int64_t ndim,
++    int64_t param_ndim,
++    const int64_t* __restrict__ out_strides,
++    const int64_t* __restrict__ x_strides,
++    const int64_t* __restrict__ param_strides,
++    const int64_t* __restrict__ shape)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t linear = idx; linear < numel; linear += stride) {
++        // Compute multi-dimensional indices from linear index
++        int64_t rem = linear;
++        int64_t out_offset = 0;
++        int64_t x_offset = 0;
++        int64_t param_offset = 0;
++        for (int64_t d = ndim - 1; d >= 0; --d) {
++            int64_t coord = rem % shape[d];
++            rem /= shape[d];
++            out_offset += coord * out_strides[d];
++            x_offset += coord * x_strides[d];
++            // For param, broadcast: if d >= ndim - param_ndim, use param coordinate,
++            // otherwise index 0 (since leading dims are broadcast).
++            int64_t param_d = d - (ndim - param_ndim);
++            if (param_d >= 0) {
++                param_offset += coord * param_strides[param_d];
++            }
++        }
++        output[out_offset] = x[x_offset] + param[param_offset];
++    }
++}
++
++// Launch configuration helper: choose block size 256, calculate grid size with cap.
++static inline int get_num_blocks(int64_t numel, int block_size) {
++    int64_t blocks = (numel + block_size - 1) / block_size;
++    // Cap grid to avoid excessive blocks, grid-stride loop handles remainder.
++    const int64_t max_blocks = 65535;
++    if (blocks > max_blocks) blocks = max_blocks;
++    return (int)blocks;
++}
++
++// Extern "C" launcher for abs_forward.
++// Signature matches binding expectations.
++extern "C" void abs_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    int64_t ndim,
++    const int64_t* out_strides,
++    const int64_t* in_strides,
++    const int64_t* shape,
++    cudaStream_t stream)
++{
++    if (numel == 0) return;
++    int block_size = 256;
++    int grid_size = get_num_blocks(numel, block_size);
++    abs_kernel_float<<<grid_size, block_size, 0, stream>>>(
++        output, input, numel, ndim, out_strides, in_strides, shape);
++}
++
++// Extern "C" launcher for add_scalar_tensor_forward.
++extern "C" void add_scalar_tensor_forward_launcher(
++    float* output,
++    const float* x,
++    const float* param,
++    int64_t numel,
++    int64_t ndim,
++    int64_t param_ndim,
++    const int64_t* out_strides,
++    const int64_t* x_strides,
++    const int64_t* param_strides,
++    const int64_t* shape,
++    cudaStream_t stream)
++{
++    if (numel == 0) return;
++    int block_size = 256;
++    int grid_size = get_num_blocks(numel, block_size);
++    add_broadcast_kernel_float<<<grid_size, block_size, 0, stream>>>(
++        output, x, param, numel, ndim, param_ndim,
++        out_strides, x_strides, param_strides, shape);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,131 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void abs_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    int64_t ndim,
++    const int64_t* out_strides,
++    const int64_t* in_strides,
++    const int64_t* shape,
++    cudaStream_t stream);
++
++extern "C" void add_scalar_tensor_forward_launcher(
++    float* output,
++    const float* x,
++    const float* param,
++    int64_t numel,
++    int64_t ndim,
++    int64_t param_ndim,
++    const int64_t* out_strides,
++    const int64_t* x_strides,
++    const int64_t* param_strides,
++    const int64_t* shape,
++    cudaStream_t stream);
++
++namespace {
++
++std::vector<int64_t> get_shape(const torch::Tensor& t) {
++    std::vector<int64_t> shape;
++    shape.reserve(t.dim());
++    for (int64_t i = 0; i < t.dim(); ++i) {
++        shape.push_back(t.size(i));
++    }
++    return shape;
++}
++
++std::vector<int64_t> get_strides(const torch::Tensor& t) {
++    std::vector<int64_t> strides;
++    strides.reserve(t.dim());
++    for (int64_t i = 0; i < t.dim(); ++i) {
++        strides.push_back(t.stride(i));
++    }
++    return strides;
++}
++
++} // namespace
++
++torch::Tensor abs_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "abs_forward: x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "abs_forward: x must be float32");
++    TORCH_CHECK(x.numel() > 0, "abs_forward: x must have at least one element");
++
++    auto shape = get_shape(x);
++    auto strides = get_strides(x);
++    int64_t ndim = x.dim();
++    int64_t numel = x.numel();
++
++    auto output = torch::empty_strided(shape, strides, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    abs_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        numel,
++        ndim,
++        strides.data(),
++        strides.data(), // input strides same as output strides (same shape)
++        shape.data(),
++        stream);
++
++    return output;
++}
++
++torch::Tensor add_scalar_tensor_forward(torch::Tensor x, torch::Tensor param) {
++    TORCH_CHECK(x.is_cuda(), "add_scalar_tensor_forward: x must be a CUDA tensor");
++    TORCH_CHECK(param.is_cuda(), "add_scalar_tensor_forward: param must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "add_scalar_tensor_forward: x must be float32");
++    TORCH_CHECK(param.dtype() == torch::kFloat32, "add_scalar_tensor_forward: param must be float32");
++    TORCH_CHECK(x.numel() > 0, "add_scalar_tensor_forward: x must have at least one element");
++
++    // Broadcast param of shape [3,256,256] over batch dimension 512.
++    // Contract: x shape [512,3,256,256], param shape [3,256,256].
++    // General broadcast: param dims must match trailing dims of x.
++    TORCH_CHECK(param.dim() <= x.dim(), "add_scalar_tensor_forward: param must have <= dims than x");
++    int64_t offset = x.dim() - param.dim();
++    for (int64_t i = 0; i < param.dim(); ++i) {
++        TORCH_CHECK(param.size(i) == x.size(offset + i),
++                    "add_scalar_tensor_forward: param shape incompatible with x for broadcasting");
++    }
++
++    auto shape = get_shape(x);
++    auto strides = get_strides(x);
++    auto param_shape = get_shape(param);
++    auto param_strides = get_strides(param);
++    int64_t ndim = x.dim();
++    int64_t param_ndim = param.dim();
++    int64_t numel = x.numel();
++
++    auto output = torch::empty_strided(shape, strides, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    add_scalar_tensor_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        param.data_ptr<float>(),
++        numel,
++        ndim,
++        param_ndim,
++        strides.data(),
++        strides.data(),
++        param_strides.data(),
++        shape.data(),
++        stream);
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("abs_forward", &abs_forward, "Element-wise absolute value", py::arg("x"));
++    m.def("add_scalar_tensor_forward", &add_scalar_tensor_forward,
++          "Broadcast addition of param over batch dimension",
++          py::arg("x"), py::arg("param"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, param_list):
++        super().__init__()
++        self.param_list = nn.ParameterList(param_list)
++
++    def forward(self, x):
++        x = cuda_extension.abs_forward(x)
++        for param in self.param_list:
++            x = cuda_extension.add_scalar_tensor_forward(x, param)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.abs_forward(x)
++        for param in self.param_list:
++            x = cuda_extension.add_scalar_tensor_forward(x, param)
++        yield 'final', x

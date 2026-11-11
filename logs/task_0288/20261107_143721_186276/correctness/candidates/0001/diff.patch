@@ -1,0 +1,155 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,61 @@
++#include <cuda_runtime.h>
++
++// Elementwise softsign kernel: out = x / (1 + |x|)
++// Supports arbitrary contiguous/non-contiguous strides via 4D index calculation.
++// Grid-stride loop handles any numel without grid dimension limits.
++__global__ void softsign_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t total_elements,
++    int64_t dim0, int64_t dim1, int64_t dim2, int64_t dim3,
++    int64_t stride0, int64_t stride1, int64_t stride2, int64_t stride3)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t linear = idx; linear < total_elements; linear += stride) {
++        int64_t rem = linear;
++        int64_t i3 = rem % dim3;
++        rem /= dim3;
++        int64_t i2 = rem % dim2;
++        rem /= dim2;
++        int64_t i1 = rem % dim1;
++        rem /= dim1;
++        int64_t i0 = rem;
++
++        int64_t offset = i0 * stride0 + i1 * stride1 + i2 * stride2 + i3 * stride3;
++        float val = input[offset];
++        output[offset] = val / (1.0f + fabsf(val));
++    }
++}
++
++// Launcher: raw pointers, shape/stride as int64_t, current CUDA stream.
++// No PyTorch/Tensor dependencies. Caller must ensure memory is valid and stream is current.
++extern "C" void softsign_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    int64_t dim0, int64_t dim1, int64_t dim2, int64_t dim3,
++    int64_t stride0, int64_t stride1, int64_t stride2, int64_t stride3,
++    cudaStream_t stream)
++{
++    if (total_elements == 0) {
++        return; // nothing to compute
++    }
++
++    const int threads = 256;
++    int64_t max_blocks_per_grid = 2147483647; // 2^31-1, device limit for gridDim.x
++    int64_t blocks = (total_elements + threads - 1) / threads;
++    if (blocks > max_blocks_per_grid) {
++        blocks = max_blocks_per_grid;
++    }
++
++    dim3 grid((unsigned int)blocks);
++    dim3 block(threads);
++
++    softsign_kernel<<<grid, block, 0, stream>>>(
++        input, output,
++        total_elements,
++        dim0, dim1, dim2, dim3,
++        stride0, stride1, stride2, stride3);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,61 @@
++// Binding for custom softsign CUDA kernel
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void softsign_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    int64_t dim0, int64_t dim1, int64_t dim2, int64_t dim3,
++    int64_t stride0, int64_t stride1, int64_t stride2, int64_t stride3,
++    cudaStream_t stream);
++
++// PyTorch wrapper: elementwise softsign, preserving shape, dtype, device, strides
++torch::Tensor softsign_forward(torch::Tensor x) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4-dimensional");
++
++    // Output tensor: same shape, dtype, device; use empty_like to preserve strides
++    auto output = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Extract dimensions and strides as int64_t
++    int64_t total_elements = x.numel();
++    int64_t dims[4];
++    int64_t strides[4];
++    for (int i = 0; i < 4; ++i) {
++        dims[i] = x.size(i);
++        strides[i] = x.stride(i);
++    }
++
++    // Call launcher with raw pointers
++    softsign_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total_elements,
++        dims[0], dims[1], dims[2], dims[3],
++        strides[0], strides[1], strides[2], strides[3],
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++void register_softsign(pybind11::module& m) {
++    m.def("softsign_forward", &softsign_forward,
++          "Elementwise softsign forward (CUDA)",
++          pybind11::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(softsign, register_softsign);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,24 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.softsign_forward(x)
++
++    def debug_forward(self, x: torch.Tensor):
++        y = cuda_extension.softsign_forward(x)
++        yield 'step_001', y
++
++
++def get_inputs():
++    x = torch.randn(16, 3, 2048, 2048)
++    return [x]
++
++
++def get_init_inputs():
++    return []

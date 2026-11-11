@@ -1,0 +1,144 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,58 @@
++#include <cuda_runtime.h>
++
++// Kernel: compute mean along dimension 1 (channels).
++// Input shape: [N, C, H, W], output shape: [N, H, W].
++// Each thread computes one output element (n, h, w) by reducing over C.
++// Input may be non-contiguous; use provided strides.
++__global__ void mean_dim_1_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 int N, int C, int H, int W,
++                                 int stride_n, int stride_c, int stride_h, int stride_w) {
++    // 2D grid: blockIdx.x covers h*w (flattened spatial), blockIdx.y covers batch n
++    int spatial_index = blockIdx.x * blockDim.x + threadIdx.x; // index in [0, H*W)
++    int n = blockIdx.y;
++    if (n >= N || spatial_index >= H * W) return;
++
++    int h = spatial_index / W;
++    int w = spatial_index - h * W;
++
++    const float* base = input + n * stride_n + h * stride_h + w * stride_w;
++    float sum = 0.0f;
++    for (int c = 0; c < C; ++c) {
++        sum += base[c * stride_c];
++    }
++    output[n * (H * W) + spatial_index] = sum / C;
++}
++
++// Launcher: host C-interface, no PyTorch dependencies.
++// Args:
++//   input       - pointer to input data (float)
++//   output      - pointer to output data (float, preallocated)
++//   N, C, H, W  - dimensions
++//   stride_n, stride_c, stride_h, stride_w - strides in elements (not bytes)
++//   stream      - CUDA stream
++// Returns: cudaError_t status.
++extern "C" cudaError_t mean_dim_1_launcher(const float* input,
++                                           float* output,
++                                           int N, int C, int H, int W,
++                                           int stride_n, int stride_c, int stride_h, int stride_w,
++                                           cudaStream_t stream) {
++    if (N == 0 || C == 0 || H == 0 || W == 0) {
++        // No work; return success.
++        return cudaSuccess;
++    }
++
++    int spatial_size = H * W;
++    int block_size = 256;
++    int grid_x = (spatial_size + block_size - 1) / block_size;
++    int grid_y = N;
++    dim3 grid(grid_x, grid_y);
++    dim3 block(block_size);
++
++    mean_dim_1_kernel<<<grid, block, 0, stream>>>(
++        input, output, N, C, H, W,
++        stride_n, stride_c, stride_h, stride_w);
++
++    // Return error from launch (caller should also cudaGetLastError)
++    return cudaGetLastError();
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,56 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration from custom_ops.cu
++extern "C" cudaError_t mean_dim_1_launcher(const float* input,
++                                           float* output,
++                                           int N, int C, int H, int W,
++                                           int stride_n, int stride_c, int stride_h, int stride_w,
++                                           cudaStream_t stream);
++
++torch::Tensor mean_dim_1_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    // Input shape: [N, C, H, W]
++    TORCH_CHECK(x.dim() == 4, "Input must have 4 dimensions");
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    // Output shape: [N, H, W]
++    auto output = torch::empty({N, H, W}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Strides in elements
++    int64_t stride_n = x.stride(0);
++    int64_t stride_c = x.stride(1);
++    int64_t stride_h = x.stride(2);
++    int64_t stride_w = x.stride(3);
++
++    cudaError_t err = mean_dim_1_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N), static_cast<int>(C), static_cast<int>(H), static_cast<int>(W),
++        static_cast<int>(stride_n), static_cast<int>(stride_c), static_cast<int>(stride_h), static_cast<int>(stride_w),
++        stream
++    );
++
++    TORCH_CHECK(err == cudaSuccess, "mean_dim_1 launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_mean_dim_1(pybind11::module& m) {
++    m.def("mean_dim_1", &mean_dim_1_forward,
++          "Compute mean along dimension 1 (channels) of a 4D tensor",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(mean_dim_1, register_mean_dim_1);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++
++class ModelNew(nn.Module):
++    def __init__(self, complex_tensor, mean_axis):
++        super().__init__()
++        self.complex_tensor = complex_tensor
++        self.mean_axis = mean_axis
++        self.is_complex_flag = torch.is_complex(self.complex_tensor)
++
++    def forward(self, x):
++        mean_tensor = torch.ops.cuda_extension.mean_dim_1(x)
++        return mean_tensor, self.is_complex_flag
++
++    def debug_forward(self, x):
++        is_complex = torch.is_complex(self.complex_tensor)
++        yield 'step_001', is_complex
++        mean_tensor = torch.ops.cuda_extension.mean_dim_1(x)
++        yield 'step_002', mean_tensor
++        result = (mean_tensor, is_complex)
++        yield 'step_003', result

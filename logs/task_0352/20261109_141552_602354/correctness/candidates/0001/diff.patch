@@ -1,0 +1,264 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,107 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Bilinear upsample kernel: align_corners=false
++__global__ void upsample_bilinear2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out, float scale_h, float scale_w)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * H_out * W_out;
++    if (idx >= total) return;
++
++    int w_out = idx % W_out;
++    int h_out = (idx / W_out) % H_out;
++    int nc = idx / (W_out * H_out);
++
++    // Source coordinates, align_corners=false:
++    // src = (dst + 0.5) / scale - 0.5
++    float h_in_f = (h_out + 0.5f) * scale_h - 0.5f;
++    float w_in_f = (w_out + 0.5f) * scale_w - 0.5f;
++
++    // Clamp to [-0.5, H_in-0.5] (PyTorch behavior with edge padding)
++    h_in_f = fmaxf(0.0f, fminf(h_in_f, H_in - 1.0f));
++    w_in_f = fmaxf(0.0f, fminf(w_in_f, W_in - 1.0f));
++
++    int h0 = (int)h_in_f;
++    int w0 = (int)w_in_f;
++    int h1 = min(h0 + 1, H_in - 1);
++    int w1 = min(w0 + 1, W_in - 1);
++
++    float lambda_h = h_in_f - h0;
++    float lambda_w = w_in_f - w0;
++
++    const float* base = input + nc * H_in * W_in;
++    float val = 
++        (1.0f - lambda_h) * (1.0f - lambda_w) * base[h0 * W_in + w0] +
++        (1.0f - lambda_h) * lambda_w * base[h0 * W_in + w1] +
++        lambda_h * (1.0f - lambda_w) * base[h1 * W_in + w0] +
++        lambda_h * lambda_w * base[h1 * W_in + w1];
++
++    output[idx] = val;
++}
++
++// Reflection padding kernel: padding (left, right, top, bottom) = (1,1,1,1)
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H_in, int W_in,
++    int pad_left, int pad_right, int pad_top, int pad_bottom)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int H_out = H_in + pad_top + pad_bottom;
++    int W_out = W_in + pad_left + pad_right;
++    int total = N * C * H_out * W_out;
++    if (idx >= total) return;
++
++    int w_out = idx % W_out;
++    int h_out = (idx / W_out) % H_out;
++    int nc = idx / (W_out * H_out);
++
++    // Map to source index using reflection
++    int h_in = h_out - pad_top;
++    if (h_in < 0) h_in = -h_in;
++    if (h_in >= H_in) h_in = 2 * H_in - 2 - h_in;
++
++    int w_in = w_out - pad_left;
++    if (w_in < 0) w_in = -w_in;
++    if (w_in >= W_in) w_in = 2 * W_in - 2 - w_in;
++
++    output[idx] = input[nc * H_in * W_in + h_in * W_in + w_in];
++}
++
++extern "C" void upsample_bilinear2d_launcher(
++    const float* input, float* output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out, double scale_factor,
++    cudaStream_t stream)
++{
++    float scale_h = (float)(1.0 / scale_factor); // scale = 1/scale_factor because output size = floor(input*scale_factor)
++    float scale_w = scale_h;
++
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    upsample_bilinear2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H_in, W_in, H_out, W_out, scale_h, scale_w);
++}
++
++extern "C" void reflection_pad2d_launcher(
++    const float* input, float* output,
++    int N, int C, int H_in, int W_in,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    cudaStream_t stream)
++{
++    int H_out = H_in + pad_top + pad_bottom;
++    int W_out = W_in + pad_left + pad_right;
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H_in, W_in,
++        pad_left, pad_right, pad_top, pad_bottom);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,126 @@
++// Binding for custom CUDA ops
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void upsample_bilinear2d_launcher(
++    const float* input, float* output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out, double scale_factor,
++    cudaStream_t stream);
++
++extern "C" void reflection_pad2d_launcher(
++    const float* input, float* output,
++    int N, int C, int H_in, int W_in,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    cudaStream_t stream);
++
++// Helper to check CUDA errors after launch
++static void check_cuda_error(const char* msg) {
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, msg, ": ", cudaGetErrorString(err));
++}
++
++// Upsample bilinear 2D forward
++torch::Tensor upsample_bilinear2d_forward(torch::Tensor input, double scale_factor) {
++    // Validate input tensor
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (N, C, H, W)");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(scale_factor > 0, "scale_factor must be positive");
++
++    // Handle non-contiguous input by making contiguous (if needed)
++    auto input_contig = input.contiguous();
++
++    const int N = input_contig.size(0);
++    const int C = input_contig.size(1);
++    const int H_in = input_contig.size(2);
++    const int W_in = input_contig.size(3);
++
++    // Compute output size: floor(H * scale_factor), floor(W * scale_factor)
++    const int H_out = static_cast<int>(std::floor(H_in * scale_factor));
++    const int W_out = static_cast<int>(std::floor(W_in * scale_factor));
++    TORCH_CHECK(H_out > 0 && W_out > 0, "output size must be positive");
++
++    // Allocate output tensor, contiguous
++    auto output = torch::empty({N, C, H_out, W_out}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    upsample_bilinear2d_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H_in, W_in,
++        H_out, W_out, scale_factor,
++        stream
++    );
++    check_cuda_error("upsample_bilinear2d_launcher failed");
++
++    return output;
++}
++
++// Reflection pad 2D forward
++torch::Tensor reflection_pad2d_forward(torch::Tensor input, torch::Tensor padding) {
++    // Validate input tensor
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (N, C, H, W)");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++
++    // Validate padding tensor: CPU int64, shape [4]
++    TORCH_CHECK(padding.is_cpu(), "padding must be a CPU tensor");
++    TORCH_CHECK(padding.dtype() == torch::kInt64, "padding must be int64");
++    TORCH_CHECK(padding.numel() == 4, "padding must have 4 elements");
++    // Ensure padding is contiguous
++    auto padding_contig = padding.contiguous();
++    const int64_t* pad_ptr = padding_contig.data_ptr<int64_t>();
++    const int pad_left = static_cast<int>(pad_ptr[0]);
++    const int pad_right = static_cast<int>(pad_ptr[1]);
++    const int pad_top = static_cast<int>(pad_ptr[2]);
++    const int pad_bottom = static_cast<int>(pad_ptr[3]);
++
++    // Validate padding values are non-negative
++    TORCH_CHECK(pad_left >= 0 && pad_right >= 0 && pad_top >= 0 && pad_bottom >= 0,
++                "padding values must be non-negative");
++
++    // Handle non-contiguous input by making contiguous (if needed)
++    auto input_contig = input.contiguous();
++
++    const int N = input_contig.size(0);
++    const int C = input_contig.size(1);
++    const int H_in = input_contig.size(2);
++    const int W_in = input_contig.size(3);
++
++    const int H_out = H_in + pad_top + pad_bottom;
++    const int W_out = W_in + pad_left + pad_right;
++
++    // Allocate output tensor, contiguous
++    auto output = torch::empty({N, C, H_out, W_out}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    reflection_pad2d_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H_in, W_in,
++        pad_left, pad_right, pad_top, pad_bottom,
++        stream
++    );
++    check_cuda_error("reflection_pad2d_launcher failed");
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("upsample_bilinear2d_forward", &upsample_bilinear2d_forward,
++          "Bilinear 2D upsample forward",
++          py::arg("input"), py::arg("scale_factor"));
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "Reflection pad 2D forward",
++          py::arg("input"), py::arg("padding"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, scale_factor, mode):
++        super().__init__()
++        self.scale_factor = scale_factor
++        self.mode = mode
++
++    def forward(self, x):
++        x = cuda_extension.upsample_bilinear2d_forward(x, self.scale_factor)
++        x = cuda_extension.reflection_pad2d_forward(x, torch.tensor([1, 1, 1, 1], dtype=torch.int64))
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.upsample_bilinear2d_forward(x, self.scale_factor)
++        yield "step_001", x
++        x = cuda_extension.reflection_pad2d_forward(x, torch.tensor([1, 1, 1, 1], dtype=torch.int64))
++        yield "step_002", x
++        yield "step_003", x

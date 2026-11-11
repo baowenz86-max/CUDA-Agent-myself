@@ -1,0 +1,122 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,52 @@
++#include <cuda_runtime.h>
++
++// Elementwise hardtanh: clamp(x, min_val, max_val)
++__global__ void hardtanh_kernel(const float* __restrict__ input,
++                               float* __restrict__ output,
++                               int64_t numel,
++                               float min_val,
++                               float max_val) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < numel) {
++        float val = input[idx];
++        val = val < min_val ? min_val : val;
++        val = val > max_val ? max_val : val;
++        output[idx] = val;
++    }
++}
++
++// Launcher: input and output are contiguous float32 tensors with numel elements.
++// Supports arbitrary strides implicitly because caller passes a contiguous output or the kernel
++// is launched over the flattened contiguous memory. For strided input, the caller may need to
++// make it contiguous first or we can handle strides separately; contract says output should
++// have same shape and dtype, and reference output is contiguous. To be safe we assume input
++// is contiguous as per current use, but we can add stride support here by indexing, though
++// the binding layer will likely pass contiguous tensors. We keep a flat launcher for simplicity
++// and performance.
++extern "C" void hardtanh_forward_launcher(const float* input,
++                                         float* output,
++                                         int64_t numel,
++                                         double min_val,
++                                         double max_val,
++                                         cudaStream_t stream) {
++    if (numel <= 0) return;
++
++    float min_f = static_cast<float>(min_val);
++    float max_f = static_cast<float>(max_val);
++
++    const int threads = 256;
++    int64_t blocks = (numel + threads - 1) / threads;
++    // Cap blocks to a reasonable number; grid-stride loop not needed as numel < 2^31
++    if (blocks > 2147483647) {
++        blocks = 2147483647;
++    }
++
++    hardtanh_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
++        input, output, numel, min_f, max_f);
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In production binding would check and throw, but here we just leave for completeness
++        // We cannot include torch here, so just do nothing; caller should check.
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,49 @@
++#include <torch/types.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Launcher declaration from custom_ops.cu
++extern "C" void hardtanh_forward_launcher(const float* input,
++                                          float* output,
++                                          int64_t numel,
++                                          double min_val,
++                                          double max_val,
++                                          cudaStream_t stream);
++
++torch::Tensor hardtanh_forward(torch::Tensor x, double min_val, double max_val) {
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be on CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++
++    // Ensure input is contiguous; if not, make a contiguous copy.
++    auto x_contig = x.is_contiguous() ? x : x.contiguous();
++
++    // Allocate output with same shape and options; use contiguous memory.
++    auto output = torch::empty_like(x_contig, x_contig.options());
++
++    int64_t numel = x_contig.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    hardtanh_forward_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        min_val,
++        max_val,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_hardtanh_forward(pybind11::module& m) {
++    m.def("hardtanh_forward", &hardtanh_forward,
++          "Hardtanh forward (elementwise clamp)",
++          py::arg("x"), py::arg("min_val"), py::arg("max_val"));
++}
++
++REGISTER_BINDING(hardtanh_forward, register_hardtanh_forward);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,13 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.hardtanh_forward(x, -1.0, 1.0)
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        y = cuda_extension.hardtanh_forward(x, -1.0, 1.0)
++        yield 'step_001', y

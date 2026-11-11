@@ -1,0 +1,79 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,5 +1,8 @@
+ #include <cuda_runtime.h>
+ #include <cublas_v2.h>
++
++// Forward declaration for kernel used in launcher
++__global__ void equal_reduce_kernel_atomic(const float* lhs, const float* rhs, long long numel, int* global_result);
+ 
+ // Launcher for baddbmm_custom: out = input + mat1 @ mat2
+ // All tensors are float32, in row-major, with shapes [B, M, N], [B, M, K], [B, K, N]
+@@ -113,6 +116,33 @@
+     }
+ }
+ 
++// Alternative kernel using atomicAnd for block results
++__global__ void equal_reduce_kernel_atomic(const float* lhs, const float* rhs, long long numel, int* global_result) {
++    int tid = threadIdx.x;
++    int idx = blockIdx.x * blockDim.x + tid;
++    int stride = blockDim.x * gridDim.x;
++    int all_equal = 1;
++    for (long long i = idx; i < numel; i += stride) {
++        if (lhs[i] != rhs[i]) {
++            all_equal = 0;
++            break;
++        }
++    }
++    // Reduce within block using shared memory
++    __shared__ int smem[256];
++    smem[tid] = all_equal;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] = smem[tid] & smem[tid + s];
++        }
++        __syncthreads();
++    }
++    if (tid == 0 && smem[0] == 0) {
++        atomicAnd(global_result, 0);
++    }
++}
++
+ // Launcher for equal_custom: returns bool (true if all elements equal).
+ extern "C" bool equal_custom_launcher(
+     const float* lhs,
+@@ -195,33 +225,3 @@
+     
+     return h_result != 0;
+ }
+-
+-// Alternative kernel using atomicAnd for block results
+-__global__ void equal_reduce_kernel_atomic(const float* lhs, const float* rhs, long long numel, int* global_result) {
+-    int tid = threadIdx.x;
+-    int idx = blockIdx.x * blockDim.x + tid;
+-    int stride = blockDim.x * gridDim.x;
+-    int all_equal = 1;
+-    for (long long i = idx; i < numel; i += stride) {
+-        if (lhs[i] != rhs[i]) {
+-            all_equal = 0;
+-            break;
+-        }
+-    }
+-    // Reduce within block using shared memory
+-    __shared__ int smem[256];
+-    smem[tid] = all_equal;
+-    __syncthreads();
+-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) {
+-            smem[tid] = smem[tid] & smem[tid + s];
+-        }
+-        __syncthreads();
+-    }
+-    if (tid == 0 && smem[0] == 0) {
+-        atomicAnd(global_result, 0);
+-    }
+-}
+-
+-// Note: The launcher above has an issue: we allocate d_block_results but never use it. Remove that.
+-// We'll write clean versions below.

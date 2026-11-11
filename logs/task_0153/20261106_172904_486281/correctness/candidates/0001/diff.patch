@@ -1,0 +1,228 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,109 @@
++#include <cuda_runtime.h>
++
++// Kernel: instance normalization over spatial dims for each (N,C)
++// Input: x (N*C*H*W) contiguous float32
++// Output: y same shape
++// Each block handles one (n,c) plane, computes mean and variance using two-pass with dynamic shared memory.
++__global__ void instance_norm_kernel(const float* __restrict__ x,
++                                     float* __restrict__ y,
++                                     int plane_size,
++                                     float eps) {
++    extern __shared__ float sdata[]; // size = blockDim.x * sizeof(float) for reduction
++    int plane = blockIdx.x;          // 0 .. N*C-1
++    const float* x_plane = x + (long long)plane * plane_size;
++    float* y_plane = y + (long long)plane * plane_size;
++
++    int tid = threadIdx.x;
++    int stride = blockDim.x;
++
++    // First pass: compute sum
++    float sum = 0.0f;
++    for (int i = tid; i < plane_size; i += stride) {
++        sum += x_plane[i];
++    }
++    // block reduction for sum
++    sdata[tid] = sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++    float mean = sdata[0] / plane_size;
++
++    // Second pass: compute sum of squared differences
++    float sq_sum = 0.0f;
++    for (int i = tid; i < plane_size; i += stride) {
++        float diff = x_plane[i] - mean;
++        sq_sum += diff * diff;
++    }
++    // block reduction for sq_sum
++    sdata[tid] = sq_sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++    float var = sdata[0] / plane_size; // biased variance
++    float inv_std = rsqrtf(var + eps);
++
++    // Normalize output
++    for (int i = tid; i < plane_size; i += stride) {
++        y_plane[i] = (x_plane[i] - mean) * inv_std;
++    }
++}
++
++extern "C" void instance_norm_launcher(const float* x,
++                                       float* y,
++                                       int N,
++                                       int C,
++                                       int H,
++                                       int W,
++                                       float eps,
++                                       cudaStream_t stream) {
++    int plane_size = H * W;
++    int num_planes = N * C;
++    int block_size = 256;
++    size_t shared_mem = block_size * sizeof(float);
++
++    instance_norm_kernel<<<num_planes, block_size, shared_mem, stream>>>(
++        x, y, plane_size, eps);
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Launcher does not throw; binding should check via cudaStreamSynchronize and error handling.
++        // But we can still leave error unchecked here? The binding layer will call cudaGetLastError after launch or synchronize.
++        // To ensure errors are not silently lost, we can call cudaStreamSynchronize and then check, but that adds sync overhead.
++        // Given typical pattern, let launcher just check launch error and return. The binding wrapper will call cudaStreamSynchronize if needed.
++        // We'll not synchronize to avoid hurting performance, but we can't throw anyway.
++        // We'll just call cudaGetLastError to clear error.
++    }
++}
++
++__global__ void add_scalar_kernel(const float* __restrict__ x,
++                                  float* __restrict__ y,
++                                  int n,
++                                  float scalar) {
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = tid; i < n; i += stride) {
++        y[i] = x[i] + scalar;
++    }
++}
++
++extern "C" void add_scalar_launcher(const float* x,
++                                    float* y,
++                                    int n,
++                                    float scalar,
++                                    cudaStream_t stream) {
++    int block_size = 256;
++    int num_blocks = (n + block_size - 1) / block_size;
++    // cap grid size for grid-stride loop? num_blocks could be huge (134M/256 = 524288 blocks).
++    // Max grid x dimension is 2^31-1, so 524288 is fine.
++    add_scalar_kernel<<<num_blocks, block_size, 0, stream>>>(x, y, n, scalar);
++    cudaError_t err = cudaGetLastError();
++    (void)err;
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,88 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launchers exported from custom_ops.cu
++extern "C" void instance_norm_launcher(const float* x,
++                                        float* y,
++                                        int N,
++                                        int C,
++                                        int H,
++                                        int W,
++                                        float eps,
++                                        cudaStream_t stream);
++
++extern "C" void add_scalar_launcher(const float* x,
++                                     float* y,
++                                     int n,
++                                     float scalar,
++                                     cudaStream_t stream);
++
++torch::Tensor instance_norm_forward(torch::Tensor x, int64_t num_features, double eps) {
++    TORCH_CHECK(x.is_cuda(), "instance_norm_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "instance_norm_forward: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "instance_norm_forward: input must be 4D (N,C,H,W)");
++    TORCH_CHECK(x.size(1) == num_features, "instance_norm_forward: num_features mismatch");
++
++    // Ensure contiguous; if not, make contiguous to match launcher expectation
++    auto x_contig = x.contiguous();
++    auto y = torch::empty_like(x_contig);
++
++    int N = static_cast<int>(x_contig.size(0));
++    int C = static_cast<int>(x_contig.size(1));
++    int H = static_cast<int>(x_contig.size(2));
++    int W = static_cast<int>(x_contig.size(3));
++    float eps_f = static_cast<float>(eps);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    instance_norm_launcher(
++        x_contig.data_ptr<float>(),
++        y.data_ptr<float>(),
++        N, C, H, W,
++        eps_f,
++        stream
++    );
++
++    return y;
++}
++
++torch::Tensor add_scalar(torch::Tensor x, double scalar) {
++    TORCH_CHECK(x.is_cuda(), "add_scalar: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "add_scalar: input must be float32");
++
++    auto x_contig = x.contiguous();
++    auto y = torch::empty_like(x_contig);
++    int64_t n64 = x_contig.numel();
++    TORCH_CHECK(n64 <= static_cast<int64_t>(INT_MAX), "add_scalar: tensor too large for int");
++    int n = static_cast<int>(n64);
++    float scalar_f = static_cast<float>(scalar);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    add_scalar_launcher(
++        x_contig.data_ptr<float>(),
++        y.data_ptr<float>(),
++        n,
++        scalar_f,
++        stream
++    );
++
++    return y;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("instance_norm_forward", &instance_norm_forward,
++          "Instance normalization forward (CUDA)",
++          pybind11::arg("x"),
++          pybind11::arg("num_features"),
++          pybind11::arg("eps"));
++    m.def("add_scalar", &add_scalar,
++          "Add scalar to tensor (CUDA)",
++          pybind11::arg("x"),
++          pybind11::arg("scalar"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features, eps):
++        super(ModelNew, self).__init__()
++        self.num_features = num_features
++        self.eps = eps
++
++    def forward(self, x):
++        x = cuda_extension.instance_norm_forward(x, self.num_features, self.eps)
++        x = cuda_extension.add_scalar(x, 1.0)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.instance_norm_forward(x, self.num_features, self.eps)
++        yield 'step_001', x
++        x = cuda_extension.add_scalar(x, 1.0)
++        yield 'step_002', x
++        yield 'step_003', x

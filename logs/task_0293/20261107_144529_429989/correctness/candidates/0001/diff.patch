@@ -1,0 +1,362 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,217 @@
++#include <cuda_runtime.h>
++
++// -----------------------------------------------------------------------------
++// Instance Normalization (InstanceNorm2d with affine=False, track_running_stats=False)
++// For each (n, c) pair, compute mean and biased variance over H*W spatial elements,
++// then normalize: (x - mean) / sqrt(var + eps)
++// -----------------------------------------------------------------------------
++
++// Block size for instance norm reduction
++#define INSTANCE_NORM_BLOCK_SIZE 256
++
++__global__ void instance_norm2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N,
++    int C,
++    int HW,
++    float eps
++) {
++    // Each block handles one (n, c) channel
++    int nc = blockIdx.x;                  // combined n*C + c
++    int n = nc / C;
++    int c = nc % C;
++
++    const float* input_channel = input + (size_t)nc * HW;
++    float* output_channel = output + (size_t)nc * HW;
++
++    // Shared memory for block reduction
++    __shared__ float sdata[INSTANCE_NORM_BLOCK_SIZE];
++
++    // Thread index
++    int tid = threadIdx.x;
++
++    // Compute sum and sum of squares using grid-stride loop within the block
++    float sum = 0.0f;
++    float sum_sq = 0.0f;
++    for (int i = tid; i < HW; i += blockDim.x) {
++        float v = input_channel[i];
++        sum += v;
++        sum_sq += v * v;
++    }
++
++    // Block reduction for sum and sum_sq
++    sdata[tid] = sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++    float block_sum = sdata[0];
++
++    sdata[tid] = sum_sq;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++    float block_sum_sq = sdata[0];
++
++    // Compute mean and variance (biased)
++    float mean = block_sum / HW;
++    float var = block_sum_sq / HW - mean * mean;
++    float inv_std = rsqrtf(var + eps);
++
++    // Normalize all elements in this channel
++    for (int i = tid; i < HW; i += blockDim.x) {
++        output_channel[i] = (input_channel[i] - mean) * inv_std;
++    }
++}
++
++// Launcher for instance_norm2d_forward
++extern "C" void instance_norm2d_forward_launcher(
++    const float* input,
++    float* output,
++    int N,
++    int C,
++    int H,
++    int W,
++    float eps,
++    cudaStream_t stream
++) {
++    int HW = H * W;
++    int NC = N * C;
++
++    // One block per (n, c), block size = INSTANCE_NORM_BLOCK_SIZE
++    dim3 grid(NC);
++    dim3 block(INSTANCE_NORM_BLOCK_SIZE);
++
++    instance_norm2d_kernel<<<grid, block, 0, stream>>>(
++        input, output, N, C, HW, eps
++    );
++
++    // Kernel launch error check
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In a real binding, this should be surfaced as an exception.
++        // Here we just return; the binding layer can check cudaGetLastError if needed.
++        return;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// LogSoftmax along dim=1 (channel dimension)
++// For each (n, h, w) position, compute log_softmax over C channels:
++//   y_i = x_i - max_j(x_j) - log(sum_j exp(x_j - max_j(x_j)))
++// -----------------------------------------------------------------------------
++
++// Block size for logsoftmax: one block per spatial position
++#define LOGSOFTMAX_BLOCK_SIZE 256
++
++__global__ void log_softmax_dim1_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N,
++    int C,
++    int HW
++) {
++    // Each block handles one spatial position (n, h, w), i.e., one column over channels
++    int spatial_idx = blockIdx.x;   // index in [0, N*HW)
++    int n = spatial_idx / HW;
++    int hw = spatial_idx % HW;
++
++    // Base offset for this spatial position across channels
++    size_t base = (size_t)n * C * HW + hw;
++    const float* input_pos = input + base;
++    float* output_pos = output + base;
++
++    // Shared memory for reduction across channels (up to LOGSOFTMAX_BLOCK_SIZE threads)
++    __shared__ float sdata[LOGSOFTMAX_BLOCK_SIZE];
++
++    int tid = threadIdx.x;
++    int num_threads = blockDim.x;
++
++    // Compute max over channels using grid-stride loop (C may be larger than blockDim.x)
++    float max_val = -INFINITY;
++    for (int c = tid; c < C; c += num_threads) {
++        float v = input_pos[(size_t)c * HW];
++        if (v > max_val) max_val = v;
++    }
++
++    // Block reduction for max
++    sdata[tid] = max_val;
++    __syncthreads();
++    for (int s = num_threads / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            float other = sdata[tid + s];
++            if (other > sdata[tid]) sdata[tid] = other;
++        }
++        __syncthreads();
++    }
++    float block_max = sdata[0];
++
++    // Compute sum of exp(x - max) over channels
++    float sum_exp = 0.0f;
++    for (int c = tid; c < C; c += num_threads) {
++        float v = input_pos[(size_t)c * HW];
++        sum_exp += __expf(v - block_max);
++    }
++
++    // Block reduction for sum
++    sdata[tid] = sum_exp;
++    __syncthreads();
++    for (int s = num_threads / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++    float block_sum = sdata[0];
++    float log_sum = logf(block_sum);
++
++    // Write output: x - max - log(sum_exp)
++    for (int c = tid; c < C; c += num_threads) {
++        float v = input_pos[(size_t)c * HW];
++        output_pos[(size_t)c * HW] = v - block_max - log_sum;
++    }
++}
++
++// Launcher for log_softmax_dim1_forward
++extern "C" void log_softmax_dim1_forward_launcher(
++    const float* input,
++    float* output,
++    int N,
++    int C,
++    int H,
++    int W,
++    cudaStream_t stream
++) {
++    int HW = H * W;
++    int total_spatial = N * HW;
++
++    // Choose block size; if C is small we can use fewer threads, but keep simple
++    int block_size = LOGSOFTMAX_BLOCK_SIZE;
++    // Limit block size to at least C if C < block_size; but must be multiple of 32 for efficiency
++    // For safety, if C < block_size, we can use a smaller multiple of 32
++    if (C < block_size) {
++        int candidate = 32;
++        while (candidate < C) candidate <<= 1;
++        block_size = candidate;
++    }
++
++    dim3 grid(total_spatial);
++    dim3 block(block_size);
++
++    log_softmax_dim1_kernel<<<grid, block, 0, stream>>>(
++        input, output, N, C, HW
++    );
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        return;
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,115 @@
++// Binding for instance_norm2d_forward and log_softmax_dim1_forward
++// No CUDA kernels here; launchers are defined in custom_ops.cu
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void instance_norm2d_forward_launcher(
++    const float* input,
++    float* output,
++    int N,
++    int C,
++    int H,
++    int W,
++    float eps,
++    cudaStream_t stream
++);
++
++extern "C" void log_softmax_dim1_forward_launcher(
++    const float* input,
++    float* output,
++    int N,
++    int C,
++    int H,
++    int W,
++    cudaStream_t stream
++);
++
++// Wrapper for instance_norm2d_forward
++torch::Tensor instance_norm2d_forward(
++    torch::Tensor input,
++    int64_t num_channels,
++    double eps
++) {
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "instance_norm2d_forward: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "instance_norm2d_forward: input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "instance_norm2d_forward: input must be contiguous");
++    TORCH_CHECK(input.dim() == 4, "instance_norm2d_forward: input must be 4D (N,C,H,W)");
++
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t H = input.size(2);
++    int64_t W = input.size(3);
++    TORCH_CHECK(C == num_channels, "instance_norm2d_forward: num_channels must match input.size(1)");
++
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    instance_norm2d_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<float>(eps),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "instance_norm2d_forward: CUDA error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for log_softmax_dim1_forward
++torch::Tensor log_softmax_dim1_forward(torch::Tensor input) {
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "log_softmax_dim1_forward: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "log_softmax_dim1_forward: input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "log_softmax_dim1_forward: input must be contiguous");
++    TORCH_CHECK(input.dim() == 4, "log_softmax_dim1_forward: input must be 4D (N,C,H,W)");
++
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t H = input.size(2);
++    int64_t W = input.size(3);
++
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    log_softmax_dim1_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "log_softmax_dim1_forward: CUDA error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("instance_norm2d_forward", &instance_norm2d_forward,
++          "InstanceNorm2d forward (affine=False, track_running_stats=False)",
++          pybind11::arg("input"),
++          pybind11::arg("num_channels"),
++          pybind11::arg("eps"));
++    m.def("log_softmax_dim1_forward", &log_softmax_dim1_forward,
++          "LogSoftmax along dim=1",
++          pybind11::arg("input"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_channels, eps):
++        super().__init__()
++        self.num_channels = num_channels
++        self.eps = eps
++
++    def forward(self, x):
++        x = cuda_extension.instance_norm2d_forward(x, self.num_channels, self.eps)
++        x = cuda_extension.log_softmax_dim1_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.instance_norm2d_forward(x, self.num_channels, self.eps)
++        yield 'step_001', x
++        x = cuda_extension.log_softmax_dim1_forward(x)
++        yield 'step_002', x
++        yield 'step_003', x

@@ -1,0 +1,154 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,5 +1,6 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
++#include <cstdio>
+ 
+ // ============ custom_mean_dim ============
+ // 计算输入张量沿 dim 维度的均值，保持维度（keepdim=True）。
+@@ -66,57 +67,71 @@
+ // 输入: input [B,C,H,W], dim=1, index [B,1,H,W] (int64_t), src [B,1,H,W]
+ // 输出: 先复制 input，然后用 index 指定位置替换为 src 对应值。
+ // 注意：如果 input 是连续的，直接复制；但为支持 strides，按元素复制。
+-__global__ void scatter_dim_kernel(
+-    const float* __restrict__ input,
++// 为了正确处理重复索引（最后写入胜出），采用原子操作保证顺序。
++
++// 内核1：处理每个 index 元素，使用 atomicMax 存储最高顺序（线性索引）对应的 src 值。
++__global__ void scatter_index_kernel(
+     const int64_t* __restrict__ index,
+     const float* __restrict__ src,
++    uint64_t* __restrict__ out_buffer,  // 每个输出位置存储打包的 (order<<32 | float_bits)
++    int64_t B,
++    int64_t C,
++    int64_t inner_size,   // H*W
++    int64_t input_outer_stride,  // C*H*W
++    int64_t input_inner_stride,  // H*W
++    int64_t index_outer_stride,  // H*W
++    int64_t index_inner_stride,  // 1
++    int64_t src_outer_stride,
++    int64_t src_inner_stride,
++    int64_t index_total   // B*H*W
++) {
++    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    if (i >= index_total) return;
++    // 解码 i 为 (b, w)
++    int64_t w = i % inner_size;
++    int64_t b = i / inner_size;
++    int64_t c = index[b * index_outer_stride + w * index_inner_stride];
++    float val = src[b * src_outer_stride + w * src_inner_stride];
++    // 计算输出位置
++    int64_t out_offset = b * input_outer_stride + c * input_inner_stride + w;
++    uint32_t val_bits = __float_as_uint(val);
++    uint64_t order = (uint64_t)i; // 用线性索引作为顺序
++    uint64_t packed = (order << 32) | val_bits;
++    atomicMax(&out_buffer[out_offset], packed);
++}
++
++// 内核2：最终确定输出：复制 input，然后根据 buffer 重写被 scatter 的位置。
++__global__ void scatter_finalize_kernel(
++    const float* __restrict__ input,
++    uint64_t* __restrict__ out_buffer,
+     float* __restrict__ output,
+-    int64_t total_elements,        // B*C*H*W
+-    int64_t inner_size,            // H*W
+-    int64_t C,                     // 通道数
+-    int64_t B,                     // batch
+-    int64_t input_outer_stride,    // input 中外层 stride (B 维度)
+-    int64_t input_inner_stride,    // input 中通道内 stride (H*W)
+-    int64_t index_outer_stride,    // index 中 B 维度 stride（通常 H*W）
+-    int64_t index_inner_stride,    // index 中 H*W 维度 stride（通常 1，但支持 strides）
+-    int64_t src_outer_stride,
+-    int64_t src_inner_stride
++    int64_t total_elements,  // B*C*H*W
++    int64_t inner_size,      // H*W
++    int64_t C,
++    int64_t B,
++    int64_t input_outer_stride,
++    int64_t input_inner_stride
+ ) {
+     int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * gridDim.x;
+-    // 第一步：复制 input 到 output（支持任意 stride）
+     for (int64_t i = idx; i < total_elements; i += stride) {
+         // 计算多维索引
+         int64_t w = i % inner_size;
+         int64_t hw = i / inner_size;
+         int64_t c = hw % C;
+         int64_t b = hw / C;
+-        output[i] = input[b * input_outer_stride + c * input_inner_stride + w];
+-    }
+-    // 第二步：对每个 index/src 元素进行 scatter 更新
+-    // index 和 src 形状为 [B,1,H,W]，总元素数为 B*H*W
+-    int64_t index_total = B * inner_size;
+-    for (int64_t i = idx; i < index_total; i += stride) {
+-        int64_t w = i % inner_size;
+-        int64_t hw = i / inner_size;
+-        int64_t b = hw; // 因为 index 的 C 维度大小为 1
+-        int64_t c = index[b * index_outer_stride + w * index_inner_stride]; // 注意：index 的 C 维度 stride 可能为 0 或等于 inner_stride，这里简化，因为 index 形状 [B,1,H,W] 且 C=1，所以 stride 不影响
+-        // 注意：index 的内存布局为连续 [B,1,H,W]，B 的 stride 为 H*W，H*W 内连续。
+-        // 上述索引计算忽略 stride，直接使用连续假设，但契约允许多种 stride，为了稳健，我们按照实际 stride 计算：
+-        // 但这里 index 形状 [B,1,H,W]，其 B stride = 1*H*W = H*W，W stride = 1，所以连续情况下 index[b*index_outer_stride + w] 即可。
+-        // 如果 index 非连续，我们会传入 stride，但契约没有明确非连续 index，为了安全，采用连续计算，但传入实际 stride 以便支持非连续。
+-        // 然而 index 的维度只有 4 个，但 C 维大小为 1，所以 index[b*index_outer_stride + w*index_inner_stride] 等价于取 index 中第 b 张、位置 w 处的值。
+-        // 我们固定使用连续偏移公式，因为契约中没有给出非连续 index 的 stride，但声明 "supports strides"。
+-        // 为完全通用，我们应使用实际 stride 参数，但当前 launcher 假设 index 连续。
+-        // 为避免复杂，此处假设 index 连续（通常满足），launcher 会检查并确保 index 连续。
+-        float val = src[b * src_outer_stride + w * src_inner_stride];
+-        // 写入 output 对应位置
+-        output[b * input_outer_stride + c * input_inner_stride + w] = val;
++        float in_val = input[b * input_outer_stride + c * input_inner_stride + w];
++        float out_val = in_val;
++        uint64_t packed = out_buffer[i];
++        if (packed != 0) {
++            // 有 scatter 更新
++            uint32_t val_bits = (uint32_t)(packed & 0xFFFFFFFFULL);
++            out_val = __uint_as_float(val_bits);
++        }
++        output[i] = out_val;
+     }
+ }
+ 
+-// 该 launcher 简化，假设 input, index, src 均为连续（或 input 任意 stride，但 index 和 src 连续）。
+-// 实际模型输入通常连续。
+ extern "C" void custom_scatter_dim_launcher(
+     const float* input,
+     const int64_t* index,
+@@ -142,12 +157,29 @@
+     int64_t src_outer_stride = H * W;
+     int64_t src_inner_stride = 1;
+ 
++    // 分配临时 buffer，初始化为0
++    uint64_t* temp_buffer = nullptr;
++    cudaError_t err = cudaMalloc(&temp_buffer, total_elements * sizeof(uint64_t));
++    if (err != cudaSuccess) {
++        // 处理错误，但这里简单返回
++        return;
++    }
++    cudaMemsetAsync(temp_buffer, 0, total_elements * sizeof(uint64_t), stream);
++
+     const int threads = 256;
+-    int64_t blocks = (total_elements + threads - 1) / threads;
+-    if (blocks > 65535) blocks = 65535;
+-    scatter_dim_kernel<<<blocks, threads, 0, stream>>>(
+-        input, index, src, output, total_elements, inner_size, C, B,
+-        input_outer_stride, input_inner_stride,
+-        index_outer_stride, index_inner_stride,
+-        src_outer_stride, src_inner_stride);
++    int64_t blocks_index = (index_total + threads - 1) / threads;
++    if (blocks_index > 65535) blocks_index = 65535;
++    scatter_index_kernel<<<blocks_index, threads, 0, stream>>>(
++        index, src, temp_buffer,
++        B, C, inner_size, input_outer_stride, input_inner_stride,
++        index_outer_stride, index_inner_stride, src_outer_stride, src_inner_stride,
++        index_total);
++
++    int64_t blocks_final = (total_elements + threads - 1) / threads;
++    if (blocks_final > 65535) blocks_final = 65535;
++    scatter_finalize_kernel<<<blocks_final, threads, 0, stream>>>(
++        input, temp_buffer, output, total_elements, inner_size, C, B,
++        input_outer_stride, input_inner_stride);
++
++    cudaFree(temp_buffer);
+ }

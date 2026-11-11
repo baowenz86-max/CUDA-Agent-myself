@@ -1,0 +1,107 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,37 @@
++// Softshrink CUDA kernel
++#include <cuda_runtime.h>
++
++// Vectorized kernel using float4 for improved memory bandwidth
++__global__ void softshrink_kernel(float* __restrict__ output, const float* __restrict__ input, long long n, float lambd) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = blockDim.x * gridDim.x;
++    // Grid-stride loop over vector elements (4 floats each)
++    long long n_vec = n / 4;
++    for (long long i = idx; i < n_vec; i += stride) {
++        float4 in = reinterpret_cast<const float4*>(input)[i];
++        float4 out;
++        out.x = (in.x > lambd) ? (in.x - lambd) : ((in.x < -lambd) ? (in.x + lambd) : 0.0f);
++        out.y = (in.y > lambd) ? (in.y - lambd) : ((in.y < -lambd) ? (in.y + lambd) : 0.0f);
++        out.z = (in.z > lambd) ? (in.z - lambd) : ((in.z < -lambd) ? (in.z + lambd) : 0.0f);
++        out.w = (in.w > lambd) ? (in.w - lambd) : ((in.w < -lambd) ? (in.w + lambd) : 0.0f);
++        reinterpret_cast<float4*>(output)[i] = out;
++    }
++    // Handle remainder elements
++    long long rem_start = n_vec * 4;
++    for (long long i = rem_start + idx; i < n; i += stride) {
++        float val = input[i];
++        output[i] = (val > lambd) ? (val - lambd) : ((val < -lambd) ? (val + lambd) : 0.0f);
++    }
++}
++
++// Launcher: raw CUDA pointers, length, lambd, stream
++extern "C" void softshrink_launcher(float* output, const float* input, long long n, float lambd, cudaStream_t stream) {
++    if (n <= 0) return;
++    // Choose block size 256, grid based on number of vectors
++    int threads = 256;
++    long long n_vec = n / 4;
++    long long blocks_ll = (n_vec + threads - 1) / threads;
++    if (blocks_ll == 0) blocks_ll = 1;
++    int blocks = (int)blocks_ll;
++    softshrink_kernel<<<blocks, threads, 0, stream>>>(output, input, n, lambd);
++}
+--- before/kernels/softshrink_binding.cpp
++++ after/kernels/softshrink_binding.cpp
+@@ -0,0 +1,43 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void softshrink_launcher(float* output, const float* input, long long n, float lambd, cudaStream_t stream);
++
++torch::Tensor softshrink_forward(torch::Tensor x, double lambd) {
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.numel() > 0, "Input must have at least one element");
++    TORCH_CHECK(lambd >= 0, "lambd must be non-negative");
++
++    torch::Tensor x_cuda;
++    if (x.is_cuda()) {
++        x_cuda = x.contiguous();
++    } else {
++        x_cuda = x.to(torch::kCUDA);
++    }
++
++    auto output = torch::empty_like(x_cuda);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    softshrink_launcher(
++        output.data_ptr<float>(),
++        x_cuda.data_ptr<float>(),
++        static_cast<long long>(x_cuda.numel()),
++        static_cast<float>(lambd),
++        stream
++    );
++
++    return output;
++}
++
++void register_softshrink(pybind11::module& m) {
++    m.def("softshrink_forward", &softshrink_forward,
++          "Softshrink forward (CUDA)",
++          py::arg("x"),
++          py::arg("lambd") = 0.5);
++}
++
++REGISTER_BINDING(softshrink, register_softshrink);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,18 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, lambd: float = 0.5):
++        super().__init__()
++        self.lambd = lambd
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        import cuda_extension
++        return cuda_extension.softshrink_forward(x, self.lambd)
++
++    def debug_forward(self, *inputs):
++        import cuda_extension
++        x = inputs[0]
++        out = cuda_extension.softshrink_forward(x, self.lambd)
++        yield 'step_001', out

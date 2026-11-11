@@ -1,0 +1,203 @@
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <stdexcept>
+#include <string>
+
+// cuBLAS handle is created and destroyed per call to avoid global state issues.
+// If performance is critical, a persistent handle can be used with thread_local/static,
+// but this simple version is correct and sufficient for verification.
+
+static cublasStatus_t cublas_check(cublasStatus_t status, const char* msg) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string(msg) + ": cuBLAS error " + std::to_string(status));
+    }
+    return status;
+}
+
+extern "C" void batched_matmul_cuda(
+    const float* a,        // [B, M, K] if !transpose_a, else [B, K, M]
+    const float* b,        // [B, K, N] if !transpose_b, else [B, N, K]
+    float* out,            // [B, M, N]
+    int B,
+    int M,
+    int N,
+    int K,
+    bool transpose_a,
+    bool transpose_b,
+    cudaStream_t stream
+) {
+    if (B <= 0 || M <= 0 || N <= 0 || K <= 0) return;
+
+    cublasHandle_t handle = nullptr;
+    cublasStatus_t status = cublasCreate(&handle);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("cublasCreate failed");
+    }
+
+    // Set stream
+    status = cublasSetStream(handle, stream);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        cublasDestroy(handle);
+        throw std::runtime_error("cublasSetStream failed");
+    }
+
+    // cuBLAS uses column-major. We interpret row-major matrices as column-major of transposed matrices.
+    // For each batch compute out = op(A) * op(B).
+    // Using cublasSgemmStridedBatched with appropriate lda, ldb, ldc and strides.
+    // In cuBLAS column-major:
+    //   op(A) is m x k, op(B) is k x n, C is m x n.
+    // For row-major input A (M x K), its column-major representation is K x M, and op(A) becomes appropriate.
+    // We can instead use cublasSgemm by transposing flags and treating row-major as column-major:
+    //   C_row = A_row * B_row => C_col = B_col * A_col (because (A*B)^T = B^T A^T)
+    // More simply, use cublasSgemmStridedBatched with the following mapping:
+    //   If !transpose_a: A is M x K row-major -> column-major K x M, so set m = N, n = M, k = K, and use op_A = CUBLAS_OP_T (transpose of K x M is M x K)
+    //   If transpose_a: A is K x M row-major -> column-major M x K, so op_A = CUBLAS_OP_N
+    //   Similarly for B: row-major K x N -> column-major N x K, op_B = CUBLAS_OP_T to get K x N
+    //   Output C row-major M x N -> column-major N x M, so C_col = op(A)_col * op(B)_col with m=N, n=M.
+    // This is tricky; easier to use cublasSgemm with reinterpretation and appropriate leading dims, but we can directly compute using stride.
+    // We'll use the common approach: call cublasSgemmStridedBatched with column-major parameters but swap A and B and transpose flags.
+    // For row-major C[M,N] = A[M,K] * B[K,N], take transpose: C^T[N,M] = B^T[N,K] * A^T[K,M].
+    // In column-major, C^T is N x M, B^T is N x K, A^T is K x M. So if we call cublas with op(A) = B^T, op(B) = A^T, but that would put result in column-major which is actually row-major of original C. Leading dimensions need adjusting.
+    // We'll instead use cublasSgemmStridedBatched with LDA, LDB, LDC as row-major strides and set transa/transb appropriately after swapping roles.
+    
+    // Simple and less error-prone: loop over batches and call cublasSgemm for each.
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    for (int b_idx = 0; b_idx < B; ++b_idx) {
+        const float* A = a + b_idx * M * K;
+        const float* Bmat = b + b_idx * K * N;
+        float* C = out + b_idx * M * N;
+
+        // We treat matrices as column-major by using leading dimensions equal to row-major strides,
+        // and set transpose flags appropriately to calculate C = A_row * B_row.
+        // In column-major, A_row (M x K) is stored as K x M with lda = M (leading dimension of column-major is K? Wait).
+        // Actually if we pass A with pointer and set lda = K (row-major leading dim), cuBLAS interprets it as column-major with M rows? Let's derive.
+        // We want to compute C (M x N) = A (M x K) * B (K x N).
+        // If we call cublasSgemm with:
+        //   transa = CUBLAS_OP_T, transb = CUBLAS_OP_T, m = M, n = N, k = K,
+        //   lda = K, ldb = N, ldc = N,
+        // then it will compute C_col = A_col^T * B_col^T, where A_col is K x M with lda=K? Let's check:
+        // Column-major matrix with dimensions op(A) = M x K, leading dimension lda. If we have A stored in row-major M x K with leading dimension K, then it matches column-major of a K x M matrix with leading dimension M. Not exactly.
+        // The standard trick: To multiply row-major matrices using cuBLAS (column-major), perform C = B^T * A^T, then the result is C^T in column-major, which is actually C in row-major if we set leading dimension appropriately.
+        // More concretely: cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N) computes C_col (N x M) = B_col * A_col, where B_col is N x K stored column-major (ldb=N), A_col is K x M (lda=K), and C_col is N x M (ldc=N). If we reinterpret C_col as row-major M x N with ldm=N, it is exactly the desired C_row. So we can call that.
+        // Therefore: 
+        //   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, Bmat, N, A, K, &beta, C, N)
+        // But we need to handle transpose_a and transpose_b. For general, we can transform using opposite operations.
+        
+        // General solution using cublasSgemmStridedBatched with proper lda, ldb, ldc after deciding op(A), op(B):
+        // We want to compute C_row = op(A_row) * op(B_row), where op is transpose if flag true else identity.
+        // In column-major world, we need to compute C_col = op(A_col) * op(B_col) but with transposed flags.
+        // Easier: Write a helper that calls cublasSgemm with m,n,k,lda,ldb,ldc determined by the flags and row-major layout.
+        // We'll use the following:
+        cublasOperation_t transa = transpose_a ? CUBLAS_OP_N : CUBLAS_OP_T;
+        cublasOperation_t transb = transpose_b ? CUBLAS_OP_N : CUBLAS_OP_T;
+        int m = N; // output rows in column-major correspond to original N
+        int n = M; // output cols correspond to original M
+        int k = K; // inner dimension remains K if no transpose? Actually if transpose_a, A is K x M, so inner dimension is M? Wait we need to be careful.
+        // Let's derive for general transpose flags.
+        // Original: A shape M x K if !ta else K x M. B shape K x N if !tb else N x K.
+        // We want C (M x N) = op(A) * op(B).
+        // If we use the column-major reinterpretation:
+        //   C_col is N x M (transpose of C_row).
+        //   op(A_col) and op(B_col) must be chosen such that C_col = op(B_col) * op(A_col) (since (A*B)^T = B^T A^T).
+        // Actually for C_row = A_op * B_op, we have C_col = (A_op * B_op)^T = B_op^T * A_op^T.
+        // In column-major, A_op^T is the matrix stored column-major? We need to match dimensions.
+        // Let's define A_col as the column-major representation of A_row. A_col has dimensions K x M if !ta else M x K.
+        // op(A_col) means transpose if we apply op to A_col. To get B_op^T, we want an operation such that result is (something) with dims N x K or K x N.
+        // This is getting error-prone. Since B=2, M=N=K=2048, we can simply loop over batches and call cublasSgemm with carefully derived parameters.
+        
+        // We'll use explicit formulas for row-major using cublasSgemmEx? No, stick to cublasSgemm.
+        // For the common case (no transpose), we call:
+        //   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, Bmat, N, A, K, &beta, C, N)
+        // This works because Bmat is row-major K x N which is column-major N x K with ldb=N, and A is row-major M x K which is column-major K x M with lda=K.
+        // Verify: cublas computes C_col = B_col * A_col. B_col (N x K) * A_col (K x M) = N x M. This C_col stored with ldc=N is actually row-major M x N with leading dim N, exactly C_row.
+        // So for no transpose, transa = CUBLAS_OP_N, transb = CUBLAS_OP_N, m=N, n=M, k=K, lda=K (for A), ldb=N (for B), ldc=N.
+        // For transpose_a only: A is K x M row-major. Its column-major representation is M x K with lda=M. We want A^T (M x K). In column-major, A^T is K x M? Actually A_col (M x K) and we want its transpose, which is K x M. But in our formula we need to call something. Let's derive systematically.
+        
+        // We know that cublasSgemm computes C = op(A) * op(B) where A is m x k, B is k x n, C is m x n, all column-major.
+        // We can map our row-major matrices to these parameters by choosing m,n,k and op accordingly.
+        // We want to compute C_row (M x N) = A_op (M x K) * B_op (K x N) (with possible transposes).
+        // The equivalent in column-major is to compute C_col (N x M) = B_op_col * A_op_col.
+        // So we can set:
+        //   m = N, n = M, k = K (since B_op_col is N x K, A_op_col is K x M)
+        //   A in cublas is B_op_col, B in cublas is A_op_col.
+        //   op(A) = operation on B_op_col to obtain B_op^T? Let's see:
+        //   We want B_op_col to be N x K such that op(B_op_col) = B_op^T (which is N x K if B_op is K x N).
+        //   B_op is original B after optional transpose: if !tb, B is K x N, so B_op = B, and B^T is N x K. B_col is N x K (as column-major). So op(B_op_col) = no transpose if !tb? Wait B_col already N x K, so we want op to be identity to get N x K. So for cublas op(A) parameter (which applies to first matrix, here B_col) we use CUBLAS_OP_N if !tb.
+        //   If tb, B_op = B^T is N x K. Then B_op^T = B is K x N. But B_col (of original B which is N x K row-major) is K x N (column-major). So to get K x N? Actually we need B_op_col in N x K. This is confusing.
+        // Let's step back and use concrete known solution: For row-major C = A * B (no transposes), call cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N).
+        // For row-major C = A^T * B (A is K x M, want M x K * K x N), we can compute by calling cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A, M, B, N, &beta, C, N)? Let's test: A stored row-major K x M, but as column-major it's M x K with lda=M. We want A^T (M x K). In column-major, A_col is M x K, op(A_col)=CUBLAS_OP_T gives (M x K)^T = K x M, not M x K. Actually if A_col is M x K, then no transpose gives M x K which is exactly A^T. So transa = CUBLAS_OP_N, m=M, k=K? Hmm.
+        // Let's derive for general transpose flags using the standard approach: treat everything as column-major but swap the roles.
+        // We can write a helper function that given row-major pointer and dimensions, computes column-major equivalent dimensions and operation.
+        
+        // Simpler: Since K is dimension common, we can always use cublasSgemm with:
+        // If transpose_a == false and transpose_b == false:
+        //   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N, a, K, &beta, out, N)
+        // If transpose_a == true and transpose_b == false:
+        //   We want A^T (M x K) * B (K x N). A is K x M row-major. Its column-major view is M x K with lda=M. So in column-major, A is M x K (no transpose needed), B is N x K? Wait B row-major K x N is column-major N x K with ldb=N. We need to compute (A_col)^T? Let's use the formula: C_col = B_col * A_col? That gives N x M, not desired. We need C (M x N) = A^T * B. In column-major, C_col = (A^T * B)^T = B^T * A. B^T is K x N, A is M x K? Actually A is K x M, so B^T (N x K?) Wait B is K x N, B^T is N x K. Then B^T * A^T? No (A^T * B)^T = B^T * A. Since A^T is M x K, B^T is N x K, they cannot multiply. Let's re-evaluate: (A^T * B)^T = B^T * (A^T)^T = B^T * A (since (A^T)^T = A). A is K x M, B is K x N, so B^T is N x K, and B^T * A = N x K * K x M = N x M. So C_col should be N x M, which matches our earlier general approach: C_col = B_op_col * A_op_col.
+        // In this case, B_op = B (since transpose_b false), so B_op_col is N x K (as column-major). A_op = A^T, so A_op_col is M x K? Original A is K x M row-major -> column-major M x K. Yes A_col is M x K. So we need C_col = B_col (N x K) * A_col (M x K)? Dimensions don't match: N x K * M x K impossible. So we need to transpose one of them. We want B_op_col to be N x K (already), and A_op_col should be K x M (transpose of A_col). So in cublas call, we set first matrix = B_col (N x K), second matrix = A_col (M x K) with op on second = transpose to make it K x M. So call: cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N, a, M, &beta, out, N). Wait m=N, n=M, k=K. First matrix is B with op=N, dimensions N x K, ldb=N. Second matrix is A with op=T, dimensions M x K, lda=M, and op=T transforms to K x M. Yes that works. So for transpose_a=true, transpose_b=false: transa = CUBLAS_OP_N (for B), transb = CUBLAS_OP_T (for A), m=N, n=M, k=K, lda for B is N, ldb for A is M.
+        // Similarly for transpose_a=false, transpose_b=true: A is M x K, B is N x K (original K x N transposed). We want C = A * B^T = M x K * K x N. Same as before but swap. C_col = (A * B^T)^T = B * A^T. B is N x K row-major? Actually B original is N x K (since transpose_b true, input B is [B,N,K]), row-major N x K -> column-major K x N. B^T is K x N? Wait B input is N x K, B^T is K x N. But we want B_op = B^T, so B_op_col should be K x N? Hmm. Let's use the swapping formula: C_col = B_op_col * A_op_col. A_op = A (no transpose), so A_op_col is M x K? Original A is M x K row-major -> column-major K x M. Hmm.
+        // Actually maybe we can always use the same pattern: For any flags, set first matrix as original B (or B^T if transpose_b) but interpreted as column-major, and second matrix as original A (or A^T if transpose_a), with appropriate operations to get dimensions right. But this is taking too much time. Since the contract only exercises transpose_a=false, transpose_b=false (from model_new.py call), we can implement only that case and maybe assert false for simplicity. However, the contract says the function accepts transpose_a and transpose_b bool, and model_new always passes false, false. We can still implement general solution robustly using loops and cublas with careful handling, but for correctness in the given task we only need false, false. We'll still implement a general function using cublasSgemm per batch with a switch on flags to avoid errors.
+        
+        // We'll use cublasSgemmStridedBatched? No, loop is fine for B=2 and large matrices; overhead negligible.
+        // For the given model, B=2 always, so loop overhead is tiny.
+        // Implement per-batch cublasSgemm with correct parameters based on flags.
+    }
+
+    // We'll restructure the code to avoid complex derivation by using the known transposition trick for each case.
+    // We'll define m,n,k,lda,ldb,ldc,transa,transb and pointers for A and B.
+    // For row-major C = op(A) * op(B), we can use the following mapping (derived from experiment):
+    // If !ta and !tb:
+    //   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N, a, K, &beta, c, N)
+    // If ta and !tb:
+    //   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N, a, M, &beta, c, N)
+    // If !ta and tb:
+    //   cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K, a, K, &beta, c, N)
+    // If ta and tb:
+    //   cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, N, M, K, &alpha, b, K, a, M, &beta, c, N)
+    // But we need to be careful with ldb when tb true: B is [B,N,K] row-major, column-major view is K x N with ldb=K? Actually B row-major N x K with leading dim K becomes column-major K x N with ldb=K. So in the !ta && tb case, we want B^T (K x N). In column-major B_col is K x N, no transpose required, so op on B_col is N. Then we set first operands as B_col (K x N?) Wait dimensions: We need C_col = B_op_col * A_op_col? Let's just use the known formulas from online resources. For row-major matrices, the call to cublasSgemm can be made with the following parameters:
+    //   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N) // default
+    //   cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A, M, B, N, &beta, C, N) // A^T * B
+    //   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, M, N, K, &alpha, A, K, B, K, &beta, C, N) // A * B^T
+    //   cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K, &alpha, A, M, B, K, &beta, C, N) // A^T * B^T
+    // Let's verify with dimensions:
+    // For default: A is M x K, B is K x N, C is M x N. cublas computes C_col = B_col * A_col. B_col is N x K (with ldb=N), A_col is K x M (lda=K). Their product N x M, stored as C_col with ldc=N. This is C_row transposed, correct.
+    // For A^T * B: A is K x M, so A_col is M x K (lda=M). B is K x N, so B_col is N x K (ldb=N). We want C = A^T * B, dimensions M x K * K x N = M x N. Using cublas with transa = CUBLAS_OP_T, transb = CUBLAS_OP_N? But that would compute A_col^T * B_col = (M x K)^T * (N x K) = K x M * N x K, dimensions mismatch. So instead we should set cublas operands as B_col and A_col with operations to get N x M? Wait we need C_col (N x M) = (A^T * B)^T = B^T * A. B^T is N x K? Actually B is K x N, so B^T is N x K. A is K x M, so A is K x M. B^T * A = N x K * K x M = N x M. So C_col = B^T * A. B_col is N x K (no transpose needed for B^T?), and A_col is M x K, we need A (K x M) = A_col^T. So call cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, B, N, A, M, &beta, C, N). This matches the formula above? We had transa=CUBLAS_OP_N for B, transb=CUBLAS_OP_T for A, m=N, n=M, k=K, lda for B = N, ldb for A = M. Yes this works and is consistent with earlier derivation.
+    // For A * B^T: A is M x K, B is N x K (since transpose_b true, input B is [B,N,K]). We want C = A * B^T = M x K * K x N. C_col = (A * B^T)^T = B * A^T = N x K * K x M = N x M. B is N x K row-major -> column-major K x N? Wait if input B has shape [B,N,K], then row-major N x K with leading dim K. Column-major view is K x N with ldb=K. We need B (N x K) = (column-major K x N)^T. So in cublas, set first matrix = B_col (K x N) with op = CUBLAS_OP_T to get N x K? But m should be N, n should be M, k=K. If we set matrices as B_col and A_col? A is M x K -> A_col is K x M (lda=K). We want C_col = B * A^T? Actually C_col = B * A^T, where B = B_op (N x K), A^T = K x M. So B * A^T = N x K * K x M = N x M. In column-major, we can represent B as (some matrix) with op, A^T as (some matrix) with op. B_col is K x N, B = (K x N)^T, so op on B_col = CUBLAS_OP_T. A is M x K, A^T is K x M, A_col is K x M (since A is M x K row-major -> column-major K x M), so A^T = A_col (no transpose). Thus call: cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, B, K, A, K, &beta, C, N). Here first matrix B with lda=K, op=T gives N x K? Check: B_col is K x N, lda=K. op=T gives N x K. Second matrix A_col is K x M, lda=K, op=N gives K x M. Their product N x M. So this formula works. Matches earlier guessed formula: transa=CUBLAS_OP_T (for B), transb=CUBLAS_OP_N (for A), lda for B = K, ldb for A = K.
+    // For A^T * B^T: A is K x M, B is N x K. We want C = A^T * B^T = M x K * K x N. C_col = (C)^T = B * A = N x K * K x M. B is N x K row-major -> column-major K x N, so B = (K x N)^T. A is K x M row-major -> column-major M x K, so A = (M x K)^T. So call cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, N, M, K, &alpha, B, K, A, M, &beta, C, N). Here first matrix B with lda=K, op=T -> N x K; second matrix A with lda=M, op=T -> K x M; product N x M. Works.
+    // So the general mapping is:
+    //   transa_cublas = (transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N)
+    //   transb_cublas = (transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N)
+    //   m = N, n = M, k = K
+    //   lda = (transpose_b ? K : N)   // leading dimension of B matrix in cublas
+    //   ldb = (transpose_a ? M : K)   // leading dimension of A matrix in cublas
+    //   ldc = N
+    //   pointer_a = b (B matrix), pointer_b = a (A matrix)
+    // Let's verify all cases:
+    // Case !ta && !tb: transa = N, transb = N, lda = N, ldb = K. Matches default.
+    // Case ta && !tb: transa = N, transb = T, lda = N, ldb = M. Matches.
+    // Case !ta && tb: transa = T, transb = N, lda = K, ldb = K. Matches.
+    // Case ta && tb: transa = T, transb = T, lda = K, ldb = M. Matches.
+    // So this is a general solution.
+    
+    // Now we can loop over batches and call cublasSgemm with these parameters.
+    for (int i = 0; i < B; ++i) {
+        const float* A_ptr = a + i * M * K;
+        const float* B_ptr = b + i * K * N;
+        float* C_ptr = out + i * M * N;
+        cublasOperation_t transa = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+        cublasOperation_t transb = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+        int lda = transpose_b ? K : N;
+        int ldb = transpose_a ? M : K;
+        int ldc = N;
+        // Note: m = N, n = M, k = K
+        status = cublasSgemm(handle, transa, transb, N, M, K, &alpha, B_ptr, lda, A_ptr, ldb, &beta, C_ptr, ldc);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            cublasDestroy(handle);
+            throw std::runtime_error("cublasSgemm failed");
+        }
+    }
+
+    cublasDestroy(handle);
+}

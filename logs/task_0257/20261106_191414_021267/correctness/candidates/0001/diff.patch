@@ -1,0 +1,200 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,83 @@
++#include <cuda_runtime.h>
++
++// CUDA kernel for affine grid generation + scale
++// theta: [N, 2, 3] float32, possibly non-contiguous
++// output: [N, H, W, 2] float32, contiguous
++// align_corners: if true, coordinates from -1 to 1 inclusive at corners;
++//                else PyTorch convention: from -1 + 1/H to 1 - 1/H
++// scale: scalar multiplier applied to both coordinates
++template <bool ALIGN_CORNERS>
++__global__ void affine_grid_scaled_kernel(
++    const float* __restrict__ theta,
++    float* __restrict__ output,
++    int64_t N, int64_t H, int64_t W,
++    int64_t theta_stride_n, int64_t theta_stride_r, int64_t theta_stride_c,
++    float scale)
++{
++    int64_t total = N * H * W;
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int64_t w = i % W;
++        int64_t tmp = i / W;
++        int64_t h = tmp % H;
++        int64_t n = tmp / H;
++
++        // Compute base x, y from theta[n]
++        const float* theta_n = theta + n * theta_stride_n;
++        float x = theta_n[0 * theta_stride_r + 0 * theta_stride_c] * w +
++                  theta_n[0 * theta_stride_r + 1 * theta_stride_c] * h +
++                  theta_n[0 * theta_stride_r + 2 * theta_stride_c];
++        float y = theta_n[1 * theta_stride_r + 0 * theta_stride_c] * w +
++                  theta_n[1 * theta_stride_r + 1 * theta_stride_c] * h +
++                  theta_n[1 * theta_stride_r + 2 * theta_stride_c];
++
++        // Apply align_corners convention to get base_x, base_y
++        float base_x, base_y;
++        if (ALIGN_CORNERS) {
++            base_x = (W == 1) ? 0.0f : (2.0f * w / (W - 1) - 1.0f);
++            base_y = (H == 1) ? 0.0f : (2.0f * h / (H - 1) - 1.0f);
++        } else {
++            base_x = (W == 1) ? 0.0f : (2.0f * (w + 0.5f) / W - 1.0f);
++            base_y = (H == 1) ? 0.0f : (2.0f * (h + 0.5f) / H - 1.0f);
++        }
++
++        // grid coordinate = base + theta linear transformation, then scale
++        float out_x = (base_x * theta_n[0 * theta_stride_r + 0 * theta_stride_c] +
++                       base_y * theta_n[0 * theta_stride_r + 1 * theta_stride_c] +
++                       theta_n[0 * theta_stride_r + 2 * theta_stride_c]) * scale;
++        float out_y = (base_x * theta_n[1 * theta_stride_r + 0 * theta_stride_c] +
++                       base_y * theta_n[1 * theta_stride_r + 1 * theta_stride_c] +
++                       theta_n[1 * theta_stride_r + 2 * theta_stride_c]) * scale;
++
++        output[2 * i] = out_x;
++        output[2 * i + 1] = out_y;
++    }
++}
++
++// Launcher function (C interface)
++extern "C" void affine_grid_scaled_launcher(
++    const float* theta,
++    float* output,
++    int64_t N, int64_t H, int64_t W,
++    int64_t theta_stride_n, int64_t theta_stride_r, int64_t theta_stride_c,
++    bool align_corners,
++    float scale,
++    cudaStream_t stream)
++{
++    if (N <= 0 || H <= 0 || W <= 0) return;
++
++    int64_t total = N * H * W;
++    int block = 256;
++    int64_t grid = (total + block - 1) / block;
++    if (grid > 2147483647LL) grid = 2147483647LL;
++
++    if (align_corners) {
++        affine_grid_scaled_kernel<true><<<(unsigned int)grid, block, 0, stream>>>(
++            theta, output, N, H, W, theta_stride_n, theta_stride_r, theta_stride_c, scale);
++    } else {
++        affine_grid_scaled_kernel<false><<<(unsigned int)grid, block, 0, stream>>>(
++            theta, output, N, H, W, theta_stride_n, theta_stride_r, theta_stride_c, scale);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,74 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void affine_grid_scaled_launcher(
++    const float* theta,
++    float* output,
++    int64_t N, int64_t H, int64_t W,
++    int64_t theta_stride_n, int64_t theta_stride_r, int64_t theta_stride_c,
++    bool align_corners,
++    float scale,
++    cudaStream_t stream);
++
++// PyTorch wrapper for affine grid generation + scale
++torch::Tensor affine_grid_scaled(
++    torch::Tensor theta,
++    int64_t size_h,
++    int64_t size_w,
++    bool align_corners,
++    double scale)
++{
++    // Check input tensor
++    TORCH_CHECK(theta.is_cuda(), "theta must be a CUDA tensor");
++    TORCH_CHECK(theta.dtype() == torch::kFloat32, "theta must be float32");
++    TORCH_CHECK(theta.dim() == 3, "theta must have shape [N, 2, 3]");
++    TORCH_CHECK(theta.size(1) == 2 && theta.size(2) == 3, "theta must have shape [N, 2, 3]");
++
++    int64_t N = theta.size(0);
++    TORCH_CHECK(N > 0, "theta batch size must be positive");
++    TORCH_CHECK(size_h > 0, "size_h must be positive");
++    TORCH_CHECK(size_w > 0, "size_w must be positive");
++
++    // Output tensor: [N, size_h, size_w, 2]
++    auto output = torch::empty({N, size_h, size_w, 2}, theta.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // theta may be non-contiguous; pass strides
++    int64_t stride_n = theta.stride(0);
++    int64_t stride_r = theta.stride(1);
++    int64_t stride_c = theta.stride(2);
++
++    // Call CUDA launcher
++    affine_grid_scaled_launcher(
++        theta.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, size_h, size_w,
++        stride_n, stride_r, stride_c,
++        align_corners,
++        static_cast<float>(scale),
++        stream);
++
++    // Check for launch errors
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA kernel launch failed");
++
++    return output;
++}
++
++// Registration function
++void register_affine_grid_scaled(pybind11::module& m) {
++    m.def("affine_grid_scaled", &affine_grid_scaled,
++          "Generate affine grid and scale by scalar",
++          pybind11::arg("theta"),
++          pybind11::arg("size_h"),
++          pybind11::arg("size_w"),
++          pybind11::arg("align_corners"),
++          pybind11::arg("scale"));
++}
++
++REGISTER_BINDING(affine_grid_scaled, register_affine_grid_scaled);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,34 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, size, scale, align_corners):
++        super().__init__()
++        self.size = size
++        self.scale = scale
++        self.align_corners = align_corners
++
++    def forward(self, theta):
++        grid = cuda_extension.affine_grid_scaled(
++            theta,
++            self.size[2],
++            self.size[3],
++            self.align_corners,
++            self.scale,
++        )
++        return grid
++
++    def debug_forward(self, theta):
++        grid = cuda_extension.affine_grid_scaled(
++            theta,
++            self.size[2],
++            self.size[3],
++            False,  # reference step_001 uses align_corners=self.align_corners which is True, but we may need to debug both steps
++            self.scale,
++        )
++        yield "step_001", grid
++        grid_scaled = grid * self.scale
++        yield "step_002", grid_scaled
++        yield "step_003", grid_scaled

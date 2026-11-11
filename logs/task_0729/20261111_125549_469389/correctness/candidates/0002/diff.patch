@@ -1,0 +1,170 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,37 +1,32 @@
+ #include <cuda_runtime.h>
+ #include <device_launch_parameters.h>
+ 
+-// Kernel to reduce a [H,W] plane of input to a scalar and add to output using atomicAdd.
+-// Each block processes a contiguous chunk of the plane.
+-// gridDim.x = number of output elements (batch*channels), blockIdx.x indexes output.
+-// gridDim.y = number of blocks per output element to achieve enough parallelism.
+-// blockDim.x = threads per block. Each thread strides over its assigned portion of the plane into shared memory, then block reduces.
+-
+-__global__ void reduce_plane_kernel(const float* __restrict__ input, float* __restrict__ output,
+-                                    int H, int W, int plane_size) {
+-    extern __shared__ float sdata[];
++// Phase 1: Each block computes a partial sum over its assigned chunk of the plane using double precision.
++// Input: float plane of size H*W, output: double partial sums per block (num_blocks_per_output values per output).
++// grid = (num_outputs, num_blocks_per_output), block = 256 threads.
++__global__ void reduce_plane_partial(const float* __restrict__ input,
++                                     double* __restrict__ partial_sums,
++                                     int H, int W, int plane_size,
++                                     int num_blocks_per_output) {
++    extern __shared__ double sdata[];
+     unsigned int tid = threadIdx.x;
+     unsigned int out_idx = blockIdx.x;
+     unsigned int block_in_output = blockIdx.y;
+-    unsigned int num_blocks_per_output = gridDim.y;
+ 
+-    // Compute base pointer for this output's plane
+     const float* plane = input + (size_t)out_idx * plane_size;
+ 
+-    float local_sum = 0.0f;
+-
+-    // Each block processes a contiguous portion of the plane using grid-stride within the block
+-    // Determine the range [start, end) of elements this block is responsible for
++    // Determine this block's contiguous chunk
+     unsigned int chunk_size = (plane_size + num_blocks_per_output - 1) / num_blocks_per_output;
+     unsigned int start = block_in_output * chunk_size;
+     unsigned int end = min(start + chunk_size, (unsigned int)plane_size);
+ 
+-    // Each thread iterates over elements with stride blockDim.x within [start, end)
++    double local_sum = 0.0;
++    // Sequential strided loop within block; accumulation in double
+     for (unsigned int idx = start + tid; idx < end; idx += blockDim.x) {
+-        local_sum += plane[idx];
++        local_sum += (double)plane[idx];
+     }
+ 
+-    // Block reduction via shared memory
++    // Block reduction in double precision
+     sdata[tid] = local_sum;
+     __syncthreads();
+ 
+@@ -42,31 +37,52 @@
+         __syncthreads();
+     }
+ 
+-    // Thread 0 atomically adds block result to output
++    // Thread 0 writes partial sum to correct location
+     if (tid == 0) {
+-        atomicAdd(&output[out_idx], sdata[0]);
++        partial_sums[out_idx * num_blocks_per_output + block_in_output] = sdata[0];
+     }
+ }
+ 
+-// Launcher for reduce_sum over dims (2,3) of a 4D tensor [N, C, H, W]
+-// Input pointer is contiguous float32. Output preallocated zero of shape [N, C]
++// Phase 2: Reduce partial sums for each output. One block per output.
++// Each block has num_blocks_per_output partials, stored contiguously.
++// We use a single warp (or all threads) to sum in order deterministically.
++__global__ void reduce_plane_final(const double* __restrict__ partial_sums,
++                                   float* __restrict__ output,
++                                   int num_outputs,
++                                   int num_blocks_per_output) {
++    unsigned int out_idx = blockIdx.x;
++    if (out_idx >= num_outputs) return;
++
++    const double* partials = partial_sums + (size_t)out_idx * num_blocks_per_output;
++    double sum = 0.0;
++    for (int i = 0; i < num_blocks_per_output; ++i) {
++        sum += partials[i];
++    }
++    output[out_idx] = (float)sum;
++}
++
+ extern "C" void reduce_sum_launcher(const float* input, float* output,
+                                    int N, int C, int H, int W,
++                                   double* temp_partials,
+                                    cudaStream_t stream) {
+     int plane_size = H * W;
+     int num_outputs = N * C;
+ 
+-    // Choose number of blocks per output to balance occupancy and atomic contention.
+-    // For large H*W (589824), we want enough blocks to saturate GPU.
+-    // Each block can handle many elements; using 64 blocks per output gives 98304 threads total for 1536 outputs*64 blocks = 98304 blocks, maybe too many but OK.
+-    // We'll set num_blocks_per_output = 32, block size 256. That gives 1536*32 = 49152 blocks, 256 threads each => 12.5M threads, enough parallelism.
+-    // But too many blocks may cause atomic contention. We'll start with 16 blocks per output.
+-    int num_blocks_per_output = 16;
++    // Choose number of blocks per output; deterministic order requires fixed count.
++    int num_blocks_per_output = 16;  // can tune later
++
+     dim3 grid(num_outputs, num_blocks_per_output);
+     int block_size = 256;
+-    size_t shared_mem_size = block_size * sizeof(float);
++    size_t shared_mem_size = block_size * sizeof(double);
+ 
+-    reduce_plane_kernel<<<grid, block_size, shared_mem_size, stream>>>(input, output, H, W, plane_size);
++    // Phase 1
++    reduce_plane_partial<<<grid, block_size, shared_mem_size, stream>>>(
++        input, temp_partials, H, W, plane_size, num_blocks_per_output);
++
++    // Phase 2: one block per output, say 128 threads (only one used for summing, but okay)
++    int final_block_size = 128;
++    reduce_plane_final<<<num_outputs, final_block_size, 0, stream>>>(
++        temp_partials, output, num_outputs, num_blocks_per_output);
+ }
+ 
+ // Kernel for torch.round, round half to even
+@@ -77,7 +93,6 @@
+     }
+ }
+ 
+-// Launcher for round operation
+ extern "C" void round_launcher(const float* input, float* output, int numel, cudaStream_t stream) {
+     int block_size = 256;
+     int grid_size = (numel + block_size - 1) / block_size;
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -8,13 +8,13 @@
+ // Declare launchers from custom_ops.cu
+ extern "C" void reduce_sum_launcher(const float* input, float* output,
+                                    int N, int C, int H, int W,
++                                   double* temp_partials,
+                                    cudaStream_t stream);
+ 
+ extern "C" void round_launcher(const float* input, float* output, int numel, cudaStream_t stream);
+ 
+ // Wrapper for torch.sum over dims (2,3) for a 4D contiguous float32 tensor.
+ torch::Tensor custom_reduce_sum(torch::Tensor x, int64_t dim0, int64_t dim1) {
+-    // Validate input
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(x.dim() == 4, "Input must be 4D");
+@@ -26,8 +26,11 @@
+     int H = x.size(2);
+     int W = x.size(3);
+ 
+-    // Allocate output of shape [N, C] and initialize to zero.
+-    auto output = torch::zeros({N, C}, x.options());
++    int num_outputs = N * C;
++    int num_blocks_per_output = 16;  // must match launcher
++
++    auto output = torch::empty({N, C}, x.options());
++    auto temp_partials = torch::empty({num_outputs * num_blocks_per_output}, x.options().dtype(torch::kFloat64));
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+@@ -35,6 +38,7 @@
+         x.data_ptr<float>(),
+         output.data_ptr<float>(),
+         N, C, H, W,
++        temp_partials.data_ptr<double>(),
+         stream
+     );
+ 
+@@ -71,4 +75,4 @@
+           py::arg("x"));
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);+REGISTER_BINDING(custom_ops, register_custom_ops);

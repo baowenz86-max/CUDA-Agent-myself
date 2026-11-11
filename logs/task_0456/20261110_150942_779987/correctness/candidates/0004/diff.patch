@@ -1,0 +1,318 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -2,12 +2,11 @@
+ #include <math.h>
+ 
+ // Batchnorm inference kernel
+-// Each thread computes one output element (NCHW contiguous)
+ __global__ void batchnorm_inference_kernel(
+     const float* __restrict__ x,
+     float* __restrict__ out,
+-    const float* __restrict__ weight, // may be null
+-    const float* __restrict__ bias,   // may be null
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
+     const float* __restrict__ running_mean,
+     const float* __restrict__ running_var,
+     float eps,
+@@ -30,20 +29,13 @@
+     }
+ }
+ 
+-// Triplet margin loss sum kernel
+-// Each block processes a subset of batch items and accumulates partial sum
+-// We assume batch size N = 16, but code is general.
+-// Each thread computes distance for one item? Better: one thread per item, reduce within block.
+-// Since feature dimension D = C*HW = 768*64*64 = 3,145,728, we cannot have one thread per item efficiently.
+-// We'll use one block per item, each thread sums over a chunk of D, then reduce across threads.
+-// To reduce code complexity, use one block per item, with 256 threads, grid-stride over D, and shared memory reduction.
+-
+-template<int BLOCK_DIM>
++// Triplet margin loss kernel: one block per item, each thread accumulates over a strided chunk
++// Shared memory reduction with proper initialization to zero for all threads
+ __global__ void triplet_margin_loss_sum_kernel(
+     const float* __restrict__ anchor,
+     const float* __restrict__ positive,
+     const float* __restrict__ negative,
+-    float* __restrict__ partial_sums, // length = N (one per item)
++    float* __restrict__ out,
+     float margin,
+     int N,
+     int D
+@@ -59,22 +51,27 @@
+     float sum_neg = 0.0f;
+ 
+     // Each thread accumulates over a strided chunk
+-    for (int idx = threadIdx.x; idx < D; idx += BLOCK_DIM) {
++    for (int idx = threadIdx.x; idx < D; idx += blockDim.x) {
+         float diff_pos = a[idx] - p[idx];
+         float diff_neg = a[idx] - n[idx];
+         sum_pos += diff_pos * diff_pos;
+         sum_neg += diff_neg * diff_neg;
+     }
+ 
+-    // Reduce sums within block using shared memory
+-    __shared__ float s_pos[BLOCK_DIM];
+-    __shared__ float s_neg[BLOCK_DIM];
++    // Shared memory for reduction, initialize all entries to zero
++    __shared__ float s_pos[256];
++    __shared__ float s_neg[256];
++    s_pos[threadIdx.x] = 0.0f;
++    s_neg[threadIdx.x] = 0.0f;
++    __syncthreads();
++
++    // Write local sums into shared memory
+     s_pos[threadIdx.x] = sum_pos;
+     s_neg[threadIdx.x] = sum_neg;
+     __syncthreads();
+ 
+     // Tree reduction
+-    for (int s = BLOCK_DIM / 2; s > 0; s >>= 1) {
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+         if (threadIdx.x < s) {
+             s_pos[threadIdx.x] += s_pos[threadIdx.x + s];
+             s_neg[threadIdx.x] += s_neg[threadIdx.x + s];
+@@ -86,51 +83,12 @@
+         float dist_pos = sqrtf(s_pos[0]);
+         float dist_neg = sqrtf(s_neg[0]);
+         float loss_i = fmaxf(dist_pos - dist_neg + margin, 0.0f);
+-        partial_sums[item] = loss_i;
++        atomicAdd(out, loss_i);
+     }
+ }
+ 
+-// Final reduction kernel: sum partial_sums into output scalar
+-__global__ void reduce_sum_kernel(
+-    const float* __restrict__ partial_sums,
+-    float* __restrict__ out,
+-    int N
+-) {
+-    // Single block, N items
+-    __shared__ float sdata[256];
+-    int tid = threadIdx.x;
+-    float sum = 0.0f;
+-    if (tid < N) {
+-        sum = partial_sums[tid];
+-    }
+-    sdata[tid] = sum;
+-    __syncthreads();
+-
+-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) {
+-            sdata[tid] += sdata[tid + s];
+-        }
+-        __syncthreads();
+-    }
+-    if (tid == 0) {
+-        out[0] = sdata[0];
+-    }
+-}
+-
+-// Forward declaration of atomic kernel to be used in launcher
+-template<int BLOCK_DIM>
+-__global__ void triplet_margin_loss_sum_atomic_kernel(
+-    const float* __restrict__ anchor,
+-    const float* __restrict__ positive,
+-    const float* __restrict__ negative,
+-    float* __restrict__ out,
+-    float margin,
+-    int N,
+-    int D
+-);
+-
+-// Launcher functions
+-extern "C" void batchnorm_inference_launcher(
++// Launcher for batchnorm
++void batchnorm_inference_launcher(
+     const float* x,
+     float* out,
+     const float* weight,
+@@ -151,7 +109,8 @@
+         x, out, weight, bias, running_mean, running_var, eps, N, C, HW);
+ }
+ 
+-extern "C" void triplet_margin_loss_sum_launcher(
++// Launcher for triplet margin loss
++void triplet_margin_loss_sum_launcher(
+     const float* anchor,
+     const float* positive,
+     const float* negative,
+@@ -161,78 +120,10 @@
+     int D,
+     cudaStream_t stream
+ ) {
+-    // Allocate partial sums on device? We need a workspace.
+-    // Better: use a single kernel with atomicAdd, but order may be non-deterministic but acceptable for sum of floats.
+-    // However, requirement says use stable scan? Actually masked_select specific, not this.
+-    // We can use an internal temporary buffer allocated in launcher with cudaMalloc, but that requires cudaFree.
+-    // Simpler: use atomicAdd in a single kernel where each block computes one item and atomically adds to output.
+-    // Since reduction='sum', atomicAdd is fine for floating point? It is deterministic up to floating point non-associativity, acceptable.
+-    // Let's implement a kernel where each block does the per-item distance computation and then atomically adds to out[0].
+-    // First zero out[0] using cudaMemsetAsync in launcher.
+-    // We'll write a kernel that does per-item block and atomicAdd.
+-    
+-    // We'll define a kernel: one block per item, threads sum over D, then one thread atomically adds loss_i to out.
+-    // Instead of partial_sums and separate reduction.
+-    
++    // Zero output before accumulation
++    cudaMemsetAsync(out, 0, sizeof(float), stream);
++
+     constexpr int BLOCK_DIM = 256;
+-    // Ensure D is divisible or handle remainder
+-    // We'll use a loop as above.
+-    
+-    // Launch zeroing kernel? Use cudaMemsetAsync before main kernel.
+-    cudaMemsetAsync(out, 0, sizeof(float), stream);
+-    
+-    int num_items = N;
+-    triplet_margin_loss_sum_atomic_kernel<BLOCK_DIM><<<num_items, BLOCK_DIM, 0, stream>>>(
++    triplet_margin_loss_sum_kernel<<<N, BLOCK_DIM, 0, stream>>>(
+         anchor, positive, negative, out, margin, N, D);
+ }
+-
+-// Kernel with atomic add directly to output scalar
+-// Shared memory reduction then one thread does atomicAdd
+-template<int BLOCK_DIM>
+-__global__ void triplet_margin_loss_sum_atomic_kernel(
+-    const float* __restrict__ anchor,
+-    const float* __restrict__ positive,
+-    const float* __restrict__ negative,
+-    float* __restrict__ out,
+-    float margin,
+-    int N,
+-    int D
+-) {
+-    int item = blockIdx.x;
+-    if (item >= N) return;
+-
+-    const float* a = anchor + (int64_t)item * D;
+-    const float* p = positive + (int64_t)item * D;
+-    const float* n = negative + (int64_t)item * D;
+-
+-    float sum_pos = 0.0f;
+-    float sum_neg = 0.0f;
+-
+-    for (int idx = threadIdx.x; idx < D; idx += BLOCK_DIM) {
+-        float diff_pos = a[idx] - p[idx];
+-        float diff_neg = a[idx] - n[idx];
+-        sum_pos += diff_pos * diff_pos;
+-        sum_neg += diff_neg * diff_neg;
+-    }
+-
+-    __shared__ float s_pos[BLOCK_DIM];
+-    __shared__ float s_neg[BLOCK_DIM];
+-    s_pos[threadIdx.x] = sum_pos;
+-    s_neg[threadIdx.x] = sum_neg;
+-    __syncthreads();
+-
+-    for (int s = BLOCK_DIM / 2; s > 0; s >>= 1) {
+-        if (threadIdx.x < s) {
+-            s_pos[threadIdx.x] += s_pos[threadIdx.x + s];
+-            s_neg[threadIdx.x] += s_neg[threadIdx.x + s];
+-        }
+-        __syncthreads();
+-    }
+-
+-    if (threadIdx.x == 0) {
+-        float dist_pos = sqrtf(s_pos[0]);
+-        float dist_neg = sqrtf(s_neg[0]);
+-        float loss_i = fmaxf(dist_pos - dist_neg + margin, 0.0f);
+-        atomicAdd(out, loss_i);
+-    }
+-}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -5,7 +5,7 @@
+ #include <cstdint>
+ #include "../binding_registry.h"
+ 
+-// Launcher declarations from custom_ops.cu
++// Launcher declarations
+ extern "C" void batchnorm_inference_launcher(
+     const float* x,
+     float* out,
+@@ -39,7 +39,6 @@
+     torch::Tensor running_var,
+     double eps)
+ {
+-    // Check device
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(running_mean.is_cuda(), "running_mean must be a CUDA tensor");
+     TORCH_CHECK(running_var.is_cuda(), "running_var must be a CUDA tensor");
+@@ -50,7 +49,6 @@
+         TORCH_CHECK(bias.value().is_cuda(), "bias must be a CUDA tensor if provided");
+     }
+ 
+-    // Check dtype
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(running_mean.dtype() == torch::kFloat32, "running_mean must be float32");
+     TORCH_CHECK(running_var.dtype() == torch::kFloat32, "running_var must be float32");
+@@ -61,7 +59,6 @@
+         TORCH_CHECK(bias.value().dtype() == torch::kFloat32, "bias must be float32 if provided");
+     }
+ 
+-    // Check shape: x must be 4D [N,C,H,W]
+     TORCH_CHECK(x.dim() == 4, "x must be 4D (N,C,H,W)");
+     int64_t N = x.size(0);
+     int64_t C = x.size(1);
+@@ -78,7 +75,6 @@
+         TORCH_CHECK(bias.value().dim() == 1 && bias.value().size(0) == C, "bias must be 1D of shape [C] if provided");
+     }
+ 
+-    // Contiguity checks for all input tensors
+     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+     TORCH_CHECK(running_mean.is_contiguous(), "running_mean must be contiguous");
+     TORCH_CHECK(running_var.is_contiguous(), "running_var must be contiguous");
+@@ -89,9 +85,7 @@
+         TORCH_CHECK(bias.value().is_contiguous(), "bias must be contiguous if provided");
+     }
+ 
+-    // Allocate output with same shape and dtype as x
+     auto out = torch::empty_like(x);
+-
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     const float* weight_ptr = weight.has_value() ? weight.value().data_ptr<float>() : nullptr;
+@@ -111,7 +105,6 @@
+         stream
+     );
+ 
+-    // Check for kernel launch errors
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
+ 
+@@ -125,24 +118,19 @@
+     double margin,
+     int64_t p)
+ {
+-    // Check device
+     TORCH_CHECK(anchor.is_cuda(), "anchor must be a CUDA tensor");
+     TORCH_CHECK(positive.is_cuda(), "positive must be a CUDA tensor");
+     TORCH_CHECK(negative.is_cuda(), "negative must be a CUDA tensor");
+ 
+-    // Check dtype
+     TORCH_CHECK(anchor.dtype() == torch::kFloat32, "anchor must be float32");
+     TORCH_CHECK(positive.dtype() == torch::kFloat32, "positive must be float32");
+     TORCH_CHECK(negative.dtype() == torch::kFloat32, "negative must be float32");
+ 
+-    // Check shapes: all must be identical
+     TORCH_CHECK(positive.sizes() == anchor.sizes(), "positive must have same shape as anchor");
+     TORCH_CHECK(negative.sizes() == anchor.sizes(), "negative must have same shape as anchor");
+ 
+-    // p must be 2 (as per contract)
+     TORCH_CHECK(p == 2, "Only p=2 is supported in this wrapper");
+ 
+-    // Contiguity checks
+     TORCH_CHECK(anchor.is_contiguous(), "anchor must be contiguous");
+     TORCH_CHECK(positive.is_contiguous(), "positive must be contiguous");
+     TORCH_CHECK(negative.is_contiguous(), "negative must be contiguous");
+@@ -150,9 +138,7 @@
+     int64_t N = anchor.size(0);
+     int64_t D = anchor.numel() / N;
+ 
+-    // Output is scalar tensor
+     auto out = torch::empty({}, anchor.options());
+-
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     triplet_margin_loss_sum_launcher(

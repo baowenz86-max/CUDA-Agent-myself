@@ -1,0 +1,204 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,102 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// GELU forward kernel (exact PyTorch F.gelu with approximate='none')
++// Formula: 0.5f * x * (1.0f + erff(x / sqrtf(2.0f)))
++__global__ void gelu_forward_kernel(const float* __restrict__ x,
++                                    float* __restrict__ y,
++                                    long long numel) {
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (long long i = idx; i < numel; i += stride) {
++        float val = x[i];
++        y[i] = 0.5f * val * (1.0f + erff(val * 0.70710678118654752440f));
++    }
++}
++
++// InstanceNorm2d forward kernel for affine=False, track_running_stats=False.
++// Each block processes one (N, C) plane, computing spatial mean/var and then normalizing.
++// Input layout: contiguous NCHW, so plane size = H * W, plane stride = H * W.
++// Grid dimension: N * C blocks.
++__global__ void instance_norm2d_no_affine_kernel(const float* __restrict__ x,
++                                                 float* __restrict__ y,
++                                                 int plane_size,
++                                                 float eps) {
++    extern __shared__ float shared_mem[];
++    float* sum_shared = shared_mem;          // length blockDim.x
++    float* sumsq_shared = &shared_mem[blockDim.x]; // length blockDim.x
++
++    int tid = threadIdx.x;
++    int plane = blockIdx.x;
++    const float* x_plane = x + (long long)plane * plane_size;
++    float* y_plane = y + (long long)plane * plane_size;
++
++    // First pass: compute sum and sum of squares using strided loop.
++    float sum = 0.0f;
++    float sumsq = 0.0f;
++    int idx = tid;
++    while (idx < plane_size) {
++        float val = x_plane[idx];
++        sum += val;
++        sumsq += val * val;
++        idx += blockDim.x;
++    }
++    sum_shared[tid] = sum;
++    sumsq_shared[tid] = sumsq;
++    __syncthreads();
++
++    // Reduce within block (blockDim.x is power of 2, <= 1024)
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sum_shared[tid] += sum_shared[tid + s];
++            sumsq_shared[tid] += sumsq_shared[tid + s];
++        }
++        __syncthreads();
++    }
++
++    float total_sum = sum_shared[0];
++    float total_sumsq = sumsq_shared[0];
++    float mean = total_sum / plane_size;
++    float var = total_sumsq / plane_size - mean * mean;
++    // Clamp var to non-negative (numerical safety)
++    var = fmaxf(var, 0.0f);
++    float inv_std = rsqrtf(var + eps);
++
++    // Second pass: normalize and write output.
++    idx = tid;
++    while (idx < plane_size) {
++        y_plane[idx] = (x_plane[idx] - mean) * inv_std;
++        idx += blockDim.x;
++    }
++}
++
++// C-interface launchers (no PyTorch dependencies).
++// All pointers must be CUDA device pointers; stream is provided by binding.
++extern "C" void gelu_forward_launcher(const float* x,
++                                      float* y,
++                                      long long numel,
++                                      cudaStream_t stream) {
++    int threads = 256;
++    long long blocks_ll = (numel + threads - 1) / threads;
++    int blocks = (int)(blocks_ll > 0 ? blocks_ll : 1);
++    gelu_forward_kernel<<<blocks, threads, 0, stream>>>(x, y, numel);
++}
++
++extern "C" void instance_norm2d_no_affine_launcher(const float* x,
++                                                    float* y,
++                                                    int num_planes,
++                                                    int plane_size,
++                                                    float eps,
++                                                    cudaStream_t stream) {
++    int threads = 256;
++    // Ensure threads <= plane_size for proper reduction, but handle plane_size=1 etc.
++    if (plane_size < threads) {
++        threads = 1;
++        while (threads * 2 <= plane_size) threads *= 2;
++        if (threads > 1024) threads = 1024; // max block size
++    }
++    // Shared memory: 2 * threads * sizeof(float)
++    size_t shared_mem_size = 2 * threads * sizeof(float);
++    instance_norm2d_no_affine_kernel<<<num_planes, threads, shared_mem_size, stream>>>(
++        x, y, plane_size, eps);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,70 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void gelu_forward_launcher(const float* x,
++                                      float* y,
++                                      long long numel,
++                                      cudaStream_t stream);
++
++extern "C" void instance_norm2d_no_affine_launcher(const float* x,
++                                                    float* y,
++                                                    int num_planes,
++                                                    int plane_size,
++                                                    float eps,
++                                                    cudaStream_t stream);
++
++// GELU forward wrapper
++torch::Tensor gelu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "gelu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "gelu_forward: input must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "gelu_forward: input must be float32");
++
++    auto y = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    gelu_forward_launcher(x.data_ptr<float>(),
++                          y.data_ptr<float>(),
++                          x.numel(),
++                          stream);
++    return y;
++}
++
++// InstanceNorm2d forward wrapper (affine=False, track_running_stats=False)
++torch::Tensor instance_norm2d_no_affine_forward(torch::Tensor x, double eps) {
++    TORCH_CHECK(x.is_cuda(), "instance_norm2d_no_affine_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "instance_norm2d_no_affine_forward: input must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "instance_norm2d_no_affine_forward: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "instance_norm2d_no_affine_forward: input must be 4D (N,C,H,W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++    TORCH_CHECK(H > 0 && W > 0, "instance_norm2d_no_affine_forward: spatial dimensions must be positive");
++
++    int num_planes = static_cast<int>(N * C);
++    int plane_size = static_cast<int>(H * W);
++
++    auto y = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    instance_norm2d_no_affine_launcher(x.data_ptr<float>(),
++                                       y.data_ptr<float>(),
++                                       num_planes,
++                                       plane_size,
++                                       static_cast<float>(eps),
++                                       stream);
++    return y;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("gelu_forward", &gelu_forward, "GELU activation forward (approx='none')",
++          py::arg("x"));
++    m.def("instance_norm2d_no_affine_forward", &instance_norm2d_no_affine_forward,
++          "InstanceNorm2d forward (affine=False, track_running_stats=False)",
++          py::arg("x"), py::arg("eps") = 1e-05);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features, norm_eps):
++        super().__init__()
++        # 保留与参考模块一致的空 state_dict；这些模块不参与 forward 计算
++        self.gelu = nn.GELU()
++        self.instance_norm = nn.InstanceNorm2d(num_features, eps=norm_eps, affine=False, track_running_stats=False)
++
++    def forward(self, x):
++        x = cuda_extension.gelu_forward(x)
++        x = cuda_extension.instance_norm2d_no_affine_forward(x, eps=1e-05)
++        return x
++
++    def debug_forward(self, x):
++        checkpoint = cuda_extension.gelu_forward(x)
++        yield 'step_001', checkpoint
++        checkpoint = cuda_extension.instance_norm2d_no_affine_forward(checkpoint, eps=1e-05)
++        yield 'step_002', checkpoint
++        yield 'step_003', checkpoint

@@ -1,0 +1,240 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,101 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// Reflection padding kernel for 4D tensor (N, C, H, W) -> (N, C, Hout, Wout)
++// Input is assumed contiguous (handled by binding layer).
++// Output is also contiguous.
++// Reflection rule: if index < 0 => -index; if index >= dim => 2*dim - index - 2;
++// For padding sizes typically small relative to dimension.
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int Hout, int Wout,
++    int pad_left, int pad_right, int pad_top, int pad_bottom)
++{
++    int total = N * C * Hout * Wout;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int linear = idx; linear < total; linear += stride) {
++        int w_out = linear % Wout;
++        int h_out = (linear / Wout) % Hout;
++        int c = (linear / (Wout * Hout)) % C;
++        int n = linear / (Wout * Hout * C);
++
++        int h_in = h_out - pad_top;
++        int w_in = w_out - pad_left;
++
++        // reflect h
++        if (h_in < 0) h_in = -h_in;
++        else if (h_in >= H) h_in = 2 * H - h_in - 2;
++        // reflect w
++        if (w_in < 0) w_in = -w_in;
++        else if (w_in >= W) w_in = 2 * W - w_in - 2;
++
++        // ensure within bounds (should be fine for valid padding)
++        if (h_in < 0 || h_in >= H || w_in < 0 || w_in >= W) {
++            output[linear] = 0.0f; // fallback, should not happen
++            continue;
++        }
++
++        int input_idx = ((n * C + c) * H + h_in) * W + w_in;
++        output[linear] = input[input_idx];
++    }
++}
++
++// Clamp min kernel: output = max(input, min_value) (equivalent to torch.minimum?)
++// torch.minimum(input, min_value) returns element-wise min(input, min_value).
++// Correct: if min_value is scalar, torch.minimum(input, min_value) = element-wise min(input, min_value).
++// For float, NaN propagates: fminf propagates NaN as torch does for minimum (NaN if either is NaN).
++// Note: torch.minimum is element-wise minimum, not maximum. Check semantics:
++// torch.minimum(input, min_value) => each element = min(input[i], min_value).
++// Using fminf(a, b) returns the smaller of a and b (NaN propagation).
++__global__ void clamp_min_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int total,
++    float min_value)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < total; i += stride) {
++        output[i] = fminf(input[i], min_value);
++    }
++}
++
++// Launcher for reflection_pad2d_forward
++extern "C" void reflection_pad2d_forward_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    cudaStream_t stream)
++{
++    int Hout = H + pad_top + pad_bottom;
++    int Wout = W + pad_left + pad_right;
++    int total = N * C * Hout * Wout;
++
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535; // grid cap
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, Hout, Wout,
++        pad_left, pad_right, pad_top, pad_bottom);
++}
++
++// Launcher for clamp_min_forward
++extern "C" void clamp_min_forward_launcher(
++    const float* input,
++    float* output,
++    int total,
++    float min_value,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    clamp_min_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, total, min_value);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,98 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void reflection_pad2d_forward_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    cudaStream_t stream);
++
++extern "C" void clamp_min_forward_launcher(
++    const float* input,
++    float* output,
++    int total,
++    float min_value,
++    cudaStream_t stream);
++
++// Wrapper for reflection_pad2d_forward
++torch::Tensor reflection_pad2d_forward(
++    torch::Tensor input,
++    int64_t pad_left,
++    int64_t pad_right,
++    int64_t pad_top,
++    int64_t pad_bottom)
++{
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    // Ensure contiguous, no channels_last support for simplicity in this kernel
++    auto input_contig = input.contiguous();
++
++    int N = static_cast<int>(input_contig.size(0));
++    int C = static_cast<int>(input_contig.size(1));
++    int H = static_cast<int>(input_contig.size(2));
++    int W = static_cast<int>(input_contig.size(3));
++    int Hout = H + pad_top + pad_bottom;
++    int Wout = W + pad_left + pad_right;
++
++    torch::Tensor output = torch::empty(
++        {N, C, Hout, Wout}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    reflection_pad2d_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        static_cast<int>(pad_left), static_cast<int>(pad_right),
++        static_cast<int>(pad_top), static_cast<int>(pad_bottom),
++        stream);
++
++    return output;
++}
++
++// Wrapper for clamp_min_forward
++torch::Tensor clamp_min_forward(
++    torch::Tensor input,
++    double min_value)
++{
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto input_contig = input.contiguous();
++    int total = static_cast<int>(input_contig.numel());
++
++    torch::Tensor output = torch::empty_like(input_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    clamp_min_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total,
++        static_cast<float>(min_value),
++        stream);
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "ReflectionPad2d forward (CUDA)",
++          py::arg("input"),
++          py::arg("pad_left"),
++          py::arg("pad_right"),
++          py::arg("pad_top"),
++          py::arg("pad_bottom"));
++
++    m.def("clamp_min_forward", &clamp_min_forward,
++          "Clamp min forward (CUDA)",
++          py::arg("input"),
++          py::arg("min_value"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,32 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, channels, padding_size, min_value):
++        super().__init__()
++        self.reflection_pad = nn.ReflectionPad2d(padding_size)
++        self.min_value = min_value
++
++    def forward(self, x):
++        x = cuda_extension.reflection_pad2d_forward(
++            x,
++            self.reflection_pad.padding[0],
++            self.reflection_pad.padding[1],
++            self.reflection_pad.padding[2],
++            self.reflection_pad.padding[3],
++        )
++        return cuda_extension.clamp_min_forward(x, self.min_value)
++
++    def debug_forward(self, x):
++        x = cuda_extension.reflection_pad2d_forward(
++            x,
++            self.reflection_pad.padding[0],
++            self.reflection_pad.padding[1],
++            self.reflection_pad.padding[2],
++            self.reflection_pad.padding[3],
++        )
++        yield 'step_001', x
++        x = cuda_extension.clamp_min_forward(x, self.min_value)
++        yield 'step_002', x

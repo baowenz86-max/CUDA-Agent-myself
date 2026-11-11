@@ -1,0 +1,129 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -7,12 +7,9 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
+ 
+-// Configuration: block size for FFT computation.
+ #define STFT_BLOCK_SIZE 256
+ #define MAX_FFT_SIZE 4096
+ 
+-// Device function for reflection padding index mapping.
+-// If idx is out of [0, length-1], return reflected index.
+ __device__ __forceinline__ int reflect_index(int idx, int length) {
+     if (idx < 0) {
+         return -idx;
+@@ -23,13 +20,11 @@
+     }
+ }
+ 
+-// Device function for complex multiply: (a+ib)*(c+id) = (ac-bd) + i(ad+bc)
+ __device__ __forceinline__ void complex_mul(float a, float b, float c, float d, float &re, float &im) {
+     re = a * c - b * d;
+     im = a * d + b * c;
+ }
+ 
+-// Device function for twiddle factor: exp(-2*pi*i*k/N) = cos(theta) - i*sin(theta)
+ __device__ __forceinline__ void twiddle(int k, int N, float &re, float &im) {
+     const float PI = 3.14159265358979323846f;
+     float theta = -2.0f * PI * k / N;
+@@ -37,7 +32,6 @@
+     im = sinf(theta);
+ }
+ 
+-// Kernel: perform STFT for each frame independently.
+ __global__ void stft_kernel(
+     const float* __restrict__ input,
+     float2* __restrict__ output,
+@@ -114,13 +108,14 @@
+         __syncthreads();
+     }
+ 
++    // Write output in [batch, n_freq, num_frames] contiguous layout:
++    // out_idx = b * output_batch_stride + f * num_frames + t
+     for (int f = threadIdx.x; f < n_freq; f += blockDim.x) {
+-        long long out_idx = (long long)b * output_batch_stride + (long long)t * n_freq + f;
++        long long out_idx = (long long)b * output_batch_stride + (long long)f * num_frames + t;
+         output[out_idx] = make_float2(s_real[f], s_imag[f]);
+     }
+ }
+ 
+-// Host launcher for STFT. Accepts raw pointers and scalars; caller (binding) ensures CUDA context and stream.
+ extern "C" void custom_stft_launcher(
+     const float* input_ptr,
+     float2* output_ptr,
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -5,7 +5,6 @@
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+-// Declare launcher from custom_ops.cu
+ extern "C" void custom_stft_launcher(
+     const float* input_ptr,
+     float2* output_ptr,
+@@ -17,7 +16,6 @@
+     cudaStream_t stream
+ );
+ 
+-// custom_reshape_input: equivalent to torch.reshape(x, (-1, x.size(-1)))
+ torch::Tensor custom_reshape_input(torch::Tensor x) {
+     TORCH_CHECK(x.is_cuda(), "custom_reshape_input: input must be CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_reshape_input: input must be float32");
+@@ -25,7 +23,6 @@
+     return x.reshape({-1, last_dim});
+ }
+ 
+-// custom_stft: compute STFT using CUDA launcher.
+ torch::Tensor custom_stft(torch::Tensor x, int64_t n_fft, int64_t hop_length, int64_t win_length) {
+     TORCH_CHECK(x.is_cuda(), "custom_stft: input must be CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_stft: input must be float32");
+@@ -36,18 +33,13 @@
+     int batch = x.size(0);
+     int samples = x.size(1);
+     int n_freq = n_fft / 2 + 1;
+-    // num_frames calculation matching torch.stft with center=True, pad_mode='reflect', even n_fft:
+-    // padded length = samples + n_fft, number of frames = (padded_length - n_fft) / hop_length + 1 = samples / hop_length + 1
+     int num_frames_calc = samples / hop_length + 1;
+     
+-    // Allocate output as complex64 tensor of shape [batch, n_freq, num_frames]
+     auto output = torch::empty({batch, n_freq, num_frames_calc},
+                                torch::TensorOptions().dtype(torch::kComplexFloat).device(x.device()));
+     
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     
+-    // Call launcher with raw data pointers
+     custom_stft_launcher(
+         x.data_ptr<float>(),
+         reinterpret_cast<float2*>(output.data_ptr<c10::complex<float>>()),
+@@ -59,25 +51,22 @@
+         stream
+     );
+     
+-    // Check for CUDA errors after launch
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "custom_stft: CUDA kernel launch failed: ", cudaGetErrorString(err));
+     
+     return output;
+ }
+ 
+-// custom_reshape_output: reshape to (batch, n_freq, -1); shape argument is unused placeholder to match contract.
+ torch::Tensor custom_reshape_output(torch::Tensor x, c10::optional<int64_t> shape) {
+     TORCH_CHECK(x.is_cuda(), "custom_reshape_output: input must be CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kComplexFloat, "custom_reshape_output: input must be complex64");
+     TORCH_CHECK(x.dim() == 3, "custom_reshape_output: input must be 3D [batch, n_freq, n_frames]");
+-    
+-    int64_t batch = x.size(0);
+-    int64_t n_freq = x.size(1);
+-    return x.reshape({batch, n_freq, -1});
++    // The STFT output already has the correct shape and stride layout [batch, n_freq, num_frames]
++    // with strides [n_freq*num_frames, 1, n_freq]. Return it as-is without reshaping.
++    (void)shape; // placeholder, not used
++    return x;
+ }
+ 
+-// Register all custom ops
+ void register_custom_ops(pybind11::module& m) {
+     m.def("custom_reshape_input", &custom_reshape_input, "Reshape input (flatten leading dims)",
+           py::arg("x"));

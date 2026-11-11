@@ -1,0 +1,278 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,124 @@
++// custom_ops.cu
++// CUDA kernels and launchers for custom_abs_forward and custom_flip_forward.
++// No PyTorch dependencies. All tensors are passed as raw pointers with metadata.
++
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// ---------------------------------------------------------------------------
++// Element-wise absolute value kernel
++// ---------------------------------------------------------------------------
++__global__ void abs_kernel(float* __restrict__ out, const float* __restrict__ in, int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        out[i] = fabsf(in[i]);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Flip kernel: flips along the two specified dimensions (dims and dim2).
++// The input tensor is assumed to be contiguous and float32. The shape and strides
++// are passed as arrays (host-side) but for contiguous tensor we can compute
++// offsets directly based on shape. However, to support potential non-contiguous
++// inputs (contract says "supports strides"), we pass both shape and strides.
++// For simplicity and correctness, we assume the input is contiguous as per
++// the actual reference data. The kernel uses stride-based indexing.
++// ---------------------------------------------------------------------------
++__global__ void flip_kernel(
++    float* __restrict__ out,
++    const float* __restrict__ in,
++    int64_t dims,        // first flip dimension (e.g., 2)
++    int64_t dim2,        // second flip dimension (e.g., 3)
++    const int64_t* __restrict__ shape,   // array of ndim elements (host pointer, but copied to device?)
++    const int64_t* __restrict__ strides, // array of ndim elements
++    int64_t ndim,
++    int64_t numel
++) {
++    // Since ndim=4 and shape/strides are small, we can copy them into registers
++    // or use constant memory. For simplicity, each thread reads them directly.
++    // We assume the arrays are in device memory (passed via cudaMemcpyAsync from binding).
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    int64_t s[8];  // support up to 8 dims
++    for (int64_t d = 0; d < ndim; ++d) {
++        s[d] = shape[d];
++    }
++
++    for (int64_t i = idx; i < numel; i += stride) {
++        // Compute multi-dimensional indices from linear index i (row-major, assuming contiguous output)
++        int64_t idx_arr[8];
++        int64_t rem = i;
++        for (int64_t d = ndim - 1; d >= 0; --d) {
++            idx_arr[d] = rem % s[d];
++            rem /= s[d];
++        }
++
++        // Apply flip on dims and dim2: new_idx = (s[d] - 1 - idx_arr[d]) for flipped dims
++        idx_arr[dims] = s[dims] - 1 - idx_arr[dims];
++        idx_arr[dim2] = s[dim2] - 1 - idx_arr[dim2];
++
++        // Compute input offset using strides (assuming input is contiguous, but strides may be standard)
++        int64_t in_offset = 0;
++        for (int64_t d = 0; d < ndim; ++d) {
++            in_offset += idx_arr[d] * strides[d];
++        }
++
++        out[i] = in[in_offset];
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Launcher: custom_abs_launcher
++// Called from binding.cpp after obtaining raw pointers and stream.
++// ---------------------------------------------------------------------------
++extern "C" void custom_abs_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    // Cap grid to avoid excessive launch config (max grid dim is 2^31-1)
++    if (grid_size > 65535) {
++        grid_size = 65535;
++    }
++    abs_kernel<<<(int)grid_size, block_size, 0, stream>>>(output, input, numel);
++}
++
++// ---------------------------------------------------------------------------
++// Launcher: custom_flip_launcher
++// Parameters:
++//   output: device pointer to output tensor (contiguous)
++//   input: device pointer to input tensor (contiguous)
++//   dims: first flip dimension
++//   dim2: second flip dimension
++//   shape: device pointer to array of ndim int64 shape values (copied by binding)
++//   strides: device pointer to array of ndim int64 stride values (copied by binding)
++//   ndim: number of dimensions
++//   numel: total number of elements
++//   stream: CUDA stream
++// Note: binding must allocate device memory for shape and strides and copy them.
++// ---------------------------------------------------------------------------
++extern "C" void custom_flip_launcher(
++    float* output,
++    const float* input,
++    int64_t dims,
++    int64_t dim2,
++    const int64_t* shape,
++    const int64_t* strides,
++    int64_t ndim,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 65535) {
++        grid_size = 65535;
++    }
++    flip_kernel<<<(int)grid_size, block_size, 0, stream>>>(
++        output, input, dims, dim2, shape, strides, ndim, numel
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,124 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_abs_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++extern "C" void custom_flip_launcher(
++    float* output,
++    const float* input,
++    int64_t dims,
++    int64_t dim2,
++    const int64_t* shape,
++    const int64_t* strides,
++    int64_t ndim,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++// Helper to get current CUDA stream
++static cudaStream_t getCurrentStream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// custom_abs_forward: element-wise absolute value
++torch::Tensor custom_abs_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = getCurrentStream();
++    custom_abs_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_abs_forward launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// custom_flip_forward: flip along specified dimensions
++torch::Tensor custom_flip_forward(torch::Tensor x, int64_t dims, int64_t dim2) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dim() >= 1, "Input must have at least 1 dimension");
++
++    int64_t ndim = x.dim();
++    TORCH_CHECK(dims >= -ndim && dims < ndim, "dims out of range");
++    TORCH_CHECK(dim2 >= -ndim && dim2 < ndim, "dim2 out of range");
++
++    // Normalize negative dimensions
++    if (dims < 0) dims += ndim;
++    if (dim2 < 0) dim2 += ndim;
++
++    // Prepare shape and strides on host
++    std::vector<int64_t> shape_host(x.sizes().begin(), x.sizes().end());
++    std::vector<int64_t> strides_host(x.strides().begin(), x.strides().end());
++
++    // Allocate device memory for shape and strides
++    int64_t* shape_dev = nullptr;
++    int64_t* strides_dev = nullptr;
++    cudaMalloc(&shape_dev, ndim * sizeof(int64_t));
++    cudaMalloc(&strides_dev, ndim * sizeof(int64_t));
++    TORCH_CHECK(shape_dev != nullptr && strides_dev != nullptr, "cudaMalloc failed");
++
++    cudaStream_t stream = getCurrentStream();
++    cudaMemcpyAsync(shape_dev, shape_host.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(strides_dev, strides_host.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
++
++    auto output = torch::empty_like(x);
++
++    // Call launcher
++    custom_flip_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        dims,
++        dim2,
++        shape_dev,
++        strides_dev,
++        ndim,
++        x.numel(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_flip_forward launch failed: ", cudaGetErrorString(err));
++
++    // Free device memory (stream may still be using it, but cudaFree after kernel completes is okay if we synchronize later)
++    // We need to ensure kernel finishes before freeing. cudaFree on device memory used by a kernel can be called after kernel completion.
++    // Since we don't explicitly synchronize, we can rely on PyTorch's stream synchronization later, but to be safe, we can use cudaStreamSynchronize or just keep memory until after kernel completes.
++    // Simpler: we can use cudaFree after the kernel potentially uses the memory, but it's not safe without synchronization.
++    // Use cudaStreamSynchronize(stream) before freeing. This adds overhead but is correct.
++    cudaStreamSynchronize(stream);
++    cudaFree(shape_dev);
++    cudaFree(strides_dev);
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_abs_forward", &custom_abs_forward, "Element-wise absolute value",
++          py::arg("x"));
++    m.def("custom_flip_forward", &custom_flip_forward, "Flip along specified dimensions",
++          py::arg("x"), py::arg("dims"), py::arg("dim2") = 3);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, flip_dims):
++        super().__init__()
++        self.flip_dims = flip_dims
++
++    def forward(self, x):
++        x = cuda_extension.custom_abs_forward(x)
++        x = cuda_extension.custom_flip_forward(x, self.flip_dims[0], self.flip_dims[1])
++        return x
++
++    def debug_forward(self, x):
++        x_abs = cuda_extension.custom_abs_forward(x)
++        yield 'step_001', x_abs
++        x_flip = cuda_extension.custom_flip_forward(x_abs, self.flip_dims[0], self.flip_dims[1])
++        yield 'step_002', x_flip
++        yield 'step_003', x_flip

@@ -1,0 +1,296 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,128 @@
++// kernels/custom_ops.cu
++// CUDA kernels for hardtanh and avg_pool3d
++// This file contains only CUDA kernels and C-style launchers with raw pointers,
++// no PyTorch/ATen dependencies.
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// Elementwise hardtanh: out = min(max(x, min_val), max_val)
++__global__ void hardtanh_kernel(float* output, const float* input, int64_t numel, float min_val, float max_val) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride_total = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride_total) {
++        float val = input[i];
++        val = fminf(fmaxf(val, min_val), max_val);
++        output[i] = val;
++    }
++}
++
++// AvgPool3d kernel with arbitrary strides.
++// input_strides and output_strides are in elements, length 5: [N_stride, C_stride, D_stride, H_stride, W_stride]
++// We assume contiguous or arbitrary but valid strides.
++__global__ void avg_pool3d_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t N, int64_t C,
++    int64_t D, int64_t H, int64_t W,
++    int64_t outD, int64_t outH, int64_t outW,
++    int64_t kernel_size, int64_t stride, int64_t padding,
++    int64_t* __restrict__ input_strides,  // length 5
++    int64_t* __restrict__ output_strides  // length 5
++) {
++    int64_t total = N * C * outD * outH * outW;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride_total = blockDim.x * gridDim.x;
++    for (int64_t linear_idx = idx; linear_idx < total; linear_idx += stride_total) {
++        // Decode linear index to output coordinates
++        int64_t ow = linear_idx % outW;
++        int64_t oh = (linear_idx / outW) % outH;
++        int64_t od = (linear_idx / (outW * outH)) % outD;
++        int64_t c  = (linear_idx / (outW * outH * outD)) % C;
++        int64_t n  = linear_idx / (outW * outH * outD * C);
++
++        // Base input coordinates corresponding to output (od, oh, ow) with padding shift
++        int64_t in_d_start = od * stride - padding;
++        int64_t in_h_start = oh * stride - padding;
++        int64_t in_w_start = ow * stride - padding;
++
++        float sum = 0.0f;
++        int count = 0;
++        for (int64_t kd = 0; kd < kernel_size; ++kd) {
++            int64_t id = in_d_start + kd;
++            if (id < 0 || id >= D) continue;
++            for (int64_t kh = 0; kh < kernel_size; ++kh) {
++                int64_t ih = in_h_start + kh;
++                if (ih < 0 || ih >= H) continue;
++                for (int64_t kw = 0; kw < kernel_size; ++kw) {
++                    int64_t iw = in_w_start + kw;
++                    if (iw < 0 || iw >= W) continue;
++                    // Compute linear offset using input_strides
++                    int64_t offset = n * input_strides[0] + c * input_strides[1]
++                                   + id * input_strides[2] + ih * input_strides[3] + iw * input_strides[4];
++                    sum += input[offset];
++                    count++;
++                }
++            }
++        }
++        // Since padding=0 in this contract, count should always equal kernel_size^3.
++        // But to be safe, handle count > 0; divisibility guaranteed by PyTorch semantics.
++        float avg = (count > 0) ? (sum / (float)count) : 0.0f;
++        // Write output at linear offset computed using output_strides
++        int64_t out_offset = n * output_strides[0] + c * output_strides[1]
++                            + od * output_strides[2] + oh * output_strides[3] + ow * output_strides[4];
++        output[out_offset] = avg;
++    }
++}
++
++// Launcher for hardtanh
++extern "C" void hardtanh_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    float min_val,
++    float max_val,
++    cudaStream_t stream
++) {
++    if (numel <= 0) return;
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    // Grid-stride loop allows any grid size, but cap at some sane limit to avoid too many blocks.
++    if (grid_size > 65535) grid_size = 65535;
++    hardtanh_kernel<<<grid_size, block_size, 0, stream>>>(output, input, numel, min_val, max_val);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In launcher we cannot throw; but binding will check after call.
++        // We just ignore or could print. Better to propagate through return? 
++        // We'll leave as is; binding should check cudaGetLastError after calling launcher.
++    }
++}
++
++// Launcher for avg_pool3d
++extern "C" void avg_pool3d_launcher(
++    float* output,
++    const float* input,
++    int64_t N, int64_t C,
++    int64_t D, int64_t H, int64_t W,
++    int64_t outD, int64_t outH, int64_t outW,
++    int64_t kernel_size, int64_t stride, int64_t padding,
++    int64_t* input_strides,
++    int64_t* output_strides,
++    cudaStream_t stream
++) {
++    int64_t total = N * C * outD * outH * outW;
++    if (total <= 0) return;
++    const int block_size = 256;
++    int64_t grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    avg_pool3d_kernel<<<grid_size, block_size, 0, stream>>>(
++        output, input,
++        N, C, D, H, W,
++        outD, outH, outW,
++        kernel_size, stride, padding,
++        input_strides, output_strides
++    );
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // binding will check
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,135 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers defined in custom_ops.cu
++extern "C" void hardtanh_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    float min_val,
++    float max_val,
++    cudaStream_t stream
++);
++
++extern "C" void avg_pool3d_launcher(
++    float* output,
++    const float* input,
++    int64_t N, int64_t C,
++    int64_t D, int64_t H, int64_t W,
++    int64_t outD, int64_t outH, int64_t outW,
++    int64_t kernel_size, int64_t stride, int64_t padding,
++    int64_t* input_strides,
++    int64_t* output_strides,
++    cudaStream_t stream
++);
++
++// Helper to get current CUDA stream
++static cudaStream_t get_stream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// hardtanh wrapper
++torch::Tensor hardtanh(torch::Tensor input, double min_val, double max_val) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    // For elementwise operation, any stride layout is fine; no need to contiguous.
++    auto output = torch::empty_like(input);
++    int64_t numel = input.numel();
++    if (numel > 0) {
++        hardtanh_launcher(
++            output.data_ptr<float>(),
++            input.data_ptr<float>(),
++            numel,
++            (float)min_val,
++            (float)max_val,
++            get_stream()
++        );
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++    }
++    return output;
++}
++
++// avg_pool3d wrapper
++torch::Tensor avg_pool3d(torch::Tensor input, int64_t kernel_size, int64_t stride, int64_t padding) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() == 5, "input must be 5D (N,C,D,H,W)");
++    TORCH_CHECK(kernel_size > 0 && stride > 0 && padding >= 0, "invalid pooling parameters");
++
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t D = input.size(2);
++    int64_t H = input.size(3);
++    int64_t W = input.size(4);
++
++    int64_t outD = (D + 2 * padding - kernel_size) / stride + 1;
++    int64_t outH = (H + 2 * padding - kernel_size) / stride + 1;
++    int64_t outW = (W + 2 * padding - kernel_size) / stride + 1;
++    TORCH_CHECK(outD > 0 && outH > 0 && outW > 0, "kernel size too large for input");
++
++    auto output = torch::empty({N, C, outD, outH, outW}, input.options());
++
++    // Launcher expects raw pointers and strides arrays on device.
++    // Since input may be non-contiguous, we create a contiguous copy if needed.
++    torch::Tensor input_contig = input.contiguous();
++    // For output, we allocate contiguous by torch::empty, so its strides are contiguous.
++    // We need to pass strides arrays to launcher; allocate on host and copy to device,
++    // or use static arrays and transfer? The launcher takes int64_t* pointers,
++    // so we need device memory for strides. Here we allocate small CUDA tensors for strides.
++    // Alternatively, we can simplify the launcher to assume contiguous layout,
++    // but the existing launcher expects strides. We'll provide strides arrays.
++    auto input_strides = torch::empty({5}, input.options().dtype(torch::kInt64));
++    auto output_strides = torch::empty({5}, input.options().dtype(torch::kInt64));
++    int64_t input_stride_arr[5] = {
++        input_contig.stride(0),
++        input_contig.stride(1),
++        input_contig.stride(2),
++        input_contig.stride(3),
++        input_contig.stride(4)
++    };
++    int64_t output_stride_arr[5] = {
++        output.stride(0),
++        output.stride(1),
++        output.stride(2),
++        output.stride(3),
++        output.stride(4)
++    };
++    // Copy host arrays to device tensors (synchronous but small)
++    cudaMemcpy(input_strides.data_ptr<int64_t>(), input_stride_arr, 5 * sizeof(int64_t), cudaMemcpyHostToDevice);
++    cudaMemcpy(output_strides.data_ptr<int64_t>(), output_stride_arr, 5 * sizeof(int64_t), cudaMemcpyHostToDevice);
++
++    avg_pool3d_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        N, C, D, H, W,
++        outD, outH, outW,
++        kernel_size, stride, padding,
++        input_strides.data_ptr<int64_t>(),
++        output_strides.data_ptr<int64_t>(),
++        get_stream()
++    );
++
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    // Strides tensors are freed after function returns; fine because kernel is asynchronous
++    // and uses the pointers before completion? Actually cudaMemcpy is synchronous,
++    // and the kernel launch is queued after the memcopies on the same stream,
++    // so memory stays allocated until stream sync. Since we don't synchronize,
++    // the tensors' memory may be freed early if we don't retain them. To be safe,
++    // we create them as local variables and they will be freed at end of scope,
++    // but the kernel may still be using the memory. Need to keep them alive until kernel finishes.
++    // We can use cudaStreamSynchronize or use a deleter. Simpler: synchronize at end.
++    cudaStreamSynchronize(get_stream());
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("hardtanh", &hardtanh, "Hardtanh elementwise clamp",
++          py::arg("input"), py::arg("min_val") = -1.0, py::arg("max_val") = 1.0);
++    m.def("avg_pool3d", &avg_pool3d, "3D average pooling",
++          py::arg("input"), py::arg("kernel_size"), py::arg("stride"), py::arg("padding"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,24 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, kernel_size, stride, padding):
++        super().__init__()
++        self.in_channels = in_channels
++        self.kernel_size = kernel_size
++        self.stride = stride
++        self.padding = padding
++
++    def forward(self, x):
++        x = cuda_extension.hardtanh(x, min_val=-1.0, max_val=1.0)
++        x = cuda_extension.avg_pool3d(x, self.kernel_size[0], self.stride[0], self.padding[0])
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.hardtanh(x, min_val=-1.0, max_val=1.0)
++        yield 'step_001', x
++        x = cuda_extension.avg_pool3d(x, self.kernel_size[0], self.stride[0], self.padding[0])
++        yield 'step_002', x
++        yield 'step_003', x

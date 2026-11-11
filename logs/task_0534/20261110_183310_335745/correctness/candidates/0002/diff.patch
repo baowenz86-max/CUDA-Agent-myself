@@ -1,0 +1,242 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -36,230 +36,7 @@
+                                   int dim,
+                                   int dim_size,
+                                   int64_t outer_size,
+-                                  int64_t inner_size,
+-                                  int64_t output_outer_stride,
+-                                  int64_t output_inner_stride)
+-{
+-    int64_t out_idx = blockIdx.x; // range 0..outer_size*inner_size-1
+-    if (out_idx >= outer_size * inner_size) return;
+-
+-    int64_t outer = out_idx / inner_size;
+-    int64_t inner = out_idx % inner_size;
+-
+-    // Starting input index for this output element (first element along dim)
+-    // We need to compute base index in input for (outer, 0, inner) position.
+-    // This is more involved: for each dim before dim, index = outer components; after dim, index = inner components.
+-    // Convert outer to multi-index for leading dims, inner to multi-index for trailing dims.
+-    // But we only need to compute input offset for each element we read: we can compute base offset by iterating.
+-    int64_t input_base = 0;
+-    // leading dims: for i=0..dim-1, calculate coordinate from outer based on input_shape
+-    int64_t rem = outer;
+-    for (int i = 0; i < dim; i++) {
+-        int64_t extent = input_shape[i];
+-        int64_t coord = rem % extent;
+-        rem /= extent;
+-        input_base += coord * input_strides[i];
+-    }
+-    // trailing dims: for i=dim+1..ndim-1, coordinate from inner based on input_shape
+-    rem = inner;
+-    for (int i = ndim - 1; i > dim; i--) {
+-        int64_t extent = input_shape[i];
+-        int64_t coord = rem % extent;
+-        rem /= extent;
+-        input_base += coord * input_strides[i];
+-    }
+-    // Note: this decomposition assumes outer indexing covers dimensions before dim in row-major order,
+-    // and inner covers dimensions after dim in row-major order. This matches typical flattening.
+-    // For shape [B,H,W], dim=1: outer = b, inner = c, input_base = b*stride0 + c*stride2.
+-    // stride along dim = input_strides[dim]
+-    int64_t stride_dim = input_strides[dim];
+-
+-    float max_val = -FLT_MAX;
+-    int64_t max_idx = 0;
+-
+-    for (int64_t i = 0; i < dim_size; ++i) {
+-        int64_t idx = input_base + i * stride_dim;
+-        float val = input[idx];
+-        if (val > max_val) {
+-            max_val = val;
+-            max_idx = i;
+-        }
+-    }
+-
+-    // Compute output offset
+-    int64_t output_offset = 0;
+-    if (output_strides == nullptr || output_shape == nullptr) {
+-        // fallback? Not expected.
+-    } else {
+-        // Reconstruct output index from outer and inner. For keepdim, output has same ndim with dim=1.
+-        // For simplicity, compute using output_strides with output_index in flattened order.
+-        // We'll compute output linear index from outer, inner and output dimensions.
+-        if (output_strides != nullptr) {
+-            // Use the same decomposition for output: leading dims from outer, trailing from inner, dim coordinate is 0.
+-            int64_t out_base = 0;
+-            rem = outer;
+-            for (int i = 0; i < dim; i++) {
+-                int64_t extent = output_shape[i];
+-                int64_t coord = rem % extent;
+-                rem /= extent;
+-                out_base += coord * output_strides[i];
+-            }
+-            rem = inner;
+-            for (int i = ndim - 1; i > dim; i--) {
+-                int64_t extent = output_shape[i];
+-                int64_t coord = rem % extent;
+-                rem /= extent;
+-                out_base += coord * output_strides[i];
+-            }
+-            output_offset = out_base;
+-        }
+-    }
+-    output_values[output_offset] = max_val;
+-    output_indices[output_offset] = max_idx;
+-}
+-
+-// Launcher for max_reduce_kernel
+-// x is input tensor float*, output_values float*, output_indices int64_t*
+-// shapes and strides arrays are int64_t arrays allocated by binding (or passed as raw pointers)
+-// For simplicity, we define launcher signature with explicit parameters:
+-//   input, output_values, output_indices, shape array (ndim), input_strides array, output_strides array,
+-//   ndim, dim, keepdim, stream
+-// Note: output_strides only needed if keepdim; if not keepdim, output has fewer dims and different indexing;
+-// But reference uses keepdim=True, so we assume keepdim true. For generality, we support keepdim false by adjusting output shape and strides.
+-// However, to reduce complexity, we'll implement only keepdim true path in this file, but include checks.
+-extern "C" void max_dim_keepdim_launcher(
+-    const float* input,
+-    float* output_values,
+-    int64_t* output_indices,
+-    const int64_t* input_shape,
+-    const int64_t* input_strides,
+-    const int64_t* output_shape,
+-    const int64_t* output_strides,
+-    int ndim,
+-    int64_t dim,
+-    bool keepdim,
+-    cudaStream_t stream)
+-{
+-    // Normalize dim
+-    if (dim < 0) dim += ndim;
+-    int64_t dim_size = input_shape[dim];
+-
+-    // Compute outer_size and inner_size
+-    int64_t outer_size = 1;
+-    for (int i = 0; i < dim; ++i) {
+-        outer_size *= input_shape[i];
+-    }
+-    int64_t inner_size = 1;
+-    for (int i = dim + 1; i < ndim; ++i) {
+-        inner_size *= input_shape[i];
+-    }
+-
+-    int64_t total_output_elements = outer_size * inner_size;
+-
+-    // Launch one block per output element, block dimension 1.
+-    // This is simple and correct, though not optimal. dim_size is 8192, each block loops 8192 times, but block only has 1 thread? Actually we should use multiple threads per block to parallelize the reduction.
+-    // For better performance, we could use block with 256 threads and each thread strides over dim_size.
+-    // Let's implement a reduction within block for each output element.
+-    // We'll use blockDim.x = 256, each thread handles multiple elements with stride blockDim.x.
+-    // Then we need shared memory reduction to find max across threads.
+-    // For simplicity in first version, we'll use one thread per output element as above, but that would be very slow for 8192*8192? Actually 8192 output elements each doing 8192 reads = 67M reads, okay but not great.
+-    // Better: use grid of blocks, each block handles one output element with 256 threads, reduce in shared memory.
+-    // We'll implement that.
+-    // But the kernel signature above has no reduction across threads. We'll rewrite kernel to use shared memory reduction and launch with blockDim.x = min(dim_size, 256).
+-    // For simplicity and correctness in this file, we decide to keep the one-thread-per-output-element version, because it passes correctness and likely performance is acceptable? The model is tiny maybe? But height=8192, width=128, batch=64, total output 8192, each does 8192 reads = 67 million floats, which is fine in CUDA. Latency may be high but torch.compile baseline maybe similar.
+-    // However, we should aim for 5% faster than torch.compile. torch.compile would fuse maybe? Hard to know. We'll keep simple but correct first; performance can be improved later.
+-    // Actually, let's implement shared memory reduction now to be safe performance-wise.
+-    // We'll define a separate kernel with block reduction.
+-    // For ease, we'll include it in this file.
+-    // We'll call cudaFuncSetAttribute for dynamic shared memory? Not needed if using static.
+-    // We'll define a new kernel max_reduce_kernel_block with shared memory.
+-    // Then launcher uses that.
+-    // Let's implement below.
+-}
+-
+-// Improved kernel with block-level reduction using shared memory
+-__global__ void max_reduce_kernel_block(
+-    const float* __restrict__ input,
+-    float* __restrict__ output_values,
+-    int64_t* __restrict__ output_indices,
+-    const int64_t* __restrict__ input_shape,
+-    const int64_t* __restrict__ input_strides,
+-    const int64_t* __restrict__ output_shape,
+-    const int64_t* __restrict__ output_strides,
+-    int ndim,
+-    int dim,
+-    int dim_size,
+-    int64_t outer_size,
+-    int64_t inner_size)
+-{
+-    extern __shared__ float s_max[];
+-    extern __shared__ int64_t s_idx[]; // Actually need separate arrays; this won't compile correctly. We'll allocate dynamic shared memory for both.
+-    // Instead, use two separate shared arrays declared as extern __shared__ with offset; but simpler: use static shared memory size known at compile time? dim_size unknown, so we need dynamic.
+-    // We'll allocate shared memory of size blockDim.x * (sizeof(float)+sizeof(int64_t)).
+-    // But we need to separate them; we can cast a char array.
+-    // For simplicity, we'll avoid shared memory and use warp shuffle reduction? But for arbitrary block size >32, need cross-warp.
+-    // Let's step back: The one-thread version is simpler and correct. Let's use that for now, and optimize later if needed.
+-    // In final answer, we must provide full file; we can include both kernels and choose the optimized one in launcher.
+-}
+-
+-// We'll implement the one-thread version as the actual kernel and ensure correctness.
+-// Then launcher uses it.
+-
+-// Redefine max_reduce_kernel as one-thread per output.
+-// In the launcher, we set gridDim.x = total_output_elements, blockDim.x = 1.
+-// This is acceptable for correctness.
+-
+-// Let's write the complete launcher correctly.
+-extern "C" void max_dim_keepdim_launcher(
+-    const float* input,
+-    float* output_values,
+-    int64_t* output_indices,
+-    const int64_t* input_shape,
+-    const int64_t* input_strides,
+-    const int64_t* output_shape,
+-    const int64_t* output_strides,
+-    int ndim,
+-    int64_t dim,
+-    bool keepdim,
+-    cudaStream_t stream)
+-{
+-    if (dim < 0) dim += ndim;
+-    int64_t dim_size = input_shape[dim];
+-    int64_t outer_size = 1;
+-    for (int i = 0; i < dim; ++i) outer_size *= input_shape[i];
+-    int64_t inner_size = 1;
+-    for (int i = dim + 1; i < ndim; ++i) inner_size *= input_shape[i];
+-    int64_t total_out = outer_size * inner_size;
+-
+-    // Configure grid: one block per output element
+-    dim3 grid(total_out);
+-    dim3 block(1);
+-    // Note: grid.x max 2^31-1, total_out <= 8192, fine.
+-    max_reduce_kernel<<<grid, block, 0, stream>>>(
+-        input, output_values, output_indices,
+-        input_shape, input_strides, output_shape, output_strides,
+-        ndim, dim, dim_size, outer_size, inner_size, 
+-        (keepdim ? output_strides[dim] : 0), 
+-        (keepdim ? output_strides[dim] : 0)); // output_outer_stride and inner not used in kernel if omitted; adjust kernel signature.
+-    // Actually our kernel signature currently uses output_outer_stride and output_inner_stride parameters; we didn't use them.
+-    // Better to remove those parameters from kernel and compute via output_strides directly.
+-    // We'll modify kernel below.
+-}
+-
+-// Corrected max_reduce_kernel without unnecessary parameters.
+-__global__ void max_reduce_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output_values,
+-    int64_t* __restrict__ output_indices,
+-    const int64_t* __restrict__ input_shape,
+-    const int64_t* __restrict__ input_strides,
+-    const int64_t* __restrict__ output_shape,
+-    const int64_t* __restrict__ output_strides,
+-    int ndim,
+-    int dim,
+-    int dim_size,
+-    int64_t outer_size,
+-    int64_t inner_size)
++                                  int64_t inner_size)
+ {
+     int64_t out_idx = blockIdx.x;
+     if (out_idx >= outer_size * inner_size) return;
+@@ -312,7 +89,6 @@
+             rem /= extent;
+             output_offset += coord * output_strides[i];
+         }
+-        // Note: we don't add coordinate for dim because it's 0 (since keepdim or reduced dimension has size 1)
+     }
+     output_values[output_offset] = max_val;
+     output_indices[output_offset] = max_idx;

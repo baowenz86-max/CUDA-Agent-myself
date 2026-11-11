@@ -1,0 +1,135 @@
+// CUDA kernel implementations for custom_abs and custom_tan
+// This file contains only CUDA kernels and launchers with raw pointers and cudaStream_t.
+// No torch/ATen/c10/pybind dependencies.
+
+#include <cuda_runtime.h>
+#include <cstdint>
+
+// Helper to compute linear index from multi-dimensional indices given strides
+__device__ __forceinline__ int64_t compute_linear_index(
+    int ndim,
+    const int64_t* strides,
+    const int64_t* indices) {
+    int64_t index = 0;
+    for (int d = 0; d < ndim; ++d) {
+        index += indices[d] * strides[d];
+    }
+    return index;
+}
+
+// Kernel for element-wise absolute value: output[i] = fabsf(input[i])
+// Supports arbitrary strides via linear index mapping
+__global__ void custom_abs_kernel(
+    float* output,
+    const float* input,
+    int ndim,
+    const int64_t* shape,
+    const int64_t* in_strides,
+    const int64_t* out_strides,
+    int64_t numel) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
+    
+    for (int64_t linear = idx; linear < numel; linear += stride) {
+        // Convert linear index to multi-dimensional indices using shape
+        int64_t remaining = linear;
+        int64_t indices[8]; // Max 8 dimensions, sufficient for typical tensors
+        for (int d = ndim - 1; d >= 0; --d) {
+            indices[d] = remaining % shape[d];
+            remaining /= shape[d];
+        }
+        // Compute input linear address using in_strides
+        int64_t in_idx = 0;
+        for (int d = 0; d < ndim; ++d) {
+            in_idx += indices[d] * in_strides[d];
+        }
+        // Compute output linear address using out_strides (usually same as in_strides)
+        int64_t out_idx = 0;
+        for (int d = 0; d < ndim; ++d) {
+            out_idx += indices[d] * out_strides[d];
+        }
+        output[out_idx] = fabsf(input[in_idx]);
+    }
+}
+
+// Kernel for element-wise tangent: output[i] = tanf(input[i])
+__global__ void custom_tan_kernel(
+    float* output,
+    const float* input,
+    int ndim,
+    const int64_t* shape,
+    const int64_t* in_strides,
+    const int64_t* out_strides,
+    int64_t numel) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
+    
+    for (int64_t linear = idx; linear < numel; linear += stride) {
+        int64_t remaining = linear;
+        int64_t indices[8];
+        for (int d = ndim - 1; d >= 0; --d) {
+            indices[d] = remaining % shape[d];
+            remaining /= shape[d];
+        }
+        int64_t in_idx = 0;
+        for (int d = 0; d < ndim; ++d) {
+            in_idx += indices[d] * in_strides[d];
+        }
+        int64_t out_idx = 0;
+        for (int d = 0; d < ndim; ++d) {
+            out_idx += indices[d] * out_strides[d];
+        }
+        output[out_idx] = tanf(input[in_idx]);
+    }
+}
+
+// Launcher for custom_abs
+// Parameters:
+//   output: pointer to output tensor (must be preallocated with same shape as input)
+//   input: pointer to input tensor
+//   ndim: number of dimensions
+//   shape: array of shape values (length ndim)
+//   in_strides: array of input strides (length ndim)
+//   out_strides: array of output strides (length ndim)
+//   numel: total number of elements
+//   stream: CUDA stream to execute on
+// Returns: void (errors checked via cudaGetLastError after launch)
+extern "C" void custom_abs_launcher(
+    float* output,
+    const float* input,
+    int ndim,
+    const int64_t* shape,
+    const int64_t* in_strides,
+    const int64_t* out_strides,
+    int64_t numel,
+    cudaStream_t stream) {
+    // Choose block size and grid size for good occupancy
+    const int block_size = 256;
+    // Cap grid size to avoid exceeding limits, use grid-stride loop
+    int64_t blocks_needed = (numel + block_size - 1) / block_size;
+    int grid_size = (blocks_needed > 65535) ? 65535 : static_cast<int>(blocks_needed);
+    if (grid_size < 1) grid_size = 1;
+    
+    custom_abs_kernel<<<grid_size, block_size, 0, stream>>>(
+        output, input, ndim, shape, in_strides, out_strides, numel);
+    // Note: caller should check cudaGetLastError() after this call
+}
+
+// Launcher for custom_tan
+extern "C" void custom_tan_launcher(
+    float* output,
+    const float* input,
+    int ndim,
+    const int64_t* shape,
+    const int64_t* in_strides,
+    const int64_t* out_strides,
+    int64_t numel,
+    cudaStream_t stream) {
+    const int block_size = 256;
+    int64_t blocks_needed = (numel + block_size - 1) / block_size;
+    int grid_size = (blocks_needed > 65535) ? 65535 : static_cast<int>(blocks_needed);
+    if (grid_size < 1) grid_size = 1;
+    
+    custom_tan_kernel<<<grid_size, block_size, 0, stream>>>(
+        output, input, ndim, shape, in_strides, out_strides, numel);
+}

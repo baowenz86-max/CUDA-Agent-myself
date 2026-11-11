@@ -1,0 +1,99 @@
+--- before/kernels/clone_forward_binding.cpp
++++ after/kernels/clone_forward_binding.cpp
+@@ -0,0 +1,50 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declaration from custom_ops.cu
++extern "C" void clone_forward_launcher(
++    float* out,
++    const float* in,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++// PyTorch binding for clone_forward
++torch::Tensor clone_forward(torch::Tensor x) {
++    // Validate input tensor
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
++
++    // Allocate output with same shape, dtype, device, and strides
++    auto output = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Launch the copy kernel
++    clone_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++void register_clone_forward(pybind11::module& m) {
++    m.def(
++        "clone_forward",
++        &clone_forward,
++        "Clone a CUDA float tensor",
++        py::arg("x")
++    );
++}
++
++// Auto-register
++REGISTER_BINDING(clone_forward, register_clone_forward);
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,23 @@
++#include <cuda_runtime.h>
++
++// CUDA kernel for deep copy: out[i] = in[i]
++// Handles arbitrary numel up to int64_t range with grid-stride loop.
++__global__ void clone_kernel(float* __restrict__ out, const float* __restrict__ in, int64_t numel) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        out[i] = in[i];
++    }
++}
++
++// Host launcher: assumes out and in are valid CUDA float pointers, numel > 0,
++// stream is the current CUDA stream obtained by the binding layer.
++extern "C" void clone_forward_launcher(float* out, const float* in, int64_t numel, cudaStream_t stream) {
++    if (numel <= 0) return;
++    const int threads = 256;
++    // Cap grid to avoid exceeding device limits; grid-stride handles large data.
++    int64_t desired_blocks = (numel + threads - 1) / threads;
++    int max_blocks_per_dim = 65535; // safe for all CUDA devices
++    int blocks = static_cast<int>(desired_blocks < max_blocks_per_dim ? desired_blocks : max_blocks_per_dim);
++    clone_kernel<<<blocks, threads, 0, stream>>>(out, in, numel);
++}
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,17 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        x_clone = cuda_extension.clone_forward(x)
++        return x_clone
++
++    def debug_forward(self, x):
++        x_clone = cuda_extension.clone_forward(x)
++        yield ('step_001', x_clone)
++        yield ('step_002', x_clone)

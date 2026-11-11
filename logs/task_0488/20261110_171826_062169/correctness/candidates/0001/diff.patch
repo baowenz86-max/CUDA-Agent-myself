@@ -1,0 +1,301 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,173 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// Kernel for softmax along dim=1 of a 3D tensor [N, H, W]
++// Each block handles one softmax vector (or multiple via grid-stride within H dimension)
++// We assign one thread per H element, and each block processes one (n, w) column of H elements.
++// To maximize parallelism, we can use multiple blocks per vector if H is large, but H=2048 fits in one block with 1024 threads and looping.
++// Here we design a kernel where each block processes a chunk of softmax vectors, using shared memory for reductions.
++// Simpler approach: each block processes one (n,w) pair and loops over H twice (max, sum).
++__global__ void softmax_dim1_kernel(const float* __restrict__ input, float* __restrict__ output,
++                                     int N, int H, int W) {
++    int nw = blockIdx.x; // combined n and w index
++    int n = nw / W;
++    int w = nw % W;
++    if (n >= N) return;
++    
++    const float* vec = input + n * H * W + w; // stride in H dimension is W, so element at h has offset h*W + w
++    float* out_vec = output + n * H * W + w;
++    
++    // Find max
++    float max_val = -INFINITY;
++    for (int h = 0; h < H; ++h) {
++        float val = vec[h * W];
++        if (val > max_val) max_val = val;
++    }
++    
++    // Compute sum of exp(x - max)
++    float sum = 0.0f;
++    for (int h = 0; h < H; ++h) {
++        float val = __expf(vec[h * W] - max_val);
++        sum += val;
++        out_vec[h * W] = val; // store exp temporarily, will divide later
++    }
++    
++    // Divide by sum
++    float inv_sum = 1.0f / sum;
++    for (int h = 0; h < H; ++h) {
++        out_vec[h * W] *= inv_sum;
++    }
++}
++
++// Launcher for softmax dim=1
++// input: [N, H, W], output same shape, dim must be 1 (checked in binding)
++extern "C" void custom_softmax_dim1_launcher(const float* input, float* output,
++                                              int N, int H, int W, cudaStream_t stream) {
++    int total_vectors = N * W;
++    int threads = 256;
++    int blocks = (total_vectors + threads - 1) / threads;
++    softmax_dim1_kernel<<<blocks, threads, 0, stream>>>(input, output, N, H, W);
++}
++
++// Kernel for KL divergence batchmean: sum(target*(log(target)-input)) / N
++// Here input and target are the same tensor (softmax output).
++// We can compute sum over all elements using a reduction.
++__global__ void kl_div_batchmean_kernel(const float* __restrict__ x, float* __restrict__ partial_sums,
++                                         int num_elements, int N) {
++    // Each thread computes its element contribution
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < num_elements) {
++        float val = x[idx];
++        float contrib = val * (__logf(val) - val);
++        // Atomic add to a single global accumulator? Better use reduction per block.
++        // For simplicity, we use one block and shared memory reduction, but num_elements may be huge (32M).
++        // We can use a grid-stride loop with atomicAdd to a single float, but atomicAdd on float is supported.
++        // However, for performance, we'll do a two-stage reduction: each block computes partial sum via shared memory, then atomicAdd to global.
++    }
++}
++
++// Better reduction implementation:
++__global__ void kl_div_partial_sum_kernel(const float* __restrict__ x, float* __restrict__ partial_sums,
++                                           int num_elements) {
++    extern __shared__ float sdata[];
++    int tid = threadIdx.x;
++    int i = blockIdx.x * blockDim.x + tid;
++    float sum = 0.0f;
++    // Grid-stride loop
++    for (int idx = i; idx < num_elements; idx += blockDim.x * gridDim.x) {
++        float val = x[idx];
++        sum += val * (__logf(val) - val);
++    }
++    sdata[tid] = sum;
++    __syncthreads();
++    
++    // Reduction in shared memory
++    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++    
++    if (tid == 0) {
++        partial_sums[blockIdx.x] = sdata[0];
++    }
++}
++
++// Kernel to combine partial sums and divide by N
++__global__ void kl_div_final_reduce_kernel(const float* __restrict__ partial_sums, float* __restrict__ output,
++                                            int num_blocks, int N) {
++    extern __shared__ float sdata[];
++    int tid = threadIdx.x;
++    float sum = 0.0f;
++    for (int i = tid; i < num_blocks; i += blockDim.x) {
++        sum += partial_sums[i];
++    }
++    sdata[tid] = sum;
++    __syncthreads();
++    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++    if (tid == 0) {
++        output[0] = sdata[0] / (float)N;
++    }
++}
++
++extern "C" void custom_kl_div_batchmean_launcher(const float* x, float* output,
++                                                  int num_elements, int N, cudaStream_t stream) {
++    // Determine block and grid sizes for partial sum kernel
++    int threads = 256;
++    int blocks = (num_elements + threads - 1) / threads;
++    // Limit blocks to avoid launching too many (e.g., max 1024 blocks)
++    int max_blocks = 1024;
++    if (blocks > max_blocks) blocks = max_blocks;
++    
++    // Allocate temporary storage for partial sums (num blocks)
++    // We'll need to allocate device memory. The launcher should receive a workspace pointer from binding.
++    // For simplicity, we can use a single atomicAdd to a global memory accumulator, but that is slower.
++    // Better: allocate workspace in binding and pass pointer. The binding will allocate via cudaMalloc.
++    // We'll assume the binding passes a preallocated workspace pointer `partial_sums` of size blocks.
++    // In this launcher signature, we include partial_sums pointer.
++}
++
++// We need to adjust launcher signatures: the binding should allocate workspace and pass it.
++// Therefore, we define the launcher to accept a workspace pointer.
++// But to keep the .cu self-contained, we can allocate using cudaMalloc inside launcher, then free after kernel.
++// However, that would be slow if called often. Since this is a one-time computation, it's acceptable.
++// We'll implement a launcher that allocates workspace internally and frees it.
++
++extern "C" void custom_kl_div_batchmean_launcher(const float* x, float* output,
++                                                  int num_elements, int N, cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (num_elements + threads - 1) / threads;
++    int max_blocks = 1024;
++    if (blocks > max_blocks) blocks = max_blocks;
++    
++    float* partial_sums = nullptr;
++    cudaError_t err = cudaMalloc(&partial_sums, blocks * sizeof(float));
++    if (err != cudaSuccess) {
++        // handle error: maybe set output to NaN? But binding should check error after launcher.
++        // We'll just return; binding will check cudaGetLastError after launch.
++        return;
++    }
++    
++    int shared_mem = threads * sizeof(float);
++    kl_div_partial_sum_kernel<<<blocks, threads, shared_mem, stream>>>(x, partial_sums, num_elements);
++    
++    // Final reduce: use one block
++    int final_threads = 256;
++    int final_shared_mem = final_threads * sizeof(float);
++    kl_div_final_reduce_kernel<<<1, final_threads, final_shared_mem, stream>>>(partial_sums, output, blocks, N);
++    
++    cudaFree(partial_sums);
++}
++
++// For softmax, the binding can call custom_softmax_dim1_launcher directly.
++
++// Since dim is always 1 for this task, we only implement that case.
++// The binding will check dim == 1 before calling.
++
++// Ensure no undefined symbols: we use __expf and __logf which are available in CUDA.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,99 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_softmax_dim1_launcher(const float* input, float* output,
++                                              int N, int H, int W, cudaStream_t stream);
++
++extern "C" void custom_kl_div_batchmean_launcher(const float* x, float* output,
++                                                  int num_elements, int N, cudaStream_t stream);
++
++// Custom softmax along dim=1 for 3D tensor [N, H, W]
++// Contract: input float32 CUDA tensor, dim=1
++torch::Tensor custom_softmax_kv_cache(torch::Tensor input, int64_t dim) {
++    // Validate input
++    TORCH_CHECK(input.is_cuda(), "custom_softmax_kv_cache: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_softmax_kv_cache: input must be float32");
++    TORCH_CHECK(input.dim() == 3, "custom_softmax_kv_cache: input must be 3D (N, H, W)");
++    TORCH_CHECK(dim == 1, "custom_softmax_kv_cache: only dim=1 is supported");
++    TORCH_CHECK(input.is_contiguous(), "custom_softmax_kv_cache: input must be contiguous");
++
++    auto N = input.size(0);
++    auto H = input.size(1);
++    auto W = input.size(2);
++
++    // Allocate output same shape
++    auto output = torch::empty_like(input);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_softmax_dim1_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        stream
++    );
++
++    // Check for kernel launch errors
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++
++    return output;
++}
++
++// Custom KL divergence batchmean for identical input/target
++torch::Tensor custom_kl_div_batchmean(torch::Tensor input, torch::Tensor target) {
++    // Validate input and target
++    TORCH_CHECK(input.is_cuda(), "custom_kl_div_batchmean: input must be a CUDA tensor");
++    TORCH_CHECK(target.is_cuda(), "custom_kl_div_batchmean: target must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_kl_div_batchmean: input must be float32");
++    TORCH_CHECK(target.dtype() == torch::kFloat32, "custom_kl_div_batchmean: target must be float32");
++    TORCH_CHECK(input.dim() == 3, "custom_kl_div_batchmean: input must be 3D (N, H, W)");
++    TORCH_CHECK(target.dim() == 3, "custom_kl_div_batchmean: target must be 3D (N, H, W)");
++    TORCH_CHECK(input.sizes() == target.sizes(), "custom_kl_div_batchmean: input and target must have same shape");
++    TORCH_CHECK(input.data_ptr() == target.data_ptr(), "custom_kl_div_batchmean: input and target must be the same tensor");
++    TORCH_CHECK(input.is_contiguous(), "custom_kl_div_batchmean: input must be contiguous");
++    TORCH_CHECK(target.is_contiguous(), "custom_kl_div_batchmean: target must be contiguous");
++
++    auto N = input.size(0);
++    auto num_elements = input.numel();
++
++    // Allocate scalar output (shape [])
++    auto output = torch::empty({}, input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_kl_div_batchmean_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(num_elements),
++        static_cast<int>(N),
++        stream
++    );
++
++    // Check for kernel launch errors
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_softmax_kv_cache", &custom_softmax_kv_cache,
++          "Custom softmax along dim=1 for 3D tensor",
++          py::arg("input"), py::arg("dim"));
++    m.def("custom_kl_div_batchmean", &custom_kl_div_batchmean,
++          "Custom KL divergence batchmean for identical input/target",
++          py::arg("input"), py::arg("target"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        x = cuda_extension.custom_softmax_kv_cache(x, dim=1)
++        x = cuda_extension.custom_kl_div_batchmean(x, x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_softmax_kv_cache(x, dim=1)
++        yield ('step_001', x)
++        x = cuda_extension.custom_kl_div_batchmean(x, x)
++        yield ('step_002', x)
++        yield ('step_003', x)

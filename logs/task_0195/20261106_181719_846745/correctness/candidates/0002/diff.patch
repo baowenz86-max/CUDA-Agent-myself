@@ -1,0 +1,392 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,25 +1,87 @@
+ #include <cuda_runtime.h>
+ 
+-// Elementwise ReLU kernel
+-__global__ void relu_kernel(float* data, long long numel) {
++// 直接卷积的 CUDA kernel，支持分组卷积、bias 和 ReLU
++// 每个线程计算一个输出元素
++__global__ void conv2d_relu_kernel(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t K, int64_t R, int64_t S,
++    int64_t stride, int64_t padding, int64_t dilation,
++    int64_t groups) {
++
+     long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-    for (long long i = idx; i < numel; i += stride) {
+-        if (data[i] < 0.0f) data[i] = 0.0f;
++    long long total = N * K * ((H + 2 * padding - dilation * (R - 1) - 1) / stride + 1) * ((W + 2 * padding - dilation * (S - 1) - 1) / stride + 1);
++    if (idx >= total) return;
++
++    // 从线性索引还原坐标
++    int64_t out_w = (W + 2 * padding - dilation * (S - 1) - 1) / stride + 1;
++    int64_t out_h = (H + 2 * padding - dilation * (R - 1) - 1) / stride + 1;
++    int64_t out_size = out_h * out_w;
++    int64_t n = idx / (K * out_size);
++    int64_t rem = idx % (K * out_size);
++    int64_t k = rem / out_size;
++    int64_t spatial = rem % out_size;
++    int64_t oh = spatial / out_w;
++    int64_t ow = spatial % out_w;
++
++    int64_t C_per_group = C / groups;
++    int64_t group = k / (K / groups); // 注意 K 必须能被 groups 整除
++    int64_t k_in_group = k % (K / groups);
++
++    float sum = 0.0f;
++    for (int64_t c = 0; c < C_per_group; ++c) {
++        int64_t channel = group * C_per_group + c;
++        for (int64_t r = 0; r < R; ++r) {
++            for (int64_t s = 0; s < S; ++s) {
++                int64_t h_in = oh * stride - padding + r * dilation;
++                int64_t w_in = ow * stride - padding + s * dilation;
++                if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
++                    float input_val = input[((n * C + channel) * H + h_in) * W + w_in];
++                    float weight_val = weight[(((k)*C_per_group + c) * R + r) * S + s];
++                    sum += input_val * weight_val;
++                }
++            }
++        }
+     }
++
++    if (bias != nullptr) {
++        sum += bias[k];
++    }
++
++    // ReLU
++    output[idx] = fmaxf(sum, 0.0f);
+ }
+ 
+-// Launcher for fused Conv+ReLU, called from C++ binding after cuDNN convolution.
+-// The binding is responsible for performing the convolution with cuDNN and
+-// then calling this function to apply ReLU on the output.
++// launcher
++// 该函数导出为 C ABI，供 binding.cpp 调用
+ extern "C" void conv2d_relu_launcher(
+-    float* conv_output,
+-    long long numel,
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t K, int64_t R, int64_t S,
++    int64_t stride, int64_t padding, int64_t dilation,
++    int64_t groups,
+     cudaStream_t stream) {
++
++    int64_t out_h = (H + 2 * padding - dilation * (R - 1) - 1) / stride + 1;
++    int64_t out_w = (W + 2 * padding - dilation * (S - 1) - 1) / stride + 1;
++    int64_t total = N * K * out_h * out_w;
++
+     int threads = 256;
+-    long long blocks_ll = (numel + threads - 1) / threads;
++    long long blocks_ll = (total + threads - 1) / threads;
+     if (blocks_ll > 0) {
+         int blocks = (int)blocks_ll;
+-        relu_kernel<<<blocks, threads, 0, stream>>>(conv_output, numel);
++        conv2d_relu_kernel<<<blocks, threads, 0, stream>>>(
++            output, input, weight, bias,
++            N, C, H, W,
++            K, R, S,
++            stride, padding, dilation,
++            groups
++        );
+     }
+-}
++}--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,28 +2,27 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cuda_runtime.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include <stdexcept>
+ #include "../binding_registry.h"
+ 
+-// Declare launcher from custom_ops.cu
++// 前向声明来自 custom_ops.cu 的 launcher
++// 该 launcher 现在执行完整的卷积+ReLU，并处理 bias
+ extern "C" void conv2d_relu_launcher(
+-    float* conv_output,
+-    long long numel,
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t K, int64_t R, int64_t S,
++    int64_t stride, int64_t padding, int64_t dilation,
++    int64_t groups,
+     cudaStream_t stream);
+ 
+-// Helper to check CUDA errors
++// 辅助：检查CUDA错误
+ static void checkCuda(cudaError_t err, const char* msg) {
+     if (err != cudaSuccess) {
+         throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(err));
+-    }
+-}
+-
+-// Helper to check cuDNN errors
+-static void checkCudnn(cudnnStatus_t status, const char* msg) {
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error(std::string(msg) + ": " + cudnnGetErrorString(status));
+     }
+ }
+ 
+@@ -53,7 +52,7 @@
+         TORCH_CHECK(bias->dim() == 1, "bias must be 1D");
+     }
+ 
+-    // 确保输入是连续的
++    // 确保张量连续
+     auto input_contig = input.contiguous();
+     auto weight_contig = weight.contiguous();
+     c10::optional<torch::Tensor> bias_contig;
+@@ -61,6 +60,7 @@
+         bias_contig = bias->contiguous();
+     }
+ 
++    // 获取尺寸
+     int64_t N = input_contig.size(0);
+     int64_t C = input_contig.size(1);
+     int64_t H = input_contig.size(2);
+@@ -72,11 +72,11 @@
+ 
+     TORCH_CHECK(groups > 0, "groups must be positive");
+     TORCH_CHECK(C == groups * C_per_group, "input channels must equal groups * weight in_channels");
+-    if (bias.has_value() && bias->defined()) {
+-        TORCH_CHECK(bias->numel() == K, "bias size must equal out_channels");
++    if (bias_contig.has_value() && bias_contig->defined()) {
++        TORCH_CHECK(bias_contig->numel() == K, "bias size must equal out_channels");
+     }
+ 
+-    // 计算输出尺寸
++    // 输出尺寸计算
+     int64_t out_h = (H + 2 * padding - dilation * (R - 1) - 1) / stride + 1;
+     int64_t out_w = (W + 2 * padding - dilation * (S - 1) - 1) / stride + 1;
+     TORCH_CHECK(out_h > 0 && out_w > 0, "invalid output size");
+@@ -86,188 +86,36 @@
+     // 获取当前 CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // cuDNN 句柄
+-    cudnnHandle_t cudnn_handle;
+-    checkCudnn(cudnnCreate(&cudnn_handle), "cudnnCreate failed");
+-    checkCudnn(cudnnSetStream(cudnn_handle, stream), "cudnnSetStream failed");
+-
+-    // 张量描述符
+-    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    checkCudnn(cudnnCreateTensorDescriptor(&input_desc), "cudnnCreateTensorDescriptor failed");
+-    checkCudnn(cudnnCreateTensorDescriptor(&output_desc), "cudnnCreateTensorDescriptor failed");
+-    checkCudnn(cudnnCreateTensorDescriptor(&bias_desc), "cudnnCreateTensorDescriptor failed");
+-    checkCudnn(cudnnCreateFilterDescriptor(&filter_desc), "cudnnCreateFilterDescriptor failed");
+-    checkCudnn(cudnnCreateConvolutionDescriptor(&conv_desc), "cudnnCreateConvolutionDescriptor failed");
+-
+-    // 设置张量描述符为 NCHW float32
+-    checkCudnn(cudnnSetTensor4dDescriptor(
+-        input_desc,
+-        CUDNN_TENSOR_NCHW,
+-        CUDNN_DATA_FLOAT,
+-        static_cast<int>(N),
+-        static_cast<int>(C),
+-        static_cast<int>(H),
+-        static_cast<int>(W)),
+-        "cudnnSetTensor4dDescriptor input failed");
+-
+-    checkCudnn(cudnnSetTensor4dDescriptor(
+-        output_desc,
+-        CUDNN_TENSOR_NCHW,
+-        CUDNN_DATA_FLOAT,
+-        static_cast<int>(N),
+-        static_cast<int>(K),
+-        static_cast<int>(out_h),
+-        static_cast<int>(out_w)),
+-        "cudnnSetTensor4dDescriptor output failed");
+-
+-    // 滤波器描述符
+-    checkCudnn(cudnnSetFilter4dDescriptor(
+-        filter_desc,
+-        CUDNN_DATA_FLOAT,
+-        CUDNN_TENSOR_NCHW,
+-        static_cast<int>(K),
+-        static_cast<int>(C_per_group),
+-        static_cast<int>(R),
+-        static_cast<int>(S)),
+-        "cudnnSetFilter4dDescriptor failed");
+-
+-    // 卷积描述符
+-    checkCudnn(cudnnSetConvolution2dDescriptor(
+-        conv_desc,
+-        static_cast<int>(padding),
+-        static_cast<int>(padding),
+-        static_cast<int>(stride),
+-        static_cast<int>(stride),
+-        static_cast<int>(dilation),
+-        static_cast<int>(dilation),
+-        CUDNN_CROSS_CORRELATION,
+-        CUDNN_DATA_FLOAT),
+-        "cudnnSetConvolution2dDescriptor failed");
+-
+-    if (groups > 1) {
+-        checkCudnn(cudnnSetConvolutionGroupCount(conv_desc, static_cast<int>(groups)), "cudnnSetConvolutionGroupCount failed");
++    // 调用 launcher 执行卷积+ReLU
++    const float* bias_ptr = nullptr;
++    if (bias_contig.has_value() && bias_contig->defined()) {
++        bias_ptr = bias_contig->data_ptr<float>();
+     }
+ 
+-    // 选择前向算法
+-    cudnnConvolutionFwdAlgo_t algo;
+-    constexpr int requested_algo_count = 1;
+-    int returned_algo_count = 0;
+-    cudnnConvolutionFwdAlgoPerf_t perf_results[requested_algo_count];
+-    checkCudnn(cudnnFindConvolutionForwardAlgorithm(
+-        cudnn_handle,
+-        input_desc,
+-        filter_desc,
+-        conv_desc,
+-        output_desc,
+-        requested_algo_count,
+-        &returned_algo_count,
+-        perf_results),
+-        "cudnnFindConvolutionForwardAlgorithm failed");
+-    if (returned_algo_count == 0) {
+-        throw std::runtime_error("No convolution algorithm found");
++    conv2d_relu_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        weight_contig.data_ptr<float>(),
++        bias_ptr,
++        N, C, H, W,
++        K, R, S,
++        stride, padding, dilation,
++        groups,
++        stream
++    );
++
++    // 检查 kernel 启动错误
++    cudaError_t launch_err = cudaGetLastError();
++    if (launch_err != cudaSuccess) {
++        throw std::runtime_error(std::string("conv2d_relu_launcher failed: ") + cudaGetErrorString(launch_err));
+     }
+-    algo = perf_results[0].algo;
+-
+-    // 计算 workspace 大小
+-    size_t workspace_size = 0;
+-    checkCudnn(cudnnGetConvolutionForwardWorkspaceSize(
+-        cudnn_handle,
+-        input_desc,
+-        filter_desc,
+-        conv_desc,
+-        output_desc,
+-        algo,
+-        &workspace_size),
+-        "cudnnGetConvolutionForwardWorkspaceSize failed");
+-
+-    // 分配 workspace
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        checkCuda(cudaMalloc(&workspace, workspace_size), "cudaMalloc workspace failed");
+-    }
+-
+-    float alpha = 1.0f, beta = 0.0f;
+-
+-    // 执行卷积
+-    if (bias_contig.has_value() && bias_contig->defined()) {
+-        // 带 bias
+-        checkCudnn(cudnnSetTensor4dDescriptor(
+-            bias_desc,
+-            CUDNN_TENSOR_NCHW,
+-            CUDNN_DATA_FLOAT,
+-            1,
+-            static_cast<int>(K),
+-            1,
+-            1),
+-            "cudnnSetTensor4dDescriptor bias failed");
+-        checkCudnn(cudnnConvolutionForward(
+-            cudnn_handle,
+-            &alpha,
+-            input_desc,
+-            input_contig.data_ptr<float>(),
+-            filter_desc,
+-            weight_contig.data_ptr<float>(),
+-            conv_desc,
+-            algo,
+-            workspace,
+-            workspace_size,
+-            &beta,
+-            output_desc,
+-            output.data_ptr<float>()),
+-            "cudnnConvolutionForward (with bias) failed");
+-        // 添加 bias（beta=1 或使用 cudnnAddTensor）
+-        float bias_alpha = 1.0f, bias_beta = 1.0f;
+-        checkCudnn(cudnnAddTensor(
+-            cudnn_handle,
+-            &bias_alpha,
+-            bias_desc,
+-            bias_contig->data_ptr<float>(),
+-            &bias_beta,
+-            output_desc,
+-            output.data_ptr<float>()),
+-            "cudnnAddTensor bias failed");
+-    } else {
+-        // 无 bias
+-        checkCudnn(cudnnConvolutionForward(
+-            cudnn_handle,
+-            &alpha,
+-            input_desc,
+-            input_contig.data_ptr<float>(),
+-            filter_desc,
+-            weight_contig.data_ptr<float>(),
+-            conv_desc,
+-            algo,
+-            workspace,
+-            workspace_size,
+-            &beta,
+-            output_desc,
+-            output.data_ptr<float>()),
+-            "cudnnConvolutionForward failed");
+-    }
+-
+-    // 应用 ReLU（调用 .cu 中的 launcher）
+-    conv2d_relu_launcher(output.data_ptr<float>(), output.numel(), stream);
+-
+-    // 清理
+-    if (workspace != nullptr) {
+-        checkCuda(cudaFree(workspace), "cudaFree workspace failed");
+-    }
+-    checkCudnn(cudnnDestroyTensorDescriptor(input_desc), "cudnnDestroyTensorDescriptor failed");
+-    checkCudnn(cudnnDestroyTensorDescriptor(output_desc), "cudnnDestroyTensorDescriptor failed");
+-    checkCudnn(cudnnDestroyTensorDescriptor(bias_desc), "cudnnDestroyTensorDescriptor failed");
+-    checkCudnn(cudnnDestroyFilterDescriptor(filter_desc), "cudnnDestroyFilterDescriptor failed");
+-    checkCudnn(cudnnDestroyConvolutionDescriptor(conv_desc), "cudnnDestroyConvolutionDescriptor failed");
+-    checkCudnn(cudnnDestroy(cudnn_handle), "cudnnDestroy failed");
+ 
+     return output;
+ }
+ 
+ void register_conv2d_relu(pybind11::module& m) {
+     m.def("conv2d_relu", &conv2d_relu,
+-          "Conv2d + ReLU using cuDNN",
++          "Conv2d + ReLU (custom CUDA kernel)",
+           py::arg("input"),
+           py::arg("weight"),
+           py::arg("bias"),
+@@ -277,4 +125,4 @@
+           py::arg("groups"));
+ }
+ 
+-REGISTER_BINDING(conv2d_relu, register_conv2d_relu);
++REGISTER_BINDING(conv2d_relu, register_conv2d_relu);

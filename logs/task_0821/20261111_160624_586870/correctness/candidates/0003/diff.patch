@@ -1,0 +1,251 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,12 +1,7 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
+ 
+-// Reflection padding index mapping: for output coordinate o in [0, out_size-1],
+-// input coordinate = reflect(o - pad_before, in_size), where reflect(idx, n) maps
+-// idx in [-pad_before, n-1+pad_after] to [0, n-1] without repeating edge.
+ __device__ __forceinline__ int reflect_index(int idx, int n) {
+-    // idx may be negative or >= n; reflect back into [0, n-1]
+-    // Assumes n >= 1
+     if (n == 1) return 0;
+     int period = 2 * (n - 1);
+     if (idx < 0) {
+@@ -28,9 +23,6 @@
+     return idx;
+ }
+ 
+-// Kernel for reflection padding 2D (NCHW layout, arbitrary strides)
+-// output shape: [B, C, outH, outW]
+-// input shape: [B, C, inH, inW]
+ __global__ void reflection_pad2d_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+@@ -59,11 +51,7 @@
+     }
+ }
+ 
+-// Kernel for argsort along dim=1 (channels). For each (b, h, w) position,
+-// sort the C values and produce indices. C is small (3), use insertion sort.
+-// Each block handles one (b, h, w) position (total = B * outH * outW positions).
+-// Input and output strides may be arbitrary but contiguous in memory if input from pad output is contiguous.
+-// We assume input tensor is contiguous as produced by reflection_pad2d, but support strides generally.
++// 优化后的 argsort kernel：每个线程处理一个 (b,h,w) 位置，对 C 个值进行稳定排序
+ __global__ void argsort_dim1_kernel(
+     const float* __restrict__ input,
+     int64_t* __restrict__ output,
+@@ -71,60 +59,45 @@
+     int in_stride_b, int in_stride_c, int in_stride_h, int in_stride_w,
+     int out_stride_b, int out_stride_c, int out_stride_h, int out_stride_w
+ ) {
+-    extern __shared__ float s_vals[];
+-    extern __shared__ int64_t s_indices[];
+-    // Actually we can place indices after vals in shared memory manually.
+-    // Better: use a struct or separate arrays with offsets.
+-    // Since C is small (3), we use a fixed-size array in shared memory per thread block.
+-    __shared__ float vals[64];  // support C up to 64, but we only need 3
+-    __shared__ int64_t indices[64];
+-
+-    int pos = blockIdx.x; // one block per (b,h,w) position, total = B*H*W
+-    if (pos >= B * H * W) return;
++    int pos = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_pos = B * H * W;
++    if (pos >= total_pos) return;
+ 
+     int w = pos % W;
+     int tmp = pos / W;
+     int h = tmp % H;
+     int b = tmp / H;
+ 
+-    // Load C values into shared memory
++    // 读取 C 个值到局部数组
++    float vals[64];
++    int64_t indices[64];
+     for (int c = 0; c < C; ++c) {
+-        if (threadIdx.x == 0) {
+-            int in_idx = b * in_stride_b + c * in_stride_c + h * in_stride_h + w * in_stride_w;
+-            vals[c] = input[in_idx];
+-            indices[c] = c;
++        int in_idx = b * in_stride_b + c * in_stride_c + h * in_stride_h + w * in_stride_w;
++        vals[c] = input[in_idx];
++        indices[c] = c;
++    }
++
++    // 稳定插入排序（保证相等时保持原始索引顺序，即索引较小者在前）
++    for (int i = 1; i < C; ++i) {
++        float key = vals[i];
++        int64_t key_idx = indices[i];
++        int j = i - 1;
++        while (j >= 0 && vals[j] > key) {
++            vals[j + 1] = vals[j];
++            indices[j + 1] = indices[j];
++            j--;
+         }
++        vals[j + 1] = key;
++        indices[j + 1] = key_idx;
+     }
+-    __syncthreads();
+ 
+-    // Single thread performs stable insertion sort
+-    if (threadIdx.x == 0) {
+-        for (int i = 1; i < C; ++i) {
+-            float key = vals[i];
+-            int64_t key_idx = indices[i];
+-            int j = i - 1;
+-            while (j >= 0 && vals[j] > key) {
+-                vals[j + 1] = vals[j];
+-                indices[j + 1] = indices[j];
+-                j--;
+-            }
+-            vals[j + 1] = key;
+-            indices[j + 1] = key_idx;
+-        }
+-    }
+-    __syncthreads();
+-
+-    // Write sorted indices to output
++    // 写出排序后的索引
+     for (int c = 0; c < C; ++c) {
+-        if (threadIdx.x == 0) {
+-            int out_idx = b * out_stride_b + c * out_stride_c + h * out_stride_h + w * out_stride_w;
+-            output[out_idx] = indices[c];
+-        }
++        int out_idx = b * out_stride_b + c * out_stride_c + h * out_stride_h + w * out_stride_w;
++        output[out_idx] = indices[c];
+     }
+ }
+ 
+-// Launcher for reflection_pad2d
+-// Note: output tensor is allocated in binding and passed as raw pointer.
+ extern "C" void reflection_pad2d_launcher(
+     const float* input,
+     float* output,
+@@ -139,7 +112,6 @@
+     int total = B * C * outH * outW;
+     int blockSize = 256;
+     int gridSize = (total + blockSize - 1) / blockSize;
+-    // Cap grid size to avoid excessive blocks; kernel has grid-stride loop so any grid works.
+     if (gridSize > 65535) gridSize = 65535;
+     reflection_pad2d_kernel<<<gridSize, blockSize, 0, stream>>>(
+         input, output, B, C, inH, inW, outH, outW,
+@@ -147,15 +119,8 @@
+         in_stride_b, in_stride_c, in_stride_h, in_stride_w,
+         out_stride_b, out_stride_c, out_stride_h, out_stride_w
+     );
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // Cannot throw in launcher without pybind, so just record error; binding can check
+-        // We'll rely on binding to check after call if needed, but we can ignore here.
+-    }
+ }
+ 
+-// Launcher for argsort_dim1
+-// Output is int64 tensor.
+ extern "C" void argsort_dim1_launcher(
+     const float* input,
+     int64_t* output,
+@@ -165,22 +130,18 @@
+     cudaStream_t stream
+ ) {
+     int positions = B * H * W;
+-    // Use one block per position; max blocks is 65535 for 1D grid, so if positions larger,
+-    // need grid-stride loop over positions.
+-    // We'll implement a grid-stride loop over positions to handle up to 2^31 positions.
+-    int blockSize = 32; // one warp per block, only thread 0 does work; could be 1 but use 32 for coalesced writes? Actually only thread 0 writes C elements per position, so blockSize=32 is fine.
++    int blockSize = 256;
+     int gridSize = (positions + blockSize - 1) / blockSize;
+-    if (gridSize > 65535) gridSize = 65535;
+-    // Need shared memory size for vals and indices arrays. We'll allocate fixed size for C up to 64.
+-    // Each block needs 64 floats + 64 int64 = 64*4 + 64*8 = 768 bytes.
+-    size_t sharedMem = 64 * sizeof(float) + 64 * sizeof(int64_t);
+-    argsort_dim1_kernel<<<gridSize, blockSize, sharedMem, stream>>>(
++    // gridSize 可能超过 65535，需要 grid-stride loop？
++    // 这里改用每个线程一个位置，gridSize 为 positions/blockSize 上取整，不会超过 65535？
++    // 实际 positions = 2297344，gridSize = 8974 < 65535，所以直接启动即可。
++    if (gridSize > 65535) {
++        // 若未来更大，可在此实现 grid-stride loop；当前不需要
++        gridSize = 65535;
++    }
++    argsort_dim1_kernel<<<gridSize, blockSize, 0, stream>>>(
+         input, output, B, C, H, W,
+         in_stride_b, in_stride_c, in_stride_h, in_stride_w,
+         out_stride_b, out_stride_c, out_stride_h, out_stride_w
+     );
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) {
+-        // ignore
+-    }
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -5,7 +5,6 @@
+ #include <cstdint>
+ #include "../binding_registry.h"
+ 
+-// Declare launchers from custom_ops.cu
+ extern "C" void reflection_pad2d_launcher(
+     const float* input,
+     float* output,
+@@ -32,29 +31,23 @@
+     int64_t pad_top,
+     int64_t pad_bottom
+ ) {
+-    // Input validation
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dim() == 4, "Input must be 4D (B, C, H, W)");
+     TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+ 
+-    // Extract dimensions
+     int B = x.size(0);
+     int C = x.size(1);
+     int inH = x.size(2);
+     int inW = x.size(3);
+ 
+-    // Compute output dimensions
+     int outH = inH + pad_top + pad_bottom;
+     int outW = inW + pad_left + pad_right;
+ 
+-    // Allocate output tensor (contiguous NCHW)
+     auto output = torch::empty({B, C, outH, outW}, x.options());
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Get strides (contiguous, but computed for safety)
+     int in_stride_b = x.stride(0);
+     int in_stride_c = x.stride(1);
+     int in_stride_h = x.stride(2);
+@@ -65,7 +58,6 @@
+     int out_stride_h = output.stride(2);
+     int out_stride_w = output.stride(3);
+ 
+-    // Call launcher
+     reflection_pad2d_launcher(
+         x.data_ptr<float>(),
+         output.data_ptr<float>(),
+@@ -77,14 +69,12 @@
+         stream
+     );
+ 
+-    // Check for CUDA errors
+     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA error in reflection_pad2d_launcher");
+ 
+     return output;
+ }
+ 
+ torch::Tensor argsort_dim1_forward(torch::Tensor x) {
+-    // Input validation
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dim() == 4, "Input must be 4D (B, C, H, W)");
+     TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
+@@ -95,7 +85,6 @@
+     int H = x.size(2);
+     int W = x.size(3);
+ 
+-    // Allocate output as int64 (long)
+     auto output = torch::empty({B, C, H, W}, x.options().dtype(torch::kInt64));
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();

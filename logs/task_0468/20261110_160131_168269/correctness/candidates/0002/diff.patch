@@ -1,0 +1,145 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,81 +1,37 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
+ 
+-// Element-wise Hardtanh (clamp) kernel supporting arbitrary strides.
+-// Each thread processes one element per iteration using a grid-stride loop.
+-template <int NDIM>
+-__global__ void hardtanh_kernel(
++// Element-wise Hardtanh (clamp) kernel for contiguous tensors.
++__global__ void hardtanh_contiguous_kernel(
+     float* __restrict__ output,
+     const float* __restrict__ input,
+     int64_t numel,
+-    const int64_t* __restrict__ shape,
+-    const int64_t* __restrict__ strides,
+     float min_val,
+     float max_val)
+ {
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int64_t stride = blockDim.x * gridDim.x;
+     for (int64_t i = idx; i < numel; i += stride) {
+-        // Convert linear index to multidimensional coordinate using strides.
+-        int64_t offset = 0;
+-        int64_t rem = i;
+-        #pragma unroll
+-        for (int d = NDIM - 1; d >= 0; --d) {
+-            int64_t coord = rem % shape[d];
+-            rem /= shape[d];
+-            offset += coord * strides[d];
+-        }
+-        float val = input[offset];
++        float val = input[i];
+         val = fminf(fmaxf(val, min_val), max_val);
+-        output[offset] = val;
++        output[i] = val;
+     }
+ }
+ 
+-// Launcher for arbitrary number of dimensions (1 to 4 supported here; extend if needed).
+-// The binding layer should pass the number of dimensions and arrays for shape and strides.
++// Launcher for contiguous tensors.
+ extern "C" void hardtanh_launcher(
+     float* output,
+     const float* input,
+     int64_t numel,
+-    int ndim,
+-    const int64_t* shape,
+-    const int64_t* strides,
+     float min_val,
+     float max_val,
+     cudaStream_t stream)
+ {
+-    // Choose block size: 256 threads per block.
+     const int block_size = 256;
+-    // Calculate grid size: enough blocks to cover all elements, but cap to avoid
+-    // exceeding grid dimension limits. Use grid-stride loop.
+     int64_t blocks64 = (numel + block_size - 1) / block_size;
+-    // Limit grid to a reasonable maximum (e.g., 65535 blocks, which is max for x-dim in grid).
+-    // For large numel, we may need multiple iterations per thread.
+-    const int64_t max_blocks = 65535; // safe for all CUDA architectures
++    const int64_t max_blocks = 65535;
+     int grid_size = (int)min(blocks64, max_blocks);
+-    
+-    // Dispatch based on ndim (up to 4, as input is 4D). For other cases, fallback to a generic
+-    // kernel that assumes contiguous (ndim not supported). Better: we can create specialized kernels.
+-    // Here we launch separate instantiations.
+-    switch (ndim) {
+-        case 1:
+-            hardtanh_kernel<1><<<grid_size, block_size, 0, stream>>>(
+-                output, input, numel, shape, strides, min_val, max_val);
+-            break;
+-        case 2:
+-            hardtanh_kernel<2><<<grid_size, block_size, 0, stream>>>(
+-                output, input, numel, shape, strides, min_val, max_val);
+-            break;
+-        case 3:
+-            hardtanh_kernel<3><<<grid_size, block_size, 0, stream>>>(
+-                output, input, numel, shape, strides, min_val, max_val);
+-            break;
+-        case 4:
+-            hardtanh_kernel<4><<<grid_size, block_size, 0, stream>>>(
+-                output, input, numel, shape, strides, min_val, max_val);
+-            break;
+-        default:
+-            // Unsupported dimension count; do nothing. Binding layer should check ndim <= 4.
+-            break;
+-    }
++
++    hardtanh_contiguous_kernel<<<grid_size, block_size, 0, stream>>>(
++        output, input, numel, min_val, max_val);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -3,7 +3,6 @@
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cstdint>
+-#include <vector>
+ #include "../binding_registry.h"
+ 
+ // Launcher declaration matching custom_ops.cu
+@@ -11,9 +10,6 @@
+     float* output,
+     const float* input,
+     int64_t numel,
+-    int ndim,
+-    const int64_t* shape,
+-    const int64_t* strides,
+     float min_val,
+     float max_val,
+     cudaStream_t stream);
+@@ -27,7 +23,7 @@
+     // Input validation
+     TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must have dtype float32");
+-    TORCH_CHECK(x.dim() <= 4, "Input tensor must have at most 4 dimensions");
++    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
+ 
+     // Allocate output with same shape, strides, dtype, device
+     auto output = torch::empty_like(x);
+@@ -35,22 +31,11 @@
+     // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Extract shape and strides as int64 vectors
+-    std::vector<int64_t> shape_vec(x.dim());
+-    std::vector<int64_t> strides_vec(x.dim());
+-    for (int i = 0; i < x.dim(); ++i) {
+-        shape_vec[i] = x.size(i);
+-        strides_vec[i] = x.stride(i);
+-    }
+-
+     // Call launcher
+     hardtanh_launcher(
+         output.data_ptr<float>(),
+         x.data_ptr<float>(),
+         x.numel(),
+-        x.dim(),
+-        shape_vec.data(),
+-        strides_vec.data(),
+         static_cast<float>(min_val),
+         static_cast<float>(max_val),
+         stream

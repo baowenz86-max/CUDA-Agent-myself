@@ -1,0 +1,260 @@
+// Binding file for custom ops: conv2d_forward, relu_forward, max_pool2d_forward
+// All computations use cuDNN. No custom CUDA kernels in this file.
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cudnn.h>
+#include <iostream>
+#include <stdexcept>
+#include <memory>
+#include "../binding_registry.h"
+
+// Helper to check cuDNN errors
+#define CUDNN_CHECK(condition)                                                     \
+    do {                                                                           \
+        cudnnStatus_t status = (condition);                                        \
+        if (status != CUDNN_STATUS_SUCCESS) {                                      \
+            throw std::runtime_error(std::string("cuDNN error at ") + __FILE__ +  \
+                                     ":" + std::to_string(__LINE__) +             \
+                                     ": " + cudnnGetErrorString(status));         \
+        }                                                                          \
+    } while (0)
+
+// Singleton cuDNN handle management
+static cudnnHandle_t get_cudnn_handle() {
+    static cudnnHandle_t handle = nullptr;
+    if (handle == nullptr) {
+        CUDNN_CHECK(cudnnCreate(&handle));
+    }
+    return handle;
+}
+
+// Set cuDNN stream to current CUDA stream
+static void set_cudnn_stream(cudnnHandle_t handle) {
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    CUDNN_CHECK(cudnnSetStream(handle, stream));
+}
+
+// Helper to create tensor descriptor for 4D NCHW tensor
+static cudnnTensorDescriptor_t create_tensor_descriptor(const torch::Tensor& t) {
+    cudnnTensorDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc));
+    // Assume NCHW format; check contiguous? We'll require contiguous input for simplicity,
+    // but the contract says supports strides, so we can handle non-contiguous by making contiguous if needed.
+    // For simplicity, we can support contiguous only but contract allows strides. Better to use underlying data if contiguous,
+    // else make contiguous copy.
+    if (!t.is_contiguous()) {
+        // Since contract allows strides, but cuDNN requires contiguous or specific strides.
+        // We'll make it contiguous to be safe.
+        torch::Tensor t_contig = t.contiguous();
+        // But we need to keep the tensor alive for cuDNN call. We'll use the contiguous tensor directly.
+        // However our function receives const reference; we can create local copy inside descriptor creator?
+        // Easier: in each op function, we ensure input is contiguous before descriptor creation.
+        // We'll just call .contiguous() on inputs at start of each op.
+        // For now, assume caller passes contiguous; we add TORCH_CHECK for contiguous to avoid complexity.
+        // Since contract says layout: supports strides, but we can handle by making contiguous.
+        // We'll treat it as contiguous after .contiguous() call.
+    }
+    // data format: NCHW
+    int n = t.size(0);
+    int c = t.size(1);
+    int h = t.size(2);
+    int w = t.size(3);
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+    return desc;
+}
+
+// Helper to create filter descriptor for convolution
+static cudnnFilterDescriptor_t create_filter_descriptor(const torch::Tensor& weight) {
+    cudnnFilterDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreateFilterDescriptor(&desc));
+    // weight shape: [out_channels, in_channels, kh, kw]
+    int k = weight.size(0); // out channels
+    int c = weight.size(1); // in channels
+    int kh = weight.size(2);
+    int kw = weight.size(3);
+    CUDNN_CHECK(cudnnSetFilter4dDescriptor(desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, k, c, kh, kw));
+    return desc;
+}
+
+// Helper to create convolution descriptor
+static cudnnConvolutionDescriptor_t create_conv_descriptor(int padding_h, int padding_w, int stride_h, int stride_w) {
+    cudnnConvolutionDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&desc));
+    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(desc, padding_h, padding_w, stride_h, stride_w, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+    return desc;
+}
+
+// Helper to create pooling descriptor
+static cudnnPoolingDescriptor_t create_pooling_descriptor(int kernel_size, int stride, int padding) {
+    cudnnPoolingDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreatePoolingDescriptor(&desc));
+    CUDNN_CHECK(cudnnSetPooling2dDescriptor(desc, CUDNN_POOLING_MAX, CUDNN_PROPAGATE_NAN, kernel_size, kernel_size, padding, padding, stride, stride));
+    return desc;
+}
+
+// Helper to destroy descriptors (RAII with unique_ptr custom deleters)
+struct CudnnTensorDescDeleter { void operator()(cudnnTensorDescriptor_t p) const { if (p) cudnnDestroyTensorDescriptor(p); } };
+struct CudnnFilterDescDeleter { void operator()(cudnnFilterDescriptor_t p) const { if (p) cudnnDestroyFilterDescriptor(p); } };
+struct CudnnConvDescDeleter { void operator()(cudnnConvolutionDescriptor_t p) const { if (p) cudnnDestroyConvolutionDescriptor(p); } };
+struct CudnnPoolingDescDeleter { void operator()(cudnnPoolingDescriptor_t p) const { if (p) cudnnDestroyPoolingDescriptor(p); } };
+using TensorDescPtr = std::unique_ptr<cudnnTensorStruct, CudnnTensorDescDeleter>;
+using FilterDescPtr = std::unique_ptr<cudnnFilterStruct, CudnnFilterDescDeleter>;
+using ConvDescPtr = std::unique_ptr<cudnnConvolutionStruct, CudnnConvDescDeleter>;
+using PoolingDescPtr = std::unique_ptr<cudnnPoolingStruct, CudnnPoolingDescDeleter>;
+
+// Conv2d forward using cuDNN
+torch::Tensor conv2d_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+                             int64_t stride_h, int64_t stride_w, int64_t padding_h, int64_t padding_w) {
+    // Validate inputs
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    if (bias.defined()) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    }
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+    if (bias.defined()) {
+        TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+    }
+    TORCH_CHECK(input.dim() == 4, "input must be 4D (N,C,H,W)");
+    TORCH_CHECK(weight.dim() == 4, "weight must be 4D (out_channels,in_channels,kh,kw)");
+
+    // Ensure contiguous (contract allows strides, but cuDNN may handle strides; we make contiguous for simplicity)
+    auto input_contig = input.contiguous();
+    auto weight_contig = weight.contiguous();
+    auto bias_contig = bias.defined() ? bias.contiguous() : torch::Tensor();
+
+    // Compute output dimensions
+    int n = input_contig.size(0);
+    int c_in = input_contig.size(1);
+    int h_in = input_contig.size(2);
+    int w_in = input_contig.size(3);
+    int k = weight_contig.size(0); // out channels
+    int c_weight = weight_contig.size(1); // should equal c_in
+    int kh = weight_contig.size(2);
+    int kw = weight_contig.size(3);
+    TORCH_CHECK(c_in == c_weight, "input channels must match weight in_channels");
+    int h_out = (h_in + 2 * padding_h - kh) / stride_h + 1;
+    int w_out = (w_in + 2 * padding_w - kw) / stride_w + 1;
+    TORCH_CHECK(h_out > 0 && w_out > 0, "invalid conv output size");
+
+    // Allocate output
+    auto output = torch::empty({n, k, h_out, w_out}, input_contig.options());
+
+    // Get cuDNN handle and set stream
+    cudnnHandle_t handle = get_cudnn_handle();
+    set_cudnn_stream(handle);
+
+    // Create descriptors
+    auto input_desc = TensorDescPtr(create_tensor_descriptor(input_contig));
+    auto weight_desc = FilterDescPtr(create_filter_descriptor(weight_contig));
+    auto conv_desc = ConvDescPtr(create_conv_descriptor(padding_h, padding_w, stride_h, stride_w));
+    auto output_desc = TensorDescPtr(create_tensor_descriptor(output));
+
+    // Set up bias descriptor (if bias present)
+    cudnnTensorDescriptor_t bias_desc = nullptr;
+    if (bias_contig.defined()) {
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&bias_desc));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, k, 1, 1));
+    }
+
+    // Determine algorithm (use heuristic)
+    cudnnConvolutionFwdAlgo_t algo;
+    CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(handle, input_desc.get(), weight_desc.get(), conv_desc.get(), output_desc.get(), 1, 0, &algo));
+
+    // Determine workspace size
+    size_t workspace_size = 0;
+    CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(handle, input_desc.get(), weight_desc.get(), conv_desc.get(), output_desc.get(), algo, &workspace_size));
+
+    // Allocate workspace if needed
+    void* workspace = nullptr;
+    if (workspace_size > 0) {
+        cudaMalloc(&workspace, workspace_size);
+    }
+
+    // Perform convolution
+    float alpha = 1.0f, beta = 0.0f;
+    CUDNN_CHECK(cudnnConvolutionForward(handle, &alpha, input_desc.get(), input_contig.data_ptr<float>(), weight_desc.get(), weight_contig.data_ptr<float>(), conv_desc.get(), algo, workspace, workspace_size, &beta, output_desc.get(), output.data_ptr<float>()));
+
+    // Add bias if present
+    if (bias_contig.defined()) {
+        beta = 1.0f;
+        CUDNN_CHECK(cudnnAddTensor(handle, &alpha, bias_desc, bias_contig.data_ptr<float>(), &beta, output_desc.get(), output.data_ptr<float>()));
+    }
+
+    // Cleanup
+    if (workspace) cudaFree(workspace);
+    if (bias_desc) cudnnDestroyTensorDescriptor(bias_desc);
+
+    return output;
+}
+
+// ReLU forward using cuDNN activation
+torch::Tensor relu_forward(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+    TORCH_CHECK(input.dim() == 4, "input must be 4D (N,C,H,W)");
+
+    auto input_contig = input.contiguous();
+    auto output = torch::empty_like(input_contig);
+
+    cudnnHandle_t handle = get_cudnn_handle();
+    set_cudnn_stream(handle);
+
+    auto input_desc = TensorDescPtr(create_tensor_descriptor(input_contig));
+
+    cudnnActivationDescriptor_t act_desc;
+    CUDNN_CHECK(cudnnCreateActivationDescriptor(&act_desc));
+    CUDNN_CHECK(cudnnSetActivationDescriptor(act_desc, CUDNN_ACTIVATION_RELU, CUDNN_PROPAGATE_NAN, 0.0));
+
+    float alpha = 1.0f, beta = 0.0f;
+    CUDNN_CHECK(cudnnActivationForward(handle, act_desc, &alpha, input_desc.get(), input_contig.data_ptr<float>(), &beta, input_desc.get(), output.data_ptr<float>()));
+
+    cudnnDestroyActivationDescriptor(act_desc);
+    return output;
+}
+
+// Max pooling forward using cuDNN
+torch::Tensor max_pool2d_forward(torch::Tensor input, int64_t kernel_size, int64_t stride, int64_t padding, int64_t dilation) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+    TORCH_CHECK(input.dim() == 4, "input must be 4D (N,C,H,W)");
+    TORCH_CHECK(dilation == 1, "only dilation=1 supported");
+
+    auto input_contig = input.contiguous();
+    int n = input_contig.size(0);
+    int c = input_contig.size(1);
+    int h_in = input_contig.size(2);
+    int w_in = input_contig.size(3);
+    int h_out = (h_in + 2 * padding - kernel_size) / stride + 1;
+    int w_out = (w_in + 2 * padding - kernel_size) / stride + 1;
+    TORCH_CHECK(h_out > 0 && w_out > 0, "invalid pooling output size");
+
+    auto output = torch::empty({n, c, h_out, w_out}, input_contig.options());
+
+    cudnnHandle_t handle = get_cudnn_handle();
+    set_cudnn_stream(handle);
+
+    auto input_desc = TensorDescPtr(create_tensor_descriptor(input_contig));
+    auto output_desc = TensorDescPtr(create_tensor_descriptor(output));
+    auto pooling_desc = PoolingDescPtr(create_pooling_descriptor(kernel_size, stride, padding));
+
+    float alpha = 1.0f, beta = 0.0f;
+    CUDNN_CHECK(cudnnPoolingForward(handle, pooling_desc.get(), &alpha, input_desc.get(), input_contig.data_ptr<float>(), &beta, output_desc.get(), output.data_ptr<float>()));
+
+    return output;
+}
+
+// Registration
+void register_custom_ops(pybind11::module& m) {
+    m.def("conv2d_forward", &conv2d_forward, "Conv2d forward using cuDNN",
+          py::arg("input"), py::arg("weight"), py::arg("bias"),
+          py::arg("stride_h"), py::arg("stride_w"), py::arg("padding_h"), py::arg("padding_w"));
+    m.def("relu_forward", &relu_forward, "ReLU forward using cuDNN", py::arg("input"));
+    m.def("max_pool2d_forward", &max_pool2d_forward, "MaxPool2d forward using cuDNN",
+          py::arg("input"), py::arg("kernel_size"), py::arg("stride"), py::arg("padding"), py::arg("dilation"));
+}
+
+REGISTER_BINDING(custom_ops, register_custom_ops);

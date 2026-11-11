@@ -1,0 +1,121 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -13,17 +13,36 @@
+     const float* __restrict__ input,
+     float* __restrict__ values_out,
+     int64_t* __restrict__ indices_out,
++    int N,
+     int C,
+     int H,
+     int W,
+     float divisor)
+ {
+-    // Total number of spatial positions: N * H * W
+-    int N = gridDim.x; // one block per batch? No, gridDim.x is number of blocks, not N.
+-    // Instead, compute global thread index.
++    int total_spatial = N * H * W;
+     int tid = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total_spatial = N * H * W; // need N, but we didn't pass N directly. We can compute N from grid? not reliable.
+-    // We'll pass N explicitly in the launcher and store it in a special way? Better to pass N as a separate argument.
++    int stride = blockDim.x * gridDim.x;
++
++    for (int pos = tid; pos < total_spatial; pos += stride) {
++        int n = pos / (H * W);
++        int residual = pos % (H * W);
++        int h = residual / W;
++        int w = residual % W;
++
++        const float* in_ptr = input + n * C * H * W + h * W + w;
++        float max_val = in_ptr[0];
++        int64_t max_idx = 0;
++        for (int c = 1; c < C; ++c) {
++            float val = in_ptr[c * H * W];
++            if (val > max_val) {
++                max_val = val;
++                max_idx = c;
++            }
++        }
++
++        values_out[n * H * W + h * W + w] = max_val / divisor;
++        indices_out[n * H * W + h * W + w] = max_idx;
++    }
+ }
+ 
+ // Launcher function (extern "C" to avoid name mangling)
+@@ -35,12 +54,10 @@
+     int C,
+     int H,
+     int W,
+-    double divisor,   // divisor as double, but kernel expects float; convert before launch
++    double divisor,
+     cudaStream_t stream)
+ {
+-    // Cast divisor to float for kernel
+     float divisor_f = static_cast<float>(divisor);
+-
+     int total_spatial = N * H * W;
+     int threads = 256;
+     int blocks = (total_spatial + threads - 1) / threads;
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -17,13 +17,12 @@
+     cudaStream_t stream);
+ 
+ // PyTorch binding for fused max reduction along dim=1 and division
+-torch::Tensor max_reduce_div_forward(
++py::tuple max_reduce_div_forward(
+     torch::Tensor x,
+     int64_t dim,
+     bool keepdim,
+     double divisor)
+ {
+-    // Input checks
+     TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
+     TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(x.dim() == 4, "Input must be 4-dimensional [N,C,H,W]");
+@@ -31,12 +30,11 @@
+     TORCH_CHECK(keepdim, "keepdim must be true for this op");
+     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+ 
+-    auto N = x.size(0);
+-    auto C = x.size(1);
+-    auto H = x.size(2);
+-    auto W = x.size(3);
++    auto N = static_cast<int>(x.size(0));
++    auto C = static_cast<int>(x.size(1));
++    auto H = static_cast<int>(x.size(2));
++    auto W = static_cast<int>(x.size(3));
+ 
+-    // Output shapes: [N, 1, H, W]
+     auto values = torch::empty({N, 1, H, W}, x.options());
+     auto indices = torch::empty({N, 1, H, W}, x.options().dtype(torch::kInt64));
+ 
+@@ -46,18 +44,16 @@
+         x.data_ptr<float>(),
+         values.data_ptr<float>(),
+         indices.data_ptr<int64_t>(),
+-        static_cast<int>(N),
+-        static_cast<int>(C),
+-        static_cast<int>(H),
+-        static_cast<int>(W),
++        N,
++        C,
++        H,
++        W,
+         divisor,
+         stream);
+ 
+-    // Return tuple as torch::Tuple-like; pybind will handle conversion
+     return py::make_tuple(values, indices);
+ }
+ 
+-// Registration function
+ void register_custom_ops(pybind11::module& m) {
+     m.def("max_reduce_div_forward", &max_reduce_div_forward,
+           "Fused max reduction over dim=1 and division by scalar",
+@@ -67,5 +63,4 @@
+           py::arg("divisor"));
+ }
+ 
+-// Auto-register
+ REGISTER_BINDING(custom_ops, register_custom_ops);

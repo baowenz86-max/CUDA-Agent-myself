@@ -1,0 +1,388 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,149 @@
++#include <cuda_runtime.h>
++
++// Helper macros for error checking
++#define CUDA_CHECK(call)                                                        \
++    do {                                                                        \
++        cudaError_t err = call;                                                 \
++        if (err != cudaSuccess) {                                               \
++            // In production launcher, just report via cudaGetLastError.        \
++            // We cannot throw here; binding will check after call.             \
++            break;                                                               \
++        }                                                                       \
++    } while (0)
++
++// -----------------------------------------------------------------------------
++// BatchNorm2d inference (evaluation mode)
++// y = weight * (x - running_mean) / sqrt(running_var + eps) + bias
++// Each thread handles one element.
++// -----------------------------------------------------------------------------
++__global__ void batch_norm_eval_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    int N, int C, int H, int W,
++    float eps
++) {
++    int64_t total = (int64_t)N * C * H * W;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        // Compute channel index: i % (H*W) / (H*W) but we can compute easier
++        int n = (int)(i / ((int64_t)C * H * W));
++        int rem = (int)(i % ((int64_t)C * H * W));
++        int c = rem / (H * W);
++
++        float mean = running_mean[c];
++        float var = running_var[c];
++        float inv_std = rsqrtf(var + eps);
++        float gamma = (weight != nullptr) ? weight[c] : 1.0f;
++        float beta = (bias != nullptr) ? bias[c] : 0.0f;
++
++        y[i] = gamma * (x[i] - mean) * inv_std + beta;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// AvgPool2d forward (kernel_size=3 assumed, stride=2, padding=0)
++// Each thread computes one output element (n, c, oh, ow).
++// -----------------------------------------------------------------------------
++__global__ void avg_pool2d_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    int N, int C, int H, int W,
++    int outputH, int outputW,
++    int kernel_size, int stride, int padding
++) {
++    int64_t total = (int64_t)N * C * outputH * outputW;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride_grid = (int64_t)gridDim.x * blockDim.x;
++
++    for (int64_t i = idx; i < total; i += stride_grid) {
++        int n = (int)(i / ((int64_t)C * outputH * outputW));
++        int rem = (int)(i % ((int64_t)C * outputH * outputW));
++        int c = rem / (outputH * outputW);
++        int ohw = rem % (outputH * outputW);
++        int oh = ohw / outputW;
++        int ow = ohw % outputW;
++
++        int h_start = oh * stride - padding;
++        int w_start = ow * stride - padding;
++        int h_end = h_start + kernel_size;
++        int w_end = w_start + kernel_size;
++        // With padding=0, boundaries are simple: h_start >= 0 and h_end <= H
++        // For general padding, handle bounds.
++        int h_begin = max(h_start, 0);
++        int w_begin = max(w_start, 0);
++        int h_last = min(h_end, H);
++        int w_last = min(w_end, W);
++
++        float sum = 0.0f;
++        int count = 0;
++        for (int h = h_begin; h < h_last; ++h) {
++            for (int w = w_begin; w < w_last; ++w) {
++                sum += x[((int64_t)n * C + c) * H * W + h * W + w];
++                ++count;
++            }
++        }
++        if (count > 0) {
++            y[i] = sum / count;
++        } else {
++            y[i] = 0.0f;  // shouldn't happen with valid kernel/padding
++        }
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Launchers exported for binding layer
++// -----------------------------------------------------------------------------
++
++extern "C" void custom_batch_norm2d_launcher(
++    const float* x,
++    float* y,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    int N, int C, int H, int W,
++    float eps,
++    cudaStream_t stream
++) {
++    int64_t total = (int64_t)N * C * H * W;
++    if (total == 0) return;
++
++    int block_size = 256;
++    int grid_size = (int)min((int64_t)65535, (total + block_size - 1) / block_size);
++    // If total exceeds grid_size*block_size, grid-stride loop covers.
++
++    batch_norm_eval_kernel<<<grid_size, block_size, 0, stream>>>(
++        x, y, weight, bias, running_mean, running_var,
++        N, C, H, W, eps
++    );
++
++    // Binding will call cudaGetLastError after launcher returns.
++}
++
++extern "C" void custom_avg_pool2d_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    int outputH, int outputW,
++    int kernel_size, int stride, int padding,
++    cudaStream_t stream
++) {
++    int64_t total = (int64_t)N * C * outputH * outputW;
++    if (total == 0) return;
++
++    int block_size = 256;
++    int grid_size = (int)min((int64_t)65535, (total + block_size - 1) / block_size);
++
++    avg_pool2d_kernel<<<grid_size, block_size, 0, stream>>>(
++        x, y,
++        N, C, H, W,
++        outputH, outputW,
++        kernel_size, stride, padding
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,178 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_batch_norm2d_launcher(
++    const float* x,
++    float* y,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    int N, int C, int H, int W,
++    float eps,
++    cudaStream_t stream
++);
++
++extern "C" void custom_avg_pool2d_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    int outputH, int outputW,
++    int kernel_size, int stride, int padding,
++    cudaStream_t stream
++);
++
++// BatchNorm2d wrapper
++torch::Tensor custom_batch_norm2d(
++    torch::Tensor x,
++    c10::optional<torch::Tensor> weight,
++    c10::optional<torch::Tensor> bias,
++    c10::optional<torch::Tensor> running_mean,
++    c10::optional<torch::Tensor> running_var,
++    bool training,
++    double momentum = 0.1,
++    double eps = 1e-05
++) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(!training, "training mode not supported in this binding");
++
++    auto x_contig = x.contiguous();
++    auto N = x_contig.size(0);
++    auto C = x_contig.size(1);
++    auto H = x_contig.size(2);
++    auto W = x_contig.size(3);
++
++    // Output same shape
++    auto y = torch::empty_like(x_contig);
++
++    // Optional tensors: ensure they are CUDA float32 contiguous if provided
++    const float* weight_ptr = nullptr;
++    const float* bias_ptr = nullptr;
++    const float* running_mean_ptr = nullptr;
++    const float* running_var_ptr = nullptr;
++
++    if (weight.has_value() && weight->defined()) {
++        TORCH_CHECK(weight->is_cuda(), "weight must be CUDA");
++        TORCH_CHECK(weight->dtype() == torch::kFloat32, "weight must be float32");
++        TORCH_CHECK(weight->numel() == C, "weight size mismatch");
++        auto w_contig = weight->contiguous();
++        weight_ptr = w_contig.data_ptr<float>();
++    }
++    if (bias.has_value() && bias->defined()) {
++        TORCH_CHECK(bias->is_cuda(), "bias must be CUDA");
++        TORCH_CHECK(bias->dtype() == torch::kFloat32, "bias must be float32");
++        TORCH_CHECK(bias->numel() == C, "bias size mismatch");
++        auto b_contig = bias->contiguous();
++        bias_ptr = b_contig.data_ptr<float>();
++    }
++    if (running_mean.has_value() && running_mean->defined()) {
++        TORCH_CHECK(running_mean->is_cuda(), "running_mean must be CUDA");
++        TORCH_CHECK(running_mean->dtype() == torch::kFloat32, "running_mean must be float32");
++        TORCH_CHECK(running_mean->numel() == C, "running_mean size mismatch");
++        auto rm_contig = running_mean->contiguous();
++        running_mean_ptr = rm_contig.data_ptr<float>();
++    }
++    if (running_var.has_value() && running_var->defined()) {
++        TORCH_CHECK(running_var->is_cuda(), "running_var must be CUDA");
++        TORCH_CHECK(running_var->dtype() == torch::kFloat32, "running_var must be float32");
++        TORCH_CHECK(running_var->numel() == C, "running_var size mismatch");
++        auto rv_contig = running_var->contiguous();
++        running_var_ptr = rv_contig.data_ptr<float>();
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_batch_norm2d_launcher(
++        x_contig.data_ptr<float>(),
++        y.data_ptr<float>(),
++        weight_ptr,
++        bias_ptr,
++        running_mean_ptr,
++        running_var_ptr,
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<float>(eps),
++        stream
++    );
++
++    // Check for errors after launch
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "BatchNorm2d launcher failed: ", cudaGetErrorString(err));
++    return y;
++}
++
++// AvgPool2d wrapper
++torch::Tensor custom_avg_pool2d(
++    torch::Tensor x,
++    int64_t kernel_size,
++    int64_t stride,
++    int64_t padding = 0
++) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++
++    auto x_contig = x.contiguous();
++    auto N = x_contig.size(0);
++    auto C = x_contig.size(1);
++    auto H = x_contig.size(2);
++    auto W = x_contig.size(3);
++
++    int64_t outputH = (H + 2 * padding - kernel_size) / stride + 1;
++    int64_t outputW = (W + 2 * padding - kernel_size) / stride + 1;
++    TORCH_CHECK(outputH > 0 && outputW > 0, "Invalid output dimensions");
++
++    auto y = torch::empty({N, C, outputH, outputW}, x_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_avg_pool2d_launcher(
++        x_contig.data_ptr<float>(),
++        y.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(outputH),
++        static_cast<int>(outputW),
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "AvgPool2d launcher failed: ", cudaGetErrorString(err));
++    return y;
++}
++
++// Register both functions
++void register_custom_ops_binding(pybind11::module& m) {
++    m.def("custom_batch_norm2d", &custom_batch_norm2d,
++          "BatchNorm2d inference (evaluation mode) custom op",
++          py::arg("x"),
++          py::arg("weight"),
++          py::arg("bias"),
++          py::arg("running_mean"),
++          py::arg("running_var"),
++          py::arg("training"),
++          py::arg("momentum") = 0.1,
++          py::arg("eps") = 1e-05);
++
++    m.def("custom_avg_pool2d", &custom_avg_pool2d,
++          "AvgPool2d custom op",
++          py::arg("x"),
++          py::arg("kernel_size"),
++          py::arg("stride"),
++          py::arg("padding") = 0);
++}
++
++REGISTER_BINDING(custom_ops_binding, register_custom_ops_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,52 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, num_units, kernel_size, stride):
++        super().__init__()
++        self.batch_norm = nn.BatchNorm2d(in_channels)
++        self.avg_pool = nn.AvgPool2d(kernel_size=kernel_size, stride=stride)
++        self.num_units = num_units
++
++    def forward(self, x):
++        x = cuda_extension.custom_batch_norm2d(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.training,
++            0.1,
++            1e-05,
++        )
++        x = cuda_extension.custom_avg_pool2d(
++            x,
++            self.avg_pool.kernel_size,
++            self.avg_pool.stride,
++            self.avg_pool.padding,
++        )
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.custom_batch_norm2d(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.training,
++            0.1,
++            1e-05,
++        )
++        yield 'step_001', x
++        x = cuda_extension.custom_avg_pool2d(
++            x,
++            self.avg_pool.kernel_size,
++            self.avg_pool.stride,
++            self.avg_pool.padding,
++        )
++        yield 'step_002', x
++        yield 'step_003', x

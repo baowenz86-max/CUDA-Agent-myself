@@ -1,0 +1,301 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,5 +1,6 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
++#include <cstdio>
+ 
+ // CUDA error check helper
+ #define CUDA_CHECK(call)                                                     \
+@@ -111,6 +112,14 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
++// Combine bias kernel: out = a + b
++// -----------------------------------------------------------------------------
++__global__ void combine_bias_kernel(float* out, const float* a, const float* b, int n) {
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  if (idx < n) out[idx] = a[idx] + b[idx];
++}
++
++// -----------------------------------------------------------------------------
+ // LSTM forward kernel (two layers, unidirectional)
+ // Input: x [batch, seq_len, input_size]
+ // Weights and biases for layer 0 and layer 1
+@@ -120,79 +129,6 @@
+ // Helper: sigmoid function
+ __device__ __forceinline__ float sigmoidf(float x) {
+   return 1.0f / (1.0f + expf(-x));
+-}
+-
+-// Kernel: each block processes one (batch, layer) pair for all time steps.
+-// Shared memory stores h_prev and c_prev for that (batch, layer).
+-// Grid: (batch, num_layers) blocks.
+-__global__ void lstm_forward_kernel(
+-    const float* __restrict__ x,        // layer0 input: [batch, seq, input_size]
+-    const float* __restrict__ weight_ih_l0, // [4*hidden, input_size]
+-    const float* __restrict__ weight_hh_l0, // [4*hidden, hidden]
+-    const float* __restrict__ bias_l0,      // [4*hidden] combined bias
+-    const float* __restrict__ weight_ih_l1, // [4*hidden, hidden]
+-    const float* __restrict__ weight_hh_l1, // [4*hidden, hidden]
+-    const float* __restrict__ bias_l1,      // [4*hidden] combined bias
+-    float* __restrict__ y,             // output [batch, seq, hidden]
+-    float* __restrict__ h_n,           // [2, batch, hidden]
+-    float* __restrict__ c_n,           // [2, batch, hidden]
+-    int batch,
+-    int seq_len,
+-    int input_size,
+-    int hidden_size) {
+-
+-  extern __shared__ float smem[];
+-  // Layout: h[hidden_size], c[hidden_size], then gates[HIDDEN]
+-  int bid = blockIdx.x;   // batch index
+-  int layer = blockIdx.y; // layer index (0 or 1)
+-
+-  // For layer 0, input feature dim = input_size; for layer 1, = hidden_size
+-  int in_dim = (layer == 0) ? input_size : hidden_size;
+-
+-  // Determine weights and bias for this layer
+-  const float* W_ih = (layer == 0) ? weight_ih_l0 : weight_ih_l1;
+-  const float* W_hh = (layer == 0) ? weight_hh_l0 : weight_hh_l1;
+-  const float* bias = (layer == 0) ? bias_l0 : bias_l1;
+-
+-  // Input pointer: for layer 0 use x[bid]; for layer 1 use y[bid] already computed? 
+-  // Since layers are processed sequentially, we launch kernel with same grid, but 
+-  // layer1 depends on layer0 output. We assume layer0 is computed first and __syncthreads 
+-  // across blocks is not possible. Instead, we organize a single kernel with two phases, 
+-  // or call kernel twice.
+-  // Here we implement a single kernel that loops over layers internally, using global sync? 
+-  // Too complex. Simpler: launch kernel once with gridDim.y = batch, and inside loop over time, 
+-  // after each time step for layer0, we need to store output, then layer1 can read it.
+-  // However, different blocks handle different batch, so no dependency across blocks.
+-  // For a given batch, layer0 and layer1 of same time step can be computed sequentially within 
+-  // the same block if we allocate separate shared memory? But hidden states for both layers needed.
+-  // We can compute both layers within one block: process time step t: compute layer0 gates using x[t], 
+-  // update h0,c0, write y0[t]; then compute layer1 gates using y0[t], update h1,c1, write y[t].
+-  // This requires h0,c0 and h1,c1 stored in shared memory. We'll do that.
+-  // Therefore gridDim = (batch) only, and we compute both layers per block.
+-  // However, the kernel below currently assumes gridDim.y = num_layers; adjust to one block per batch.
+-  // We'll rewrite appropriately.
+-}
+-
+-// Launcher will call a kernel that processes both layers per batch block.
+-extern "C" void lstm_forward_launcher(
+-    const float* x,
+-    const float* weight_ih_l0,
+-    const float* weight_hh_l0,
+-    const float* bias_ih_l0,
+-    const float* bias_hh_l0,
+-    const float* weight_ih_l1,
+-    const float* weight_hh_l1,
+-    const float* bias_ih_l1,
+-    const float* bias_hh_l1,
+-    float* y,
+-    float* h_n,
+-    float* c_n,
+-    int batch,
+-    int seq_len,
+-    int input_size,
+-    int hidden_size,
+-    cudaStream_t stream) {
+-  // Placeholder: not used, actual implementation below in separate kernel.
+ }
+ 
+ // Actual LSTM kernel: one block per batch, processes both layers.
+@@ -240,37 +176,26 @@
+   const float* x_b = x + (int64_t)bid * seq_len * I;
+   float* y_b = y + (int64_t)bid * seq_len * H;
+ 
+-  // Gate computation helpers (assume H threads to cover H, if blockDim < H, loop)
+-  // We use blockDim threads, typically 256, and H=256, so one thread per hidden unit.
++  // Gate arrays in shared memory: i0,f0,g0,o0,i1,f1,g1,o1
++  float* i0 = smem + 4 * H;
++  float* f0 = smem + 5 * H;
++  float* g0 = smem + 6 * H;
++  float* o0 = smem + 7 * H;
++  float* i1 = smem + 8 * H;
++  float* f1 = smem + 9 * H;
++  float* g1 = smem + 10 * H;
++  float* o1 = smem + 11 * H;
+ 
+   for (int t = 0; t < seq_len; ++t) {
+     // ----- Layer 0 -----
+     const float* x_t = x_b + t * I;
+-    // gate arrays in shared memory: i, f, g, o (each size H)
+-    // Reuse additional shared memory beyond h/c, need allocation in launcher
+-    // For simplicity, compute each gate one by one using temporary thread-local registers? 
+-    // Better: allocate gates in shared memory: i0,f0,g0,o0,i1,f1,g1,o1 => 8*H floats
+-    // We'll declare shmem size accordingly in launcher.
+-
+-    // Since we already defined only 4 arrays for states, we'll place gates after.
+-    // In this kernel, we assume shared memory size = (4 + 8) * H * sizeof(float).
+-    float* i0 = smem + 4 * H;
+-    float* f0 = smem + 5 * H;
+-    float* g0 = smem + 6 * H;
+-    float* o0 = smem + 7 * H;
+-    float* i1 = smem + 8 * H;
+-    float* f1 = smem + 9 * H;
+-    float* g1 = smem + 10 * H;
+-    float* o1 = smem + 11 * H;
+-
+-    // Compute gates for layer0: for each hidden index j (0..H-1)
++
+     for (int j = tid; j < H; j += threads) {
+       float pre_i = bias_l0[j];
+       float pre_f = bias_l0[H + j];
+       float pre_g = bias_l0[2 * H + j];
+       float pre_o = bias_l0[3 * H + j];
+ 
+-      // Input contribution: sum over k
+       for (int k = 0; k < I; ++k) {
+         float x_val = x_t[k];
+         pre_i += weight_ih_l0[j * I + k] * x_val;
+@@ -278,7 +203,6 @@
+         pre_g += weight_ih_l0[(2 * H + j) * I + k] * x_val;
+         pre_o += weight_ih_l0[(3 * H + j) * I + k] * x_val;
+       }
+-      // Hidden contribution
+       for (int k = 0; k < H; ++k) {
+         float h_val = h0[k];
+         pre_i += weight_hh_l0[j * H + k] * h_val;
+@@ -294,19 +218,15 @@
+     }
+     __syncthreads();
+ 
+-    // Update c0 and h0 for layer0
+     for (int j = tid; j < H; j += threads) {
+       c0[j] = f0[j] * c0[j] + i0[j] * g0[j];
+       h0[j] = o0[j] * tanhf(c0[j]);
+-      // Store layer0 output to y_b (this will be input to layer1)
+       y_b[t * H + j] = h0[j];
+     }
+     __syncthreads();
+ 
+     // ----- Layer 1 -----
+-    // Input for layer1 is y_b[t * H + ...] which is h0
+-    // We can read from shared h0 (already synchronized)
+-    const float* in1 = h0; // alias to h0 (layer0 output at current time)
++    const float* in1 = h0;
+ 
+     for (int j = tid; j < H; j += threads) {
+       float pre_i = bias_l1[j];
+@@ -315,7 +235,7 @@
+       float pre_o = bias_l1[3 * H + j];
+ 
+       for (int k = 0; k < H; ++k) {
+-        float val = in1[k]; // h0[k]
++        float val = in1[k];
+         pre_i += weight_ih_l1[j * H + k] * val;
+         pre_f += weight_ih_l1[(H + j) * H + k] * val;
+         pre_g += weight_ih_l1[(2 * H + j) * H + k] * val;
+@@ -336,21 +256,18 @@
+     }
+     __syncthreads();
+ 
+-    // Update c1 and h1 for layer1
+     for (int j = tid; j < H; j += threads) {
+       c1[j] = f1[j] * c1[j] + i1[j] * g1[j];
+       h1[j] = o1[j] * tanhf(c1[j]);
+-      // Store final output y_b[t * H + j]
+       y_b[t * H + j] = h1[j];
+     }
+     __syncthreads();
+   }
+ 
+-  // After all time steps, write final h_n and c_n for this batch (layer 0 and 1)
+   for (int j = tid; j < H; j += threads) {
+-    h_n[0 * batch * H + bid * H + j] = h0[j];  // layer 0 h_n
++    h_n[0 * batch * H + bid * H + j] = h0[j];
+     c_n[0 * batch * H + bid * H + j] = c0[j];
+-    h_n[1 * batch * H + bid * H + j] = h1[j];  // layer 1 h_n
++    h_n[1 * batch * H + bid * H + j] = h1[j];
+     c_n[1 * batch * H + bid * H + j] = c1[j];
+   }
+ }
+@@ -376,29 +293,18 @@
+     cudaStream_t stream) {
+ 
+   // Combine biases: bias = bias_ih + bias_hh
+-  // We need to allocate temporary arrays for combined bias; do on host with cudaMalloc
+   float *bias_l0, *bias_l1;
+   cudaMalloc(&bias_l0, 4 * hidden_size * sizeof(float));
+   cudaMalloc(&bias_l1, 4 * hidden_size * sizeof(float));
+ 
+-  // Simple kernel to combine
+   int total_bias = 4 * hidden_size;
+   int threads_bias = 256;
+   int blocks_bias = (total_bias + threads_bias - 1) / threads_bias;
+-  // Launch a kernel to compute bias_l0 = bias_ih_l0 + bias_hh_l0
+-  // We'll define a small kernel inline? Easier: use cudaMemcpyAsync? But we need sum on device.
+-  // We'll create a small kernel combine_bias_kernel.
+-  // To keep file concise, we define here.
+-  {
+-    __global__ void combine_bias_kernel(float* out, const float* a, const float* b, int n) {
+-      int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-      if (idx < n) out[idx] = a[idx] + b[idx];
+-    }
+-    combine_bias_kernel<<<blocks_bias, threads_bias, 0, stream>>>(
+-        bias_l0, bias_ih_l0, bias_hh_l0, total_bias);
+-    combine_bias_kernel<<<blocks_bias, threads_bias, 0, stream>>>(
+-        bias_l1, bias_ih_l1, bias_hh_l1, total_bias);
+-  }
++
++  combine_bias_kernel<<<blocks_bias, threads_bias, 0, stream>>>(
++      bias_l0, bias_ih_l0, bias_hh_l0, total_bias);
++  combine_bias_kernel<<<blocks_bias, threads_bias, 0, stream>>>(
++      bias_l1, bias_ih_l1, bias_hh_l1, total_bias);
+ 
+   // Launch main LSTM kernel
+   int threads = hidden_size; // assume hidden_size <= 1024, here 256
+@@ -418,47 +324,10 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// Reshape 2D kernel: copies data preserving order. 
+-// Assumes output is contiguous with shape [dim0, dim1]. Input may have arbitrary strides.
+-// -----------------------------------------------------------------------------
+-__global__ void reshape_2d_kernel(const float* __restrict__ x,
+-                                  float* __restrict__ y,
+-                                  int64_t total,
+-                                  int64_t stride_batch_x,
+-                                  int64_t stride_dim1_x,
+-                                  int64_t stride_dim2_x,
+-                                  int dim1_x) {
+-  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+-  int64_t stride = blockDim.x * gridDim.x;
+-  for (int64_t i = idx; i < total; i += stride) {
+-    int64_t d2 = i % dim1_x;
+-    int64_t tmp = i / dim1_x;
+-    int64_t d1 = tmp % dim1_x; // Actually dim1_x is hidden_size? Need careful mapping.
+-    int64_t b = tmp / dim1_x;
+-    // Input 3D shape [batch, seq, hidden], flattened to [batch, seq*hidden]
+-    // For linear index i in output flat [batch, seq*hidden], map to input coordinates:
+-    int64_t b_out = i / (dim1_x * dim1_x); // wait dim1_x is seq? 
+-    // We need input dims: batch, seq, hidden. Let's pass them explicitly.
+-  }
+-}
+-
+-extern "C" void reshape_2d_launcher(const float* x,
+-                                    float* y,
+-                                    int batch,
+-                                    int seq_len,
+-                                    int hidden_size,
+-                                    int64_t stride_batch_x,
+-                                    int64_t stride_seq_x,
+-                                    int64_t stride_hidden_x,
+-                                    cudaStream_t stream) {
+-  int64_t total = (int64_t)batch * seq_len * hidden_size;
+-  int threads = 256;
+-  int64_t blocks64 = (total + threads - 1) / threads;
+-  int blocks = (blocks64 > 1024) ? 1024 : (int)blocks64;
+-  // Use a different kernel with explicit dimensions
+-}
+-
+-// Actual reshape kernel with dimensions
++// Reshape 2D kernel: copies data preserving order.
++// Input x [batch, seq_len, hidden_size], output y [batch, seq_len*hidden_size]
++// Handles arbitrary strides via explicit dimensions.
++// -----------------------------------------------------------------------------
+ __global__ void reshape_2d_dim_kernel(const float* __restrict__ x,
+                                       float* __restrict__ y,
+                                       int batch,

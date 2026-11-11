@@ -1,0 +1,250 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,86 @@
++// kernels/custom_ops.cu
++// CUDA kernels and launchers for embedding_add_forward
++#include <cuda_runtime.h>
++
++// Kernel: compute output[b,s,:] = weight1[x1[b,s], :] + weight2[x2[b,s], :]
++// Inputs x1, x2 are int64 index tensors with shape [batch, seq_len]
++// weight1: [num_embeddings_1, embedding_dim]
++// weight2: [num_embeddings_2, embedding_dim]
++// Output: [batch, seq_len, embedding_dim] float32
++// All pointers are raw device pointers.
++__global__ void embedding_add_kernel(
++    const int64_t* __restrict__ x1,
++    const int64_t* __restrict__ x2,
++    const float* __restrict__ weight1,
++    const float* __restrict__ weight2,
++    float* __restrict__ output,
++    int64_t num_embeddings_1,
++    int64_t num_embeddings_2,
++    int64_t embedding_dim,
++    int64_t batch,
++    int64_t seq_len,
++    int64_t stride_x1_batch,
++    int64_t stride_x1_seq,
++    int64_t stride_x2_batch,
++    int64_t stride_x2_seq)
++{
++    // Total number of output rows = batch * seq_len
++    int64_t total_rows = batch * seq_len;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total_rows) return;
++
++    // Decode (b, s) from linear index
++    int64_t b = idx / seq_len;
++    int64_t s = idx - b * seq_len;
++
++    // Load indices (with strides)
++    int64_t i1 = x1[b * stride_x1_batch + s * stride_x1_seq];
++    int64_t i2 = x2[b * stride_x2_batch + s * stride_x2_seq];
++
++    // Assume indices are in range (contract says valid)
++    // Compute output row pointer: output + idx * embedding_dim
++    float* out_row = output + idx * embedding_dim;
++    const float* w1_row = weight1 + i1 * embedding_dim;
++    const float* w2_row = weight2 + i2 * embedding_dim;
++
++    // Elementwise add over embedding_dim
++    for (int64_t e = 0; e < embedding_dim; ++e) {
++        out_row[e] = w1_row[e] + w2_row[e];
++    }
++}
++
++// Launcher function: no PyTorch dependencies
++extern "C" void embedding_add_launcher(
++    const int64_t* x1,
++    const int64_t* x2,
++    const float* weight1,
++    const float* weight2,
++    float* output,
++    int64_t num_embeddings_1,
++    int64_t num_embeddings_2,
++    int64_t embedding_dim,
++    int64_t batch,
++    int64_t seq_len,
++    int64_t stride_x1_batch,
++    int64_t stride_x1_seq,
++    int64_t stride_x2_batch,
++    int64_t stride_x2_seq,
++    cudaStream_t stream)
++{
++    int64_t total_rows = batch * seq_len;
++    if (total_rows <= 0) return; // no work
++
++    // Launch configuration: one thread per output row
++    const int threads = 256;
++    int64_t blocks = (total_rows + threads - 1) / threads;
++    // Cap blocks to avoid grid dimension overflow? For large batch, we use grid stride loop or just rely on large grid.
++    // CUDA grid dimension can be up to 2^31-1, so no overflow for our sizes.
++    if (blocks > 2147483647) blocks = 2147483647; // safety, but unlikely
++
++    embedding_add_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
++        x1, x2, weight1, weight2, output,
++        num_embeddings_1, num_embeddings_2, embedding_dim,
++        batch, seq_len,
++        stride_x1_batch, stride_x1_seq,
++        stride_x2_batch, stride_x2_seq);
++}
+--- before/kernels/embedding_add_binding.cpp
++++ after/kernels/embedding_add_binding.cpp
+@@ -0,0 +1,112 @@
++// kernels/embedding_add_binding.cpp
++// PyTorch binding for embedding_add_forward
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void embedding_add_launcher(
++    const int64_t* x1,
++    const int64_t* x2,
++    const float* weight1,
++    const float* weight2,
++    float* output,
++    int64_t num_embeddings_1,
++    int64_t num_embeddings_2,
++    int64_t embedding_dim,
++    int64_t batch,
++    int64_t seq_len,
++    int64_t stride_x1_batch,
++    int64_t stride_x1_seq,
++    int64_t stride_x2_batch,
++    int64_t stride_x2_seq,
++    cudaStream_t stream);
++
++torch::Tensor embedding_add_forward(
++    torch::Tensor x1,
++    torch::Tensor x2,
++    torch::Tensor weight1,
++    torch::Tensor weight2,
++    int64_t num_embeddings_1,
++    int64_t num_embeddings_2,
++    int64_t embedding_dim)
++{
++    // Check CUDA device
++    TORCH_CHECK(x1.is_cuda(), "x1 must be a CUDA tensor");
++    TORCH_CHECK(x2.is_cuda(), "x2 must be a CUDA tensor");
++    TORCH_CHECK(weight1.is_cuda(), "weight1 must be a CUDA tensor");
++    TORCH_CHECK(weight2.is_cuda(), "weight2 must be a CUDA tensor");
++
++    // Check dtype
++    TORCH_CHECK(x1.dtype() == torch::kInt64, "x1 must be int64");
++    TORCH_CHECK(x2.dtype() == torch::kInt64, "x2 must be int64");
++    TORCH_CHECK(weight1.dtype() == torch::kFloat32, "weight1 must be float32");
++    TORCH_CHECK(weight2.dtype() == torch::kFloat32, "weight2 must be float32");
++
++    // Check shapes
++    TORCH_CHECK(x1.dim() == 2, "x1 must be 2D");
++    TORCH_CHECK(x2.dim() == 2, "x2 must be 2D");
++    TORCH_CHECK(x1.size(0) == x2.size(0), "batch dimensions must match");
++    TORCH_CHECK(x1.size(1) == x2.size(1), "seq_len dimensions must match");
++    int64_t batch = x1.size(0);
++    int64_t seq_len = x1.size(1);
++    TORCH_CHECK(weight1.dim() == 2, "weight1 must be 2D");
++    TORCH_CHECK(weight2.dim() == 2, "weight2 must be 2D");
++    TORCH_CHECK(weight1.size(0) == num_embeddings_1, "weight1 first dim mismatch");
++    TORCH_CHECK(weight1.size(1) == embedding_dim, "weight1 second dim mismatch");
++    TORCH_CHECK(weight2.size(0) == num_embeddings_2, "weight2 first dim mismatch");
++    TORCH_CHECK(weight2.size(1) == embedding_dim, "weight2 second dim mismatch");
++
++    // Compute strides (assume row-major; if not contiguous, strides are in elements)
++    int64_t stride_x1_batch = x1.stride(0);
++    int64_t stride_x1_seq = x1.stride(1);
++    int64_t stride_x2_batch = x2.stride(0);
++    int64_t stride_x2_seq = x2.stride(1);
++
++    // Allocate output with same device and dtype
++    auto output = torch::empty({batch, seq_len, embedding_dim}, x1.options().dtype(torch::kFloat32));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    embedding_add_launcher(
++        x1.data_ptr<int64_t>(),
++        x2.data_ptr<int64_t>(),
++        weight1.data_ptr<float>(),
++        weight2.data_ptr<float>(),
++        output.data_ptr<float>(),
++        num_embeddings_1,
++        num_embeddings_2,
++        embedding_dim,
++        batch,
++        seq_len,
++        stride_x1_batch,
++        stride_x1_seq,
++        stride_x2_batch,
++        stride_x2_seq,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_embedding_add_forward(pybind11::module& m) {
++    m.def("embedding_add_forward", &embedding_add_forward,
++          "Compute embedding1(x1) + embedding2(x2)",
++          py::arg("x1"),
++          py::arg("x2"),
++          py::arg("weight1"),
++          py::arg("weight2"),
++          py::arg("num_embeddings_1"),
++          py::arg("num_embeddings_2"),
++          py::arg("embedding_dim"));
++}
++
++REGISTER_BINDING(embedding_add_forward, register_embedding_add_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,43 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings_1, num_embeddings_2, embedding_dim):
++        super().__init__()
++        self.embedding1 = nn.Embedding(num_embeddings_1, embedding_dim)
++        self.embedding2 = nn.Embedding(num_embeddings_2, embedding_dim)
++
++    def forward(self, x1, x2):
++        # Move inputs to CUDA if necessary; custom op expects CUDA int64 tensors.
++        if not x1.is_cuda:
++            x1 = x1.cuda()
++        if not x2.is_cuda:
++            x2 = x2.cuda()
++        # Ensure weights are on the same device as inputs (they should be, but we guard).
++        weight1 = self.embedding1.weight.to(x1.device)
++        weight2 = self.embedding2.weight.to(x1.device)
++        num_embeddings_1 = weight1.shape[0]
++        num_embeddings_2 = weight2.shape[0]
++        embedding_dim = weight1.shape[1]
++        return cuda_extension.embedding_add_forward(
++            x1, x2, weight1, weight2,
++            num_embeddings_1, num_embeddings_2, embedding_dim
++        )
++
++    def debug_forward(self, x1, x2):
++        # Same computation as forward but yielding checkpoints.
++        if not x1.is_cuda:
++            x1 = x1.cuda()
++        if not x2.is_cuda:
++            x2 = x2.cuda()
++        weight1 = self.embedding1.weight.to(x1.device)
++        weight2 = self.embedding2.weight.to(x1.device)
++        num_embeddings_1 = weight1.shape[0]
++        num_embeddings_2 = weight2.shape[0]
++        embedding_dim = weight1.shape[1]
++        result = cuda_extension.embedding_add_forward(
++            x1, x2, weight1, weight2,
++            num_embeddings_1, num_embeddings_2, embedding_dim
++        )
++        yield 'step_001', result

@@ -1,0 +1,144 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -18,13 +18,15 @@
+     }
+ }
+ 
++// AvgPool2d kernel: input NCHW, output NCHW
+ __global__ void avg_pool2d_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+     int N, int C, int H, int W,
+     int H_out, int W_out,
+     int kernel_h, int kernel_w,
+-    int stride_h, int stride_w) {
++    int stride_h, int stride_w,
++    int padding_h, int padding_w) {
+     int total = N * C * H_out * W_out;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx >= total) return;
+@@ -38,15 +40,13 @@
+     
+     float sum = 0.0f;
+     int count = 0;
+-    const float* in_base = input + ((int64_t)n * H + 0) * W * C + c;
+-    
+     for (int kh = 0; kh < kernel_h; ++kh) {
+-        int h_in = ho * stride_h + kh;
+-        if (h_in >= H) continue;
++        int hi = ho * stride_h + kh - padding_h;
++        if (hi < 0 || hi >= H) continue;
+         for (int kw = 0; kw < kernel_w; ++kw) {
+-            int w_in = wo * stride_w + kw;
+-            if (w_in >= W) continue;
+-            sum += in_base[(h_in * W + w_in) * C];
++            int wi = wo * stride_w + kw - padding_w;
++            if (wi < 0 || wi >= W) continue;
++            sum += input[((n * C + c) * H + hi) * W + wi];
+             ++count;
+         }
+     }
+@@ -95,7 +95,7 @@
+     }
+ }
+ 
+-// Launcher for avg_pool2d
++// Launcher for avg_pool2d (NCHW)
+ extern "C" void avg_pool2d_launcher(
+     const float* input_gpu,
+     float* output_gpu,
+@@ -103,6 +103,7 @@
+     int H_out, int W_out,
+     int kernel_h, int kernel_w,
+     int stride_h, int stride_w,
++    int padding_h, int padding_w,
+     cudaStream_t stream) {
+     int total = N * C * H_out * W_out;
+     if (total <= 0) return;
+@@ -112,5 +113,6 @@
+     avg_pool2d_kernel<<<blocks, threads, 0, stream>>>(
+         input_gpu, output_gpu,
+         N, C, H, W, H_out, W_out,
+-        kernel_h, kernel_w, stride_h, stride_w);
++        kernel_h, kernel_w, stride_h, stride_w,
++        padding_h, padding_w);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -21,6 +21,7 @@
+     int H_out, int W_out,
+     int kernel_h, int kernel_w,
+     int stride_h, int stride_w,
++    int padding_h, int padding_w,
+     cudaStream_t stream);
+ 
+ // Embedding forward: weight (CUDA float32 [num_embeddings, embedding_dim]), indices (int64, CPU or CUDA)
+@@ -32,7 +33,6 @@
+ 
+     TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
+     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
+-    // Accept both CPU and CUDA indices; launcher handles pointer type
+ 
+     int64_t embedding_dim = weight.size(1);
+     int64_t num_indices = indices.numel();
+@@ -57,26 +57,26 @@
+     return output;
+ }
+ 
+-// AvgPool2d forward: input (CUDA float32 [N, H, W, C]), kernel_size, stride, padding (all ints)
++// AvgPool2d forward: input (CUDA float32 [N,C,H,W]), kernel_size, stride, padding
+ torch::Tensor avg_pool2d_forward(torch::Tensor input, int64_t kernel_size, int64_t stride, int64_t padding) {
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+-    TORCH_CHECK(input.dim() == 4, "input must be 4D (N, H, W, C)");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (N,C,H,W)");
+     TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
+     TORCH_CHECK(stride > 0, "stride must be positive");
+     TORCH_CHECK(padding >= 0, "padding must be non-negative");
+ 
+     int64_t N = input.size(0);
+-    int64_t H = input.size(1);
+-    int64_t W = input.size(2);
+-    int64_t C = input.size(3);
++    int64_t C = input.size(1);
++    int64_t H = input.size(2);
++    int64_t W = input.size(3);
+ 
+     int64_t H_out = (H + 2 * padding - kernel_size) / stride + 1;
+     int64_t W_out = (W + 2 * padding - kernel_size) / stride + 1;
+     TORCH_CHECK(H_out > 0 && W_out > 0, "invalid pooling dimensions");
+ 
+-    auto output = torch::empty({N, H_out, W_out, C}, input.options());
++    auto output = torch::empty({N, C, H_out, W_out}, input.options());
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+ 
+@@ -93,6 +93,8 @@
+         static_cast<int>(kernel_size),
+         static_cast<int>(stride),
+         static_cast<int>(stride),
++        static_cast<int>(padding),
++        static_cast<int>(padding),
+         stream
+     );
+ 
+@@ -104,7 +106,7 @@
+ void register_custom_ops(pybind11::module& m) {
+     m.def("embedding_forward", &embedding_forward, "Embedding lookup (CPU or CUDA indices)",
+           py::arg("weight"), py::arg("indices"));
+-    m.def("avg_pool2d_forward", &avg_pool2d_forward, "2D average pooling (CUDA)",
++    m.def("avg_pool2d_forward", &avg_pool2d_forward, "2D average pooling (CUDA, NCHW)",
+           py::arg("input"), py::arg("kernel_size"), py::arg("stride"), py::arg("padding"));
+ }
+ 
+--- before/model_new.py
++++ after/model_new.py
+@@ -10,7 +10,6 @@
+         self.avg_pool = nn.AvgPool2d(kernel_size, stride=stride)
+ 
+     def forward(self, x):
+-        # Ensure weight is CUDA
+         if not self.embedding.weight.is_cuda:
+             self.embedding.weight.data = self.embedding.weight.data.cuda()
+         x = cuda_extension.embedding_forward(self.embedding.weight, x)

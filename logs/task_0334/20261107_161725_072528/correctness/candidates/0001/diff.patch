@@ -1,0 +1,299 @@
+--- before/kernels/cumprod_binding.cpp
++++ after/kernels/cumprod_binding.cpp
+@@ -0,0 +1,76 @@
++// Binding for cumprod CUDA kernel
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void cumprod_launcher(
++    const float* input,
++    float* output,
++    int dim0,
++    int dim1,
++    int dim2,
++    long long input_stride0,
++    long long input_stride1,
++    long long input_stride2,
++    long long output_stride0,
++    long long output_stride1,
++    long long output_stride2,
++    cudaStream_t stream);
++
++// Wrapper function called from Python
++torch::Tensor cumprod(torch::Tensor input, int64_t dim) {
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 3, "Input must be a 3D tensor");
++    TORCH_CHECK(dim == 0, "Only dim=0 is supported for cumprod");
++
++    // Contract shape is [8192, 3, 4], but we keep generic for 3D tensors.
++    int64_t dim0 = input.size(0);
++    int64_t dim1 = input.size(1);
++    int64_t dim2 = input.size(2);
++
++    // Get strides in elements (they are in bytes in PyTorch, convert to element count)
++    auto strides = input.strides();
++    long long input_stride0 = static_cast<long long>(strides[0]);
++    long long input_stride1 = static_cast<long long>(strides[1]);
++    long long input_stride2 = static_cast<long long>(strides[2]);
++
++    // Allocate output with same sizes and strides
++    auto output = torch::empty_strided(input.sizes(), input.strides(), input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    cumprod_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(dim0),
++        static_cast<int>(dim1),
++        static_cast<int>(dim2),
++        input_stride0,
++        input_stride1,
++        input_stride2,
++        static_cast<long long>(output.strides()[0]),
++        static_cast<long long>(output.strides()[1]),
++        static_cast<long long>(output.strides()[2]),
++        stream);
++
++    // Check for kernel launch errors
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++
++    return output;
++}
++
++// Registration function
++void register_cumprod(pybind11::module& m) {
++    m.def("cumprod", &cumprod, "Cumulative product along dimension 0",
++          pybind11::arg("input"), pybind11::arg("dim"));
++}
++
++// Auto-register
++REGISTER_BINDING(cumprod, register_cumprod);
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,195 @@
++#include <cuda_runtime.h>
++
++// Kernel: cumulative product along dimension 0 for a 3D tensor.
++// Input shape: (dim0, dim1, dim2). We compute cumprod along dim0.
++// The input and output tensors may have arbitrary strides, so we use
++// linear addressing for the inner dim1*dim2 elements, and for each
++// such inner index, iterate over dim0 to compute the cumulative product.
++// This approach avoids assuming contiguous memory while maintaining
++// coalesced access for the inner dimensions.
++__global__ void cumprod_along_dim0_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int dim0,
++    int inner_size,          // dim1 * dim2
++    long long input_stride0, // stride in elements for dim0
++    long long input_stride_inner, // stride in elements within inner dims (usually 1, but not guaranteed)
++    long long output_stride0,
++    long long output_stride_inner)
++{
++    int inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (inner_idx >= inner_size) return;
++
++    // Compute base pointer offset for this inner index.
++    // For non-contiguous inner dims, we need to compute the linear index
++    // by considering inner strides. However, we assume the inner dims are
++    // contiguous for simplicity (as in the contract stride [12,4,1]).
++    // To be fully general, we could pass the strides for each inner dim,
++    // but the contract only requires support for the given strides and
++    // arbitrary strides along non-reduced dims should be handled, but
++    // here we focus on the typical case.
++    // The contract specifically says "supports strides" and the reference
++    // tensor has stride [12,4,1] (contiguous inner). We'll handle arbitrary
++    // stride0 and inner stride, but assume inner stride is constant.
++    // For the general case, one could compute the offset using modular arithmetic,
++    // but that would be slower. We'll rely on the binding code to ensure
++    // contiguity for inner dimensions if needed.
++    // However, we can support arbitrary inner strides by passing a single
++    // stride for the innermost dimension and assuming the second inner dim
++    // stride is dim2 * inner_stride, but that's not general.
++    // Since contract allows only these shapes, we'll keep it simple.
++    // In practice, torch tensors from randn are contiguous, and even if
++    // the outer stride is not contiguous, inner dims are contiguous.
++    // So we can compute the starting offset for inner index as
++    // (inner_idx % dim2) * input_stride_inner + (inner_idx / dim2) * (input_stride_inner * dim2)
++    // but if strides are arbitrary, we need more info.
++    // To be safe, we'll require that the inner dimensions are contiguous,
++    // which is the case for the given contract.
++    // So we assume input_stride_inner == 1 and the stride for dim1 is dim2.
++    // Then the offset for inner_idx is simply inner_idx * input_stride_inner.
++    // This is valid if the tensor is contiguous in the inner dims.
++    // The launcher will check contiguity and possibly make contiguous.
++    // Actually, we can support any inner stride by computing
++    // int dim2 = ... but we don't have dim2 separately.
++    // We'll pass dim1 and dim2, but for now we assume inner linear indexing.
++    // We'll adjust later if needed.
++
++    long long input_offset = inner_idx * input_stride_inner;
++    long long output_offset = inner_idx * output_stride_inner;
++
++    float cum = 1.0f;
++    for (int i = 0; i < dim0; ++i) {
++        cum *= input[input_offset + i * input_stride0];
++        output[output_offset + i * output_stride0] = cum;
++    }
++}
++
++// Host launcher: computes cumprod along dim=0 for a 3D tensor.
++// Parameters:
++//   input: pointer to input data (float)
++//   output: pointer to output data (float)
++//   dim0, dim1, dim2: tensor dimensions
++//   input_stride0, input_stride1, input_stride2: strides in elements
++//   output_stride0, ...: output strides (usually same as input)
++//   stream: CUDA stream to launch on
++// The launcher is responsible for choosing grid/block based on inner_size.
++extern "C" void cumprod_launcher(
++    const float* input,
++    float* output,
++    int dim0,
++    int dim1,
++    int dim2,
++    long long input_stride0,
++    long long input_stride1,
++    long long input_stride2,
++    long long output_stride0,
++    long long output_stride1,
++    long long output_stride2,
++    cudaStream_t stream)
++{
++    int inner_size = dim1 * dim2;
++
++    // Check if inner dimensions are contiguous (stride2 == 1 and stride1 == dim2)
++    // If not, we need a more general kernel. But for now, we assume they are.
++    // The launcher will be called from binding code that ensures contiguous
++    // tensor or passes strides accordingly. Since contract only tests contiguous
++    // tensors (from randn), it's safe to assume.
++    // For robustness, if not contiguous, we can fallback to a kernel that
++    // computes offset per inner index using modular arithmetic, but not needed.
++    // We'll add a check and if not contiguous, we still use the simple kernel
++    // but with incorrect indexing? To avoid wrong results, we should require
++    // contiguity in inner dims, and the binding will call .contiguous() if needed.
++    // However, to keep launcher independent of torch, we cannot call .contiguous().
++    // So we assume the tensors are already contiguous in inner dims.
++    // Actually, we can handle arbitrary inner strides if we pass dim1 and dim2,
++    // and compute offsets using integer division and modulo:
++    //   int idx0 = inner_idx % dim2;
++    //   int idx1 = (inner_idx / dim2) % dim1;
++    //   int idx2 = inner_idx % dim2;
++    // But that requires dim1 and dim2 to be powers? Not necessarily.
++    // We can compute the offset as:
++    //   long long offset = (inner_idx % dim2) * input_stride2 +
++    //                      ((inner_idx / dim2) % dim1) * input_stride1 +
++    //                      (inner_idx / (dim1*dim2)) * input_stride0; // but dim0 loop separate
++    // However, we are iterating over dim0 inside, so we need base offset for each inner index.
++    // The base offset for inner index = (inner_idx % dim2) * input_stride2 +
++    //                                 ((inner_idx / dim2) % dim1) * input_stride1.
++    // That is general and works with any strides.
++    // Let's implement that in the kernel by passing dim1, dim2, and strides.
++    // That is more general and correct.
++    // We'll modify kernel to take dim1, dim2, input_stride1, input_stride2, etc.
++    // Then inner_size = dim1*dim2.
++    // For each inner_idx, compute inner_offset = (inner_idx % dim2) * input_stride2 +
++    //                                          ((inner_idx / dim2) % dim1) * input_stride1.
++    // Then for i in 0..dim0-1, access input[inner_offset + i * input_stride0].
++    // This works for arbitrary strides.
++    // Similarly for output.
++    // Let's update kernel accordingly.
++    int block_size = 256;
++    int grid_size = (inner_size + block_size - 1) / block_size;
++
++    // Use a grid-stride loop if inner_size > grid*block, but we already have one block per element if needed.
++    // Actually, we can use a simple one-thread-per-inner-element approach.
++    cumprod_along_dim0_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, dim0, dim1, dim2,
++        input_stride0, input_stride1, input_stride2,
++        output_stride0, output_stride1, output_stride2);
++}
++
++// Kernel with general stride support
++__global__ void cumprod_along_dim0_kernel_general(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int dim0,
++    int dim1,
++    int dim2,
++    long long input_stride0,
++    long long input_stride1,
++    long long input_stride2,
++    long long output_stride0,
++    long long output_stride1,
++    long long output_stride2)
++{
++    int inner_size = dim1 * dim2;
++    int inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (inner_idx >= inner_size) return;
++
++    // Compute base offsets for this inner index using modular arithmetic.
++    // inner_idx = idx1 * dim2 + idx2 (assuming row-major order)
++    int idx2 = inner_idx % dim2;
++    int idx1 = (inner_idx / dim2) % dim1;
++
++    long long input_base = idx1 * input_stride1 + idx2 * input_stride2;
++    long long output_base = idx1 * output_stride1 + idx2 * output_stride2;
++
++    float cum = 1.0f;
++    for (int i = 0; i < dim0; ++i) {
++        cum *= input[input_base + i * input_stride0];
++        output[output_base + i * output_stride0] = cum;
++    }
++}
++
++// Launcher updated to use general kernel
++extern "C" void cumprod_launcher(
++    const float* input,
++    float* output,
++    int dim0,
++    int dim1,
++    int dim2,
++    long long input_stride0,
++    long long input_stride1,
++    long long input_stride2,
++    long long output_stride0,
++    long long output_stride1,
++    long long output_stride2,
++    cudaStream_t stream)
++{
++    int inner_size = dim1 * dim2;
++    int block_size = 256;
++    int grid_size = (inner_size + block_size - 1) / block_size;
++
++    cumprod_along_dim0_kernel_general<<<grid_size, block_size, 0, stream>>>(
++        input, output, dim0, dim1, dim2,
++        input_stride0, input_stride1, input_stride2,
++        output_stride0, output_stride1, output_stride2);
++}
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,19 @@
++import torch
++import cuda_extension
++
++
++class ModelNew(torch.nn.Module):
++    def __init__(self, tensor_shape, dim):
++        super().__init__()
++        self.tensor = torch.nn.Parameter(torch.randn(*tensor_shape))
++        self.dim = dim
++
++    def forward(self, x):
++        x = cuda_extension.cumprod(x, self.dim)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.cumprod(x, self.dim)
++        yield 'step_001', x
++        yield 'step_002', x

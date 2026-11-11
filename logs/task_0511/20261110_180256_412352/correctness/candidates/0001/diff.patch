@@ -1,0 +1,194 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,70 @@
++#include <cuda_runtime.h>
++
++// Elementwise addition with broadcasting: out = x + parameter.
++// x has shape [dim0, dim1, dim2, dim3] and strides [sx0, sx1, sx2, sx3].
++// parameter has shape [dim0, dim1, 1, 1] (as per contract), contiguous, with strides [sp0, sp1].
++// The output is written using the same strides as x.
++// Grid-stride loop handles very large element counts.
++__global__ void add_parameter_kernel(
++    const float* __restrict__ x,
++    const float* __restrict__ parameter,
++    float* __restrict__ out,
++    int64_t total,
++    int64_t dim0, int64_t dim1, int64_t dim2, int64_t dim3,
++    int64_t sx0, int64_t sx1, int64_t sx2, int64_t sx3,
++    int64_t sp0, int64_t sp1)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        // Decompose linear index into 4D coordinates (assuming row-major layout as given by strides)
++        int64_t i0 = i / (dim1 * dim2 * dim3);
++        int64_t rem = i % (dim1 * dim2 * dim3);
++        int64_t i1 = rem / (dim2 * dim3);
++        rem = rem % (dim2 * dim3);
++        int64_t i2 = rem / dim3;
++        int64_t i3 = rem % dim3;
++
++        // Compute linear offset into x using actual strides (supports non-contiguous)
++        int64_t x_offset = i0 * sx0 + i1 * sx1 + i2 * sx2 + i3 * sx3;
++        // Parameter index: broadcast from [dim0, dim1, 1, 1], so i2 and i3 are ignored.
++        // parameter is contiguous with strides sp0, sp1.
++        int64_t p_offset = i0 * sp0 + i1 * sp1;
++
++        out[x_offset] = x[x_offset] + parameter[p_offset];
++    }
++}
++
++// Launcher function called from binding.cpp
++extern "C" void add_parameter_launcher(
++    const float* x,
++    const float* parameter,
++    float* out,
++    int64_t total,
++    int64_t dim0,
++    int64_t dim1,
++    int64_t dim2,
++    int64_t dim3,
++    int64_t stride_x0,
++    int64_t stride_x1,
++    int64_t stride_x2,
++    int64_t stride_x3,
++    int64_t stride_param0,
++    int64_t stride_param1,
++    cudaStream_t stream)
++{
++    if (total <= 0) return;
++
++    const int threads = 256;
++    // Cap blocks to avoid excessive grid size; grid-stride loop handles the rest.
++    int64_t blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535; // 1D grid max limit (actually can be larger, but this is safe)
++    dim3 grid((unsigned int)blocks);
++
++    add_parameter_kernel<<<grid, threads, 0, stream>>>(
++        x, parameter, out, total,
++        dim0, dim1, dim2, dim3,
++        stride_x0, stride_x1, stride_x2, stride_x3,
++        stride_param0, stride_param1);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,99 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void add_parameter_launcher(
++    const float* x,
++    const float* parameter,
++    float* out,
++    int64_t total,
++    int64_t dim0,
++    int64_t dim1,
++    int64_t dim2,
++    int64_t dim3,
++    int64_t stride_x0,
++    int64_t stride_x1,
++    int64_t stride_x2,
++    int64_t stride_x3,
++    int64_t stride_param0,
++    int64_t stride_param1,
++    cudaStream_t stream);
++
++// PyTorch wrapper for elementwise addition with broadcasting
++torch::Tensor add_parameter(torch::Tensor x, torch::Tensor parameter) {
++    // Validate device
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(parameter.is_cuda(), "parameter must be a CUDA tensor");
++
++    // Validate dtype
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(parameter.dtype() == torch::kFloat32, "parameter must be float32");
++
++    // Validate shapes: x must be 4D (as per contract), parameter must be [dim0, dim1, 1, 1]
++    TORCH_CHECK(x.dim() == 4, "x must be a 4D tensor");
++    TORCH_CHECK(parameter.dim() == 4, "parameter must be a 4D tensor");
++    TORCH_CHECK(parameter.size(0) == x.size(0) && parameter.size(1) == x.size(1),
++                "parameter dim0/dim1 must match x");
++    TORCH_CHECK(parameter.size(2) == 1 && parameter.size(3) == 1,
++                "parameter must have shape [dim0, dim1, 1, 1]");
++
++    // parameter must be contiguous (required by launcher's stride assumption)
++    TORCH_CHECK(parameter.is_contiguous(), "parameter must be contiguous");
++
++    // x may be non-contiguous; launcher handles arbitrary strides.
++    // No need to enforce contiguity on x.
++
++    // Allocate output with same shape, dtype, device as x
++    auto output = torch::empty_like(x);
++
++    // Get dimensions and strides
++    int64_t dim0 = x.size(0);
++    int64_t dim1 = x.size(1);
++    int64_t dim2 = x.size(2);
++    int64_t dim3 = x.size(3);
++    int64_t total = x.numel();
++
++    int64_t stride_x0 = x.stride(0);
++    int64_t stride_x1 = x.stride(1);
++    int64_t stride_x2 = x.stride(2);
++    int64_t stride_x3 = x.stride(3);
++
++    // parameter is contiguous, so strides: [dim1*1*1, 1*1, 1, 1] effectively [dim1, 1, 1, 1]
++    // But we only need first two strides for indexing [i0, i1] in launcher.
++    int64_t stride_param0 = parameter.stride(0); // should be dim1
++    int64_t stride_param1 = parameter.stride(1); // should be 1
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    add_parameter_launcher(
++        x.data_ptr<float>(),
++        parameter.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total,
++        dim0, dim1, dim2, dim3,
++        stride_x0, stride_x1, stride_x2, stride_x3,
++        stride_param0, stride_param1,
++        stream);
++
++    // Check for kernel launch errors (optional but recommended)
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_add_parameter(pybind11::module& m) {
++    m.def("add_parameter", &add_parameter,
++          "Elementwise addition with broadcasting: output = x + parameter",
++          pybind11::arg("x"),
++          pybind11::arg("parameter"));
++}
++
++// Auto-register using the provided macro
++REGISTER_BINDING(add_parameter, register_add_parameter);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,16 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, parameter_shape):
++        super().__init__()
++        self.parameter = nn.Parameter(torch.randn(*parameter_shape))
++
++    def forward(self, x):
++        return cuda_extension.add_parameter(x, self.parameter)
++
++    def debug_forward(self, x):
++        result = cuda_extension.add_parameter(x, self.parameter)
++        yield 'step_001', result

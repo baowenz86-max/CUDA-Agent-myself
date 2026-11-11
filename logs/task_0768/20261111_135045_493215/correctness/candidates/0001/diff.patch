@@ -1,0 +1,239 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,118 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel: element-wise absolute value for float32, supports arbitrary stride via
++// linear index? Actually input is given as pointer and we assume contiguous layout
++// as per contract stride [163840, 16384, 128, 1] which is contiguous. We will
++// use a simple 1D grid-stride loop over total elements, but handle possible
++// non-contiguity by mapping linear index to 4D indices if needed. However,
++// abs_forward contract says supports strides, but likely contiguous. To be safe,
++// we can launch with total numel and use index into flat pointer assuming input
++// is contiguous; if not, caller should make contiguous in binding. The binding
++// will check contiguity and call .contiguous() if needed. Our launcher just
++// accepts raw pointer and total count.
++__global__ void abs_kernel(float* __restrict__ out, const float* __restrict__ in, int64_t n) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < n; i += stride) {
++        out[i] = fabsf(in[i]);
++    }
++}
++
++// Kernel: argmax over dim=1 (size classes) and one-hot encode.
++// Input: x of shape [batch, classes, height, width] (float)
++// Output: one_hot of shape [batch, height, width, num_classes] (int64)
++// We assume x is contiguous, but we can handle strides by passing strides.
++// However, to keep launcher simple, we pass total batch, classes, height, width,
++// and assume x is contiguous. The binding can ensure contiguity. Output will be
++// contiguous as allocated by torch::empty_like? Actually we need shape
++// [batch, height, width, num_classes]. We create output in binding and pass pointer,
++// so it's contiguous. We compute argmax and write 1 at position [b, h, w, argmax],
++// all other positions zero. We can either write zeros then set one, or each thread
++// writes only its one position; but output may not be initialized, so we must ensure
++// every element gets written. We can do two kernels: one to zero, one to set ones,
++// or single kernel where each thread writes multiple elements. Simpler: single kernel
++// where each thread handles one output element and checks if its class index equals
++// argmax for that (b,h,w) location. That would require recomputing argmax for each
++// class, which is inefficient. Better: each thread handles one (b,h,w) position,
++// computes argmax, then writes num_classes elements (zero all then one). That still
++// writes num_classes per thread, but output has batch*height*width*num_classes elements
++// total, and we have batch*height*width threads, so exactly matches total writes.
++// So one kernel, each thread handles one spatial location, loops over classes to find
++// argmax, then loops again to write zeros and one. That writes num_classes int64 values
++// per thread sequentially. This is acceptable for num_classes=10.
++__global__ void argmax_onehot_kernel(const float* __restrict__ x,
++                                     int64_t* __restrict__ out,
++                                     int64_t batch,
++                                     int64_t classes,
++                                     int64_t height,
++                                     int64_t width,
++                                     int64_t num_classes) {
++    int64_t total = batch * height * width;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t linear = idx; linear < total; linear += stride) {
++        // Decompose linear index into (b, h, w)
++        int64_t w = linear % width;
++        int64_t tmp = linear / width;
++        int64_t h = tmp % height;
++        int64_t b = tmp / height;
++
++        // Find argmax over classes.
++        // Input x layout: [batch, classes, height, width]
++        // Index: ((b * classes + c) * height + h) * width + w
++        int64_t argmax = 0;
++        float max_val = x[((b * classes + 0) * height + h) * width + w];
++        for (int64_t c = 1; c < classes; ++c) {
++            float val = x[((b * classes + c) * height + h) * width + w];
++            if (val > max_val) {
++                max_val = val;
++                argmax = c;
++            }
++        }
++
++        // Write one-hot output at position [b, h, w, :]
++        // Output layout: [batch, height, width, num_classes]
++        // Index: ((b * height + h) * width + w) * num_classes + c
++        int64_t base_out = ((b * height + h) * width + w) * num_classes;
++        for (int64_t c = 0; c < num_classes; ++c) {
++            out[base_out + c] = (c == argmax) ? 1 : 0;
++        }
++    }
++}
++
++// Launcher for abs
++extern "C" void abs_forward_launcher(float* out, const float* in, int64_t total, cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // max grid dim
++    if (total > 0) {
++        abs_kernel<<<blocks, threads, 0, stream>>>(out, in, total);
++    }
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Cannot throw, but we can maybe printf? We'll just ignore for now.
++    }
++}
++
++// Launcher for argmax_onehot
++extern "C" void argmax_onehot_forward_launcher(const float* x,
++                                               int64_t* out,
++                                               int64_t batch,
++                                               int64_t classes,
++                                               int64_t height,
++                                               int64_t width,
++                                               int64_t num_classes,
++                                               cudaStream_t stream) {
++    int64_t total = batch * height * width;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    if (total > 0) {
++        argmax_onehot_kernel<<<blocks, threads, 0, stream>>>(x, out, batch, classes, height, width, num_classes);
++    }
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // ignore
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,92 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void abs_forward_launcher(float* out, const float* in, int64_t total, cudaStream_t stream);
++extern "C" void argmax_onehot_forward_launcher(
++    const float* x,
++    int64_t* out,
++    int64_t batch,
++    int64_t classes,
++    int64_t height,
++    int64_t width,
++    int64_t num_classes,
++    cudaStream_t stream);
++
++// abs_forward: element-wise absolute value
++torch::Tensor abs_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "abs_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "abs_forward: input must be float32");
++
++    // Ensure contiguous; launcher assumes linear access
++    auto x_contig = x.contiguous();
++    auto output = torch::empty_like(x_contig);
++
++    int64_t total = x_contig.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    abs_forward_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        total,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "abs_forward: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// argmax_onehot_forward: argmax over dim=1 then one-hot encode
++torch::Tensor argmax_onehot_forward(torch::Tensor x, int64_t num_classes) {
++    TORCH_CHECK(x.is_cuda(), "argmax_onehot_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "argmax_onehot_forward: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "argmax_onehot_forward: input must be 4D [batch, classes, height, width]");
++
++    int64_t batch = x.size(0);
++    int64_t classes = x.size(1);
++    int64_t height = x.size(2);
++    int64_t width = x.size(3);
++
++    TORCH_CHECK(classes > 0, "argmax_onehot_forward: classes dimension must be positive");
++    TORCH_CHECK(num_classes >= classes, "argmax_onehot_forward: num_classes must be >= classes");
++
++    // Ensure contiguous input
++    auto x_contig = x.contiguous();
++
++    // Allocate output shape [batch, height, width, num_classes]
++    auto output = torch::empty({batch, height, width, num_classes},
++                               x_contig.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    argmax_onehot_forward_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<int64_t>(),
++        batch,
++        classes,
++        height,
++        width,
++        num_classes,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "argmax_onehot_forward: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("abs_forward", &abs_forward, "Element-wise absolute value",
++          pybind11::arg("x"));
++    m.def("argmax_onehot_forward", &argmax_onehot_forward,
++          "Argmax over dim=1 and one-hot encode",
++          pybind11::arg("x"), pybind11::arg("num_classes"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self, num_classes):
++        super().__init__()
++        self.num_classes = num_classes
++
++    def forward(self, x):
++        abs_x = cuda_extension.abs_forward(x)
++        one_hot = cuda_extension.argmax_onehot_forward(abs_x, self.num_classes)
++        return one_hot
++
++    def debug_forward(self, x):
++        abs_x = cuda_extension.abs_forward(x)
++        yield 'step_001', abs_x
++        one_hot = cuda_extension.argmax_onehot_forward(abs_x, self.num_classes)
++        yield 'step_002', one_hot
++        yield 'step_003', one_hot

@@ -1,0 +1,383 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -15,6 +15,55 @@
+     }
+ }
+ 
++// Conv2d forward: input (N, C, H, W), weight (K, C_per_group, kH, kW), output (N, K, H_out, W_out)
++// Supports stride, padding, dilation, groups. Assumes float32, NCHW layout, contiguous tensors.
++__global__ void conv2d_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    int N, int C, int H, int W,
++    int K, int C_per_group, int kH, int kW,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    int groups,
++    int H_out, int W_out
++) {
++    int total = N * K * H_out * W_out;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total) return;
++
++    int w_out = idx % W_out;
++    int tmp = idx / W_out;
++    int h_out = tmp % H_out;
++    tmp /= H_out;
++    int k = tmp % K;
++    int n = tmp / K;
++
++    int group = k / (K / groups);
++    int c_start = group * C_per_group;
++    int c_end = c_start + C_per_group;
++
++    float accum = bias != nullptr ? bias[k] : 0.0f;
++
++    for (int c = c_start; c < c_end; ++c) {
++        for (int kh = 0; kh < kH; ++kh) {
++            int in_h = h_out * stride_h - padding_h + kh * dilation_h;
++            if (in_h < 0 || in_h >= H) continue;
++            for (int kw = 0; kw < kW; ++kw) {
++                int in_w = w_out * stride_w - padding_w + kw * dilation_w;
++                if (in_w < 0 || in_w >= W) continue;
++                float input_val = input[((n * C + c) * H + in_h) * W + in_w];
++                float weight_val = weight[((k * C_per_group + (c - c_start)) * kH + kh) * kW + kw];
++                accum += input_val * weight_val;
++            }
++        }
++    }
++
++    output[((n * K + k) * H_out + h_out) * W_out + w_out] = accum;
++}
++
+ extern "C" void selu_forward_launcher(
+     float* out,
+     const float* in,
+@@ -28,3 +77,34 @@
+     int grid_x = (int)max_grid_x;
+     selu_kernel<<<grid_x, block_size, 0, stream>>>(out, in, numel);
+ }
++
++extern "C" void conv2d_forward_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int N, int C, int H, int W,
++    int K, int C_per_group, int kH, int kW,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    int groups,
++    int H_out, int W_out,
++    cudaStream_t stream
++) {
++    int total = N * K * H_out * W_out;
++    if (total <= 0) return;
++    const int block_size = 256;
++    int grid_x = (total + block_size - 1) / block_size;
++    if (grid_x > 2147483647) grid_x = 2147483647;
++    conv2d_kernel<<<grid_x, block_size, 0, stream>>>(
++        output, input, weight, bias,
++        N, C, H, W,
++        K, C_per_group, kH, kW,
++        stride_h, stride_w,
++        padding_h, padding_w,
++        dilation_h, dilation_w,
++        groups,
++        H_out, W_out
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,7 +2,6 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include "../binding_registry.h"
+ 
+ // 声明来自 custom_ops.cu 的 launcher
+@@ -13,17 +12,27 @@
+     cudaStream_t stream
+ );
+ 
++extern "C" void conv2d_forward_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int N, int C, int H, int W,
++    int K, int C_per_group, int kH, int kW,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    int dilation_h, int dilation_w,
++    int groups,
++    int H_out, int W_out,
++    cudaStream_t stream
++);
++
+ namespace {
+ 
+ // 辅助函数：检查 CUDA 错误
+ void checkCudaError(const char* msg) {
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, msg, ": ", cudaGetErrorString(err));
+-}
+-
+-// cuDNN 错误检查
+-void checkCudnnError(cudnnStatus_t status, const char* msg) {
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, msg, ": ", cudnnGetErrorString(status));
+ }
+ 
+ } // anonymous namespace
+@@ -50,12 +59,10 @@
+ 
+     checkCudaError("selu_forward_launcher failed");
+ 
+-    // 如果输入原本是连续的，output 可以直接返回；否则需要 reshape 回原始形状，但这里形状不变，只是 strides 可能不同
+-    // 由于 empty_like(x_contig) 结果形状相同，连续性符合要求。
+     return output;
+ }
+ 
+-// conv2d_forward：使用 cuDNN 执行 2D 卷积
++// conv2d_forward：使用自定义 CUDA kernel 执行 2D 卷积
+ torch::Tensor conv2d_forward(
+     torch::Tensor x,
+     torch::Tensor weight,
+@@ -99,130 +106,6 @@
+     // 获取当前 CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // 创建 cuDNN handle（每次调用创建/销毁，避免全局状态和线程安全问题，性能影响可接受）
+-    cudnnHandle_t cudnn_handle;
+-    checkCudnnError(cudnnCreate(&cudnn_handle), "cudnnCreate failed");
+-    checkCudnnError(cudnnSetStream(cudnn_handle, stream), "cudnnSetStream failed");
+-
+-    // 描述符
+-    cudnnTensorDescriptor_t x_desc, y_desc;
+-    cudnnFilterDescriptor_t w_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    checkCudnnError(cudnnCreateTensorDescriptor(&x_desc), "cudnnCreateTensorDescriptor x failed");
+-    checkCudnnError(cudnnCreateTensorDescriptor(&y_desc), "cudnnCreateTensorDescriptor y failed");
+-    checkCudnnError(cudnnCreateFilterDescriptor(&w_desc), "cudnnCreateFilterDescriptor failed");
+-    checkCudnnError(cudnnCreateConvolutionDescriptor(&conv_desc), "cudnnCreateConvolutionDescriptor failed");
+-
+-    // 设置张量描述符 (NCHW 格式)
+-    checkCudnnError(
+-        cudnnSetTensor4dDescriptor(
+-            x_desc,
+-            CUDNN_TENSOR_NCHW,
+-            CUDNN_DATA_FLOAT,
+-            (int)N,
+-            (int)C,
+-            (int)H,
+-            (int)W
+-        ),
+-        "cudnnSetTensor4dDescriptor x failed"
+-    );
+-    checkCudnnError(
+-        cudnnSetTensor4dDescriptor(
+-            y_desc,
+-            CUDNN_TENSOR_NCHW,
+-            CUDNN_DATA_FLOAT,
+-            (int)N,
+-            (int)K,
+-            (int)H_out,
+-            (int)W_out
+-        ),
+-        "cudnnSetTensor4dDescriptor y failed"
+-    );
+-
+-    // 设置滤波器描述符
+-    checkCudnnError(
+-        cudnnSetFilter4dDescriptor(
+-            w_desc,
+-            CUDNN_DATA_FLOAT,
+-            CUDNN_TENSOR_NCHW,
+-            (int)K,
+-            (int)C_per_group,
+-            (int)kH,
+-            (int)kW
+-        ),
+-        "cudnnSetFilter4dDescriptor failed"
+-    );
+-
+-    // 设置卷积描述符
+-    checkCudnnError(
+-        cudnnSetConvolution2dDescriptor(
+-            conv_desc,
+-            (int)padding,
+-            (int)padding,
+-            (int)stride,
+-            (int)stride,
+-            (int)dilation,
+-            (int)dilation,
+-            CUDNN_CROSS_CORRELATION, // PyTorch Conv2d 使用 cross-correlation
+-            CUDNN_DATA_FLOAT
+-        ),
+-        "cudnnSetConvolution2dDescriptor failed"
+-    );
+-
+-    // 如果 groups > 1，需要设置 group count (cuDNN 7.0+)
+-    if (groups > 1) {
+-        checkCudnnError(
+-            cudnnSetConvolutionGroupCount(conv_desc, (int)groups),
+-            "cudnnSetConvolutionGroupCount failed"
+-        );
+-    }
+-
+-    // 选择算法（使用自动调优或默认算法）
+-    cudnnConvolutionFwdAlgo_t algo;
+-    // 使用 cudnnGetConvolutionForwardAlgorithm_v7 或 cudnnFindConvolutionForwardAlgorithm
+-    // 为了简单和可移植性，这里使用默认算法，然后通过 workspace 限制选择最优
+-    constexpr int requested_algo_count = 1;
+-    int returned_algo_count = 0;
+-    cudnnConvolutionFwdAlgoPerf_t perf_results[requested_algo_count];
+-    checkCudnnError(
+-        cudnnFindConvolutionForwardAlgorithm(
+-            cudnn_handle,
+-            x_desc,
+-            w_desc,
+-            conv_desc,
+-            y_desc,
+-            requested_algo_count,
+-            &returned_algo_count,
+-            perf_results
+-        ),
+-        "cudnnFindConvolutionForwardAlgorithm failed"
+-    );
+-    TORCH_CHECK(returned_algo_count > 0, "No cuDNN convolution algorithm found");
+-    algo = perf_results[0].algo;
+-
+-    // 获取 workspace 大小
+-    size_t workspace_size = 0;
+-    checkCudnnError(
+-        cudnnGetConvolutionForwardWorkspaceSize(
+-            cudnn_handle,
+-            x_desc,
+-            w_desc,
+-            conv_desc,
+-            y_desc,
+-            algo,
+-            &workspace_size
+-        ),
+-        "cudnnGetConvolutionForwardWorkspaceSize failed"
+-    );
+-
+-    // 分配 workspace（如果大于 0）
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaError_t cuda_err = cudaMalloc(&workspace, workspace_size);
+-        TORCH_CHECK(cuda_err == cudaSuccess, "cudaMalloc for workspace failed: ", cudaGetErrorString(cuda_err));
+-    }
+-
+     // 确定 bias 指针
+     float* bias_ptr = nullptr;
+     torch::Tensor bias_contig;
+@@ -234,77 +117,23 @@
+         bias_ptr = bias_contig.data_ptr<float>();
+     }
+ 
+-    // 卷积计算
+-    float alpha = 1.0f, beta = 0.0f; // 无 bias 时 beta=0，有 bias 时 beta=1 并在之后加 bias，
+-    // 但 cuDNN 支持融合 bias via cudnnConvolutionBiasActivationForward，这里先使用标准 forward 再手动加 bias
+-    // 为简化，先用无 bias 阶段，然后单独加 bias kernel？但任务要求不得在 .cpp 中实现 CUDA kernel，加 bias 可以用 cudnnOpTensor 或者直接使用 cudnnAddTensor。
+-    // 由于我们已经有了 bias 指针，可以使用 cudnnAddTensor 将 bias 加到输出上，此接口不是 CUDA kernel，而是 cuDNN 提供的操作。
+-    checkCudnnError(
+-        cudnnConvolutionForward(
+-            cudnn_handle,
+-            &alpha,
+-            x_desc,
+-            x_contig.data_ptr<float>(),
+-            w_desc,
+-            weight_contig.data_ptr<float>(),
+-            conv_desc,
+-            algo,
+-            workspace,
+-            workspace_size,
+-            &beta,
+-            y_desc,
+-            output.data_ptr<float>()
+-        ),
+-        "cudnnConvolutionForward failed"
++    // 调用卷积 launcher
++    conv2d_forward_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        weight_contig.data_ptr<float>(),
++        bias_ptr,
++        (int)N, (int)C, (int)H, (int)W,
++        (int)K, (int)C_per_group, (int)kH, (int)kW,
++        (int)stride, (int)stride,
++        (int)padding, (int)padding,
++        (int)dilation, (int)dilation,
++        (int)groups,
++        (int)H_out, (int)W_out,
++        stream
+     );
+ 
+-    // 添加 bias（如果需要）
+-    if (bias_ptr != nullptr) {
+-        // 使用 cudnnAddTensor 实现 y += bias
+-        cudnnTensorDescriptor_t bias_desc;
+-        checkCudnnError(cudnnCreateTensorDescriptor(&bias_desc), "cudnnCreateTensorDescriptor bias failed");
+-        // bias 是一维的，需要构造为 4D 描述符，将 bias 广播到 NCHW 的输出上
+-        // cudnnAddTensor 需要 bias 描述符与输出描述符具有相同的维度，但低维可以通过设置 stride 为 0 来实现广播。
+-        // 简便做法：设置 bias 描述符为 NCHW 形状 [1, K, 1, 1]。
+-        checkCudnnError(
+-            cudnnSetTensor4dDescriptor(
+-                bias_desc,
+-                CUDNN_TENSOR_NCHW,
+-                CUDNN_DATA_FLOAT,
+-                1,
+-                (int)K,
+-                1,
+-                1
+-            ),
+-            "cudnnSetTensor4dDescriptor bias failed"
+-        );
+-        float alpha_bias = 1.0f;
+-        checkCudnnError(
+-            cudnnAddTensor(
+-                cudnn_handle,
+-                &alpha_bias,
+-                bias_desc,
+-                bias_ptr,
+-                &alpha_bias, // beta 等于 1，累加到输出
+-                y_desc,
+-                output.data_ptr<float>()
+-            ),
+-            "cudnnAddTensor bias failed"
+-        );
+-        checkCudnnError(cudnnDestroyTensorDescriptor(bias_desc), "cudnnDestroyTensorDescriptor bias failed");
+-    }
+-
+-    // 清理
+-    if (workspace != nullptr) {
+-        cudaFree(workspace);
+-    }
+-    checkCudnnError(cudnnDestroyTensorDescriptor(x_desc), "cudnnDestroyTensorDescriptor x failed");
+-    checkCudnnError(cudnnDestroyTensorDescriptor(y_desc), "cudnnDestroyTensorDescriptor y failed");
+-    checkCudnnError(cudnnDestroyFilterDescriptor(w_desc), "cudnnDestroyFilterDescriptor failed");
+-    checkCudnnError(cudnnDestroyConvolutionDescriptor(conv_desc), "cudnnDestroyConvolutionDescriptor failed");
+-    checkCudnnError(cudnnDestroy(cudnn_handle), "cudnnDestroy failed");
+-
+-    checkCudaError("conv2d_forward post-cudnn");
++    checkCudaError("conv2d_forward_launcher failed");
+     return output;
+ }
+ 
+@@ -312,7 +141,7 @@
+ void register_custom_ops(pybind11::module& m) {
+     m.def("selu_forward", &selu_forward, "SELU activation forward",
+           pybind11::arg("x"));
+-    m.def("conv2d_forward", &conv2d_forward, "2D convolution forward using cuDNN",
++    m.def("conv2d_forward", &conv2d_forward, "2D convolution forward using custom CUDA kernel",
+           pybind11::arg("x"),
+           pybind11::arg("weight"),
+           pybind11::arg("bias"),

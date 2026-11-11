@@ -1,0 +1,254 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,109 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Softmax along the innermost dimension (dim = 2) for a 3D tensor [batch, seq_len, dim_size]
++// Each block processes one row of length dim_size.
++__global__ void softmax_kernel(const float* __restrict__ x,
++                               float* __restrict__ out,
++                               int64_t batch,
++                               int64_t seq_len,
++                               int64_t dim_size) {
++    int64_t row = blockIdx.y * static_cast<int64_t>(gridDim.x) + blockIdx.x; // flattened batch*seq_len index
++    int64_t total_rows = batch * seq_len;
++    if (row >= total_rows) return;
++
++    const float* row_ptr = x + row * dim_size; // assuming contiguous layout
++    float* out_ptr = out + row * dim_size;
++
++    extern __shared__ float smem[]; // use shared memory for max and sum reduction
++    float* s_max = smem;                     // size blockDim.x
++    float* s_sum = smem + blockDim.x;        // size blockDim.x
++
++    int tid = threadIdx.x;
++    int stride = blockDim.x;
++
++    // Compute max for numerical stability
++    float local_max = -1e30f;
++    for (int64_t i = tid; i < dim_size; i += stride) {
++        float val = row_ptr[i];
++        if (val > local_max) local_max = val;
++    }
++    s_max[tid] = local_max;
++    __syncthreads();
++
++    // Reduce max
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            if (s_max[tid + s] > s_max[tid]) s_max[tid] = s_max[tid + s];
++        }
++        __syncthreads();
++    }
++    float row_max = s_max[0];
++
++    // Compute sum of exp(x - max)
++    float local_sum = 0.0f;
++    for (int64_t i = tid; i < dim_size; i += stride) {
++        local_sum += expf(row_ptr[i] - row_max);
++    }
++    s_sum[tid] = local_sum;
++    __syncthreads();
++
++    // Reduce sum
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            s_sum[tid] += s_sum[tid + s];
++        }
++        __syncthreads();
++    }
++    float row_sum = s_sum[0];
++
++    // Avoid division by zero (should not happen for normal inputs but safe)
++    float inv_sum = 1.0f / row_sum;
++
++    // Write output
++    for (int64_t i = tid; i < dim_size; i += stride) {
++        out_ptr[i] = expf(row_ptr[i] - row_max) * inv_sum;
++    }
++}
++
++__global__ void add_kernel(const float* __restrict__ x,
++                           const float* __restrict__ bias,
++                           float* __restrict__ out,
++                           int64_t total_elements,
++                           int64_t dim_size) {
++    int64_t idx = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
++    int64_t stride = blockDim.x * static_cast<int64_t>(gridDim.x);
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        int64_t bias_idx = i % dim_size;
++        out[i] = x[i] + bias[bias_idx];
++    }
++}
++
++extern "C" void custom_softmax_launcher(const float* x,
++                                        float* out,
++                                        int64_t batch,
++                                        int64_t seq_len,
++                                        int64_t dim_size,
++                                        cudaStream_t stream) {
++    int64_t total_rows = batch * seq_len;
++    const int block_size = 256;
++    // dim_size is 2048, so 256 threads is fine
++    dim3 block(block_size, 1);
++    dim3 grid(static_cast<unsigned int>(total_rows), 1);
++    size_t shared_mem = 2 * block_size * sizeof(float);
++    softmax_kernel<<<grid, block, shared_mem, stream>>>(x, out, batch, seq_len, dim_size);
++}
++
++extern "C" void custom_add_launcher(const float* x,
++                                    const float* bias,
++                                    float* out,
++                                    int64_t total_elements,
++                                    int64_t dim_size,
++                                    cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t blocks = (total_elements + block_size - 1) / block_size;
++    if (blocks > 65535) blocks = 65535; // grid dimension limit, grid-stride loop handles rest
++    dim3 block(block_size);
++    dim3 grid(static_cast<unsigned int>(blocks));
++    add_kernel<<<grid, block, 0, stream>>>(x, bias, out, total_elements, dim_size);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,114 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_softmax_launcher(
++    const float* x,
++    float* out,
++    int64_t batch,
++    int64_t seq_len,
++    int64_t dim_size,
++    cudaStream_t stream);
++
++extern "C" void custom_add_launcher(
++    const float* x,
++    const float* bias,
++    float* out,
++    int64_t total_elements,
++    int64_t dim_size,
++    cudaStream_t stream);
++
++// Wrapper for softmax along given dim (only dim=2 supported in current kernel)
++torch::Tensor custom_softmax_forward(torch::Tensor x, int64_t dim) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 3, "Input tensor must be 3D (batch, seq_len, dim)");
++    TORCH_CHECK(dim == 2, "Softmax dimension must be 2 for this implementation");
++
++    // Ensure contiguity for the kernel's assumption: row-major with last dim contiguous
++    auto x_contig = x.contiguous();
++
++    auto batch = x_contig.size(0);
++    auto seq_len = x_contig.size(1);
++    auto dim_size = x_contig.size(2);
++
++    // Allocate output tensor with same shape and options
++    auto out = torch::empty_like(x_contig);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_softmax_launcher(
++        x_contig.data_ptr<float>(),
++        out.data_ptr<float>(),
++        batch,
++        seq_len,
++        dim_size,
++        stream
++    );
++
++    // Check for kernel errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_softmax_launcher failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Wrapper for elementwise add with bias broadcast
++torch::Tensor custom_add_forward(torch::Tensor x, torch::Tensor bias) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input tensor x must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "Input tensor bias must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor x must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Input tensor bias must be float32");
++    TORCH_CHECK(x.dim() == 3, "Input tensor x must be 3D (batch, seq_len, dim)");
++    TORCH_CHECK(bias.dim() == 1, "Bias tensor must be 1D");
++    TORCH_CHECK(bias.size(0) == x.size(2), "Bias size must match last dimension of x");
++
++    // Ensure both are contiguous for kernel assumptions
++    auto x_contig = x.contiguous();
++    auto bias_contig = bias.contiguous();
++
++    int64_t total_elements = x_contig.numel();
++    int64_t dim_size = bias_contig.size(0);
++
++    // Allocate output tensor with same shape as x
++    auto out = torch::empty_like(x_contig);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_add_launcher(
++        x_contig.data_ptr<float>(),
++        bias_contig.data_ptr<float>(),
++        out.data_ptr<float>(),
++        total_elements,
++        dim_size,
++        stream
++    );
++
++    // Check for kernel errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_add_launcher failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_softmax_forward", &custom_softmax_forward,
++          "Custom softmax along dimension 2 for 3D tensor",
++          py::arg("x"), py::arg("dim"));
++    m.def("custom_add_forward", &custom_add_forward,
++          "Custom elementwise add with bias broadcast",
++          py::arg("x"), py::arg("bias"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, dim, soft_max_dim):
++        super().__init__()
++        self.soft_max_dim = soft_max_dim
++        self.add_value = nn.Parameter(torch.randn(dim))
++
++    def forward(self, x):
++        x = cuda_extension.custom_softmax_forward(x, self.soft_max_dim)
++        x = cuda_extension.custom_add_forward(x, self.add_value)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_softmax_forward(x, self.soft_max_dim)
++        yield 'step_001', x
++        x = cuda_extension.custom_add_forward(x, self.add_value)
++        yield 'step_002', x
++        yield 'step_003', x

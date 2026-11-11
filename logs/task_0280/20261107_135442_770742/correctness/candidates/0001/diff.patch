@@ -1,0 +1,262 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,116 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// ReflectionPad2d kernel: outputs are contiguous, input may have arbitrary strides.
++// padding is assumed symmetric (same for all sides) as per contract.
++__global__ void reflection_pad2d_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    int padding,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride)
++{
++    long long total = (long long)N * C * H_out * W_out;
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++
++    for (; idx < total; idx += stride) {
++        int w_out = idx % W_out;
++        long long tmp = idx / W_out;
++        int h_out = tmp % H_out;
++        tmp /= H_out;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        // compute source coordinates with reflection
++        int h_in = h_out - padding;
++        int w_in = w_out - padding;
++
++        // reflect if out of bounds
++        h_in = (h_in < 0) ? -h_in : h_in;
++        if (h_in >= H_in) h_in = 2 * (H_in - 1) - h_in;
++        w_in = (w_in < 0) ? -w_in : w_in;
++        if (w_in >= W_in) w_in = 2 * (W_in - 1) - w_in;
++
++        // input may not be contiguous; use strides
++        const float* src = input + (long long)n * in_n_stride + (long long)c * in_c_stride
++                           + (long long)h_in * in_h_stride + (long long)w_in * in_w_stride;
++        output[idx] = *src;
++    }
++}
++
++// Log2 kernel: elementwise log2f, handles arbitrary strides, output contiguous.
++__global__ void log2_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    long long numel,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    int N, int C, int H, int W)
++{
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++
++    for (; idx < numel; idx += stride) {
++        // decompose idx into n,c,h,w
++        int w = idx % W;
++        long long tmp = idx / W;
++        int h = tmp % H;
++        tmp /= H;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        const float* src = input + (long long)n * in_n_stride + (long long)c * in_c_stride
++                           + (long long)h * in_h_stride + (long long)w * in_w_stride;
++        output[idx] = log2f(*src);
++    }
++}
++
++// Launcher for reflection_pad2d_forward.
++// Input: x (float32 CUDA tensor, arbitrary strides), padding (int).
++// Output: newly allocated contiguous float32 tensor of shape [N, C, H+2p, W+2p].
++// The allocation is done by the binding layer; this launcher receives the data pointer.
++extern "C" void reflection_pad2d_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H_in, int W_in,
++    int padding,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    cudaStream_t stream)
++{
++    int H_out = H_in + 2 * padding;
++    int W_out = W_in + 2 * padding;
++    long long total = (long long)N * C * H_out * W_out;
++    if (total == 0) return;
++
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;  // cap grid to avoid launch failure; kernel uses grid-stride loop
++
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, N, C, H_in, W_in, H_out, W_out, padding,
++        in_n_stride, in_c_stride, in_h_stride, in_w_stride);
++}
++
++// Launcher for log2_forward.
++// Input: x (float32 CUDA tensor, arbitrary strides).
++// Output: newly allocated contiguous float32 tensor of same shape.
++extern "C" void log2_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    cudaStream_t stream)
++{
++    long long numel = (long long)N * C * H * W;
++    if (numel == 0) return;
++
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++
++    log2_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, numel,
++        in_n_stride, in_c_stride, in_h_stride, in_w_stride,
++        N, C, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,102 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declarations from custom_ops.cu
++extern "C" void reflection_pad2d_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H_in, int W_in,
++    int padding,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    cudaStream_t stream);
++
++extern "C" void log2_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int64_t in_n_stride, int64_t in_c_stride, int64_t in_h_stride, int64_t in_w_stride,
++    cudaStream_t stream);
++
++namespace {
++
++torch::Tensor reflection_pad2d_forward(torch::Tensor x, int64_t padding) {
++    // Validate input
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N,C,H,W)");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H_in = x.size(2);
++    int64_t W_in = x.size(3);
++    int64_t H_out = H_in + 2 * padding;
++    int64_t W_out = W_in + 2 * padding;
++
++    // Allocate contiguous output
++    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher with input strides (may be non-contiguous)
++    reflection_pad2d_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H_in),
++        static_cast<int>(W_in),
++        static_cast<int>(padding),
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        stream);
++
++    return output;
++}
++
++torch::Tensor log2_forward(torch::Tensor x) {
++    // Validate input
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N,C,H,W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    // Allocate contiguous output
++    auto output = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher with input strides
++    log2_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        stream);
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "ReflectionPad2d forward",
++          pybind11::arg("x"), pybind11::arg("padding"));
++    m.def("log2_forward", &log2_forward,
++          "Log2 elementwise forward",
++          pybind11::arg("x"));
++}
++
++} // anonymous namespace
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,35 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, padding):
++        super().__init__()
++        self.padding = padding
++
++    def forward(self, x):
++        x = cuda_extension.reflection_pad2d_forward(x, self.padding)
++        x = cuda_extension.log2_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.reflection_pad2d_forward(x, self.padding)
++        yield 'step_001', x
++        x = cuda_extension.log2_forward(x)
++        yield 'step_002', x
++        yield 'step_003', x
++
++
++batch_size = 128
++channels = 3
++height, width = 1024, 256
++padding = 2
++
++
++def get_inputs():
++    return [torch.rand(batch_size, channels, height, width) + 1e-5]
++
++
++def get_init_inputs():
++    return [padding]

@@ -1,0 +1,94 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,27 @@
++#include <cuda_runtime.h>
++
++// Element-wise ReLU: out = max(x, 0)
++__global__ void relu_kernel(const float* __restrict__ input,
++                            float* __restrict__ output,
++                            int64_t n) {
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < n; i += stride) {
++        float val = input[i];
++        output[i] = (val > 0.0f) ? val : 0.0f;
++    }
++}
++
++// Launcher used by binding.cpp
++extern "C" void relu_forward_launcher(const float* input,
++                                     float* output,
++                                     int64_t n,
++                                     cudaStream_t stream) {
++    if (n <= 0) return;
++    const int block_size = 256;
++    // Cap grid to avoid exceeding limits for huge tensors; grid-stride loop handles rest.
++    // Maximum grid dimension in x is 2^31 - 1, so no need to cap for realistic n.
++    int64_t grid_size = (n + block_size - 1) / block_size;
++    if (grid_size > 1073741824LL) grid_size = 1073741824LL; // safety cap
++    relu_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(input, output, n);
++}
+--- before/kernels/relu_binding.cpp
++++ after/kernels/relu_binding.cpp
+@@ -0,0 +1,40 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void relu_forward_launcher(const float* input, float* output, int64_t n, cudaStream_t stream);
++
++// PyTorch wrapper for element-wise ReLU
++torch::Tensor relu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.numel() >= 0, "Input must have non-negative number of elements");
++
++    auto output = torch::empty_like(x);
++    if (x.numel() == 0) {
++        return output;
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    relu_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_relu(pybind11::module& m) {
++    m.def("relu_forward", &relu_forward, "Element-wise ReLU", py::arg("x"));
++}
++
++REGISTER_BINDING(relu, register_relu);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,18 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, start, end, step):
++        super().__init__()
++        self.sequence = torch.arange(start, end, step)
++
++    def forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        yield 'step_001', x
++        yield 'step_002', x

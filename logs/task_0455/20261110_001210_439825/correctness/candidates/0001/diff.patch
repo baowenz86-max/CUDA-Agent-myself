@@ -1,0 +1,241 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,110 @@
++#include <cuda_runtime.h>
++
++// Kernel for torch.max over a single dimension (dim_size small)
++// Each thread computes one output element (b, h, w) by scanning dim_size values.
++template <typename T>
++__global__ void max_dim_kernel(const T* __restrict__ input,
++                               T* __restrict__ values,
++                               int64_t* __restrict__ indices,
++                               int batch, int height, int width, int dim_size) {
++    int64_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t out_stride = (int64_t)gridDim.x * blockDim.x;
++    int64_t total = (int64_t)batch * height * width;
++
++    for (; out_idx < total; out_idx += out_stride) {
++        int b = out_idx / (height * width);
++        int rem = out_idx % (height * width);
++        int h = rem / width;
++        int w = rem % width;
++
++        // Base offset: input[b, 0, h, w]
++        int64_t in_base = ((int64_t)b * dim_size * height + 0 * height + h) * width + w;
++        // assuming contiguous layout: shape [batch, dim_size, height, width]
++        // stride: dim_size*height*width, height*width, width, 1
++
++        T best_val = input[in_base];
++        int64_t best_idx = 0;
++        for (int d = 1; d < dim_size; ++d) {
++            int64_t in_offset = in_base + (int64_t)d * height * width;
++            T val = input[in_offset];
++            if (val > best_val) {
++                best_val = val;
++                best_idx = d;
++            }
++        }
++        values[out_idx] = best_val;
++        indices[out_idx] = best_idx;
++    }
++}
++
++// Kernel for torch.argmin over a single dimension
++template <typename T>
++__global__ void argmin_dim_kernel(const T* __restrict__ input,
++                                  int64_t* __restrict__ indices,
++                                  int batch, int height, int width, int dim_size) {
++    int64_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t out_stride = (int64_t)gridDim.x * blockDim.x;
++    int64_t total = (int64_t)batch * height * width;
++
++    for (; out_idx < total; out_idx += out_stride) {
++        int b = out_idx / (height * width);
++        int rem = out_idx % (height * width);
++        int h = rem / width;
++        int w = rem % width;
++
++        int64_t in_base = ((int64_t)b * dim_size * height + 0 * height + h) * width + w;
++
++        T best_val = input[in_base];
++        int64_t best_idx = 0;
++        for (int d = 1; d < dim_size; ++d) {
++            int64_t in_offset = in_base + (int64_t)d * height * width;
++            T val = input[in_offset];
++            if (val < best_val) {
++                best_val = val;
++                best_idx = d;
++            }
++        }
++        indices[out_idx] = best_idx;
++    }
++}
++
++// Launcher for custom_max_dim
++// input is assumed contiguous float32 tensor of shape [batch, dim_size, height, width]
++// values output float32 [batch, height, width]
++// indices output int64 [batch, height, width]
++extern "C" void custom_max_dim_launcher(const float* input,
++                                        float* values,
++                                        int64_t* indices,
++                                        int64_t batch,
++                                        int64_t dim_size,
++                                        int64_t height,
++                                        int64_t width,
++                                        cudaStream_t stream) {
++    int64_t total = batch * height * width;
++    const int block_size = 256;
++    int64_t grid_size = (total + block_size - 1) / block_size;
++    // cap grid size to avoid excessive blocks if total is small
++    if (grid_size > 65535) grid_size = 65535;
++
++    max_dim_kernel<float><<<(int)grid_size, block_size, 0, stream>>>(
++        input, values, indices,
++        (int)batch, (int)height, (int)width, (int)dim_size);
++}
++
++// Launcher for custom_argmin_dim
++extern "C" void custom_argmin_dim_launcher(const float* input,
++                                           int64_t* indices,
++                                           int64_t batch,
++                                           int64_t dim_size,
++                                           int64_t height,
++                                           int64_t width,
++                                           cudaStream_t stream) {
++    int64_t total = batch * height * width;
++    const int block_size = 256;
++    int64_t grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++
++    argmin_dim_kernel<float><<<(int)grid_size, block_size, 0, stream>>>(
++        input, indices,
++        (int)batch, (int)height, (int)width, (int)dim_size);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,101 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_max_dim_launcher(
++    const float* input,
++    float* values,
++    int64_t* indices,
++    int64_t batch,
++    int64_t dim_size,
++    int64_t height,
++    int64_t width,
++    cudaStream_t stream);
++
++extern "C" void custom_argmin_dim_launcher(
++    const float* input,
++    int64_t* indices,
++    int64_t batch,
++    int64_t dim_size,
++    int64_t height,
++    int64_t width,
++    cudaStream_t stream);
++
++// Helper to resolve dim and ensure contiguous, CUDA float32 tensor
++static std::tuple<torch::Tensor, int64_t, int64_t, int64_t, int64_t>
++prepare_input(torch::Tensor x, int64_t dim) {
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4D");
++    
++    int64_t ndim = x.dim();
++    if (dim < 0) dim += ndim;
++    TORCH_CHECK(dim >= 0 && dim < ndim, "dim out of range");
++    
++    // Make contiguous if not already
++    x = x.contiguous();
++    
++    // Assume shape [batch, channels, height, width]
++    int64_t batch = x.size(0);
++    int64_t dim_size = x.size(dim);
++    int64_t height = x.size(2);
++    int64_t width = x.size(3);
++    
++    // For dim=1, output is [batch, height, width]
++    // Other dims not supported by current launcher (launcher assumes dim=1)
++    TORCH_CHECK(dim == 1, "Only dim=1 supported");
++    
++    return {x, batch, dim_size, height, width};
++}
++
++torch::Tensor custom_max_dim(torch::Tensor x, int64_t dim) {
++    auto [x_contig, batch, dim_size, height, width] = prepare_input(x, dim);
++    
++    auto values = torch::empty({batch, height, width}, x_contig.options());
++    auto indices = torch::empty({batch, height, width}, x_contig.options().dtype(torch::kInt64));
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_max_dim_launcher(
++        x_contig.data_ptr<float>(),
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        batch,
++        dim_size,
++        height,
++        width,
++        stream);
++    
++    return std::make_tuple(values, indices);
++}
++
++torch::Tensor custom_argmin_dim(torch::Tensor x, int64_t dim) {
++    auto [x_contig, batch, dim_size, height, width] = prepare_input(x, dim);
++    
++    auto indices = torch::empty({batch, height, width}, x_contig.options().dtype(torch::kInt64));
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_argmin_dim_launcher(
++        x_contig.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        batch,
++        dim_size,
++        height,
++        width,
++        stream);
++    
++    return indices;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_max_dim", &custom_max_dim,
++          "Custom max over dim",
++          py::arg("x"), py::arg("dim"));
++    m.def("custom_argmin_dim", &custom_argmin_dim,
++          "Custom argmin over dim",
++          py::arg("x"), py::arg("dim"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_dim):
++        super(ModelNew, self).__init__()
++        self.input_dim = input_dim
++
++    def forward(self, x):
++        max_val, _ = cuda_extension.custom_max_dim(x, self.input_dim)
++        argmin_val = cuda_extension.custom_argmin_dim(x, self.input_dim)
++        return max_val, argmin_val
++
++    def debug_forward(self, x):
++        max_val, _ = cuda_extension.custom_max_dim(x, self.input_dim)
++        yield 'step_001', (max_val, _)
++        argmin_val = cuda_extension.custom_argmin_dim(x, self.input_dim)
++        yield 'step_002', argmin_val
++        yield 'step_003', (max_val, argmin_val)

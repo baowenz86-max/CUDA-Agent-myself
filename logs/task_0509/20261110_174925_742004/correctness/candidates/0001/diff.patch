@@ -1,0 +1,497 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,178 @@
++#include <cuda_runtime.h>
++#include <cublas_v2.h>
++#include <math.h>
++
++// -----------------------------------------------------------------------------
++// Element-wise sigmoid kernel: computes 1 / (1 + exp(-x))
++// Supports arbitrary strides via input_stride and output_stride (element-wise per element)
++// Grid-stride loop for large tensors.
++// -----------------------------------------------------------------------------
++__global__ void sigmoid_kernel(const float* __restrict__ input,
++                               float* __restrict__ output,
++                               int64_t total_elements,
++                               int64_t input_stride,
++                               int64_t output_stride) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        // Assuming contiguous-ish but stride may be 1 if contiguous; handle general by using stride offset
++        // For simplicity, if stride is not 1, we compute per element using base + i*stride.
++        // However, in our use case input and output are contiguous, but we keep stride for generality.
++        float x = input[i * input_stride];
++        float val = 1.0f / (1.0f + expf(-x));
++        output[i * output_stride] = val;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Bias addition kernel: output += bias
++// -----------------------------------------------------------------------------
++__global__ void bias_add_kernel(float* __restrict__ output,
++                                const float* __restrict__ bias,
++                                int64_t batch_size,
++                                int64_t out_features) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t total = batch_size * out_features;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total; i += stride) {
++        int64_t b = i / out_features;
++        int64_t f = i % out_features;
++        output[i] += bias[f];
++    }
++}
++
++// -----------------------------------------------------------------------------
++// BatchNorm1d inference kernel: output = (input - running_mean) / sqrt(running_var + eps) * weight + bias
++// Optional tensors: if weight is null, use 1; if bias is null, use 0; if running_mean is null, use 0; if running_var is null, use 1.
++// Supports arbitrary input/output strides via input_stride and output_stride.
++// -----------------------------------------------------------------------------
++__global__ void batch_norm1d_inference_kernel(const float* __restrict__ input,
++                                               float* __restrict__ output,
++                                               const float* __restrict__ running_mean,
++                                               const float* __restrict__ running_var,
++                                               const float* __restrict__ weight,
++                                               const float* __restrict__ bias,
++                                               float eps,
++                                               int64_t total_elements,
++                                               int64_t num_features,
++                                               int64_t input_stride,
++                                               int64_t output_stride) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        int64_t b = i / num_features;
++        int64_t f = i % num_features;
++
++        float x = input[i * input_stride];
++        float mean = (running_mean != nullptr) ? running_mean[f] : 0.0f;
++        float var = (running_var != nullptr) ? running_var[f] : 1.0f;
++        float gamma = (weight != nullptr) ? weight[f] : 1.0f;
++        float beta = (bias != nullptr) ? bias[f] : 0.0f;
++
++        float inv_std = rsqrtf(var + eps);
++        float normalized = (x - mean) * inv_std;
++        float result = normalized * gamma + beta;
++
++        output[i * output_stride] = result;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Launcher: linear_forward
++// Computes output = input @ weight.T + bias
++// input: [batch, in_features], weight: [out_features, in_features], bias: optional [out_features]
++// output: [batch, out_features]
++// Uses cuBLAS sgemm with transa=OP_T, transb=OP_N, alpha=1, beta=0
++// Then applies bias add if bias is not null (beta=1 would require pre-broadcast, so separate kernel)
++// -----------------------------------------------------------------------------
++extern "C" void linear_forward_launcher(const float* input,
++                                        const float* weight,
++                                        const float* bias,
++                                        float* output,
++                                        int64_t batch_size,
++                                        int64_t in_features,
++                                        int64_t out_features,
++                                        cudaStream_t stream) {
++    cublasHandle_t handle;
++    cublasCreate(&handle);
++    cublasSetStream(handle, stream);
++
++    const float alpha = 1.0f;
++    const float beta = 0.0f;
++
++    // Perform GEMM: C = A^T * B, where A is weight [out_features x in_features], B is input [in_features x batch]
++    // Actually torch linear: input [batch, in] @ weight.T [in, out] -> [batch, out]
++    // For cuBLAS, we need dimensions: m = batch, n = out_features, k = in_features
++    // C (m x n) = A (m x k) * B (k x n)
++    // A = input (batch x in), B = weight.T? But weight.T is [in, out], which is B (k x n). So we need B = weight.T (not stored).
++    // Alternative: use cublasSgemm with transa=CUBLAS_OP_T, transb=CUBLAS_OP_N: C = A^T * B where A is weight (out x in), B is input (in x batch)
++    // Then C would be out x batch, not batch x out. We need batch x out, so we can compute C^T = A * B^T where A is input (batch x in), B is weight (out x in).
++    // Use cublasSgemm with transa=CUBLAS_OP_N, transb=CUBLAS_OP_T on A=input, B=weight: C = A * B^T = input @ weight.T, dimensions: m=batch, n=out_features, k=in_features.
++    cublasSgemm(handle,
++                CUBLAS_OP_N, CUBLAS_OP_T,
++                (int)batch_size, (int)out_features, (int)in_features,
++                &alpha,
++                input, (int)in_features,   // A: batch x in (leading dimension = in_features)
++                weight, (int)in_features,   // B: out x in (leading dimension = in_features), but with trans, effectively in x out
++                &beta,
++                output, (int)batch_size);
++
++    cublasDestroy(handle);
++
++    if (bias != nullptr) {
++        // Launch bias add kernel
++        int block = 256;
++        int grid = (int)((batch_size * out_features + block - 1) / block);
++        bias_add_kernel<<<grid, block, 0, stream>>>(output, bias, batch_size, out_features);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Launcher: sigmoid_forward
++// input and output may be non-contiguous, so we use stride parameters.
++// The binding layer will compute the strides and pass them.
++// -----------------------------------------------------------------------------
++extern "C" void sigmoid_forward_launcher(const float* input,
++                                         float* output,
++                                         int64_t total_elements,
++                                         int64_t input_stride,
++                                         int64_t output_stride,
++                                         cudaStream_t stream) {
++    // For typical contiguous tensors, stride is 1. But we support arbitrary.
++    int block = 256;
++    // Grid size limited to avoid launching too many blocks; use grid-stride loop safely
++    int max_blocks = 65535;
++    int64_t needed_blocks = (total_elements + block - 1) / block;
++    int grid = (int)min(needed_blocks, (int64_t)max_blocks);
++    // For small tensors, needed_blocks may be smaller
++    if (grid < 1) grid = 1;
++    sigmoid_kernel<<<grid, block, 0, stream>>>(input, output, total_elements, input_stride, output_stride);
++}
++
++// -----------------------------------------------------------------------------
++// Launcher: batch_norm1d_forward
++// input: [batch, num_features], output same.
++// running_mean, running_var, weight, bias are optional (nullptr if not provided).
++// Strides handled via input_stride/output_stride.
++// -----------------------------------------------------------------------------
++extern "C" void batch_norm1d_forward_launcher(const float* input,
++                                             float* output,
++                                             const float* running_mean,
++                                             const float* running_var,
++                                             const float* weight,
++                                             const float* bias,
++                                             double eps,
++                                             int64_t total_elements,
++                                             int64_t num_features,
++                                             int64_t input_stride,
++                                             int64_t output_stride,
++                                             cudaStream_t stream) {
++    int block = 256;
++    int max_blocks = 65535;
++    int64_t needed_blocks = (total_elements + block - 1) / block;
++    int grid = (int)min(needed_blocks, (int64_t)max_blocks);
++    if (grid < 1) grid = 1;
++    batch_norm1d_inference_kernel<<<grid, block, 0, stream>>>(
++        input, output, running_mean, running_var, weight, bias,
++        (float)eps, total_elements, num_features, input_stride, output_stride);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,230 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void linear_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int64_t batch_size,
++    int64_t in_features,
++    int64_t out_features,
++    cudaStream_t stream);
++
++extern "C" void sigmoid_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    int64_t input_stride,
++    int64_t output_stride,
++    cudaStream_t stream);
++
++extern "C" void batch_norm1d_forward_launcher(
++    const float* input,
++    float* output,
++    const float* running_mean,
++    const float* running_var,
++    const float* weight,
++    const float* bias,
++    double eps,
++    int64_t total_elements,
++    int64_t num_features,
++    int64_t input_stride,
++    int64_t output_stride,
++    cudaStream_t stream);
++
++// Helper to get current CUDA stream
++static cudaStream_t get_stream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// -----------------------------------------------------------------------------
++// linear_forward: output = input @ weight.T + bias
++// Parameters:
++//   input: [batch, in_features] CUDA float32, contiguous or supports strides (made contiguous)
++//   weight: [out_features, in_features] CUDA float32, should be contiguous
++//   bias: optional [out_features] CUDA float32
++// Returns: [batch, out_features] CUDA float32
++// -----------------------------------------------------------------------------
++torch::Tensor linear_forward(torch::Tensor input, torch::Tensor weight, c10::optional<torch::Tensor> bias) {
++    // Check CUDA and dtype
++    TORCH_CHECK(input.is_cuda(), "linear_forward: input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "linear_forward: weight must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "linear_forward: input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "linear_forward: weight must be float32");
++
++    // Ensure contiguous for cuBLAS
++    auto input_contig = input.contiguous();
++    auto weight_contig = weight.contiguous();
++
++    // Optional bias handling
++    const float* bias_ptr = nullptr;
++    if (bias.has_value() && bias.value().defined()) {
++        auto bias_tensor = bias.value();
++        TORCH_CHECK(bias_tensor.is_cuda(), "linear_forward: bias must be a CUDA tensor");
++        TORCH_CHECK(bias_tensor.dtype() == torch::kFloat32, "linear_forward: bias must be float32");
++        TORCH_CHECK(bias_tensor.dim() == 1 && bias_tensor.size(0) == weight.size(0),
++                    "linear_forward: bias shape must be [out_features]");
++        auto bias_contig = bias_tensor.contiguous();
++        bias_ptr = bias_contig.data_ptr<float>();
++    }
++
++    // Shape checks
++    TORCH_CHECK(input_contig.dim() == 2, "linear_forward: input must be 2D");
++    TORCH_CHECK(weight_contig.dim() == 2, "linear_forward: weight must be 2D");
++    int64_t batch_size = input_contig.size(0);
++    int64_t in_features = input_contig.size(1);
++    int64_t out_features = weight_contig.size(0);
++    TORCH_CHECK(weight_contig.size(1) == in_features, "linear_forward: weight shape mismatch");
++
++    // Allocate output [batch, out_features]
++    auto output = torch::empty({batch_size, out_features}, input_contig.options());
++
++    // Call launcher
++    linear_forward_launcher(
++        input_contig.data_ptr<float>(),
++        weight_contig.data_ptr<float>(),
++        bias_ptr,
++        output.data_ptr<float>(),
++        batch_size,
++        in_features,
++        out_features,
++        get_stream()
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// sigmoid_forward: element-wise sigmoid
++// Parameters:
++//   input: any shape CUDA float32, supports strides (we handle stride via launcher)
++// Returns: same shape CUDA float32
++// -----------------------------------------------------------------------------
++torch::Tensor sigmoid_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "sigmoid_forward: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "sigmoid_forward: input must be float32");
++
++    // To support arbitrary strides, compute row stride (or element stride if 1D).
++    // Since launcher expects stride in elements, we pass input.stride(0) if dim>0 else 1.
++    // For contiguous tensors, this will be 1 (assuming last dim contiguous), but if input is non-contiguous
++    // the launcher currently assumes linear indexing with stride? We need to check launcher implementation.
++    // The launcher uses input[i * input_stride] and output[i * output_stride] with i = total element index.
++    // This is incorrect for non-contiguous tensors with non-unit stride in first dimension.
++    // To ensure correctness, we simply make input contiguous and pass stride=1.
++    auto input_contig = input.contiguous();
++    int64_t total_elements = input_contig.numel();
++
++    // Allocate output with same shape
++    auto output = torch::empty_like(input_contig);
++
++    // Since we made contiguous, strides are 1 (assuming contiguous memory layout with last-dim stride 1)
++    sigmoid_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total_elements,
++        1, // input_stride
++        1, // output_stride
++        get_stream()
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// batch_norm1d_forward: inference batch norm
++// Parameters:
++//   input: [batch, num_features] CUDA float32, supports strides (made contiguous)
++//   weight: optional [num_features] CUDA float32
++//   bias: optional [num_features] CUDA float32
++//   running_mean: optional [num_features] CUDA float32
++//   running_var: optional [num_features] CUDA float32
++//   eps: double
++//   momentum: double (unused in inference)
++// Returns: [batch, num_features] CUDA float32
++// -----------------------------------------------------------------------------
++torch::Tensor batch_norm1d_forward(
++    torch::Tensor input,
++    c10::optional<torch::Tensor> weight,
++    c10::optional<torch::Tensor> bias,
++    c10::optional<torch::Tensor> running_mean,
++    c10::optional<torch::Tensor> running_var,
++    double eps,
++    double momentum) {
++
++    TORCH_CHECK(input.is_cuda(), "batch_norm1d_forward: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "batch_norm1d_forward: input must be float32");
++
++    // Ensure input is contiguous for simplicity; launcher handles linear indexing with stride=1
++    auto input_contig = input.contiguous();
++    int64_t batch_size = input_contig.size(0);
++    int64_t num_features = input_contig.size(1);
++    int64_t total_elements = input_contig.numel();
++
++    // Prepare optional parameter pointers (make contiguous)
++    const float* weight_ptr = nullptr;
++    const float* bias_ptr = nullptr;
++    const float* running_mean_ptr = nullptr;
++    const float* running_var_ptr = nullptr;
++
++    // Helper lambda to validate and return contiguous data pointer for optional tensor
++    auto get_optional_ptr = [&](const c10::optional<torch::Tensor>& opt, const char* name, int64_t size) -> const float* {
++        if (opt.has_value() && opt.value().defined()) {
++            auto t = opt.value();
++            TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++            TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++            TORCH_CHECK(t.dim() == 1 && t.size(0) == size, name, " shape must be [", size, "]");
++            return t.contiguous().data_ptr<float>();
++        }
++        return nullptr;
++    };
++
++    weight_ptr = get_optional_ptr(weight, "weight", num_features);
++    bias_ptr = get_optional_ptr(bias, "bias", num_features);
++    running_mean_ptr = get_optional_ptr(running_mean, "running_mean", num_features);
++    running_var_ptr = get_optional_ptr(running_var, "running_var", num_features);
++
++    // Allocate output
++    auto output = torch::empty_like(input_contig);
++
++    // Call launcher
++    batch_norm1d_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        running_mean_ptr,
++        running_var_ptr,
++        weight_ptr,
++        bias_ptr,
++        eps,
++        total_elements,
++        num_features,
++        1, // input_stride (since contiguous)
++        1, // output_stride
++        get_stream()
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// Registration
++// -----------------------------------------------------------------------------
++void register_custom_ops(pybind11::module& m) {
++    m.def("linear_forward", &linear_forward,
++          "Linear forward: output = input @ weight.T + bias",
++          py::arg("input"), py::arg("weight"), py::arg("bias"));
++    m.def("sigmoid_forward", &sigmoid_forward,
++          "Sigmoid forward",
++          py::arg("input"));
++    m.def("batch_norm1d_forward", &batch_norm1d_forward,
++          "BatchNorm1d inference forward",
++          py::arg("input"), py::arg("weight"), py::arg("bias"),
++          py::arg("running_mean"), py::arg("running_var"),
++          py::arg("eps") = 1e-05, py::arg("momentum") = 0.1);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,80 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, hidden_size):
++        super(ModelNew, self).__init__()
++        # Preserve state_dict keys exactly: linear1.weight, linear1.bias, linear2.weight, linear2.bias,
++        # norm.weight, norm.bias, norm.running_mean, norm.running_var, norm.num_batches_tracked
++        self.linear1_weight = nn.Parameter(torch.empty(hidden_size, input_size))
++        self.linear1_bias = nn.Parameter(torch.empty(hidden_size))
++        self.linear2_weight = nn.Parameter(torch.empty(input_size, hidden_size))
++        self.linear2_bias = nn.Parameter(torch.empty(input_size))
++        self.norm_weight = nn.Parameter(torch.empty(input_size))
++        self.norm_bias = nn.Parameter(torch.empty(input_size))
++        self.norm_running_mean = nn.Parameter(torch.empty(input_size), requires_grad=False)
++        self.norm_running_var = nn.Parameter(torch.empty(input_size), requires_grad=False)
++        self.norm_num_batches_tracked = nn.Parameter(torch.zeros((), dtype=torch.int64), requires_grad=False)
++
++        # Initialize parameters to match reference defaults (nn.Linear and BatchNorm1d)
++        # Linear: kaiming_uniform with a=sqrt(5), bias uniform(-1/sqrt(fan_in), 1/sqrt(fan_in))
++        # BatchNorm1d: weight=1, bias=0, running_mean=0, running_var=1, num_batches_tracked=0
++        nn.init.kaiming_uniform_(self.linear1_weight, a=5 ** 0.5)
++        bound = 1 / (input_size ** 0.5)
++        nn.init.uniform_(self.linear1_bias, -bound, bound)
++        nn.init.kaiming_uniform_(self.linear2_weight, a=5 ** 0.5)
++        bound = 1 / (hidden_size ** 0.5)
++        nn.init.uniform_(self.linear2_bias, -bound, bound)
++        nn.init.ones_(self.norm_weight)
++        nn.init.zeros_(self.norm_bias)
++        nn.init.zeros_(self.norm_running_mean)
++        nn.init.ones_(self.norm_running_var)
++
++        # Store eps and momentum for batch_norm1d_forward call
++        self.eps = 1e-05
++        self.momentum = 0.1
++
++    def forward(self, x):
++        # Step 1: linear1
++        x = cuda_extension.linear_forward(x, self.linear1_weight, self.linear1_bias)
++        # Step 2: sigmoid
++        x = cuda_extension.sigmoid_forward(x)
++        # Step 3: linear2
++        x = cuda_extension.linear_forward(x, self.linear2_weight, self.linear2_bias)
++        # Step 4: batch norm (inference)
++        x = cuda_extension.batch_norm1d_forward(
++            x,
++            self.norm_weight,
++            self.norm_bias,
++            self.norm_running_mean,
++            self.norm_running_var,
++            self.eps,
++            self.momentum,
++        )
++        return x
++
++    def debug_forward(self, x):
++        # Step 1: linear1
++        x = cuda_extension.linear_forward(x, self.linear1_weight, self.linear1_bias)
++        yield "step_001", x
++        # Step 2: sigmoid
++        x = cuda_extension.sigmoid_forward(x)
++        yield "step_002", x
++        # Step 3: linear2
++        x = cuda_extension.linear_forward(x, self.linear2_weight, self.linear2_bias)
++        yield "step_003", x
++        # Step 4: batch norm
++        x = cuda_extension.batch_norm1d_forward(
++            x,
++            self.norm_weight,
++            self.norm_bias,
++            self.norm_running_mean,
++            self.norm_running_var,
++            self.eps,
++            self.momentum,
++        )
++        yield "step_004", x
++        # Final return
++        yield "step_005", x

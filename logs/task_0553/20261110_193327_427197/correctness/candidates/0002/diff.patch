@@ -1,0 +1,198 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -11,8 +11,6 @@
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx >= num_indices) return;
+     int64_t token = indices[idx];
+-    // Note: assumes token is within [0, num_embeddings), which is guaranteed by contract
+-    // but we can add a safety clamp to avoid out-of-bounds if needed
+     const float* src = weight + token * embedding_dim;
+     float* dst = output + idx * embedding_dim;
+     for (int i = 0; i < embedding_dim; ++i) {
+@@ -20,7 +18,6 @@
+     }
+ }
+ 
+-// AvgPool2d kernel for 4D input (N, H, W, C), pool on H,W with kernel_size, stride, padding=0
+ __global__ void avg_pool2d_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+@@ -32,7 +29,6 @@
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx >= total) return;
+     
+-    // decompose idx into (n, c, ho, wo)
+     int wo = idx % W_out;
+     int tmp = idx / W_out;
+     int ho = tmp % H_out;
+@@ -42,8 +38,6 @@
+     
+     float sum = 0.0f;
+     int count = 0;
+-    
+-    // input base pointer for (n, h, w, c)
+     const float* in_base = input + ((int64_t)n * H + 0) * W * C + c;
+     
+     for (int kh = 0; kh < kernel_h; ++kh) {
+@@ -56,14 +50,12 @@
+             ++count;
+         }
+     }
+-    
+-    // Average (count should always be kernel_h*kernel_w for valid region, but handle boundary)
+     output[idx] = (count > 0) ? sum / count : 0.0f;
+ }
+ 
+-// Launcher for embedding: indices is CPU pointer, weight/output are GPU pointers
++// Launcher for embedding: accepts indices pointer that may be CPU or GPU, determined at runtime.
+ extern "C" void embedding_launcher(
+-    const int64_t* indices_cpu,
++    const int64_t* indices_ptr,
+     const float* weight_gpu,
+     float* output_gpu,
+     int num_indices,
+@@ -71,32 +63,36 @@
+     cudaStream_t stream) {
+     if (num_indices <= 0) return;
+     
+-    // Allocate temporary device buffer for indices
+     int64_t* indices_gpu = nullptr;
+-    cudaError_t err = cudaMalloc(&indices_gpu, num_indices * sizeof(int64_t));
+-    if (err != cudaSuccess) return; // binding should check but we cannot report; assume success
++    bool is_device_ptr = false;
++    cudaPointerAttributes attrs;
++    cudaError_t err = cudaPointerGetAttributes(&attrs, indices_ptr);
++    if (err == cudaSuccess && attrs.type == cudaMemoryTypeDevice) {
++        is_device_ptr = true;
++    }
+     
+-    // Copy CPU indices to GPU asynchronously on the provided stream
+-    cudaMemcpyAsync(indices_gpu, indices_cpu, num_indices * sizeof(int64_t),
+-                    cudaMemcpyHostToDevice, stream);
++    if (is_device_ptr) {
++        indices_gpu = const_cast<int64_t*>(indices_ptr);
++    } else {
++        // Assume CPU pointer
++        err = cudaMalloc(&indices_gpu, num_indices * sizeof(int64_t));
++        if (err != cudaSuccess) return;
++        cudaMemcpyAsync(indices_gpu, indices_ptr, num_indices * sizeof(int64_t),
++                        cudaMemcpyHostToDevice, stream);
++    }
+     
+-    // Launch embedding kernel
+     int threads = 256;
+     int blocks = (num_indices + threads - 1) / threads;
+     embedding_kernel<<<blocks, threads, 0, stream>>>(
+         indices_gpu, weight_gpu, output_gpu, num_indices, embedding_dim);
+     
+-    // Free temporary buffer after kernel completion (cudaFree is blocking? Better to enqueue)
+-    // Since cudaFree synchronizes? Actually cudaFree does not synchronize by default.
+-    // To ensure safe free, we could use cudaFreeAsync if available, but cudaFree is acceptable
+-    // for simplicity. However, using cudaFree after launch without synchronization may cause issues
+-    // if kernel is still running. Better to use cudaFreeAsync (CUDA 11.2+) or schedule a callback.
+-    // We'll use cudaFreeAsync if available, else fallback to cudaFree (which may wait).
++    if (!is_device_ptr) {
+ #if CUDART_VERSION >= 11020
+-    cudaFreeAsync(indices_gpu, stream);
++        cudaFreeAsync(indices_gpu, stream);
+ #else
+-    cudaFree(indices_gpu); // This will synchronize on legacy CUDA, but acceptable for correctness
++        cudaFree(indices_gpu);
+ #endif
++    }
+ }
+ 
+ // Launcher for avg_pool2d
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -7,7 +7,7 @@
+ 
+ // Declare launchers from custom_ops.cu
+ extern "C" void embedding_launcher(
+-    const int64_t* indices_cpu,
++    const int64_t* indices_ptr,
+     const float* weight_gpu,
+     float* output_gpu,
+     int num_indices,
+@@ -23,21 +23,20 @@
+     int stride_h, int stride_w,
+     cudaStream_t stream);
+ 
+-// Embedding forward: weight (CUDA float32 [num_embeddings, embedding_dim]), indices (CPU int64 [batch, ...])
++// Embedding forward: weight (CUDA float32 [num_embeddings, embedding_dim]), indices (int64, CPU or CUDA)
+ torch::Tensor embedding_forward(torch::Tensor weight, torch::Tensor indices) {
+     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+     TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+ 
+-    TORCH_CHECK(!indices.is_cuda(), "indices must be a CPU tensor");
+     TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
+     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
++    // Accept both CPU and CUDA indices; launcher handles pointer type
+ 
+     int64_t embedding_dim = weight.size(1);
+     int64_t num_indices = indices.numel();
+ 
+-    // Allocate output with same shape as indices plus trailing embedding_dim
+     std::vector<int64_t> output_shape(indices.sizes().begin(), indices.sizes().end());
+     output_shape.push_back(embedding_dim);
+     auto output = torch::empty(output_shape, weight.options());
+@@ -53,7 +52,6 @@
+         stream
+     );
+ 
+-    // Check for kernel launch errors
+     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "embedding_launcher failed");
+ 
+     return output;
+@@ -74,7 +72,6 @@
+     int64_t W = input.size(2);
+     int64_t C = input.size(3);
+ 
+-    // Compute output spatial dimensions
+     int64_t H_out = (H + 2 * padding - kernel_size) / stride + 1;
+     int64_t W_out = (W + 2 * padding - kernel_size) / stride + 1;
+     TORCH_CHECK(H_out > 0 && W_out > 0, "invalid pooling dimensions");
+@@ -93,7 +90,7 @@
+         static_cast<int>(H_out),
+         static_cast<int>(W_out),
+         static_cast<int>(kernel_size),
+-        static_cast<int>(kernel_size), // kernel_h == kernel_w since we only accept single int kernel_size
++        static_cast<int>(kernel_size),
+         static_cast<int>(stride),
+         static_cast<int>(stride),
+         stream
+@@ -105,7 +102,7 @@
+ }
+ 
+ void register_custom_ops(pybind11::module& m) {
+-    m.def("embedding_forward", &embedding_forward, "Embedding lookup (CPU indices to CUDA output)",
++    m.def("embedding_forward", &embedding_forward, "Embedding lookup (CPU or CUDA indices)",
+           py::arg("weight"), py::arg("indices"));
+     m.def("avg_pool2d_forward", &avg_pool2d_forward, "2D average pooling (CUDA)",
+           py::arg("input"), py::arg("kernel_size"), py::arg("stride"), py::arg("padding"));
+--- before/model_new.py
++++ after/model_new.py
+@@ -10,14 +10,19 @@
+         self.avg_pool = nn.AvgPool2d(kernel_size, stride=stride)
+ 
+     def forward(self, x):
++        # Ensure weight is CUDA
++        if not self.embedding.weight.is_cuda:
++            self.embedding.weight.data = self.embedding.weight.data.cuda()
+         x = cuda_extension.embedding_forward(self.embedding.weight, x)
+-        x = cuda_extension.avg_pool2d_forward(x, kernel_size=(2, 2), stride=2, padding=0)
++        x = cuda_extension.avg_pool2d_forward(x, kernel_size=2, stride=2, padding=0)
+         return x
+ 
+     def debug_forward(self, *inputs):
+         x = inputs[0]
++        if not self.embedding.weight.is_cuda:
++            self.embedding.weight.data = self.embedding.weight.data.cuda()
+         x = cuda_extension.embedding_forward(self.embedding.weight, x)
+         yield 'step_001', x
+-        x = cuda_extension.avg_pool2d_forward(x, kernel_size=(2, 2), stride=2, padding=0)
++        x = cuda_extension.avg_pool2d_forward(x, kernel_size=2, stride=2, padding=0)
+         yield 'step_002', x
+         yield 'step_003', x

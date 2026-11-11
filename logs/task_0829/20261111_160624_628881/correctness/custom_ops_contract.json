@@ -1,0 +1,183 @@
+{
+  "operators": [
+    {
+      "name": "multihead_attention_forward",
+      "parameters": [
+        {
+          "name": "query",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[B, L, E]",
+          "layout": "strided (contiguous in E)",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "key",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[B, S, E]",
+          "layout": "strided (contiguous in E)",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "value",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[B, S, E]",
+          "layout": "strided (contiguous in E)",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "in_proj_weight",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[3*E, E]",
+          "layout": "contiguous",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "in_proj_bias",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[3*E]",
+          "layout": "contiguous",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "out_proj_weight",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[E, E]",
+          "layout": "contiguous",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "out_proj_bias",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[E]",
+          "layout": "contiguous",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "num_heads",
+          "kind": "int",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "batch_first",
+          "kind": "bool",
+          "nullable": false,
+          "optional": false
+        }
+      ],
+      "returns": {
+        "type": "tuple of (tensor, tensor)",
+        "items": [
+          {
+            "type": "tensor",
+            "dtype": "torch.float32",
+            "device": "cuda",
+            "shape": "[B, L, E]",
+            "layout": "strided, stride [E, H*E, 1] (non-contiguous due to transpose)"
+          },
+          {
+            "type": "tensor",
+            "dtype": "torch.float32",
+            "device": "cuda",
+            "shape": "[B, L, S]",
+            "layout": "contiguous"
+          }
+        ]
+      },
+      "semantics": [
+        "Splits combined projection weight and bias into q_proj_weight, k_proj_weight, v_proj_weight (each [E,E]) and corresponding biases",
+        "Projects query, key, value: q = query @ q_proj_weight.T + q_proj_bias, k = key @ k_proj_weight.T + k_proj_bias, v = value @ v_proj_weight.T + v_proj_bias",
+        "Reshapes to [B, L, num_heads, head_dim] and transposes to [B, num_heads, L, head_dim] for q,k,v; head_dim = E // num_heads",
+        "Scales q by 1/sqrt(head_dim)",
+        "Computes attn_logits = q @ k.transpose(-2,-1) (batch matmul) -> [B, num_heads, L, S]",
+        "Applies softmax over dim=-1 to attn_logits, yielding attn_weights",
+        "Computes attn_output = attn_weights @ v -> [B, num_heads, L, head_dim]",
+        "Transposes attn_output to [B, L, num_heads, head_dim] and reshapes to [B, L, E]",
+        "Applies output projection: x = attn_output @ out_proj_weight.T + out_proj_bias, preserving the non-contiguous strides as in the reference",
+        "Returns tuple (x, attn_weights); attn_weights is contiguous [B, L, S], x may be non-contiguous [B, L, E] with stride [E, H*E, 1] as observed"
+      ]
+    },
+    {
+      "name": "batched_matmul",
+      "parameters": [
+        {
+          "name": "a",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[B, L, E]",
+          "layout": "strided, non-contiguous (stride [E, H*E, 1])",
+          "nullable": false,
+          "optional": false
+        },
+        {
+          "name": "b",
+          "kind": "tensor",
+          "dtype": "torch.float32",
+          "device": "cuda",
+          "shape": "[B, S, E] but transposed view [B, E, S]",
+          "layout": "strided via transpose",
+          "nullable": false,
+          "optional": false
+        }
+      ],
+      "returns": {
+        "type": "tensor",
+        "dtype": "torch.float32",
+        "device": "cuda",
+        "shape": "[B, L, S]",
+        "layout": "contiguous"
+      },
+      "semantics": [
+        "Performs batched matrix multiplication: out[b] = a[b] @ b_transposed[b], where b_transposed = b.transpose(1,2)",
+        "a is the attention output x with shape [B, L, E] and stride [E, H*E, 1]; b is value.transpose(1,2), a non-contiguous view of value [B, S, E] viewed as [B, E, S]",
+        "Output shape [B, L, S] = [32,1024,1024]",
+        "Uses cuBLAS-like batched GEMM internally; output is contiguous"
+      ]
+    }
+  ],
+  "reference_steps": [
+    {
+      "checkpoint": "step_001",
+      "source": "x, _ = self.attention(query, key, value)",
+      "semantics": [
+        "Executes nn.MultiheadAttention with default parameters: no key_padding_mask, no attn_mask, need_weights=True, average_attn_weights=True, is_causal=False",
+        "Model not in training, so dropout is inactive (dropout=0.0)",
+        "Returns tuple (attn_output, attn_output_weights)",
+        "attn_output shape [32,1024,128], dtype float32, device cuda:0, stride [128,4096,1] indicating a transpose that causes non-contiguity",
+        "attn_output_weights shape [32,1024,1024], contiguous"
+      ]
+    },
+    {
+      "checkpoint": "step_002",
+      "source": "return torch.matmul(x, value.transpose(1, 2))",
+      "semantics": [
+        "x is the attn_output from step_001, shape [32,1024,128], non-contiguous",
+        "value.transpose(1,2) is a view of value with shape [32,128,1024], stride [131072,1,128]",
+        "torch.matmul performs batched matrix multiplication, resulting in shape [32,1024,1024]",
+        "Output dtype float32, device cuda:0, contiguous"
+      ]
+    }
+  ]
+}

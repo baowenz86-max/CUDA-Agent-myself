@@ -1,0 +1,232 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,119 @@
++#include <cuda_runtime.h>
++
++// -----------------------------------------------------------------------------
++// kernel: sum over channel dimension (dim=1) with keepdim
++// Input: x [N, C, H, W] contiguous float32
++// Output: out [N, 1, H, W] contiguous float32
++// Each thread handles one (n, h, w) output element, summing over C channels.
++// Grid-stride loop over total output elements N*H*W.
++// -----------------------------------------------------------------------------
++__global__ void sum_dim1_keepdim_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int N, int C, int H, int W) {
++  int total = N * H * W;
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int stride = blockDim.x * gridDim.x;
++
++  for (int i = idx; i < total; i += stride) {
++    int w = i % W;
++    int tmp = i / W;
++    int h = tmp % H;
++    int n = tmp / H;
++
++    const float* base = x + ((long long)n * C + 0) * H * W + h * W + w;
++    float sum = base[0];
++    // unroll first 4 channels for better performance (C often small)
++    int c = 1;
++    for (; c + 3 < C; c += 4) {
++      sum += base[c * H * W];
++      sum += base[(c + 1) * H * W];
++      sum += base[(c + 2) * H * W];
++      sum += base[(c + 3) * H * W];
++    }
++    for (; c < C; ++c) {
++      sum += base[c * H * W];
++    }
++
++    out[(long long)n * H * W + h * W + w] = sum;
++  }
++}
++
++// -----------------------------------------------------------------------------
++// kernel: elementwise sigmoid, stable for large |x|
++// Input: x [N, 1, H, W] contiguous float32
++// Output: out [same shape] contiguous float32
++// -----------------------------------------------------------------------------
++__global__ void sigmoid_elementwise_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int total) {
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int stride = blockDim.x * gridDim.x;
++
++  for (int i = idx; i < total; i += stride) {
++    float v = x[i];
++    // stable sigmoid: 1/(1+exp(-|v|)) and then handle sign
++    float exp_neg_abs = __expf(-fabsf(v));
++    float sig = 1.0f / (1.0f + exp_neg_abs);
++    out[i] = (v >= 0.0f) ? sig : (1.0f - sig);
++  }
++}
++
++// -----------------------------------------------------------------------------
++// Host launcher for sum_dim1_keepdim
++// Input pointer x points to contiguous float32 CUDA tensor of shape [N,C,H,W]
++// Output pointer out points to allocated float32 CUDA tensor of shape [N,1,H,W]
++// -----------------------------------------------------------------------------
++extern "C" void sum_dim1_keepdim_launcher(
++    const float* x,
++    float* out,
++    int N, int C, int H, int W,
++    cudaStream_t stream) {
++  int total = N * H * W;
++  if (total <= 0) {
++    return;  // empty tensor, nothing to do
++  }
++
++  int threads = 256;
++  int blocks = (total + threads - 1) / threads;
++  // Cap grid to avoid too many blocks; use grid-stride loop.
++  if (blocks > 4096) blocks = 4096;
++
++  sum_dim1_keepdim_kernel<<<blocks, threads, 0, stream>>>(
++      x, out, N, C, H, W);
++
++  cudaError_t err = cudaGetLastError();
++  if (err != cudaSuccess) {
++    // Cannot use exceptions here; launcher is C-compatible.
++    // The caller (binding.cpp) should check cudaGetLastError after launch.
++    // We leave error checking to the binding layer via cudaGetLastError.
++  }
++}
++
++// -----------------------------------------------------------------------------
++// Host launcher for sigmoid_elementwise
++// Input pointer x points to contiguous float32 CUDA tensor of shape [N,1,H,W]
++// Output pointer out points to allocated float32 CUDA tensor of same shape
++// -----------------------------------------------------------------------------
++extern "C" void sigmoid_elementwise_launcher(
++    const float* x,
++    float* out,
++    int total,
++    cudaStream_t stream) {
++  if (total <= 0) {
++    return;
++  }
++
++  int threads = 256;
++  int blocks = (total + threads - 1) / threads;
++  if (blocks > 4096) blocks = 4096;
++
++  sigmoid_elementwise_kernel<<<blocks, threads, 0, stream>>>(
++      x, out, total);
++
++  cudaError_t err = cudaGetLastError();
++  if (err != cudaSuccess) {
++    // Errors are reported by binding layer after launch.
++  }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,82 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void sum_dim1_keepdim_launcher(
++    const float* x,
++    float* out,
++    int N, int C, int H, int W,
++    cudaStream_t stream);
++
++extern "C" void sigmoid_elementwise_launcher(
++    const float* x,
++    float* out,
++    int total,
++    cudaStream_t stream);
++
++// Wrapper for sum_dim1_keepdim
++torch::Tensor sum_dim1_keepdim(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    auto output = torch::empty({N, 1, H, W}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    sum_dim1_keepdim_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "sum_dim1_keepdim kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for sigmoid_elementwise
++torch::Tensor sigmoid_elementwise(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, 1, H, W)");
++    TORCH_CHECK(x.size(1) == 1, "Second dimension must be 1 (keepdim output)");
++
++    int64_t total = x.numel();
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    sigmoid_elementwise_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(total),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "sigmoid_elementwise kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("sum_dim1_keepdim", &sum_dim1_keepdim, "Sum over channel dim (dim=1) with keepdim", py::arg("x"));
++    m.def("sigmoid_elementwise", &sigmoid_elementwise, "Elementwise sigmoid", py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_shape, apply_sigmoid):
++        super().__init__()
++        self.apply_sigmoid = apply_sigmoid
++
++    def forward(self, x):
++        x = cuda_extension.sum_dim1_keepdim(x)
++        if self.apply_sigmoid:
++            x = cuda_extension.sigmoid_elementwise(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.sum_dim1_keepdim(x)
++        if self.apply_sigmoid:
++            x = cuda_extension.sigmoid_elementwise(x)
++        return x

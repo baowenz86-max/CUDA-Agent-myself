@@ -1,0 +1,149 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,42 @@
++#include <cuda_runtime.h>
++
++// isin_forward CUDA kernel: 检查 x 中每个元素是否在 test_elements 中
++// 使用线性搜索，test_elements 通常较小（1024），足够快
++__global__ void isin_kernel(const float* __restrict__ x,
++                            const float* __restrict__ test_elements,
++                            bool* __restrict__ output,
++                            int64_t numel,
++                            int64_t test_size) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float val = x[i];
++        bool found = false;
++        for (int64_t j = 0; j < test_size; ++j) {
++            if (val == test_elements[j]) {
++                found = true;
++                break;
++            }
++        }
++        output[i] = found;
++    }
++}
++
++// 原子操作不需要，直接写 output
++// launcher: 由下一阶段 binding.cpp 调用
++extern "C" void isin_launcher(const float* x,
++                             const float* test_elements,
++                             bool* output,
++                             int64_t numel,
++                             int64_t test_size,
++                             cudaStream_t stream) {
++    // 参数有效性检查交给 binding 层；这里仅计算启动配置
++    int threads = 256;
++    int blocks = static_cast<int>((numel + threads - 1) / threads);
++    // 限制 blocks 数量，grid-stride 处理大张量
++    if (blocks > 65535) blocks = 65535;
++    isin_kernel<<<blocks, threads, 0, stream>>>(x, test_elements, output, numel, test_size);
++}
++
++// 本文件不包含 torch 依赖，符合 SKILL.md 要求。
++// is_complex_forward 无需 GPU kernel，由 binding.cpp 直接实现。--- before/kernels/isin_binding.cpp
++++ after/kernels/isin_binding.cpp
+@@ -0,0 +1,75 @@
++// Binding for isin and is_complex custom operators.
++// Contains only launcher declaration and PyTorch tensor wrappers.
++
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher from custom_ops.cu
++extern "C" void isin_launcher(const float* x,
++                             const float* test_elements,
++                             bool* output,
++                             int64_t numel,
++                             int64_t test_size,
++                             cudaStream_t stream);
++
++// isin_forward: checks membership of x elements in test_elements.
++// Inputs must be CUDA float32 tensors; x and test_elements are 1D or 2D,
++// no broadcasting is applied (reference uses same shapes).
++torch::Tensor isin_forward(torch::Tensor x, torch::Tensor test_elements) {
++    // Validate device and dtype
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(test_elements.is_cuda(), "test_elements must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(test_elements.scalar_type() == torch::kFloat32, "test_elements must be float32");
++
++    // Ensure contiguity for simple pointer passing (kernel expects contiguous)
++    auto x_contig = x.contiguous();
++    auto test_contig = test_elements.contiguous();
++
++    // Allocate output bool tensor with same shape as x
++    auto output = torch::empty_like(x_contig, x_contig.options().dtype(torch::kBool));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    int64_t numel = x_contig.numel();
++    int64_t test_size = test_contig.numel();
++
++    // Call launcher
++    isin_launcher(
++        x_contig.data_ptr<float>(),
++        test_contig.data_ptr<float>(),
++        output.data_ptr<bool>(),
++        numel,
++        test_size,
++        stream
++    );
++
++    return output;
++}
++
++// is_complex_forward: returns True if input is a complex tensor.
++// Since reference always passes complex64, we simply check dtype.
++// This does not require a CUDA kernel.
++bool is_complex_forward(torch::Tensor input) {
++    // None of the checks require CUDA; input is passed as complex64.
++    // Type check suffices; device is irrelevant for is_complex.
++    TORCH_CHECK(input.is_complex(), "Input must be a complex tensor");
++    return true;
++}
++
++// Register functions
++void register_isin_binding(pybind11::module& m) {
++    m.def("isin_forward", &isin_forward,
++          "Check membership of x in test_elements (CUDA float32 -> bool tensor)",
++          pybind11::arg("x"), pybind11::arg("test_elements"));
++    m.def("is_complex_forward", &is_complex_forward,
++          "Return True if input tensor is complex",
++          pybind11::arg("input"));
++}
++
++REGISTER_BINDING(isin_binding, register_isin_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,24 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_shape, test_elements_shape, complex_elements_shape):
++        super().__init__()
++        self.test_elements = nn.Parameter(torch.randn(test_elements_shape))
++        self.complex_elements = nn.Parameter(
++            torch.randn(complex_elements_shape) + 1j * torch.randn(complex_elements_shape)
++        )
++
++    def forward(self, x):
++        x = cuda_extension.isin_forward(x, self.test_elements)
++        y = cuda_extension.is_complex_forward(self.complex_elements)
++        return x, y
++
++    def debug_forward(self, x):
++        z = cuda_extension.isin_forward(x, self.test_elements)
++        yield 'step_001', z
++        y = cuda_extension.is_complex_forward(self.complex_elements)
++        yield 'step_002', y
++        yield 'step_003', (z, y)

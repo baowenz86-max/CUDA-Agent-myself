@@ -1,0 +1,212 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,91 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// Elementwise ReLU kernel: output = max(input, 0)
++__global__ void relu_kernel(const float* input, float* output, long long numel) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (; idx < numel; idx += stride) {
++        float v = input[idx];
++        output[idx] = v > 0.0f ? v : 0.0f;
++    }
++}
++
++// Log-softmax along dim=1.
++// input shape: [B, H, W] with arbitrary strides.
++// Each thread handles a (b, w) pair and iterates over h to compute max, sum exp, and final values.
++// This parallelization avoids cross-thread reduction and works for any strides.
++__global__ void log_softmax_dim1_kernel(
++    const float* input,
++    float* output,
++    int B,
++    int H,
++    int W,
++    long long stride_b,
++    long long stride_h,
++    long long stride_w)
++{
++    int total_pairs = B * W;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total_pairs) return;
++
++    int b = idx / W;
++    int w = idx % W;
++
++    const float* base = input + (long long)b * stride_b + (long long)w * stride_w;
++    float* out_base = output + (long long)b * stride_b + (long long)w * stride_w;
++
++    // Find max over H
++    float max_val = -INFINITY;
++    for (int h = 0; h < H; ++h) {
++        float v = base[(long long)h * stride_h];
++        if (v > max_val) max_val = v;
++    }
++
++    // Compute sum of exp(x - max)
++    float sum = 0.0f;
++    for (int h = 0; h < H; ++h) {
++        float v = base[(long long)h * stride_h];
++        sum += expf(v - max_val);
++    }
++    float log_sum = logf(sum);
++
++    // Write output
++    for (int h = 0; h < H; ++h) {
++        float v = base[(long long)h * stride_h];
++        out_base[(long long)h * stride_h] = v - max_val - log_sum;
++    }
++}
++
++// Launcher for ReLU
++extern "C" void relu_forward_launcher(
++    const float* input,
++    float* output,
++    long long numel,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    relu_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++// Launcher for log_softmax along dim=1
++extern "C" void log_softmax_dim1_forward_launcher(
++    const float* input,
++    float* output,
++    int B,
++    int H,
++    int W,
++    long long stride_b,
++    long long stride_h,
++    long long stride_w,
++    cudaStream_t stream)
++{
++    int total_pairs = B * W;
++    int threads = 256;
++    int blocks = (total_pairs + threads - 1) / threads;
++    if (blocks == 0) return; // no work
++    log_softmax_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, B, H, W, stride_b, stride_h, stride_w);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,92 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void relu_forward_launcher(
++    const float* input,
++    float* output,
++    long long numel,
++    cudaStream_t stream
++);
++
++extern "C" void log_softmax_dim1_forward_launcher(
++    const float* input,
++    float* output,
++    int B,
++    int H,
++    int W,
++    long long stride_b,
++    long long stride_h,
++    long long stride_w,
++    cudaStream_t stream
++);
++
++// Helper to validate CUDA float32 tensor
++static void check_cuda_float32(const torch::Tensor& t, const char* name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++
++// Elementwise ReLU forward
++torch::Tensor relu_forward(torch::Tensor x) {
++    check_cuda_float32(x, "x");
++    auto output = torch::empty_like(x);
++    long long numel = x.numel();
++    if (numel == 0) {
++        return output;
++    }
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    relu_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        stream
++    );
++    return output;
++}
++
++// Log softmax along dim=1 forward
++torch::Tensor log_softmax_dim1_forward(torch::Tensor x) {
++    check_cuda_float32(x, "x");
++    TORCH_CHECK(x.dim() == 3, "log_softmax_dim1_forward expects a 3D tensor [B, H, W]");
++    auto output = torch::empty_like(x);
++    
++    int B = static_cast<int>(x.size(0));
++    int H = static_cast<int>(x.size(1));
++    int W = static_cast<int>(x.size(2));
++    
++    long long stride_b = x.stride(0);
++    long long stride_h = x.stride(1);
++    long long stride_w = x.stride(2);
++    
++    // Ensure strides are positive (contiguous)
++    TORCH_CHECK(stride_b > 0 && stride_h > 0 && stride_w > 0, "x must have positive strides");
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    log_softmax_dim1_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B,
++        H,
++        W,
++        stride_b,
++        stride_h,
++        stride_w,
++        stream
++    );
++    return output;
++}
++
++// Register bindings
++void register_custom_ops(pybind11::module& m) {
++    m.def("relu_forward", &relu_forward, "ReLU forward (CUDA)",
++          pybind11::arg("x"));
++    m.def("log_softmax_dim1_forward", &log_softmax_dim1_forward, "Log softmax along dim=1 (CUDA)",
++          pybind11::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        x = cuda_extension.log_softmax_dim1_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.relu_forward(x)
++        yield ('step_001', x)
++        x = cuda_extension.log_softmax_dim1_forward(x)
++        yield ('step_002', x)
++        yield ('step_003', x)

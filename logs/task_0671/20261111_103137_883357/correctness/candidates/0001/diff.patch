@@ -1,0 +1,136 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,48 @@
++#include <cuda_runtime.h>
++
++// Element-wise absolute value: y = |x|
++__global__ void abs_kernel(const float* __restrict__ input,
++                          float* __restrict__ output,
++                          int64_t n) {
++    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (; i < n; i += stride) {
++        output[i] = fabsf(input[i]);
++    }
++}
++
++// Element-wise floor: y = floor(x)
++__global__ void floor_kernel(const float* __restrict__ input,
++                             float* __restrict__ output,
++                             int64_t n) {
++    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (; i < n; i += stride) {
++        output[i] = floorf(input[i]);
++    }
++}
++
++// Launcher for custom_abs
++extern "C" void custom_abs_launcher(const float* input,
++                                     float* output,
++                                     int64_t n,
++                                     cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t grid_size = (n + block_size - 1) / block_size;
++    // Cap grid size to avoid exceeding max grid dimension (2^31-1)
++    const int64_t max_grid = 2147483647LL;
++    if (grid_size > max_grid) grid_size = max_grid;
++    abs_kernel<<<static_cast<unsigned int>(grid_size), block_size, 0, stream>>>(input, output, n);
++}
++
++// Launcher for custom_floor
++extern "C" void custom_floor_launcher(const float* input,
++                                      float* output,
++                                      int64_t n,
++                                      cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t grid_size = (n + block_size - 1) / block_size;
++    const int64_t max_grid = 2147483647LL;
++    if (grid_size > max_grid) grid_size = max_grid;
++    floor_kernel<<<static_cast<unsigned int>(grid_size), block_size, 0, stream>>>(input, output, n);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,54 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_abs_launcher(const float* input,
++                                     float* output,
++                                     int64_t n,
++                                     cudaStream_t stream);
++
++extern "C" void custom_floor_launcher(const float* input,
++                                       float* output,
++                                       int64_t n,
++                                       cudaStream_t stream);
++
++// Wrapper for custom_abs
++torch::Tensor custom_abs(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "custom_abs: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_abs: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "custom_abs: input must be contiguous");
++
++    auto output = torch::empty_like(x);
++    int64_t n = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_abs_launcher(x.data_ptr<float>(), output.data_ptr<float>(), n, stream);
++
++    return output;
++}
++
++// Wrapper for custom_floor
++torch::Tensor custom_floor(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "custom_floor: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_floor: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "custom_floor: input must be contiguous");
++
++    auto output = torch::empty_like(x);
++    int64_t n = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_floor_launcher(x.data_ptr<float>(), output.data_ptr<float>(), n, stream);
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_abs", &custom_abs, "Custom absolute value kernel", py::arg("x"));
++    m.def("custom_floor", &custom_floor, "Custom floor kernel", py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,25 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size):
++        super().__init__()
++        self.input_size = input_size
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        # Reference: x = torch.abs(x)
++        x = cuda_extension.custom_abs(x)
++        # Reference: x = torch.floor(x)
++        x = cuda_extension.custom_floor(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        # inputs is expected to contain a single tensor x
++        x = inputs[0]
++        x_abs = cuda_extension.custom_abs(x)
++        yield ("step_001", x_abs)
++        x_floor = cuda_extension.custom_floor(x_abs)
++        yield ("step_002", x_floor)
++        yield ("step_003", x_floor)

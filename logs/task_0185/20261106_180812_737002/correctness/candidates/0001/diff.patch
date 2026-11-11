@@ -1,0 +1,320 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,145 @@
++#include <cuda_runtime.h>
++
++// Kernel to compute mean over channel dimension (dim=1) with keepdim=True.
++// Input: x with shape [B, C, H, W], arbitrary strides.
++// Output: out with shape [B, 1, H, W], arbitrary strides.
++// Each thread processes one (b, h, w) position using grid-stride loop.
++__global__ void mean_dim1_keepdim_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int B,
++    int C,
++    int H,
++    int W,
++    long long x_stride_b,
++    long long x_stride_c,
++    long long x_stride_h,
++    long long x_stride_w,
++    long long out_stride_b,
++    long long out_stride_h,
++    long long out_stride_w)
++{
++    long long total = (long long)B * H * W;
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < total; idx += stride) {
++        int b = idx / ((long long)H * W);
++        int rem = idx % ((long long)H * W);
++        int h = rem / W;
++        int w = rem % W;
++
++        const float* base = x + b * x_stride_b + h * x_stride_h + w * x_stride_w;
++        float sum = 0.0f;
++        for (int c = 0; c < C; ++c) {
++            sum += base[c * x_stride_c];
++        }
++        float mean = sum / C;
++
++        float* out_ptr = out + b * out_stride_b + h * out_stride_h + w * out_stride_w;
++        *out_ptr = mean;
++    }
++}
++
++// Launcher for mean over dim=1 with keepdim=True.
++// Parameters:
++//   x: pointer to input tensor (float)
++//   out: pointer to output tensor (float)
++//   B, C, H, W: dimensions
++//   x_strides: array of 4 strides (in elements)
++//   out_strides: array of 3 strides for output (B, H, W), since C=1
++//   stream: CUDA stream
++void mean_dim1_keepdim_launcher(
++    const float* x,
++    float* out,
++    int B,
++    int C,
++    int H,
++    int W,
++    const long long* x_strides,
++    const long long* out_strides,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    long long total = (long long)B * H * W;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++
++    mean_dim1_keepdim_kernel<<<blocks, threads, 0, stream>>>(
++        x, out, B, C, H, W,
++        x_strides[0], x_strides[1], x_strides[2], x_strides[3],
++        out_strides[0], out_strides[1], out_strides[2]);
++}
++
++// Kernel to tile dimension 1 by repeats factor.
++// The input has shape [B, 1, H, W] and output [B, repeats, H, W].
++// We copy data and set output strides to achieve broadcast-like non-contiguous view.
++// Since the expansion is along dim1 which is singleton, we can simply copy the input data
++// for each repeat index. However, the reference output has stride [524288, 65536, 256, 1]
++// which is exactly the same as if output was contiguous with shape [B, 8, H, W] but with
++// dim1 stride equal to input dim0 stride (65536) and dim0 stride equal to repeats*65536.
++// This corresponds to a non-overlapping repetition, so we can write each output element.
++__global__ void tile_dim1_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int B,
++    int repeats,
++    int H,
++    int W,
++    long long x_stride_b,
++    long long x_stride_h,
++    long long x_stride_w,
++    long long out_stride_b,
++    long long out_stride_r,
++    long long out_stride_h,
++    long long out_stride_w)
++{
++    long long total = (long long)B * repeats * H * W;
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < total; idx += stride) {
++        int b = idx / ((long long)repeats * H * W);
++        int rem = idx % ((long long)repeats * H * W);
++        int r = rem / ((long long)H * W);
++        int rem2 = rem % ((long long)H * W);
++        int h = rem2 / W;
++        int w = rem2 % W;
++
++        // Input element at (b, 0, h, w)
++        const float* src = x + b * x_stride_b + h * x_stride_h + w * x_stride_w;
++        // Output element at (b, r, h, w)
++        float* dst = out + b * out_stride_b + r * out_stride_r + h * out_stride_h + w * out_stride_w;
++        *dst = *src;
++    }
++}
++
++// Launcher for tile along dim=1.
++// Parameters:
++//   x: pointer to input tensor (float) with shape [B,1,H,W]
++//   out: pointer to output tensor (float) with shape [B,repeats,H,W]
++//   B, repeats, H, W: dimensions
++//   x_strides: array of 4 strides for input (in elements)
++//   out_strides: array of 4 strides for output (in elements), as specified by reference
++//   stream: CUDA stream
++void tile_dim1_launcher(
++    const float* x,
++    float* out,
++    int B,
++    int repeats,
++    int H,
++    int W,
++    const long long* x_strides,
++    const long long* out_strides,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    long long total = (long long)B * repeats * H * W;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++
++    tile_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        x, out, B, repeats, H, W,
++        x_strides[0], x_strides[2], x_strides[3],
++        out_strides[0], out_strides[1], out_strides[2], out_strides[3]);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,143 @@
++// Binding for custom mean and tile operators
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <c10/cuda/CUDAException.h>
++#include "../binding_registry.h"
++
++// Launchers from custom_ops.cu
++extern "C" void mean_dim1_keepdim_launcher(
++    const float* x,
++    float* out,
++    int B,
++    int C,
++    int H,
++    int W,
++    const long long* x_strides,
++    const long long* out_strides,
++    cudaStream_t stream);
++
++extern "C" void tile_dim1_launcher(
++    const float* x,
++    float* out,
++    int B,
++    int repeats,
++    int H,
++    int W,
++    const long long* x_strides,
++    const long long* out_strides,
++    cudaStream_t stream);
++
++// Helper to copy strides (in elements, as long long) from tensor
++static void fill_strides(const torch::Tensor& t, long long* strides) {
++    TORCH_CHECK(t.dim() <= 4, "Unexpected tensor rank");
++    for (int i = 0; i < t.dim(); ++i) {
++        strides[i] = t.stride(i);
++    }
++}
++
++torch::Tensor mean_dim1_keepdim(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (B,C,H,W)");
++
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++    TORCH_CHECK(C > 0, "Channel dimension must be positive");
++
++    // Output shape [B,1,H,W] with reference strides [B*C? Actually stride:
++    // reference stride [65536, 65536, 256, 1] for B=512, H=256, W=256, C=3.
++    // Here output dim1 stride equals input dim0 stride (H*W typically), and output dim0 stride = H*W.
++    // More generally, to mimic torch.mean keepdim output which preserves memory format,
++    // we allocate contiguous [B,1,H,W] but then as_strided to broadcast-like strides matching reference.
++    auto out_shape = torch::IntArrayRef({B, 1, H, W});
++    auto options = x.options();
++    auto out_contig = torch::empty(out_shape, options);
++
++    // Reference stride pattern: [H*W, H*W, W, 1] when input is contiguous NCHW and output is not?
++    // For this task input is contiguous NCHW with strides [C*H*W, H*W, W, 1] = [196608,65536,256,1].
++    // torch.mean keepdim output for such input has strides [C*H*W, H*W, W, 1]? Actually let's verify:
++    // torch.mean with keepdim on contiguous input returns a view with stride [C*H*W, H*W, W, 1]
++    // and shape [B,1,H,W]. The reference output stride is [65536,65536,256,1] for B=512, H=256, W=256, C=3.
++    // Note: 65536 = H*W, so output stride[0]=H*W, stride[1]=H*W. This indicates non-contiguous but in our case
++    // we can simply create as_strided from contiguous storage with those strides. We'll allocate contiguous [B,1,H,W]
++    // and then create view with desired strides.
++    std::vector<long long> out_strides = {static_cast<long long>(H) * W, static_cast<long long>(H) * W, static_cast<long long>(W), 1};
++    auto out = out_contig.as_strided(out_shape, out_strides);
++
++    // Input strides (in elements)
++    long long x_strides[4];
++    fill_strides(x, x_strides);
++
++    long long out_strides_arr[4] = {out_strides[0], out_strides[1], out_strides[2], out_strides[3]};
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    mean_dim1_keepdim_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        B, C, H, W,
++        x_strides,
++        out_strides_arr,
++        stream);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return out;
++}
++
++torch::Tensor tile_dim1(torch::Tensor x, int64_t repeats = 8) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (B,1,H,W)");
++    TORCH_CHECK(x.size(1) == 1, "Input dim1 must be 1 for tiling along that dimension");
++    TORCH_CHECK(repeats > 0, "repeats must be positive");
++
++    int B = x.size(0);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Output shape [B, repeats, H, W]
++    auto out_shape = torch::IntArrayRef({B, repeats, H, W});
++    auto options = x.options();
++    auto out_contig = torch::empty(out_shape, options);
++
++    // Desired output strides for reference: for B=512, repeats=8, H=256, W=256 => [524288, 65536, 256, 1].
++    // General case: out_stride[0] = repeats * H * W, out_stride[1] = H * W, out_stride[2] = W, out_stride[3] = 1.
++    // This is the same as contiguous strides for shape [B, repeats, H, W] BUT dim1 stride is H*W (not repeats*H*W).
++    // This indicates broadcasting along dim1: the same data is shared across repeats with stride 0 in memory,
++    // but PyTorch tile returns a view with stride[1] equal to input stride[1]? Actually reference stride is [524288,65536,256,1].
++    // For contiguous output with repeats=8, contiguous stride would be [8*H*W, H*W, W, 1] = [524288, 65536, 256, 1] exactly!
++    // Wait: that's identical. So reference output is contiguous. Let's check: [512,8,256,256] total elements 268435456;
++    // contiguous strides are [repeats*H*W, H*W, W, 1] = [524288, 65536, 256, 1]. So output is contiguous in reference.
++    // However, the semantics say non-contiguous view, but stride matches contiguous for this shape. So we can allocate contiguous.
++    auto out = out_contig;
++
++    // Input strides
++    long long x_strides[4];
++    fill_strides(x, x_strides);
++    long long out_strides_arr[4] = {static_cast<long long>(repeats) * H * W, static_cast<long long>(H) * W, static_cast<long long>(W), 1};
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    tile_dim1_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        B, static_cast<int>(repeats), H, W,
++        x_strides,
++        out_strides_arr,
++        stream);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return out;
++}
++
++void register_custom_ops_ops(pybind11::module& m) {
++    m.def("mean_dim1_keepdim", &mean_dim1_keepdim,
++          "Mean over dim=1 with keepdim=True",
++          py::arg("x"));
++    m.def("tile_dim1", &tile_dim1,
++          "Tile along dim=1 by repeats",
++          py::arg("x"),
++          py::arg("repeats") = 8);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        # Step 1: mean over channel dimension keeping the dimension
++        x = cuda_extension.mean_dim1_keepdim(x)
++        # Step 2: tile along channel dimension by factor 8
++        x = cuda_extension.tile_dim1(x, 8)
++        return x
++
++    def debug_forward(self, x):
++        # Recompute steps identically to forward for checkpoint tracking.
++        x = cuda_extension.mean_dim1_keepdim(x)
++        yield ('step_001', x)
++        x = cuda_extension.tile_dim1(x, 8)
++        yield ('step_002', x)
++        yield ('step_003', x)

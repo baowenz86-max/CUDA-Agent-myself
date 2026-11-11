@@ -1,0 +1,146 @@
+#include <cuda_runtime.h>
+#include <cstdint>
+
+// Helper: compute floor division for positive integers
+__device__ __forceinline__ int64_t floor_div(int64_t a, int64_t b) {
+    return a / b;
+}
+
+// Helper: compute ceil division
+__device__ __forceinline__ int64_t ceil_div(int64_t a, int64_t b) {
+    return (a + b - 1) / b;
+}
+
+// Adaptive average pooling kernel: output (N, C, out_h, out_w)
+// Each thread computes one output element.
+__global__ void adaptive_avg_pool2d_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int64_t N, int64_t C, int64_t H, int64_t W,
+    int64_t out_h, int64_t out_w) {
+
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = N * C * out_h * out_w;
+    if (idx >= total) return;
+
+    // Decode output index
+    int64_t ow = idx % out_w;
+    int64_t tmp = idx / out_w;
+    int64_t oh = tmp % out_h;
+    tmp /= out_h;
+    int64_t c = tmp % C;
+    int64_t n = tmp / C;
+
+    // Compute input window using same formulas as PyTorch adaptive_avg_pool2d
+    int64_t h_start = floor_div(oh * H, out_h);
+    int64_t h_end = ceil_div((oh + 1) * H, out_h);
+    int64_t w_start = floor_div(ow * W, out_w);
+    int64_t w_end = ceil_div((ow + 1) * W, out_w);
+
+    // Clamp to valid range (shouldn't be needed but safety)
+    if (h_start < 0) h_start = 0;
+    if (h_end > H) h_end = H;
+    if (w_start < 0) w_start = 0;
+    if (w_end > W) w_end = W;
+
+    float sum = 0.0f;
+    int64_t count = (h_end - h_start) * (w_end - w_start);
+
+    // Index of first channel plane
+    const float* in_plane = input + (n * C + c) * H * W;
+
+    // Sum over window (coalesced access along W dimension)
+    for (int64_t h = h_start; h < h_end; ++h) {
+        const float* row_ptr = in_plane + h * W;
+        for (int64_t w = w_start; w < w_end; ++w) {
+            sum += row_ptr[w];
+        }
+    }
+
+    output[idx] = (count > 0) ? sum / static_cast<float>(count) : 0.0f;
+}
+
+// Softmax over channel dimension (dim=1) for tensor layout (N, C, H, W)
+// Each thread computes softmax for one (n, h, w) position across all C channels.
+__global__ void softmax_dim1_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int64_t N, int64_t C, int64_t H, int64_t W) {
+
+    int64_t spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t spatial_total = N * H * W;
+    if (spatial_idx >= spatial_total) return;
+
+    int64_t w = spatial_idx % W;
+    int64_t tmp = spatial_idx / W;
+    int64_t h = tmp % H;
+    int64_t n = tmp / H;
+
+    // Base offset within each channel for this (n,h,w)
+    int64_t base = (n * C) * (H * W) + h * W + w; // channel stride is H*W
+
+    // Find max for numerical stability
+    float max_val = -1e30f;
+    for (int64_t c = 0; c < C; ++c) {
+        float val = input[base + c * (H * W)];
+        if (val > max_val) max_val = val;
+    }
+
+    // Compute sum of exp(x - max)
+    float sum_exp = 0.0f;
+    for (int64_t c = 0; c < C; ++c) {
+        float val = input[base + c * (H * W)];
+        sum_exp += expf(val - max_val);
+    }
+
+    // Write softmax outputs
+    float inv_sum = 1.0f / sum_exp;
+    for (int64_t c = 0; c < C; ++c) {
+        float val = input[base + c * (H * W)];
+        output[base + c * (H * W)] = expf(val - max_val) * inv_sum;
+    }
+}
+
+// Launcher for adaptive_avg_pool2d_forward
+// input: pointer to float32 tensor contiguous, shape (N,C,H,W)
+// output: allocated by caller, shape (N,C,out_h,out_w)
+// out_h, out_w: output spatial dimensions (int64_t)
+// stream: CUDA stream to launch on
+extern "C" void adaptive_avg_pool2d_forward_launcher(
+    const float* input,
+    float* output,
+    int64_t N, int64_t C, int64_t H, int64_t W,
+    int64_t out_h, int64_t out_w,
+    cudaStream_t stream) {
+
+    int64_t total = N * C * out_h * out_w;
+    if (total <= 0) return;
+
+    const int block_size = 256;
+    int64_t grid_size = (total + block_size - 1) / block_size;
+    if (grid_size > 2147483647) grid_size = 2147483647; // grid dim limit, unused in this task but safe
+
+    adaptive_avg_pool2d_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
+        input, output, N, C, H, W, out_h, out_w);
+}
+
+// Launcher for softmax_dim1_forward
+// input: pointer to float32 tensor contiguous, shape (N,C,H,W)
+// output: allocated by caller, same shape
+// stream: CUDA stream to launch on
+extern "C" void softmax_dim1_forward_launcher(
+    const float* input,
+    float* output,
+    int64_t N, int64_t C, int64_t H, int64_t W,
+    cudaStream_t stream) {
+
+    int64_t spatial_total = N * H * W;
+    if (spatial_total <= 0) return;
+
+    const int block_size = 256;
+    int64_t grid_size = (spatial_total + block_size - 1) / block_size;
+    if (grid_size > 2147483647) grid_size = 2147483647;
+
+    softmax_dim1_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
+        input, output, N, C, H, W);
+}

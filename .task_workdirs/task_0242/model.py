@@ -1,0 +1,25 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        x = torch.relu(x)
+        x = F.smooth_l1_loss(x, torch.zeros_like(x))
+        return x
+
+
+batch_size = 512
+height, width = 512, 512  # Increased from 32x32 to 512x512 to increase computation
+
+
+def get_inputs():
+    return [torch.randn(batch_size, height, width)]
+
+
+def get_init_inputs():
+    return []

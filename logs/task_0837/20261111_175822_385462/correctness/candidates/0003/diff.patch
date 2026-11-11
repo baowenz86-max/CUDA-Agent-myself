@@ -1,0 +1,171 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -72,16 +72,16 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// Combine kernel: copies head and tail into a 3D tensor with shape [batch, 1, n_classes]
+-// head: [batch, head_cols]
++// Combine kernel: copies head (first head_copy_cols columns) and tail into a 3D tensor.
++// head: [batch, head_total_cols] (head_total_cols may be head_copy_cols or larger)
+ // tail: [batch, tail_cols]
+ // output: [batch, 1, n_classes] with stride (n_classes, n_classes, 1) for contiguous
+ // This kernel writes directly into the unsqueezed layout.
+ // -----------------------------------------------------------------------------
+ __global__ void combine_kernel(
+-    const float* __restrict__ head, int head_row_stride, int head_col_stride,
++    const float* __restrict__ head, int head_row_stride, int head_col_stride, int head_copy_cols,
+     const float* __restrict__ tail, int tail_row_stride, int tail_col_stride,
+-    float* __restrict__ output, int out_row_stride, int out_col_stride, // output is 3D: [batch,1,nclasses]
++    float* __restrict__ output, int out_row_stride, int out_col_stride,
+     int batch, int head_cols, int tail_cols, int n_classes
+ ) {
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+@@ -91,27 +91,26 @@
+     int r = idx / n_classes;
+     int c = idx % n_classes;
+     float val;
+-    if (c < head_cols) {
++    if (c < head_copy_cols) {
++        // Use head column c; head tensor has at least head_copy_cols columns
+         val = head[r * head_row_stride + c * head_col_stride];
+     } else {
+-        int tail_c = c - head_cols;
++        int tail_c = c - head_copy_cols;
+         val = tail[r * tail_row_stride + tail_c * tail_col_stride];
+     }
+-    // output has shape [batch, 1, n_classes], so row (batch) -> offset r*out_row_stride
+-    // column within last dim -> c*out_col_stride (out_col_stride should be 1)
+     output[r * out_row_stride + c * out_col_stride] = val;
+ }
+ 
+ // -----------------------------------------------------------------------------
+ // Launcher functions (extern "C").
+ // These are called from binding.cpp. They perform no tensor checks; the binding
+-// layer must ensure inputs are on CUDA, float32, and valid shapes. We do handle
++// layer must ensure inputs are on CUDA, float32, and valid shapes. We handle
+ // zero sizes gracefully by returning early.
+ // -----------------------------------------------------------------------------
+ 
+ // Head log softmax: out = log_softmax(x @ head_weight^T)
+ // x: [batch, in_features]
+-// head_weight: [n_head_classes, in_features]
++// head_weight: [n_head_classes, in_features]  (n_head_classes includes the extra head class)
+ // output: [batch, n_head_classes]
+ // All tensors are assumed contiguous in the last dimension (stride[-1] = 1).
+ // We pass appropriate row strides.
+@@ -203,25 +202,26 @@
+     cudaFree(hidden);
+ }
+ 
+-// Combine: output[b,0,c] = head[b,c] if c<5000 else tail[b,c-5000]
+-// head: [batch, head_cols]
++// Combine: output[b,0,c] = head[b,c] if c < head_copy_cols else tail[b,c-head_copy_cols]
++// head: [batch, head_total_cols] (head_total_cols >= head_copy_cols)
+ // tail: [batch, tail_cols]
+ // output: [batch, 1, n_classes]
+ extern "C" void adaptive_logsoftmax_combine_launcher(
+-    const float* head, int head_rows, int head_cols, int head_row_stride,
++    const float* head, int head_rows, int head_total_cols, int head_row_stride,
+     const float* tail, int tail_rows, int tail_cols, int tail_row_stride,
+     float* output, int out_d0, int out_d1, int out_d2, int out_row_stride, int out_col_stride,
++    int head_copy_cols,
+     cudaStream_t stream
+ ) {
+-    if (head_rows == 0 || head_cols == 0 || tail_rows == 0) return;
+-    int n_classes = head_cols + tail_cols;
++    if (head_rows == 0 || head_copy_cols == 0 || tail_rows == 0) return;
++    int n_classes = head_copy_cols + tail_cols;
+     int total = head_rows * n_classes;
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+     combine_kernel<<<blocks, threads, 0, stream>>>(
+-        head, head_row_stride, 1,
++        head, head_row_stride, 1, head_copy_cols,
+         tail, tail_row_stride, 1,
+         output, out_row_stride, out_col_stride,
+-        head_rows, head_cols, tail_cols, n_classes
+-    );
+-}
++        head_rows, head_total_cols, tail_cols, n_classes
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -19,9 +19,10 @@
+     cudaStream_t stream);
+ 
+ extern "C" void adaptive_logsoftmax_combine_launcher(
+-    const float* head, int head_rows, int head_cols, int head_row_stride,
++    const float* head, int head_rows, int head_total_cols, int head_row_stride,
+     const float* tail, int tail_rows, int tail_cols, int tail_row_stride,
+     float* output, int out_d0, int out_d1, int out_d2, int out_row_stride, int out_col_stride,
++    int head_copy_cols,
+     cudaStream_t stream);
+ 
+ // Helper to get current CUDA stream
+@@ -41,16 +42,14 @@
+ 
+     int batch_size = x.size(0);
+     int in_features = x.size(1);
+-    // We only need the first 5000 head classes (excluding the tail class)
+-    int n_head_classes = 5000;
+-    TORCH_CHECK(head_weight.size(0) >= n_head_classes, "head_weight must have at least 5000 rows");
++    // Use the full head weight rows (5001) for log-softmax
++    int n_head_classes = head_weight.size(0);
++    TORCH_CHECK(n_head_classes == 5001, "head_weight must have 5001 rows");
+ 
+     auto output = torch::empty({batch_size, n_head_classes}, x.options());
+ 
+-    // Use only the first 5000 rows of head_weight
+-    auto head_weight_sliced = head_weight.narrow(0, 0, n_head_classes);
+     auto x_contig = x.contiguous();
+-    auto head_contig = head_weight_sliced.contiguous();
++    auto head_contig = head_weight.contiguous();
+ 
+     cudaStream_t stream = getCurrentStream();
+     adaptive_logsoftmax_head_launcher(
+@@ -115,9 +114,12 @@
+     TORCH_CHECK(head_log_probs.size(0) == tail_log_probs.size(0), "batch sizes must match");
+ 
+     int batch_size = head_log_probs.size(0);
+-    int head_cols = head_log_probs.size(1);  // expected 5000
+-    int tail_cols = tail_log_probs.size(1);  // expected 5000
+-    int n_classes = head_cols + tail_cols;   // 10000
++    int head_total_cols = head_log_probs.size(1);  // expected 5001
++    int tail_cols = tail_log_probs.size(1);       // expected 5000
++    TORCH_CHECK(head_total_cols == 5001, "head_log_probs must have 5001 columns");
++    TORCH_CHECK(tail_cols == 5000, "tail_log_probs must have 5000 columns");
++    int head_copy_cols = 5000; // only first 5000 head columns are used
++    int n_classes = head_copy_cols + tail_cols; // 10000
+ 
+     auto output = torch::empty({batch_size, 1, n_classes}, head_log_probs.options());
+ 
+@@ -129,9 +131,10 @@
+ 
+     cudaStream_t stream = getCurrentStream();
+     adaptive_logsoftmax_combine_launcher(
+-        head_contig.data_ptr<float>(), batch_size, head_cols, head_contig.stride(0),
++        head_contig.data_ptr<float>(), batch_size, head_total_cols, head_contig.stride(0),
+         tail_contig.data_ptr<float>(), batch_size, tail_cols, tail_contig.stride(0),
+         output.data_ptr<float>(), batch_size, 1, n_classes, out_row_stride, out_col_stride,
++        head_copy_cols,
+         stream
+     );
+ 
+@@ -143,13 +146,13 @@
+ 
+ void register_adaptive_logsoftmax_ops(pybind11::module& m) {
+     m.def("adaptive_logsoftmax_head_forward", &adaptive_logsoftmax_head_forward,
+-          "Compute head log softmax",
++          "Compute head log softmax over 5001 classes",
+           py::arg("x"), py::arg("head_weight"));
+     m.def("adaptive_logsoftmax_tail_forward", &adaptive_logsoftmax_tail_forward,
+           "Compute tail log softmax",
+           py::arg("x"), py::arg("tail_0_weight"), py::arg("tail_1_weight"));
+     m.def("adaptive_logsoftmax_combine", &adaptive_logsoftmax_combine,
+-          "Combine head and tail log probs",
++          "Combine first 5000 head log probs with tail log probs",
+           py::arg("head_log_probs"), py::arg("tail_log_probs"));
+ }
+ 

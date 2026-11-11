@@ -1,0 +1,304 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,143 @@
++#include <cuda_runtime.h>
++#include <cuComplex.h>
++
++// ============================================================================
++// STFT CUDA kernels
++// ============================================================================
++// Reference: torch.stft(input, n_fft, hop_length, win_length, return_complex=True)
++// Uses rectangular window (None), center=True, pad_mode='reflect', normalized=False, onesided=True.
++// Input layout: [batch, num_samples], float32, contiguous (or at least stride[1]=1).
++// Output layout: complex64 with shape [batch, n_fft//2 + 1, frames],
++//    and strides as in torch.stft: [frames * (n_fft//2+1), 1, n_fft//2+1].
++// frames = 1 + (num_samples - n_fft) / hop_length.
++// For onesided, output frequency bins = n_fft//2 + 1.
++
++// Utility to compute reflect padding index for a given index i in padded signal.
++// Padded length = num_samples + 2 * pad, where pad = n_fft // 2 (center=True default).
++__device__ inline int reflect_index(int i, int num_samples, int pad) {
++    int N = num_samples;
++    int total = N + 2 * pad;
++    if (i < pad) {
++        // reflect about boundary between pad and pad-1: index in original = pad - 1 - (i - pad) = 2*pad - 1 - i
++        return 2 * pad - 1 - i;
++    } else if (i >= pad + N) {
++        // reflect about boundary at pad+N: index = 2*(pad+N)-1 - i = 2*pad + 2*N -1 - i
++        return 2 * pad + 2 * N - 1 - i;
++    } else {
++        return i - pad;
++    }
++}
++
++// Precompute twiddle factors for each n_fft length, reused across all frames/batches.
++__global__ void precompute_twiddle_kernel(cuComplex* twiddle, int n_fft) {
++    int k = blockIdx.x * blockDim.x + threadIdx.x;
++    if (k >= n_fft) return;
++    float angle = -2.0f * 3.14159265358979323846f * (float)k / (float)n_fft;
++    twiddle[k] = make_cuComplex(cosf(angle), sinf(angle));
++}
++
++// STFT kernel: each thread computes one (batch, freq_bin, frame) output element.
++// Input: float* input, shape [batch, num_samples], contiguous (but we use stride via num_samples).
++// Output: cuComplex* output, shape [batch, bins, frames], with strides: out_stride_batch = frames * bins, out_stride_frame = bins, out_stride_freq = 1.
++__global__ void stft_kernel(
++    const float* __restrict__ input,
++    cuComplex* __restrict__ output,
++    const cuComplex* __restrict__ twiddle,
++    int batch,
++    int num_samples,
++    int n_fft,
++    int hop_length,
++    int win_length,
++    int bins,
++    int frames,
++    int pad
++) {
++    int total_output = batch * bins * frames;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    
++    for (int linear = idx; linear < total_output; linear += stride) {
++        // Decode linear index to (b, freq, frame)
++        int frame = linear % frames;
++        int tmp = linear / frames;
++        int freq = tmp % bins;
++        int b = tmp / bins;
++        
++        // Compute DFT for this (b, freq, frame)
++        // Window is rectangular: for n < win_length, weight=1; for n >= win_length, weight=0.
++        // But win_length == n_fft in this task, so no truncation.
++        // Use win_length for generality, but assume win_length <= n_fft; if shorter, zero beyond win_length.
++        int start_sample = frame * hop_length;  // because center=True, actual signal segment starts at start_sample - pad in input coordinate, but we use reflect index.
++        
++        cuComplex sum = make_cuComplex(0.0f, 0.0f);
++        int n_eff = min(win_length, n_fft);
++        for (int n = 0; n < n_eff; ++n) {
++            // Index in padded signal: start_sample + n (since padded signal has length num_samples+2*pad, and we pad reflect)
++            int padded_idx = start_sample + n;
++            int orig_idx = reflect_index(padded_idx, num_samples, pad);
++            // orig_idx is guaranteed in [0, num_samples-1] due to reflect padding.
++            float x = input[b * num_samples + orig_idx];
++            // Twiddle factor: exp(-2*pi*i * freq * n / n_fft)
++            int twiddle_idx = (freq * n) % n_fft;
++            cuComplex tw = twiddle[twiddle_idx];
++            // sum += x * tw
++            sum.x += x * tw.x;
++            sum.y += x * tw.y;
++        }
++        // normalized=False, so no scaling.
++        int out_idx = (b * frames + frame) * bins + freq;  // matches strides [frames*bins, 1, bins] ? Actually output stride: batch stride = frames*bins, frame stride = bins, freq stride = 1.
++        output[out_idx] = sum;
++    }
++}
++
++// Launcher function matching expected C interface used by binding.
++// Arguments:
++//   input: float pointer, shape [batch, num_samples]
++//   output: cuComplex pointer, shape [batch, bins, frames], allocated by binding
++//   batch, num_samples, n_fft, hop_length, win_length: int64_t
++//   stream: cudaStream_t
++extern "C" void custom_stft_launcher(
++    const float* input,
++    cuComplex* output,
++    int64_t batch,
++    int64_t num_samples,
++    int64_t n_fft,
++    int64_t hop_length,
++    int64_t win_length,
++    cudaStream_t stream
++) {
++    int64_t bins = n_fft / 2 + 1;
++    int64_t frames = 1 + (num_samples - n_fft) / hop_length;
++    int64_t pad = n_fft / 2;
++
++    // Allocate twiddle factors once on device (could be optimized with constant memory, but simple).
++    // We allocate inside launcher, then free after kernel. Better to cache but for simplicity.
++    cuComplex* twiddle_device = nullptr;
++    cudaMalloc(&twiddle_device, n_fft * sizeof(cuComplex));
++    // Precompute twiddle factors
++    int threads_pre = 256;
++    int blocks_pre = (int)((n_fft + threads_pre - 1) / threads_pre);
++    precompute_twiddle_kernel<<<blocks_pre, threads_pre, 0, stream>>>(twiddle_device, (int)n_fft);
++
++    // Launch STFT kernel
++    int64_t total_output = batch * bins * frames;
++    int threads = 256;
++    int blocks = (int)((total_output + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid cap, but kernel uses grid-stride loop
++    stft_kernel<<<blocks, threads, 0, stream>>>(
++        input,
++        output,
++        twiddle_device,
++        (int)batch,
++        (int)num_samples,
++        (int)n_fft,
++        (int)hop_length,
++        (int)win_length,
++        (int)bins,
++        (int)frames,
++        (int)pad
++    );
++
++    // Free twiddle after kernel completes (need synchronize? but stream ordering ensures kernel done before free? Actually cudaFree after kernel launch in same stream is safe because free waits for kernel? No, cudaFree is synchronous? It may block until kernel completes? According to CUDA, cudaFree does implicit synchronization. So it's fine.)
++    cudaFree(twiddle_device);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,123 @@
++// Binding file for custom_reshape and custom_stft
++// This file contains only PyTorch tensor handling and binding code.
++// CUDA kernel launchers are declared from custom_ops.cu.
++
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void custom_stft_launcher(
++    const float* input,
++    cuComplex* output,
++    int64_t batch,
++    int64_t num_samples,
++    int64_t n_fft,
++    int64_t hop_length,
++    int64_t win_length,
++    cudaStream_t stream
++);
++
++// ======================= custom_reshape =======================
++// Performs torch.reshape(input, shape) as a view. shape can be a single int (int64_t)
++// or a tuple/list of ints (handled via py::tuple overload).
++
++// Overload 1: shape as single int (contract signature)
++torch::Tensor custom_reshape_int(torch::Tensor input, int64_t shape) {
++    TORCH_CHECK(input.is_cuda(), "custom_reshape: input must be a CUDA tensor");
++    // Allow float32 and complex64 as required by contract
++    TORCH_CHECK(input.dtype() == torch::kFloat32 || input.dtype() == torch::kComplex64,
++                "custom_reshape: input must be float32 or complex64");
++    // Single int shape: convert to a one-element array and reshape
++    return input.reshape({shape});
++}
++
++// Overload 2: shape as tuple (for model_new.py calls like (-1, x.size(-1)))
++torch::Tensor custom_reshape_tuple(torch::Tensor input, py::tuple shape) {
++    TORCH_CHECK(input.is_cuda(), "custom_reshape: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32 || input.dtype() == torch::kComplex64,
++                "custom_reshape: input must be float32 or complex64");
++    std::vector<int64_t> dims;
++    for (auto item : shape) {
++        // Convert each element to int64_t (handles Python ints)
++        dims.push_back(py::cast<int64_t>(item));
++    }
++    return input.reshape(torch::IntArrayRef(dims));
++}
++
++// ======================= custom_stft =======================
++torch::Tensor custom_stft(
++    torch::Tensor input,
++    int64_t n_fft,
++    int64_t hop_length,
++    int64_t win_length,
++    bool return_complex
++) {
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "custom_stft: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_stft: input must be float32");
++    TORCH_CHECK(input.dim() == 2, "custom_stft: input must be 2D [batch, num_samples]");
++    TORCH_CHECK(n_fft > 0 && hop_length > 0 && win_length > 0, "custom_stft: n_fft/hop_length/win_length must be positive");
++    TORCH_CHECK(win_length <= n_fft, "custom_stft: win_length must be <= n_fft");
++    TORCH_CHECK((input.size(1) - n_fft) % hop_length == 0, "custom_stft: (num_samples - n_fft) must be divisible by hop_length");
++
++    // Compute output dimensions
++    int64_t batch = input.size(0);
++    int64_t num_samples = input.size(1);
++    int64_t bins = n_fft / 2 + 1;
++    int64_t frames = 1 + (num_samples - n_fft) / hop_length;
++    TORCH_CHECK(frames > 0, "custom_stft: too few frames");
++
++    // Allocate output tensor with correct dtype and strides matching torch.stft
++    auto options = torch::TensorOptions()
++        .dtype(torch::kComplex64)
++        .device(input.device());
++    torch::Tensor output = torch::empty({batch, bins, frames}, options);
++
++    // Ensure output is contiguous (it should be by default from empty)
++    TORCH_CHECK(output.is_contiguous(), "custom_stft: output must be contiguous");
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_stft_launcher(
++        input.data_ptr<float>(),
++        reinterpret_cast<cuComplex*>(output.data_ptr<c10::complex<float>>()),
++        batch,
++        num_samples,
++        n_fft,
++        hop_length,
++        win_length,
++        stream
++    );
++
++    // Check for CUDA errors after launch
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_stft: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    // Synchronize to catch asynchronous errors (optional, may be removed for performance)
++    // cudaStreamSynchronize(stream); // Uncomment for debugging, but not needed here.
++
++    return output;
++}
++
++// ======================= Registration =======================
++void register_custom_ops(pybind11::module& m) {
++    // Register custom_reshape with two overloads: int shape and tuple shape.
++    // The tuple overload is used by model_new.py as it passes (-1, x.size(-1)).
++    m.def("custom_reshape", &custom_reshape_int, "Reshape tensor (single int shape)",
++          py::arg("input"), py::arg("shape"));
++    m.def("custom_reshape", &custom_reshape_tuple, "Reshape tensor (tuple shape)",
++          py::arg("input"), py::arg("shape"));
++
++    // Register custom_stft
++    m.def("custom_stft", &custom_stft, "Short-time Fourier transform",
++          py::arg("input"), py::arg("n_fft"), py::arg("hop_length"),
++          py::arg("win_length"), py::arg("return_complex"));
++}
++
++// Auto-register using the fixed infrastructure
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,29 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, n_fft: int, hop_length: int, win_length: int, n_mels: int, mel_shape: tuple):
++        super().__init__()
++        self.n_fft = n_fft
++        self.hop_length = hop_length
++        self.win_length = win_length
++        self.n_mels = n_mels
++        self.mel_shape = mel_shape
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.custom_reshape(x, (-1, x.size(-1)))
++        x = cuda_extension.custom_stft(x, self.n_fft, self.hop_length, self.win_length, True)
++        x = cuda_extension.custom_reshape(x, self.mel_shape)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.custom_reshape(x, (-1, x.size(-1)))
++        yield 'step_001', x
++        x = cuda_extension.custom_stft(x, self.n_fft, self.hop_length, self.win_length, True)
++        yield 'step_002', x
++        x = cuda_extension.custom_reshape(x, self.mel_shape)
++        yield 'step_003', x
++        yield 'step_004', x

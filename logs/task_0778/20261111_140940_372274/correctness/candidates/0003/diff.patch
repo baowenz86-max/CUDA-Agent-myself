@@ -1,0 +1,206 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -4,87 +4,27 @@
+ // Contract: only float32 tensors on CUDA; output bool for isin, float32 for maxpool.
+ // No PyTorch/ATen headers. All tensors passed as raw pointers plus sizes/strides.
+ 
+-// isin kernel: elementwise check if x value belongs to values (1D contiguous).
+-__global__ void isin_kernel(
+-    const float* __restrict__ x,
+-    const float* __restrict__ values,
+-    bool* __restrict__ out,
+-    long long total_elements,
+-    int values_size)
+-{
+-    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+-    long long stride = (long long)gridDim.x * blockDim.x;
+-    for (; idx < total_elements; idx += stride) {
+-        float val = x[idx];
+-        bool found = false;
+-        for (int v = 0; v < values_size; ++v) {
+-            if (val == values[v]) {
+-                found = true;
+-                break;
+-            }
+-        }
+-        out[idx] = found;
+-    }
+-}
+-
+-// Generic strided isin kernel: pass arrays for shape and strides.
+-__global__ void isin_kernel_generic(
++// isin kernel for 3D tensors (batch, channel, length) with arbitrary strides.
++__global__ void isin_kernel_3d(
+     const float* __restrict__ x,
+     const float* __restrict__ values,
+     bool* __restrict__ out,
+     long long total_elements,
+     int values_size,
+-    const long long* __restrict__ x_shape,
+-    const long long* __restrict__ x_strides,
+-    int dim)
++    long long shape0, long long shape1, long long shape2,
++    long long x_stride0, long long x_stride1, long long x_stride2,
++    long long out_stride0, long long out_stride1, long long out_stride2)
+ {
+     long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+     long long grid_stride = (long long)gridDim.x * blockDim.x;
+     for (; idx < total_elements; idx += grid_stride) {
+-        // Compute multi-index from linear idx (row-major order)
+-        long long offset = 0;
+-        long long remaining = idx;
+-        for (int d = dim - 1; d >= 0; --d) {
+-            long long coord = remaining % x_shape[d];
+-            remaining /= x_shape[d];
+-            offset += coord * x_strides[d];
+-        }
+-        float val = x[offset];
+-        bool found = false;
+-        for (int v = 0; v < values_size; ++v) {
+-            if (val == values[v]) {
+-                found = true;
+-                break;
+-            }
+-        }
+-        out[idx] = found;  // output is contiguous bool (binding allocates contiguous with x's shape)
+-    }
+-}
+-
+-// Final kernel for isin (handles arbitrary strides for both x and out, but out shape matches x shape).
+-__global__ void isin_kernel_strided_both(
+-    const float* __restrict__ x,
+-    const float* __restrict__ values,
+-    bool* __restrict__ out,
+-    long long total_elements,
+-    int values_size,
+-    const long long* __restrict__ x_shape,
+-    const long long* __restrict__ x_strides,
+-    const long long* __restrict__ out_strides,
+-    int dim)
+-{
+-    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+-    long long grid_stride = (long long)gridDim.x * blockDim.x;
+-    for (; idx < total_elements; idx += grid_stride) {
+-        long long remaining = idx;
+-        long long x_offset = 0;
+-        long long out_offset = 0;
+-        for (int d = dim - 1; d >= 0; --d) {
+-            long long coord = remaining % x_shape[d];
+-            remaining /= x_shape[d];
+-            x_offset += coord * x_strides[d];
+-            out_offset += coord * out_strides[d];
+-        }
++        // Compute 3D multi-index from linear idx (row-major order)
++        long long coord0 = idx / (shape1 * shape2);
++        long long rem = idx % (shape1 * shape2);
++        long long coord1 = rem / shape2;
++        long long coord2 = rem % shape2;
++        long long x_offset = coord0 * x_stride0 + coord1 * x_stride1 + coord2 * x_stride2;
++        long long out_offset = coord0 * out_stride0 + coord1 * out_stride1 + coord2 * out_stride2;
+         float val = x[x_offset];
+         bool found = false;
+         for (int v = 0; v < values_size; ++v) {
+@@ -119,10 +59,10 @@
+     long long grid_stride = (long long)gridDim.x * blockDim.x;
+     long long total_outputs = (long long)batch_size * channels * output_length;
+     for (; idx < total_outputs; idx += grid_stride) {
+-        int out_i = idx % output_length;
++        int out_i = (int)(idx % output_length);
+         long long tmp = idx / output_length;
+-        int out_c = tmp % channels;
+-        int out_b = tmp / channels;
++        int out_c = (int)(tmp % channels);
++        int out_b = (int)(tmp / channels);
+ 
+         int start = out_i * stride - padding;
+         float max_val = -3.402823466e+38F;
+@@ -142,15 +82,15 @@
+     }
+ }
+ 
+-// Launcher for isin_custom (single extern "C" definition)
++// Launcher for isin_custom: receives shape and strides as scalars (3D).
++// No dynamic memory on host that could be freed before async kernel finishes.
+ extern "C" void isin_custom_launcher(
+     const float* x,
+     const float* values,
+     bool* out,
+-    const long long* x_shape,
+-    const long long* x_strides,
+-    const long long* out_strides,
+-    int dim,
++    long long shape0, long long shape1, long long shape2,
++    long long x_stride0, long long x_stride1, long long x_stride2,
++    long long out_stride0, long long out_stride1, long long out_stride2,
+     int values_size,
+     long long total_elements,
+     cudaStream_t stream)
+@@ -159,9 +99,11 @@
+     long long blocks = (total_elements + threads - 1) / threads;
+     if (blocks > 65535) blocks = 65535;
+     
+-    isin_kernel_strided_both<<<(int)blocks, threads, 0, stream>>>(
++    isin_kernel_3d<<<(int)blocks, threads, 0, stream>>>(
+         x, values, out, total_elements, values_size,
+-        x_shape, x_strides, out_strides, dim);
++        shape0, shape1, shape2,
++        x_stride0, x_stride1, x_stride2,
++        out_stride0, out_stride1, out_stride2);
+ }
+ 
+ // Launcher for maxpool1d_custom
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -8,10 +8,9 @@
+     const float* x,
+     const float* values,
+     bool* out,
+-    const long long* x_shape,
+-    const long long* x_strides,
+-    const long long* out_strides,
+-    int dim,
++    long long shape0, long long shape1, long long shape2,
++    long long x_stride0, long long x_stride1, long long x_stride2,
++    long long out_stride0, long long out_stride1, long long out_stride2,
+     int values_size,
+     long long total_elements,
+     cudaStream_t stream);
+@@ -45,25 +44,27 @@
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    auto x_shape = x.sizes().vec();
+-    auto x_strides = x.strides().vec();
+-    auto out_strides = out.strides().vec();
+-    std::vector<long long> shape_ll(x_shape.begin(), x_shape.end());
+-    std::vector<long long> x_strides_ll(x_strides.begin(), x_strides.end());
+-    std::vector<long long> out_strides_ll(out_strides.begin(), out_strides.end());
++    TORCH_CHECK(x.dim() == 3, "x must be 3D [batch, channels, length]");
++    long long shape0 = x.size(0);
++    long long shape1 = x.size(1);
++    long long shape2 = x.size(2);
++    long long x_stride0 = x.stride(0);
++    long long x_stride1 = x.stride(1);
++    long long x_stride2 = x.stride(2);
++    long long out_stride0 = out.stride(0);
++    long long out_stride1 = out.stride(1);
++    long long out_stride2 = out.stride(2);
+ 
+     long long total_elements = x.numel();
+-    int dim = x.dim();
+     int values_size = values.size(0);
+ 
+     isin_custom_launcher(
+         x.data_ptr<float>(),
+         values.data_ptr<float>(),
+         out.data_ptr<bool>(),
+-        shape_ll.data(),
+-        x_strides_ll.data(),
+-        out_strides_ll.data(),
+-        dim,
++        shape0, shape1, shape2,
++        x_stride0, x_stride1, x_stride2,
++        out_stride0, out_stride1, out_stride2,
+         values_size,
+         total_elements,
+         stream

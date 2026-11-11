@@ -1,0 +1,310 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,129 @@
++#include <cuda_runtime.h>
++
++// Elementwise sigmoid: y = 1 / (1 + exp(-x))
++__global__ void sigmoid_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    long long numel,
++    long long* __restrict__ in_strides,
++    long long* __restrict__ out_strides,
++    int ndim)
++{
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (long long linear = idx; linear < numel; linear += stride) {
++        // compute multi-dimensional index from linear index
++        long long in_offset = 0;
++        long long out_offset = 0;
++        long long tmp = linear;
++        for (int d = ndim - 1; d >= 0; --d) {
++            long long coord = tmp % in_strides[d] == 0 ? 0 : 0; // placeholder no
++            // actual computation below
++        }
++        // Correct implementation:
++        long long rem = linear;
++        for (int d = 0; d < ndim; ++d) {
++            long long size_d = in_strides[d] == 0 ? 1 : 0; // won't be used
++        }
++        // Since strides may be zero for size-1 dims, we need sizes. But we can compute using original shape.
++        // We only have strides, not sizes. The launcher can pass sizes as well.
++    }
++}
++
++// Actually easier: pass integer sizes to compute linear index mapping.
++// Let's define a more general elementwise kernel with strides and sizes.
++__global__ void sigmoid_kernel_v2(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    long long numel,
++    const long long* __restrict__ input_strides,
++    const long long* __restrict__ output_strides,
++    const long long* __restrict__ sizes,
++    int ndim)
++{
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long step = (long long)gridDim.x * blockDim.x;
++    for (long long linear = idx; linear < numel; linear += step) {
++        long long in_offset = 0;
++        long long out_offset = 0;
++        long long tmp = linear;
++        for (int d = ndim - 1; d >= 0; --d) {
++            long long coord = tmp % sizes[d];
++            tmp /= sizes[d];
++            in_offset += coord * input_strides[d];
++            out_offset += coord * output_strides[d];
++        }
++        float x = input[in_offset];
++        // stable sigmoid
++        float exp_val = __expf(-x);
++        float y = 1.0f / (1.0f + exp_val);
++        output[out_offset] = y;
++    }
++}
++
++// multiply scalar kernel
++__global__ void multiply_scalar_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    long long numel,
++    float scalar,
++    const long long* __restrict__ input_strides,
++    const long long* __restrict__ output_strides,
++    const long long* __restrict__ sizes,
++    int ndim)
++{
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long step = (long long)gridDim.x * blockDim.x;
++    for (long long linear = idx; linear < numel; linear += step) {
++        long long in_offset = 0;
++        long long out_offset = 0;
++        long long tmp = linear;
++        for (int d = ndim - 1; d >= 0; --d) {
++            long long coord = tmp % sizes[d];
++            tmp /= sizes[d];
++            in_offset += coord * input_strides[d];
++            out_offset += coord * output_strides[d];
++        }
++        output[out_offset] = input[in_offset] * scalar;
++    }
++}
++
++// Launcher for sigmoid: output tensor with same shape, but may have different strides (contiguous allocation)
++// We assume output is contiguous; we can also pass output strides if needed.
++extern "C" void custom_sigmoid_launcher(
++    float* output,
++    const float* input,
++    long long numel,
++    const long long* input_strides,
++    const long long* output_strides,
++    const long long* sizes,
++    int ndim,
++    cudaStream_t stream)
++{
++    int block_size = 256;
++    long long grid_size_long = (numel + block_size - 1) / block_size;
++    if (grid_size_long > 65535) grid_size_long = 65535;
++    dim3 grid((unsigned)grid_size_long);
++    sigmoid_kernel_v2<<<grid, block_size, 0, stream>>>(
++        output, input, numel, input_strides, output_strides, sizes, ndim);
++}
++
++extern "C" void custom_multiply_scalar_launcher(
++    float* output,
++    const float* input,
++    long long numel,
++    float scalar,
++    const long long* input_strides,
++    const long long* output_strides,
++    const long long* sizes,
++    int ndim,
++    cudaStream_t stream)
++{
++    int block_size = 256;
++    long long grid_size_long = (numel + block_size - 1) / block_size;
++    if (grid_size_long > 65535) grid_size_long = 65535;
++    dim3 grid((unsigned)grid_size_long);
++    multiply_scalar_kernel<<<grid, block_size, 0, stream>>>(
++        output, input, numel, scalar, input_strides, output_strides, sizes, ndim);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,152 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_sigmoid_launcher(
++    float* output,
++    const float* input,
++    long long numel,
++    const long long* input_strides,
++    const long long* output_strides,
++    const long long* sizes,
++    int ndim,
++    cudaStream_t stream
++);
++
++extern "C" void custom_multiply_scalar_launcher(
++    float* output,
++    const float* input,
++    long long numel,
++    float scalar,
++    const long long* input_strides,
++    const long long* output_strides,
++    const long long* sizes,
++    int ndim,
++    cudaStream_t stream
++);
++
++namespace {
++
++// Helper: allocate device memory for strides/sizes, copy from host, and free after call
++class DeviceStridesSizes {
++public:
++    DeviceStridesSizes(const torch::Tensor& tensor) {
++        ndim = tensor.dim();
++        sizes_host.resize(ndim);
++        in_strides_host.resize(ndim);
++        out_strides_host.resize(ndim);
++
++        // Get sizes and strides
++        for (int d = 0; d < ndim; ++d) {
++            sizes_host[d] = tensor.size(d);
++            in_strides_host[d] = tensor.stride(d);
++            out_strides_host[d] = tensor.stride(d); // output same shape, same strides
++        }
++
++        // Allocate device arrays
++        cudaMalloc((void**)&sizes_dev, ndim * sizeof(long long));
++        cudaMalloc((void**)&in_strides_dev, ndim * sizeof(long long));
++        cudaMalloc((void**)&out_strides_dev, ndim * sizeof(long long));
++
++        cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++        cudaMemcpyAsync(sizes_dev, sizes_host.data(), ndim * sizeof(long long), cudaMemcpyHostToDevice, stream);
++        cudaMemcpyAsync(in_strides_dev, in_strides_host.data(), ndim * sizeof(long long), cudaMemcpyHostToDevice, stream);
++        cudaMemcpyAsync(out_strides_dev, out_strides_host.data(), ndim * sizeof(long long), cudaMemcpyHostToDevice, stream);
++    }
++
++    ~DeviceStridesSizes() {
++        cudaFree(sizes_dev);
++        cudaFree(in_strides_dev);
++        cudaFree(out_strides_dev);
++    }
++
++    long long* sizes_ptr() { return sizes_dev; }
++    long long* in_strides_ptr() { return in_strides_dev; }
++    long long* out_strides_ptr() { return out_strides_dev; }
++    int dim() const { return ndim; }
++
++private:
++    int ndim;
++    std::vector<long long> sizes_host;
++    std::vector<long long> in_strides_host;
++    std::vector<long long> out_strides_host;
++    long long* sizes_dev = nullptr;
++    long long* in_strides_dev = nullptr;
++    long long* out_strides_dev = nullptr;
++};
++
++} // anonymous namespace
++
++// Wrapper for custom_sigmoid
++torch::Tensor custom_sigmoid(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.numel() > 0, "Input must not be empty");
++
++    auto x_contig = x.contiguous();
++    auto output = torch::empty_like(x_contig);
++
++    DeviceStridesSizes strides_sizes(x_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_sigmoid_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        x_contig.numel(),
++        strides_sizes.in_strides_ptr(),
++        strides_sizes.out_strides_ptr(),
++        strides_sizes.sizes_ptr(),
++        strides_sizes.dim(),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_sigmoid kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for custom_multiply_scalar
++torch::Tensor custom_multiply_scalar(torch::Tensor x, double scalar = 2.0) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.numel() > 0, "Input must not be empty");
++
++    auto x_contig = x.contiguous();
++    auto output = torch::empty_like(x_contig);
++
++    DeviceStridesSizes strides_sizes(x_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_multiply_scalar_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        x_contig.numel(),
++        static_cast<float>(scalar),
++        strides_sizes.in_strides_ptr(),
++        strides_sizes.out_strides_ptr(),
++        strides_sizes.sizes_ptr(),
++        strides_sizes.dim(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_multiply_scalar kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Register bindings
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_sigmoid", &custom_sigmoid, "Sigmoid activation (CUDA)",
++          py::arg("x"));
++    m.def("custom_multiply_scalar", &custom_multiply_scalar, "Multiply tensor by scalar (CUDA)",
++          py::arg("x"), py::arg("scalar") = 2.0);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        x = cuda_extension.custom_sigmoid(x)
++        x = cuda_extension.custom_multiply_scalar(x, 2.0)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_sigmoid(x)
++        yield 'step_001', x
++        x = cuda_extension.custom_multiply_scalar(x, 2.0)
++        yield 'step_002', x
++        yield 'step_003', x

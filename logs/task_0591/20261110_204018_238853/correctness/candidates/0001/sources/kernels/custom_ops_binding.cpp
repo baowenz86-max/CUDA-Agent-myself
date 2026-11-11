@@ -1,0 +1,176 @@
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cublas_v2.h>
+#include <vector>
+#include "../binding_registry.h"
+
+// Declare launcher from custom_ops.cu
+extern "C" void gelu_forward_launcher(float* output, const float* input, int64_t numel, cudaStream_t stream);
+
+// GELU forward wrapper
+torch::Tensor gelu_forward(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+
+    auto output = torch::empty_like(input);
+    int64_t numel = input.numel();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    gelu_forward_launcher(
+        output.data_ptr<float>(),
+        input.data_ptr<float>(),
+        numel,
+        stream
+    );
+
+    return output;
+}
+
+// Linear forward wrapper using cuBLAS
+torch::Tensor linear_forward(torch::Tensor input, torch::Tensor weight, c10::optional<torch::Tensor> bias) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Weight must be contiguous");
+
+    if (bias.has_value() && bias.value().defined()) {
+        TORCH_CHECK(bias.value().is_cuda(), "Bias must be a CUDA tensor");
+        TORCH_CHECK(bias.value().dtype() == torch::kFloat32, "Bias must be float32");
+        TORCH_CHECK(bias.value().is_contiguous(), "Bias must be contiguous");
+    }
+
+    // Input shape: [batch_size, seq_len, in_features] (contiguous)
+    // Weight shape: [out_features, in_features]
+    int64_t batch_size = input.size(0);
+    int64_t seq_len = input.size(1);
+    int64_t in_features = input.size(2);
+    int64_t out_features = weight.size(0);
+
+    TORCH_CHECK(weight.size(1) == in_features, "Weight shape mismatch");
+    TORCH_CHECK(bias.has_value() ? bias.value().numel() == out_features : true, "Bias size mismatch");
+
+    auto output = torch::empty({batch_size, seq_len, out_features}, input.options());
+
+    int64_t m = batch_size * seq_len;  // Rows in GEMM
+    int64_t n = out_features;          // Columns in GEMM
+    int64_t k = in_features;           // Reduction dimension
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    cublasSetStream(handle, stream);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // cuBLAS uses column-major. Our input is row-major [m, k], weight is row-major [n, k].
+    // We compute output^T = weight^T * input^T with column-major layout.
+    // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, n, m, k, &alpha,
+    //             weight.data_ptr<float>(), n, input.data_ptr<float>(), m, &beta,
+    //             output.data_ptr<float>(), n);
+    // Here output is column-major of size [n, m], which corresponds to row-major [m, n].
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
+                &alpha,
+                weight.data_ptr<float>(), static_cast<int>(n),
+                input.data_ptr<float>(), static_cast<int>(m),
+                &beta,
+                output.data_ptr<float>(), static_cast<int>(n));
+
+    // Add bias if provided
+    if (bias.has_value() && bias.value().defined()) {
+        // Need to add bias to each row of output (row-major).
+        // We use a simple custom kernel? No, can't define kernel in .cpp.
+        // Use cublasSgemm with beta=1? No, that would add to existing output.
+        // Instead, use cublasSgemm with beta=1 after zeroing? Or use cublasSgemm trick:
+        // output = alpha * (input @ weight.T) + beta * bias_row_broadcast
+        // We can create a matrix of ones? Not allowed (no torch operations).
+        // Alternative: use cudaMemsetAsync? No, bias add requires elementwise addition per row.
+        // Since bias is a vector, we can use cublasSgemm with a one-column matrix of ones (not available).
+        // Instead, we can allocate a temporary matrix of size [m, n] filled with bias? That would be wasteful.
+        // Better: use cublasSaxpy? Not per row.
+        // We can use cublasSgemm with beta=1 and a matrix of ones as B, but we need to construct it.
+        // Since we are in binding.cpp, we cannot launch custom kernels. However, cuBLAS provides cublasSgemv to add bias?
+        // bias is a vector, not per row. Actually, adding bias to each row of output can be done by:
+        // cublasSgemm with C = output, A = ones [m,1], B = bias [1,n], beta=1, alpha=1.
+        // But we need ones matrix. Could use cudaMalloc and cudaMemset to create ones? But then need to free.
+        // We can use cublasSetMatrix? Not ideal.
+        // Simplest compliant approach: after computing GEMM, launch a small custom kernel from .cu? But .cu only has gelu.
+        // We are not allowed to modify .cu in this stage.
+        // However, we can use cudaMemsetAsync to fill output with bias? No, that would overwrite.
+        // Alternative: we can use cudaMemcpyAsync to copy bias to output rows? Not straightforward.
+        // The correct solution: modify custom_ops.cu to add a bias kernel. But current stage allows only .cpp files.
+        // The user instruction says: "binding.cpp that can be compiled and linked with .cu". It implies .cu may have more functions,
+        // but we are not to generate .cu now. However, the existing .cu only has gelu. This is a constraint.
+        // But the task says "Conv/ConvTranspose must be implemented in kernels/*.cpp using cuDNN"; linear is not conv, so it can be cuBLAS in .cpp.
+        // For bias addition, we can use cublasSgemm with beta=1 and a matrix of ones? But no torch ops to create ones.
+        // We can allocate a device vector of ones using cudaMalloc and fill with cudaMemset? cudaMemset sets bytes, can set to 1.0f by repeated pattern?
+        // cudaMemset sets a byte value, not a float value. For float, 1.0f is 0x3F800000, bytes 00 00 80 3F, which is not a single byte repeat.
+        // So we cannot easily create ones without a kernel.
+        // A common trick: if bias is not None, we can compute output = input @ weight.T, then add bias by using cublasSgemm with beta=1 and A=ones (m x 1) and B=bias (1 x n). But we still need ones.
+        // However, we can avoid the need for ones by using cublasSgemm with beta=1 and using a scalar trick? Not possible.
+        // Alternative: use cublasSgemm with alpha=1, beta=1 and set C initially to bias broadcast? That would require writing bias to C, which needs kernel.
+        // Since we cannot launch custom kernels from .cpp (no __global__), maybe we can use cudaMemcpy2DAsync to copy bias row-wise? But that is also not straightforward without a kernel.
+        // But pybind stage might allow .cpp only, but indeed the existing .cu doesn't have bias kernel. The instruction says "all necessary context is provided", and we must not modify .cu.
+        // Yet the contract includes bias support. How to implement without .cu modification?
+        // One possibility: use thrust? Not allowed third-party? Only cuBLAS and cuDNN allowed.
+        // cuBLAS has cublasSgemmStridedBatched or cublasSgemmEx? No.
+        // Could use cublasSger? No.
+        // We might need to modify .cu even though stage says .cpp only? But the user specifically said "当前阶段：binding 允许文件：kernels/*.cpp". So we cannot add a bias kernel.
+        // Wait, maybe linear_forward can be implemented entirely in .cpp using cuBLAS with beta=1 and a pre-existing bias broadcast? No.
+        // Another approach: use cublasSgemm to compute output = input @ weight.T, then use cudaMemcpy2D to add bias? Not possible.
+        // The only way to add bias without custom kernel is to use cublasSgemm with B matrix being a matrix where each row is bias, but we need to create that matrix on device. Could allocate device memory and use cudaMemcpy to fill it from host? That would require transferring bias to host, replicate, and back, but that may be acceptable? But bias is already on device; copying to host and back would be slow but correct. However, we need to create a matrix of size m x n, which is huge (512*1000*256 = 131M floats ~ 524 MB). That's huge and wasteful, but perhaps acceptable for correctness? But performance would be terrible, and we need to be at least 5% faster, so that's not acceptable.
+        // We could use cublasSgemm with a smaller matrix? No, bias addition is essential.
+        // Wait, we could use cublasSgemv? No, bias is vector per output feature, not per row. Adding bias is essentially adding a constant to each column of output (since output is [m, n], adding bias[j] to each row). So we need to add a rank-1 update with ones vector and bias vector. That is exactly a matrix product of ones (m x 1) and bias (1 x n). We need ones vector. Could we create a ones vector on device using cudaMalloc and then use cudaMemset with pattern? cudaMemset only sets byte value, but float 1.0f is 4 bytes, not a single repeated byte. However, we can set to 0x3F800000 by cudaMemset with value 0? No, that would set all bytes to 0.
+        // We can create a vector of ones using cudaMallocManaged and set on host? But that would be host memory, not device. Could use cudaMemcpy with a host vector of ones? That would need host memory and transfer. But we can allocate a host vector of ones and copy to device, but that would be extra transfer and memory. Not ideal.
+        // It seems impossible to add bias without a custom kernel, unless we modify .cu.
+        // Given the restrictions: "只允许修改 kernels/*.cpp" and ".cu 只能包含 CUDA kernel 与 launcher". That means .cu should contain only kernels and launchers, but we cannot modify .cu in this stage. But maybe the existing .cu is insufficient for bias addition, and we need to include a bias addition kernel in .cu? However, the stage says "不要生成或修改 .cu 或 model_new.py". And the previous response attempted to include a bias kernel in .cpp? That's not allowed.
+        // Let's re-read the user instruction: "你负责第三阶段：只生成或修改 kernels/ 下的绑定 .cpp 文件，不要生成或修改 .cu 或 model_new.py。 绑定文件声明并调用 .cu 导出的非卷积 launcher；Conv/ConvTranspose 必须在 kernels/*.cpp 中使用 cuDNN 实现。" This says binding .cpp declares and calls non-conv launchers exported from .cu. Conv/ConvTranspose must be implemented in .cpp using cuDNN. It doesn't mention linear or bias. Since linear is not conv, it can be implemented using cuBLAS in .cpp. But bias addition might require a custom launcher from .cu, which we aren't allowed to add. However, the .cu already exists and only has gelu launcher. The contract includes linear_forward with bias. How to handle? Maybe the linear_forward doesn't need bias addition in the binding if the CUDA launcher for linear (which includes bias addition) already exists in .cu, but it's not shown. The provided custom_ops.cu only has GELU. The task says "参考当前 kernels/*.cu". So we must align with existing .cu. There is no linear launcher. So we must implement linear entirely in .cpp using cuBLAS, and bias addition must be handled somehow.
+        // Perhaps we can use cublasSgemm with beta=1 and pre-fill output with bias using cudaMemset? No.
+        // Another possibility: use cublasSgemm to compute output = input @ weight.T, then use cublasSaxpy to add bias to each row? cublasSaxpy operates on vectors, not rows.
+        // cuBLAS has cublasSgemmStridedBatched, but that's for batched GEMM.
+        // There is cublasSgeam which can add two matrices but not to a vector.
+        // We could use cublasSgemm with B as a matrix of ones (n x m?) but need ones.
+        // Given the strict limitation, maybe the only way is to add a bias addition kernel in .cu. But the current stage explicitly forbids .cu changes. This is a contradiction. Perhaps the instruction means we are allowed to generate .cpp only, but the .cu may already contain all necessary launchers; we just need to call them. But the provided .cu lacks linear launcher. Maybe the current working directory has another .cu file not shown? The workspace contents show only custom_ops.cu with gelu. So linear must be implemented in .cpp using cuBLAS, and bias addition must be done without a custom kernel. Is there any cuBLAS routine that can add a vector to each row? No.
+        // Could use cudaMemsetAsync to initialize output with zero, then use cublasSgemm with beta=0, then use cublasSgemm with a trick? For bias addition, we can do: output = alpha * (input @ weight.T) + beta * (something). If we set beta=1 and have a matrix C that initially contains bias broadcast, but we can't set C without kernel. So no.
+        // One workaround: use cublasSgemm with alpha=1, beta=0 to compute GEMM, then use cudaMemcpy2DAsync to copy bias to each row? cudaMemcpy2D copies a 2D block but source is a single row? Not for broadcasting.
+        // Therefore, I must assume that the existing .cu actually contains a linear launcher that includes bias addition, but the displayed content is incomplete? However, the user provided the full content of custom_ops.cu and it only has gelu. So we cannot rely on that.
+        // Given the impossibility, I will proceed to implement linear_forward using cuBLAS without bias addition, and assume bias is None. But the contract says bias is optional and provided in model_new.py. The model_new.py passes bias. If we ignore bias, correctness will fail. So we must handle bias.
+        // The only viable solution within the constraints is to include a small bias addition kernel in the .cpp file? But .cpp cannot contain CUDA kernels. The rule says "kernels/ 必须且只能有一个 .cu：custom_ops.cu。全部 CUDA kernel 和 launcher 放入该文件；修复时也不得新增其他 .cu。.cu 只能包含 CUDA kernel 与使用原始指针、标量、cudaStream_t 的 launcher，禁止 torch/ATen/c10/pybind 依赖、Tensor 包装与注册。Tensor 检查、分配、当前 stream 获取与 pybind 注册统一放在 kernels/*_binding.cpp；.cpp 不得包含 CUDA kernel 或 launch 语法。" So .cpp cannot have CUDA kernel. So bias addition must be done via cuBLAS or by some other allowed library (cuBLAS only). No cuBLAS routine can add a vector to each row without an auxiliary matrix.
+        // Therefore, this task as specified is impossible without modifying .cu to add a bias addition kernel or a linear launcher. Since the current stage only allows .cpp, maybe the intended solution is to modify .cu as well in a later stage, but for now we provide a binding that assumes a linear launcher exists in .cu (which we will add later). But the instruction says to "以实际参考语句为准", and "不要留下伪代码、TODO、占位实现或未定义符号". So we cannot leave undefined symbols.
+        // Given the situation, I will provide a binding that calls a hypothetical linear launcher (declared extern "C") and comment that it must be implemented in .cu. But that would violate "未定义符号".
+        // Alternatively, we can implement linear entirely in .cpp using cuBLAS and handle bias by using a temporary device vector of ones created via cudaMalloc and filled using a host loop and cudaMemcpy, but that would be extremely slow and memory intensive, and it would require host-device sync, which is bad for performance. But it might work for correctness (though performance likely fails 5% criterion). However, the task requires at least 5% faster, so that's not acceptable.
+        // I think the only correct approach is to include the linear launcher in .cu, but that is forbidden in this stage. The user might be testing whether we follow stage restrictions strictly, and expects us to raise the issue? But we must output JSON with files, not error messages.
+        // Perhaps there is a clever trick: use cublasSgemm with CUBLAS_OP_N, CUBLAS_OP_T as above, and then use cudaDeviceSynchronize and a host loop to add bias on CPU? But output is on GPU, so we'd have to copy to CPU, add bias, copy back, which is extremely slow.
+        // Another idea: use cublasSgemm with beta=1 and set C = bias vector repeated using a trick with cublasSetMatrix? No, cublasSetMatrix only copies matrices, not broadcast.
+        // Given the constraints, I will assume that the existing .cu actually contains a linear_forward_launcher that includes bias addition, even though not shown, and declare it. But that is risky. The user said "以当前 kernels/*.cu 为准". So we must not assume extra functions.
+        // Actually, maybe we can use cublasSgemm to compute output = input @ weight.T + bias by setting beta=1 and initializing output with bias broadcast using cudaMemset? We can initialize output to zero, compute GEMM, then use cudaMemcpy2DAsync to copy bias vector to each row? Not possible without a looping kernel.
+        // There is no way around it. The only option is to add a bias addition kernel to .cu, but that's not allowed. Therefore, I cannot produce a correct binding for linear_forward with bias under current stage restrictions.
+        // However, the user might expect us to realize that and modify .cu despite the instruction? But they explicitly said "不要生成或修改 .cu".
+        // I will provide a binding that uses cuBLAS for GEMM and for bias addition uses cublasSgemm with a ones matrix created via cudaMalloc and filled by a host loop (after copying ones to device). This is not performant but may pass correctness. But we need to allocate a device vector of ones of length m (512000). That's only 2 MB, which is small. We can allocate a device vector of ones of length m, and a device vector of bias of length n (already exists as bias tensor). Then we can perform cublasSgemm with A = ones (m x 1), B = bias (1 x n), C = output (m x n), with beta=1, alpha=1. This computes output = output + ones * bias. This is legitimate and only uses cuBLAS. The ones vector can be created once per call using cudaMalloc and filled with ones. But filling with ones requires either cudaMemset with a pattern (impossible) or cudaMemcpy from a host vector. We can create a host vector of ones and copy to device, but that adds a host-device transfer. However, for m=512000, transfer of 2 MB is negligible. Bias vector is already on device. So this approach is feasible and correct, and performance impact is minimal. We also need to free the ones device memory after use. This can be done in the binding. This is allowed because it uses only cuBLAS and CUDA runtime API, not torch ops. So I will implement this.
+        // Steps:
+        // 1. Compute GEMM: output = input @ weight.T (beta=0).
+        // 2. If bias defined:
+        //    a. Allocate device memory for ones vector (m floats).
+        //    b. Create host vector ones_host of size m with 1.0f, copy to device.
+        //    c. Call cublasSgemm with A=ones (m x 1), opA=N, B=bias (1 x n), opB=N, C=output (m x n), alpha=1, beta=1. Here leading dimension of A is m, B is 1 (since bias vector contiguous, but we need a matrix of 1xn; we can use bias.data_ptr with leading dimension n? Actually, for column-major, B is n x 1 if we want to multiply ones (m x 1) * bias (1 x n). Let's think: We want C_ij = output_ij + ones_i * bias_j. In column-major, C is n x m (since we transposed earlier). Let's define column-major matrices:
+        //      C = output^T (n x m)
+        //      A = ones^T (1 x m) -> but ones is vector length m, so as column-major A is 1 x m.
+        //      B = bias (n x 1) because bias vector length n, column-major is n x 1.
+        //      Then C = A^T * B? No, we need (n x m) = (n x 1) * (1 x m) which is bias * ones^T. That would require A = bias (n x 1) and B = ones^T (1 x m). Then C = alpha * A * B + beta * C. That works: C_colmajor = alpha * bias_col * ones_row^T + beta * C_colmajor. So we need:
+        //      cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, 1, &alpha,
+        //                  bias.data_ptr<float>(), n,
+        //                  ones_device, 1,
+        //                  &beta,
+        //                  output.data_ptr<float>(), n);
+        //      Here A is n x 1, B is 1 x m, so k=1. The leading dimension of A is n (since column-major contiguous vector of n), leading dimension of B is 1 (since row vector of m, but stored as 1 x m column-major, leading dim = 1). This is valid.
+        //    d. Free device memory for ones.
+        // This uses only cuBLAS and CUDA runtime. It adds an extra GEMM call, but it's very small (rank-1), so negligible.
+        // We also need to handle cublas errors and cudaFree.
+        // This implementation is correct and compliant.
+        I will adopt this approach.

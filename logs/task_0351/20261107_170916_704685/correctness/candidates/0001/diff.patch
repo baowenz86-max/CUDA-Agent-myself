@@ -1,0 +1,295 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,146 @@
++#include <cuda_runtime.h>
++
++// Embedding forward launcher
++// indices: CPU int64 pointer, shape [batch, seq]
++// weight: CUDA float pointer, shape [num_embeddings, embedding_dim]
++// output: CUDA float pointer, shape [batch, seq, embedding_dim]
++// stream: CUDA stream for kernel launch
++extern "C" void embedding_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int batch,
++    int seq,
++    int embedding_dim,
++    cudaStream_t stream)
++{
++    int total_indices = batch * seq;
++    if (total_indices <= 0) return;
++
++    int total_output_elements = total_indices * embedding_dim;
++    int threads = 256;
++    int blocks = (total_output_elements + threads - 1) / threads;
++
++    // Use grid-stride loop
++    int grid_size = blocks;
++
++    // Kernel launch with grid-stride pattern
++    embedding_kernel<<<blocks, threads, 0, stream>>>(
++        indices, weight, output, total_indices, embedding_dim, total_output_elements);
++}
++
++// Kernel: each thread handles one output element, but we need block-based copy for efficiency.
++// Better approach: each thread block handles one or more indices and copies embedding_dim floats.
++__global__ void embedding_kernel_naive(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int total_indices,
++    int embedding_dim,
++    int total_output_elements)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total_output_elements; i += stride) {
++        int index_pos = i / embedding_dim;
++        int dim = i % embedding_dim;
++        int64_t index = indices[index_pos];
++        output[i] = weight[index * embedding_dim + dim];
++    }
++}
++
++// Optimized kernel: each thread block processes one or more indices,
++// threads within block copy consecutive embedding_dim elements.
++__global__ void embedding_kernel(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int total_indices,
++    int embedding_dim,
++    int total_output_elements)
++{
++    extern __shared__ int64_t s_indices[];
++    int tid = threadIdx.x;
++    int block_size = blockDim.x;
++
++    // Process indices in chunks of block_size
++    for (int base = blockIdx.x * block_size; base < total_indices; base += gridDim.x * block_size) {
++        int idx = base + tid;
++        if (idx < total_indices) {
++            s_indices[tid] = indices[idx];
++        }
++        __syncthreads();
++
++        // Copy embedding_dim elements for each index in shared memory
++        // Assume embedding_dim is multiple of block_size for simplicity, but handle general case.
++        int num_indices_in_block = min(block_size, total_indices - base);
++        for (int i = 0; i < num_indices_in_block; ++i) {
++            int64_t emb_idx = s_indices[i];
++            const float* src = weight + emb_idx * embedding_dim;
++            float* dst = output + (base + i) * embedding_dim;
++            // Copy embedding_dim elements using threads in block, grid-stride within block
++            for (int j = tid; j < embedding_dim; j += block_size) {
++                dst[j] = src[j];
++            }
++        }
++        __syncthreads();
++    }
++}
++
++// But the above kernel uses dynamic shared memory and might be suboptimal.
++// Simpler: each thread handles one output element as in naive, but with vectorized loads?
++// embedding_dim = 256, so each index copies 256 floats. A block of 256 threads can handle one index perfectly.
++// We'll implement a kernel where each block handles one index (or multiple if blockDim > embedding_dim, not needed).
++// block_size = 256, each block handles one index, one thread per element.
++// This is coalesced for output, input weight access is also coalesced if consecutive indices have consecutive weights? Not necessarily, but okay.
++
++// Let's define final kernel: each thread handles one output element, blockDim=256, grid covers total_output_elements.
++// But that may be many blocks. For total_output_elements = 128*4096*256 = 134,217,728 -> blocks = 524,288 if 256 threads.
++// That's fine.
++
++// Use a simple grid-stride loop with vectorized float4? Leave as simple.
++
++__global__ void embedding_kernel_simple(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int total_indices,
++    int embedding_dim,
++    int total_output_elements)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < total_output_elements) {
++        int index_pos = idx / embedding_dim;
++        int dim = idx % embedding_dim;
++        int64_t index = indices[index_pos];
++        output[idx] = weight[index * embedding_dim + dim];
++    }
++}
++
++// We'll use the simple kernel for correctness first.
++
++// mul_scalar launcher
++extern "C" void mul_scalar_launcher(
++    const float* input,
++    const float* scalar,
++    float* output,
++    int n,
++    cudaStream_t stream)
++{
++    if (n <= 0) return;
++    int threads = 256;
++    int blocks = (n + threads - 1) / threads;
++    mul_scalar_kernel<<<blocks, threads, 0, stream>>>(input, scalar, output, n);
++}
++
++__global__ void mul_scalar_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ scalar,
++    float* __restrict__ output,
++    int n)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < n) {
++        output[idx] = input[idx] * scalar[0];
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,118 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void embedding_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int batch,
++    int seq,
++    int embedding_dim,
++    cudaStream_t stream);
++
++extern "C" void mul_scalar_launcher(
++    const float* input,
++    const float* scalar,
++    float* output,
++    int n,
++    cudaStream_t stream);
++
++// PyTorch wrapper for embedding_forward
++torch::Tensor embedding_forward(torch::Tensor indices, torch::Tensor weight) {
++    // Validate indices
++    TORCH_CHECK(indices.is_cpu(), "indices must be a CPU tensor");
++    TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
++    TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
++    TORCH_CHECK(indices.dim() == 2, "indices must be 2D [batch, seq]");
++
++    // Validate weight
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [num_embeddings, embedding_dim]");
++
++    int64_t batch = indices.size(0);
++    int64_t seq = indices.size(1);
++    int64_t embedding_dim = weight.size(1);
++
++    // Ensure indices are in valid range (optional but good)
++    // TORCH_CHECK(indices.min().item<int64_t>() >= 0 && indices.max().item<int64_t>() < weight.size(0), "indices out of range");
++    // Skip range check for performance; contract assumes valid indices.
++
++    // Allocate output on CUDA
++    auto output = torch::empty({batch, seq, embedding_dim}, weight.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    embedding_launcher(
++        indices.data_ptr<int64_t>(),
++        weight.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(seq),
++        static_cast<int>(embedding_dim),
++        stream
++    );
++
++    // Check for launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "embedding_launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// PyTorch wrapper for mul_scalar
++torch::Tensor mul_scalar(torch::Tensor input, torch::Tensor scalar) {
++    // Validate input
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++
++    // Validate scalar
++    TORCH_CHECK(scalar.is_cuda(), "scalar must be a CUDA tensor");
++    TORCH_CHECK(scalar.dtype() == torch::kFloat32, "scalar must be float32");
++    TORCH_CHECK(scalar.numel() == 1, "scalar must have exactly one element");
++    TORCH_CHECK(scalar.is_contiguous(), "scalar must be contiguous");
++
++    // Allocate output same shape as input
++    auto output = torch::empty_like(input);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    int64_t n = input.numel();
++
++    // Call launcher
++    mul_scalar_launcher(
++        input.data_ptr<float>(),
++        scalar.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(n),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "mul_scalar_launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Register functions
++void register_custom_ops(pybind11::module& m) {
++    m.def("embedding_forward", &embedding_forward,
++          "Embedding forward (CUDA)",
++          pybind11::arg("indices"),
++          pybind11::arg("weight"));
++    m.def("mul_scalar", &mul_scalar,
++          "Multiply tensor by scalar (CUDA)",
++          pybind11::arg("input"),
++          pybind11::arg("scalar"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim, scalar_value):
++        super().__init__()
++        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
++        self.scalar = torch.scalar_tensor(scalar_value)
++
++    def forward(self, x):
++        x = cuda_extension.embedding_forward(x, self.embedding.weight)
++        x = cuda_extension.mul_scalar(x, self.scalar)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.embedding_forward(x, self.embedding.weight)
++        yield ('step_001', x)
++        x = cuda_extension.mul_scalar(x, self.scalar)
++        yield ('step_002', x)
++        yield ('step_003', x)
++        return

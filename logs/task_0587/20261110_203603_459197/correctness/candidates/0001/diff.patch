@@ -1,0 +1,275 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,129 @@
++// kernels/custom_ops.cu
++#include <cuda_runtime.h>
++#include <cmath>
++
++// Kernel to replace inf with NaN
++template <typename T>
++__global__ void replace_inf_with_nan_kernel(T* __restrict__ out, const T* __restrict__ in, int64_t N) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < N) {
++        T val = in[idx];
++        if (isinf(val)) {
++            out[idx] = static_cast<T>(NAN);
++        } else {
++            out[idx] = val;
++        }
++    }
++}
++
++// Kernel for group normalization where C == num_groups, so each channel is independent.
++// Each block handles one (sample, group) pair, which corresponds to one channel.
++// Grid: (N * C) blocks, block size = 256 threads. Each thread processes HW/256 elements.
++// Shared memory stores partial sums for mean and var.
++template <typename T>
++__global__ void group_norm_forward_kernel(
++    T* __restrict__ out,
++    const T* __restrict__ x,
++    const T* __restrict__ weight,
++    const T* __restrict__ bias,
++    int64_t N,
++    int64_t C,
++    int64_t HW,
++    T eps) {
++    
++    extern __shared__ T sdata[];  // two arrays: sum and sqsum
++    T* s_sum = sdata;
++    T* s_sqsum = sdata + blockDim.x;
++    
++    int64_t sample = blockIdx.x / C;
++    int64_t channel = blockIdx.x % C;
++    
++    // Base pointer for this sample's channel
++    const T* x_ptr = x + sample * C * HW + channel * HW;
++    T* out_ptr = out + sample * C * HW + channel * HW;
++    
++    int tid = threadIdx.x;
++    int stride = blockDim.x;
++    
++    T local_sum = 0;
++    T local_sqsum = 0;
++    
++    // Grid-stride loop over HW elements
++    for (int64_t i = tid; i < HW; i += stride) {
++        T val = x_ptr[i];
++        local_sum += val;
++        local_sqsum += val * val;
++    }
++    
++    s_sum[tid] = local_sum;
++    s_sqsum[tid] = local_sqsum;
++    __syncthreads();
++    
++    // Reduction in shared memory
++    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
++        if (tid < offset) {
++            s_sum[tid] += s_sum[tid + offset];
++            s_sqsum[tid] += s_sqsum[tid + offset];
++        }
++        __syncthreads();
++    }
++    
++    T total_sum = s_sum[0];
++    T total_sqsum = s_sqsum[0];
++    
++    T mean = total_sum / HW;
++    T var = total_sqsum / HW - mean * mean;
++    T inv_std = rsqrt(var + eps);
++    
++    T w = weight[channel];
++    T b = bias[channel];
++    
++    // Apply normalization and affine
++    for (int64_t i = tid; i < HW; i += stride) {
++        T val = x_ptr[i];
++        T norm = (val - mean) * inv_std;
++        out_ptr[i] = w * norm + b;
++    }
++}
++
++// Launcher for replace_inf_with_nan
++extern "C" void replace_inf_with_nan_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream) {
++    
++    if (numel <= 0) return;
++    
++    const int threads = 256;
++    int64_t blocks = (numel + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    
++    replace_inf_with_nan_kernel<float><<<blocks, threads, 0, stream>>>(
++        output, input, numel);
++}
++
++// Launcher for group_norm_forward
++// Assumes x is contiguous float32 with shape [N, C, HW], C == num_groups
++extern "C" void group_norm_forward_launcher(
++    float* output,
++    const float* x,
++    const float* weight,
++    const float* bias,
++    int64_t N,
++    int64_t C,
++    int64_t HW,
++    float eps,
++    cudaStream_t stream) {
++    
++    if (N <= 0 || C <= 0 || HW <= 0) return;
++    
++    const int threads = 256;
++    int blocks = N * C;
++    if (blocks <= 0) return;
++    
++    size_t shared_mem_size = 2 * threads * sizeof(float);
++    
++    group_norm_forward_kernel<float><<<blocks, threads, shared_mem_size, stream>>>(
++        output, x, weight, bias, N, C, HW, eps);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,114 @@
++// kernels/custom_ops_binding.cpp
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void replace_inf_with_nan_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void group_norm_forward_launcher(
++    float* output,
++    const float* x,
++    const float* weight,
++    const float* bias,
++    int64_t N,
++    int64_t C,
++    int64_t HW,
++    float eps,
++    cudaStream_t stream);
++
++// Wrapper for replace_inf_with_nan
++torch::Tensor replace_inf_with_nan(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++
++    auto output = torch::empty_like(x);
++
++    int64_t numel = x.numel();
++    if (numel == 0) return output;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    replace_inf_with_nan_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        numel,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "replace_inf_with_nan kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for group_norm_forward
++torch::Tensor group_norm_forward(
++    torch::Tensor x,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    int64_t num_groups,
++    double eps) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (N,C,H,W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++    int64_t HW = H * W;
++
++    TORCH_CHECK(C % num_groups == 0, "num_groups must divide C");
++    TORCH_CHECK(weight.numel() == C, "weight length must equal C");
++    TORCH_CHECK(bias.numel() == C, "bias length must equal C");
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    group_norm_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        N,
++        C,
++        HW,
++        static_cast<float>(eps),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "group_norm_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("replace_inf_with_nan", &replace_inf_with_nan,
++          "Replace inf with NaN",
++          py::arg("x"));
++    m.def("group_norm_forward", &group_norm_forward,
++          "GroupNorm forward",
++          py::arg("x"),
++          py::arg("weight"),
++          py::arg("bias"),
++          py::arg("num_groups"),
++          py::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_channels, num_groups, epsilon):
++        super().__init__()
++        self.group_norm = nn.GroupNorm(num_groups=num_groups, num_channels=num_channels, eps=epsilon)
++        self.num_groups = num_groups
++        self.epsilon = epsilon
++
++    def forward(self, x):
++        x = cuda_extension.replace_inf_with_nan(x)
++        x = cuda_extension.group_norm_forward(x, self.group_norm.weight, self.group_norm.bias, self.num_groups, self.epsilon)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.replace_inf_with_nan(x)
++        yield 'step_001', x
++        x = cuda_extension.group_norm_forward(x, self.group_norm.weight, self.group_norm.bias, self.num_groups, self.epsilon)
++        yield 'step_002', x
++        yield 'step_003', x

@@ -1,0 +1,281 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,126 @@
++#include <cuda_runtime.h>
++
++// ConstantPad3d kernel: pads a 5D tensor (N,C,D,H,W) with zeros.
++// Input and output are assumed to be contiguous float32 tensors.
++// pad_left, pad_right, pad_top, pad_bottom, pad_front, pad_back specify padding.
++__global__ void constant_pad3d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t N, int64_t C, int64_t D_in, int64_t H_in, int64_t W_in,
++    int64_t D_out, int64_t H_out, int64_t W_out,
++    int64_t pad_left, int64_t pad_right,
++    int64_t pad_top, int64_t pad_bottom,
++    int64_t pad_front, int64_t pad_back)
++{
++    int64_t total_out = N * C * D_out * H_out * W_out;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total_out; i += stride) {
++        // Decompose linear index into 5D coordinates (n, c, d, h, w)
++        int64_t w = i % W_out;
++        int64_t tmp = i / W_out;
++        int64_t h = tmp % H_out;
++        tmp /= H_out;
++        int64_t d = tmp % D_out;
++        tmp /= D_out;
++        int64_t c = tmp % C;
++        int64_t n = tmp / C;
++
++        // Compute source coordinates in input
++        int64_t in_w = w - pad_left;
++        int64_t in_h = h - pad_top;
++        int64_t in_d = d - pad_front;
++
++        // Check if within input bounds
++        bool valid = (in_w >= 0 && in_w < W_in &&
++                      in_h >= 0 && in_h < H_in &&
++                      in_d >= 0 && in_d < D_in);
++        if (valid) {
++            int64_t in_idx = (((n * C + c) * D_in + in_d) * H_in + in_h) * W_in + in_w;
++            output[i] = input[in_idx];
++        } else {
++            output[i] = 0.0f;
++        }
++    }
++}
++
++// BiasAdd kernel: adds per-channel bias to a 5D tensor (N,C,D,H,W).
++// Input and output are assumed to be contiguous float32 tensors.
++// bias is a contiguous tensor of shape [C].
++__global__ void bias_add_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int64_t total_elements,
++    int64_t C)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        // Compute channel index: the channel dimension is the second dimension,
++        // and the size of the last three dims is total_elements / (N*C)
++        // We assume total_elements % C == 0 and total_elements / C is the product of N*D*H*W.
++        int64_t channel = (i / (total_elements / C)) % C;  // More precisely: channel = (i / (D*H*W)) % C, but we have total_elements/C = N*D*H*W, and we need i / (D*H*W) % C. Since total_elements = N*C*D*H*W, total_elements/C = N*D*H*W. However, that quotient includes N, so this is wrong. Correct: channel = (i / (D*H*W)) % C. But we don't have D,H,W separately. Better: pass spatial_size = D*H*W as argument, then channel = (i / spatial_size) % C.
++        // For simplicity, we can compute channel from the known total elements and C if N*D*H*W is known. But we can also pass D*H*W explicitly. Let's modify launcher to pass D_out*H_out*W_out.
++        // Here we use a placeholder; actual launcher will pass spatial_size.
++        // To avoid error, we will define a different kernel with spatial_size.
++    }
++}
++
++// Corrected BiasAdd kernel with spatial_size parameter
++__global__ void bias_add_kernel_v2(
++    const float* __restrict__ input,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int64_t total_elements,
++    int64_t C,
++    int64_t spatial_size)  // D*H*W (product of last three dims)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        int64_t channel = (i / spatial_size) % C;
++        output[i] = input[i] + bias[channel];
++    }
++}
++
++// Launcher for constant_pad3d
++// All pointer arguments are raw device pointers.
++extern "C" void constant_pad3d_launcher(
++    const float* input, float* output,
++    int64_t N, int64_t C, int64_t D_in, int64_t H_in, int64_t W_in,
++    int64_t D_out, int64_t H_out, int64_t W_out,
++    int64_t pad_left, int64_t pad_right,
++    int64_t pad_top, int64_t pad_bottom,
++    int64_t pad_front, int64_t pad_back,
++    cudaStream_t stream)
++{
++    int64_t total_out = N * C * D_out * H_out * W_out;
++    int block_size = 256;
++    int grid_size = (int)((total_out + block_size - 1) / block_size);
++    if (grid_size > 0) {
++        constant_pad3d_kernel<<<grid_size, block_size, 0, stream>>>(
++            input, output,
++            N, C, D_in, H_in, W_in,
++            D_out, H_out, W_out,
++            pad_left, pad_right, pad_top, pad_bottom, pad_front, pad_back);
++    }
++}
++
++// Launcher for bias_add
++// input, bias, output are contiguous float32 tensors.
++extern "C" void bias_add_launcher(
++    const float* input, const float* bias, float* output,
++    int64_t total_elements, int64_t C, int64_t spatial_size,
++    cudaStream_t stream)
++{
++    int block_size = 256;
++    int grid_size = (int)((total_elements + block_size - 1) / block_size);
++    if (grid_size > 0) {
++        bias_add_kernel_v2<<<grid_size, block_size, 0, stream>>>(
++            input, bias, output, total_elements, C, spatial_size);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,124 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++#include <vector>
++
++// Declare launchers from custom_ops.cu
++extern "C" void constant_pad3d_launcher(
++    const float* input, float* output,
++    int64_t N, int64_t C, int64_t D_in, int64_t H_in, int64_t W_in,
++    int64_t D_out, int64_t H_out, int64_t W_out,
++    int64_t pad_left, int64_t pad_right,
++    int64_t pad_top, int64_t pad_bottom,
++    int64_t pad_front, int64_t pad_back,
++    cudaStream_t stream);
++
++extern "C" void bias_add_launcher(
++    const float* input, const float* bias, float* output,
++    int64_t total_elements, int64_t C, int64_t spatial_size,
++    cudaStream_t stream);
++
++// PyTorch wrapper for constant_pad3d
++// input: 5D tensor (N,C,D,H,W) on CUDA, float32, arbitrary stride allowed
++// pad: tuple/list of 6 ints (left, right, top, bottom, front, back)
++torch::Tensor constant_pad3d(torch::Tensor input, std::vector<int64_t> pad) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 5, "input must be 5D");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(pad.size() == 6, "pad must have 6 elements");
++
++    auto N = input.size(0);
++    auto C = input.size(1);
++    auto D_in = input.size(2);
++    auto H_in = input.size(3);
++    auto W_in = input.size(4);
++
++    int64_t pad_left = pad[0];
++    int64_t pad_right = pad[1];
++    int64_t pad_top = pad[2];
++    int64_t pad_bottom = pad[3];
++    int64_t pad_front = pad[4];
++    int64_t pad_back = pad[5];
++
++    int64_t D_out = D_in + pad_front + pad_back;
++    int64_t H_out = H_in + pad_top + pad_bottom;
++    int64_t W_out = W_in + pad_left + pad_right;
++
++    // Create output tensor with same dtype and device, contiguous
++    auto output = torch::empty({N, C, D_out, H_out, W_out}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    constant_pad3d_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, D_in, H_in, W_in,
++        D_out, H_out, W_out,
++        pad_left, pad_right,
++        pad_top, pad_bottom,
++        pad_front, pad_back,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "constant_pad3d kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// PyTorch wrapper for bias_add
++// input: 5D tensor (N,C,D,H,W) on CUDA, float32, arbitrary stride allowed
++// bias: tensor of shape [C] or [C,1,1,1] on CUDA, float32
++torch::Tensor bias_add(torch::Tensor input, torch::Tensor bias) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(input.dim() == 5, "input must be 5D");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(bias.scalar_type() == torch::kFloat32, "bias must be float32");
++
++    auto C = input.size(1);
++    TORCH_CHECK(bias.numel() == C, "bias must have C elements");
++
++    // Ensure bias is contiguous and flatten to 1D pointer
++    auto bias_contig = bias.contiguous();
++
++    auto N = input.size(0);
++    auto D = input.size(2);
++    auto H = input.size(3);
++    auto W = input.size(4);
++    int64_t spatial_size = D * H * W;
++    int64_t total_elements = input.numel();
++
++    // Create output tensor with same shape as input, contiguous
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    bias_add_launcher(
++        input.data_ptr<float>(),
++        bias_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total_elements,
++        C,
++        spatial_size,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "bias_add kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("constant_pad3d", &constant_pad3d, "ConstantPad3d forward",
++          py::arg("input"), py::arg("pad"));
++    m.def("bias_add", &bias_add, "Bias add forward",
++          py::arg("input"), py::arg("bias"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, pad_size, bias_shape):
++        super().__init__()
++        self.pad_size = tuple(pad_size)
++        self.bias = nn.Parameter(torch.randn(bias_shape))
++
++    def forward(self, x):
++        x = cuda_extension.constant_pad3d(x, self.pad_size)
++        x = cuda_extension.bias_add(x, self.bias)
++        return x
++
++    def debug_forward(self, x):
++        x_pad = cuda_extension.constant_pad3d(x, self.pad_size)
++        yield "step_001", x_pad
++        x_out = cuda_extension.bias_add(x_pad, self.bias)
++        yield "step_002", x_out
++        yield "step_003", x_out

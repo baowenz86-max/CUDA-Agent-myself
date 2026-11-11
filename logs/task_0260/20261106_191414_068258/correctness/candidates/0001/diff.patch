@@ -1,0 +1,231 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,104 @@
++#include <cuda_runtime.h>
++
++// AvgPool2d kernel: 3x3 window, stride=2, padding=1, count_include_pad=True
++__global__ void avg_pool2d_kernel(const float* __restrict__ input,
++                                  float* __restrict__ output,
++                                  int N, int C, int H, int W,
++                                  int H_out, int W_out) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * H_out * W_out;
++    if (idx >= total) return;
++
++    int w_out = idx % W_out;
++    int h_out = (idx / W_out) % H_out;
++    int c = (idx / (W_out * H_out)) % C;
++    int n = idx / (W_out * H_out * C);
++
++    int h_start = h_out * 2 - 1;  // stride=2, padding=1
++    int w_start = w_out * 2 - 1;
++
++    float sum = 0.0f;
++    int count = 0;
++    for (int kh = 0; kh < 3; ++kh) {
++        int h_in = h_start + kh;
++        if (h_in < 0 || h_in >= H) continue;
++        for (int kw = 0; kw < 3; ++kw) {
++            int w_in = w_start + kw;
++            if (w_in < 0 || w_in >= W) continue;
++            // input is contiguous NCHW
++            sum += input[((n * C + c) * H + h_in) * W + w_in];
++            ++count;
++        }
++    }
++    // count_include_pad=True: divide by kernel_size * kernel_size = 9
++    output[idx] = sum / 9.0f;
++}
++
++// LogSoftmax along dim=1 (channels) for NCHW tensor
++__global__ void log_softmax_dim1_kernel(const float* __restrict__ input,
++                                         float* __restrict__ output,
++                                         int N, int C, int H, int W) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int HW = H * W;
++    int total = N * HW;
++    if (idx >= total) return;
++
++    int n = idx / HW;
++    int spatial = idx % HW;
++
++    // find max over channel dimension for numerical stability
++    float max_val = input[(n * C) * HW + spatial];
++    for (int c = 1; c < C; ++c) {
++        float val = input[(n * C + c) * HW + spatial];
++        if (val > max_val) max_val = val;
++    }
++
++    // compute sum of exp(x - max)
++    float sum_exp = 0.0f;
++    for (int c = 0; c < C; ++c) {
++        sum_exp += expf(input[(n * C + c) * HW + spatial] - max_val);
++    }
++
++    // log_sum = max + log(sum_exp)
++    float log_sum = max_val + logf(sum_exp);
++
++    // compute log softmax each channel
++    for (int c = 0; c < C; ++c) {
++        int out_idx = (n * C + c) * HW + spatial;
++        output[out_idx] = input[out_idx] - log_sum;
++    }
++}
++
++// Launcher for avg_pool2d, assumes contiguous NCHW input
++// The binding layer should ensure input is contiguous CUDA float32.
++extern "C" void avg_pool2d_launcher(const float* input,
++                                    float* output,
++                                    int N, int C, int H, int W,
++                                    int kernel_size, int stride, int padding,
++                                    cudaStream_t stream) {
++    int H_out = (H + 2 * padding - kernel_size) / stride + 1;
++    int W_out = (W + 2 * padding - kernel_size) / stride + 1;
++
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    // Currently only supports kernel_size=3, stride=2, padding=1 (as per contract)
++    // Could be generalized if needed, but kept simple for performance.
++    avg_pool2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, H_out, W_out);
++}
++
++// Launcher for log_softmax_dim1, assumes contiguous NCHW input
++extern "C" void log_softmax_dim1_launcher(const float* input,
++                                           float* output,
++                                           int N, int C, int H, int W,
++                                           cudaStream_t stream) {
++    int HW = H * W;
++    int total = N * HW;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    log_softmax_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,96 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// 声明来自 custom_ops.cu 的 launcher
++extern "C" void avg_pool2d_launcher(const float* input,
++                                    float* output,
++                                    int N, int C, int H, int W,
++                                    int kernel_size, int stride, int padding,
++                                    cudaStream_t stream);
++
++extern "C" void log_softmax_dim1_launcher(const float* input,
++                                           float* output,
++                                           int N, int C, int H, int W,
++                                           cudaStream_t stream);
++
++// avg_pool2d 绑定函数
++torch::Tensor avg_pool2d(torch::Tensor x, int64_t kernel_size, int64_t stride, int64_t padding) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    // 转换为 contiguous（如果不是）
++    auto x_contig = x.contiguous();
++
++    int N = x_contig.size(0);
++    int C = x_contig.size(1);
++    int H = x_contig.size(2);
++    int W = x_contig.size(3);
++
++    int H_out = (H + 2 * padding - kernel_size) / stride + 1;
++    int W_out = (W + 2 * padding - kernel_size) / stride + 1;
++
++    auto output = torch::empty({N, C, H_out, W_out}, x_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    avg_pool2d_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        stream
++    );
++
++    return output;
++}
++
++// log_softmax_dim1 绑定函数
++torch::Tensor log_softmax_dim1(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    auto x_contig = x.contiguous();
++
++    int N = x_contig.size(0);
++    int C = x_contig.size(1);
++    int H = x_contig.size(2);
++    int W = x_contig.size(3);
++
++    auto output = torch::empty_like(x_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    log_softmax_dim1_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        stream
++    );
++
++    return output;
++}
++
++// 注册函数
++void register_custom_ops(pybind11::module& m) {
++    m.def("avg_pool2d", &avg_pool2d,
++          "Average pooling 2D",
++          py::arg("x"),
++          py::arg("kernel_size"),
++          py::arg("stride"),
++          py::arg("padding"));
++
++    m.def("log_softmax_dim1", &log_softmax_dim1,
++          "Log softmax along dimension 1",
++          py::arg("x"));
++}
++
++// 自动注册
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
++        super().__init__()
++        # 保留原始模块结构，但 forward 将改用自定义算子
++        self.avg_pool = nn.AvgPool2d(kernel_size, stride=stride, padding=padding)
++        self.softmax = torch.nn.LogSoftmax(dim=1)
++
++    def forward(self, x):
++        x = cuda_extension.avg_pool2d(x, kernel_size=3, stride=2, padding=1)
++        x = cuda_extension.log_softmax_dim1(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.avg_pool2d(x, kernel_size=3, stride=2, padding=1)
++        yield 'step_001', x
++        x = cuda_extension.log_softmax_dim1(x)
++        yield 'step_002', x
++        yield 'step_003', x
++

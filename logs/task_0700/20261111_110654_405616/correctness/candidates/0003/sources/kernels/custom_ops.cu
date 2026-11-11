@@ -1,0 +1,106 @@
+#include <cuda_runtime.h>
+
+__global__ void unfold_kernel_float(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int64_t N, int64_t C, int64_t H, int64_t W,
+    int64_t kh, int64_t kw,
+    int64_t dh, int64_t dw,
+    int64_t ph, int64_t pw,
+    int64_t sh, int64_t sw,
+    int64_t out_h, int64_t out_w,
+    int64_t L,
+    int64_t total_output)
+{
+    int64_t linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (linear_idx >= total_output) return;
+
+    int64_t l = linear_idx % L;
+    int64_t tmp = linear_idx / L;
+    int64_t c = tmp % C;
+    int64_t n = tmp / C;
+
+    int64_t kk = c % (kh * kw);
+    int64_t in_c = c / (kh * kw);
+    int64_t k_h = kk / kw;
+    int64_t k_w = kk % kw;
+
+    int64_t out_i = l / out_w;
+    int64_t out_j = l % out_w;
+
+    int64_t in_i = out_i * sh - ph + k_h * dh;
+    int64_t in_j = out_j * sw - pw + k_w * dw;
+
+    float val = 0.0f;
+    if (in_i >= 0 && in_i < H && in_j >= 0 && in_j < W) {
+        val = input[((n * C + in_c) * H + in_i) * W + in_j];
+    }
+    output[linear_idx] = val;
+}
+
+__global__ void cat_duplicate_kernel_float(
+    const float* __restrict__ tensor_a,
+    const float* __restrict__ tensor_b,
+    float* __restrict__ output,
+    int64_t total_elements_per_tensor,
+    int64_t total_output,
+    int64_t chunk_size)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= chunk_size) return;
+
+    output[idx] = tensor_a[idx];
+    output[chunk_size + idx] = tensor_b[idx];
+}
+
+extern "C" void unfold_forward_launcher(
+    const float* input,
+    float* output,
+    int64_t N, int64_t C, int64_t H, int64_t W,
+    int64_t kh, int64_t kw,
+    int64_t dh, int64_t dw,
+    int64_t ph, int64_t pw,
+    int64_t sh, int64_t sw,
+    cudaStream_t stream)
+{
+    int64_t out_h = (H + 2 * ph - dh * (kh - 1) - 1) / sh + 1;
+    int64_t out_w = (W + 2 * pw - dw * (kw - 1) - 1) / sw + 1;
+    int64_t L = out_h * out_w;
+    int64_t C_out = C * kh * kw;
+    int64_t total_output = N * C_out * L;
+
+    const int threads = 256;
+    int64_t blocks = (total_output + threads - 1) / threads;
+    if (blocks > 2147483647LL) blocks = 2147483647LL;
+    if (total_output > 0) {
+        unfold_kernel_float<<<(unsigned int)blocks, threads, 0, stream>>>(
+            input, output, N, C, H, W,
+            kh, kw, dh, dw, ph, pw, sh, sw,
+            out_h, out_w, L, total_output);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            // Could not report, but at least avoid silent failure
+        }
+    }
+}
+
+extern "C" void cat_forward_launcher(
+    const float* tensor_a,
+    const float* tensor_b,
+    float* output,
+    int64_t total_elements_per_tensor,
+    cudaStream_t stream)
+{
+    int64_t total_output = 2 * total_elements_per_tensor;
+    const int threads = 256;
+    int64_t blocks = (total_output + threads - 1) / threads;
+    if (blocks > 2147483647LL) blocks = 2147483647LL;
+    if (total_output > 0) {
+        cat_duplicate_kernel_float<<<(unsigned int)blocks, threads, 0, stream>>>(
+            tensor_a, tensor_b, output, total_elements_per_tensor, total_output, total_elements_per_tensor);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            // Could not report, but at least avoid silent failure
+        }
+    }
+}

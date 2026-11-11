@@ -1,0 +1,257 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,13 +1,9 @@
+ // kernels/custom_ops.cu
+ // CUDA kernels for BatchNorm2d evaluation and clamp_min.
+-// All launchers are declared extern "C" and receive raw pointers and scalar values only.
+ 
+ #include <cuda_runtime.h>
+ 
+-// Compute scale and shift for each channel from weight, bias, running_mean, running_var, eps.
+-// The kernel iterates over all elements of the input tensor, mapping each element to its channel index.
+-// Supports arbitrary strides via input strides array.
+-__global__ void batch_norm_eval_kernel(
++__global__ void batch_norm_eval_kernel_v2(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+     const float* __restrict__ weight,
+@@ -17,35 +13,21 @@
+     float eps,
+     int64_t total_elements,
+     int64_t C,
+-    const int64_t* __restrict__ input_strides,
+-    const int64_t* __restrict__ output_strides
++    int64_t input_stride_n, int64_t input_stride_c, int64_t input_stride_h, int64_t input_stride_w,
++    int64_t output_stride_n, int64_t output_stride_c, int64_t output_stride_h, int64_t output_stride_w
+ ) {
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * gridDim.x;
+ 
+     for (int64_t linear = idx; linear < total_elements; linear += stride) {
+-        // 将线性索引分解为 (n, c, h, w) 以获取通道 c
+         int64_t rem = linear;
+-        int64_t n = rem / (C * input_strides[1]); // 这里 input_strides[1] 是 H*W 的 stride，但需要根据 strides 灵活处理
+-        // 实际上我们需要根据 strides 还原各维度索引，但这里采用通用方法：
+-        // 使用除法和取模，假设 strides 是标准的 NCHW 格式，但支持任意 strides。
+-        // 更稳健：迭代维度以获得通道索引 c。
+-        // 由于只有 4 维，手动展开。
+-        int64_t n_idx = linear / (C * input_strides[1]);
+-        int64_t c_idx = (linear / input_strides[1]) % C;
+-        // 注意：这种分解假设 input_strides[1] 是 H*W 每通道的元素数，对于非连续 strides 可能不准确。
+-        // 但根据契约，input layout 为 supports strides，且实际模型中的输入来自参考，初始 stride 为 [8388608, 131072, 256, 1]，
+-        // 是标准连续 NCHW，所以 C*input_strides[1] 正确。但为了安全起见，我们使用显式循环计算坐标。
+-        // 性能考虑：直接计算 c 索引可能更快，此处采用直接计算。
+-        // 为了避免潜在错误，使用更通用的坐标计算。
+-        // 重新实现坐标计算：
+-        int64_t idx_rem = linear;
+-        int64_t n_coord = idx_rem / input_strides[0];
+-        idx_rem %= input_strides[0];
+-        int64_t c_coord = idx_rem / input_strides[1];
+-        idx_rem %= input_strides[1];
+-        int64_t h_coord = idx_rem / input_strides[2];
+-        int64_t w_coord = idx_rem % input_strides[2];
++        int64_t n_coord = rem / input_stride_n;
++        rem %= input_stride_n;
++        int64_t c_coord = rem / input_stride_c;
++        rem %= input_stride_c;
++        int64_t h_coord = rem / input_stride_h;
++        rem %= input_stride_h;
++        int64_t w_coord = rem / input_stride_w; // input_stride_w is usually 1
+ 
+         float scale, shift;
+         if (weight != nullptr && bias != nullptr) {
+@@ -66,154 +48,8 @@
+             shift = -running_mean[c_coord] * scale;
+         }
+ 
+-        // 计算输入/输出偏移
+-        int64_t input_offset = n_coord * input_strides[0] + c_coord * input_strides[1] + h_coord * input_strides[2] + w_coord * input_strides[3];
+-        int64_t output_offset = n_coord * output_strides[0] + c_coord * output_strides[1] + h_coord * output_strides[2] + w_coord * output_strides[3];
+-
+-        float val = input[input_offset];
+-        output[output_offset] = val * scale + shift;
+-    }
+-}
+-
+-// Clamp min kernel: output[i] = max(input[i], min_val)
+-__global__ void clamp_min_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    float min_val,
+-    int64_t total_elements,
+-    const int64_t* __restrict__ input_strides,
+-    const int64_t* __restrict__ output_strides
+-) {
+-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+-
+-    for (int64_t linear = idx; linear < total_elements; linear += stride) {
+-        // 坐标分解与 batch_norm 相同
+-        int64_t idx_rem = linear;
+-        int64_t n_coord = idx_rem / input_strides[0];
+-        idx_rem %= input_strides[0];
+-        int64_t c_coord = idx_rem / input_strides[1];
+-        idx_rem %= input_strides[1];
+-        int64_t h_coord = idx_rem / input_strides[2];
+-        int64_t w_coord = idx_rem % input_strides[2];
+-
+-        int64_t input_offset = n_coord * input_strides[0] + c_coord * input_strides[1] + h_coord * input_strides[2] + w_coord * input_strides[3];
+-        int64_t output_offset = n_coord * output_strides[0] + c_coord * output_strides[1] + h_coord * output_strides[2] + w_coord * output_strides[3];
+-
+-        float val = input[input_offset];
+-        output[output_offset] = fmaxf(val, min_val);
+-    }
+-}
+-
+-// Launcher for batch_norm_eval_forward
+-// Contract: input, weight, bias, running_mean, running_var are CUDA float32 tensors;
+-// weight/bias may be nullptr if not provided (but in this task they are always provided).
+-// eps is double, converted to float in kernel.
+-// N, C, H, W are int64_t dimensions.
+-// input_strides, output_strides point to arrays of 4 int64_t (must be on host? Actually launcher receives device pointers? No, these are host values passed as parameters).
+-// We'll pass each stride as separate int64_t arguments for simplicity, not pointer.
+-extern "C" void batch_norm_eval_launcher(
+-    const float* input,
+-    float* output,
+-    const float* weight,
+-    const float* bias,
+-    const float* running_mean,
+-    const float* running_var,
+-    double eps,
+-    int64_t N, int64_t C, int64_t H, int64_t W,
+-    int64_t input_stride_n, int64_t input_stride_c, int64_t input_stride_h, int64_t input_stride_w,
+-    int64_t output_stride_n, int64_t output_stride_c, int64_t output_stride_h, int64_t output_stride_w,
+-    cudaStream_t stream
+-) {
+-    int64_t total_elements = N * C * H * W;
+-    if (total_elements <= 0) return;
+-
+-    // 准备 strides 数组（放在常量内存或直接传数值？内核内使用局部数组）
+-    // 为避免动态分配，将 strides 作为 kernel 参数直接传递，但 kernel 需要数组访问，可以传入一个小的结构体或使用 __constant__ 内存。
+-    // 简单方式：在内核中使用局部数组，通过参数逐个赋值。
+-    // 我们修改 kernel 接收四个独立的 stride 参数，而不是指针。
+-    // 为了代码简洁，我们重载两个 kernel 以接收独立参数。
+-    // 直接在下方声明修正版 kernel。
+-    // 为了避免冗长，重新实现两个 kernel 使用独立 stride 参数。
+-}
+-
+-// 由于上面注释提到需要修改 kernel 签名，我们直接定义最终 kernel 采用独立 stride 参数。
+-__global__ void batch_norm_eval_kernel_v2(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    const float* __restrict__ weight,
+-    const float* __restrict__ bias,
+-    const float* __restrict__ running_mean,
+-    const float* __restrict__ running_var,
+-    float eps,
+-    int64_t total_elements,
+-    int64_t C,
+-    int64_t input_stride_n, int64_t input_stride_c, int64_t input_stride_h, int64_t input_stride_w,
+-    int64_t output_stride_n, int64_t output_stride_c, int64_t output_stride_h, int64_t output_stride_w
+-) {
+-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+-
+-    for (int64_t linear = idx; linear < total_elements; linear += stride) {
+-        int64_t rem = linear;
+-        int64_t n = rem / input_stride_n;
+-        rem %= input_stride_n;
+-        int64_t c = rem / input_stride_c;
+-        rem %= input_stride_c;
+-        int64_t h = rem / input_stride_h;
+-        int64_t w = rem % input_stride_w; // 注意：最后一个维度的 stride 通常是 1，所以 w = rem / input_stride_w? 应为 rem % input_stride_w = rem % 1 = 0, 错误。
+-        // 正确的分解：如果 input_stride_w 是最后一个维度的 stride（通常为1），则 w = rem; 且 h 的除数为 input_stride_h。
+-        // 但我们需要根据 strides 确定除数。对于标准 NCHW strides: [C*H*W, H*W, W, 1]
+-        // 分解：n = linear / (C*H*W), rem = linear % (C*H*W); c = rem / (H*W), rem = rem % (H*W); h = rem / W; w = rem % W;
+-        // 这些除数正是对应维度的 stride。例如 n 的除数是 input_stride_n（即 C*H*W），c 的除数是 input_stride_c（H*W），h 的除数是 input_stride_h（W），w 的除数是 input_stride_w（1）。
+-        // 但注意：上面的分解使用了 input_stride_n, input_stride_c, input_stride_h, input_stride_w 作为除数，而 rem % input_stride_w 得到 w？如果 input_stride_w = 1，则 rem % 1 = 0，所以 w 应为 rem。
+-        // 正确的做法：w = rem / input_stride_w? 不对。我们需要依次除以每个维度的 stride 来得到该维度的索引，但最后一个维度的索引应该是 rem 本身（因为 rem < input_stride_h）。
+-        // 重新推导：linear = n*input_stride_n + c*input_stride_c + h*input_stride_h + w*input_stride_w。
+-        // 因为我们有 n 的系数是 input_stride_n，所以 n = linear / input_stride_n；余数 rem1 = linear % input_stride_n。
+-        // 然后 c = rem1 / input_stride_c；余数 rem2 = rem1 % input_stride_c。
+-        // 然后 h = rem2 / input_stride_h；余数 rem3 = rem2 % input_stride_h。
+-        // 然后 w = rem3 / input_stride_w；但 input_stride_w 通常为 1，所以 w = rem3。
+-        // 这要求各 stride 为非零，且满足整除关系（对于连续布局）。对于非连续布局，这种线性索引到坐标的映射可能不是简单的顺序关系，但契约中此类任务的布局通常仍是常规的 NCHW 变体（支持 strides 但维度顺序仍是 N,C,H,W）。
+-        // 我们假设 stride 顺序与 NCHW 一致，但值可能不同（如转置）。对于一般情况，最好使用循环计算坐标，但性能略低。
+-        // 为了正确性和可维护性，我们采用简单循环计算坐标（4次除法/模），在 GPU 上仍然很快。
+-        // 重新实现为清晰版本：
+-        int64_t idx_local = linear;
+-        int64_t n = idx_local / input_stride_n;
+-        idx_local %= input_stride_n;
+-        int64_t c = idx_local / input_stride_c;
+-        idx_local %= input_stride_c;
+-        int64_t h = idx_local / input_stride_h;
+-        int64_t w = idx_local % input_stride_w; // 如果 input_stride_w 为 1，则 w = idx_local。但 idx_local 已经小于 input_stride_h，所以 w = idx_local，正确。
+-        // 上面一行其实应为 w = idx_local / input_stride_w，因为 idx_local 已经小于 input_stride_h，除以 1 得到 idx_local。如果 input_stride_w 不是 1，则此分解可能不唯一。
+-        // 更好的：使用已知的 shape 计算 H*W 等，但这里我们直接用 stride。
+-        // 鉴于合同要求 supports strides，但实际任务中的张量是连续的，我们可以在 binding 层检查连续性并调用一个简单 kernel（无需 stride 分解），否则使用通用 kernel。
+-        // 然而本 .cu 只提供通用 kernel，由 binding 层决定是否传入 strides。
+-        // 我们将采用更通用的方式：使用显式循环遍历四个维度，但这会降低性能。
+-        // 权衡：任务数据规模大，使用通用坐标计算可能带来额外开销，但仍在可接受范围。
+-        // 决定：假设 strides 符合 NCHW 顺序，且最后一维 stride 为 1（最常见），我们使用上述分解。
+-        // 若遇到不满足的情况，后续可调整。
+-
+-        float scale, shift;
+-        if (weight != nullptr && bias != nullptr) {
+-            float inv_std = rsqrtf(running_var[c] + eps);
+-            scale = weight[c] * inv_std;
+-            shift = bias[c] - running_mean[c] * scale;
+-        } else if (weight != nullptr) {
+-            float inv_std = rsqrtf(running_var[c] + eps);
+-            scale = weight[c] * inv_std;
+-            shift = -running_mean[c] * scale;
+-        } else if (bias != nullptr) {
+-            float inv_std = rsqrtf(running_var[c] + eps);
+-            scale = inv_std;
+-            shift = bias[c] - running_mean[c] * scale;
+-        } else {
+-            float inv_std = rsqrtf(running_var[c] + eps);
+-            scale = inv_std;
+-            shift = -running_mean[c] * scale;
+-        }
+-
+-        int64_t input_offset = n * input_stride_n + c * input_stride_c + h * input_stride_h + w;
+-        int64_t output_offset = n * output_stride_n + c * output_stride_c + h * output_stride_h + w;
++        int64_t input_offset = n_coord * input_stride_n + c_coord * input_stride_c + h_coord * input_stride_h + w_coord * input_stride_w;
++        int64_t output_offset = n_coord * output_stride_n + c_coord * output_stride_c + h_coord * output_stride_h + w_coord * output_stride_w;
+         output[output_offset] = input[input_offset] * scale + shift;
+     }
+ }
+@@ -230,16 +66,17 @@
+     int64_t stride = (int64_t)blockDim.x * gridDim.x;
+ 
+     for (int64_t linear = idx; linear < total_elements; linear += stride) {
+-        int64_t idx_local = linear;
+-        int64_t n = idx_local / input_stride_n;
+-        idx_local %= input_stride_n;
+-        int64_t c = idx_local / input_stride_c;
+-        idx_local %= input_stride_c;
+-        int64_t h = idx_local / input_stride_h;
+-        int64_t w = idx_local % input_stride_w;
++        int64_t rem = linear;
++        int64_t n_coord = rem / input_stride_n;
++        rem %= input_stride_n;
++        int64_t c_coord = rem / input_stride_c;
++        rem %= input_stride_c;
++        int64_t h_coord = rem / input_stride_h;
++        rem %= input_stride_h;
++        int64_t w_coord = rem / input_stride_w;
+ 
+-        int64_t input_offset = n * input_stride_n + c * input_stride_c + h * input_stride_h + w;
+-        int64_t output_offset = n * output_stride_n + c * output_stride_c + h * output_stride_h + w;
++        int64_t input_offset = n_coord * input_stride_n + c_coord * input_stride_c + h_coord * input_stride_h + w_coord * input_stride_w;
++        int64_t output_offset = n_coord * output_stride_n + c_coord * output_stride_c + h_coord * output_stride_h + w_coord * output_stride_w;
+         output[output_offset] = fmaxf(input[input_offset], min_val);
+     }
+ }
+@@ -261,9 +98,8 @@
+     if (total_elements <= 0) return;
+ 
+     int threads = 256;
+-    // 使用足够的块覆盖所有元素，但不超过 grid 上限。使用 grid-stride loop。
+     int blocks = (int)((total_elements + threads - 1) / threads);
+-    if (blocks > 65535) blocks = 65535; // 适当限制
++    if (blocks > 65535) blocks = 65535;
+     if (blocks <= 0) blocks = 1;
+ 
+     batch_norm_eval_kernel_v2<<<blocks, threads, 0, stream>>>(

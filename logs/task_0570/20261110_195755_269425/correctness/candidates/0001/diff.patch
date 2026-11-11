@@ -1,0 +1,219 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,96 @@
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// ReflectionPad2d for uint8 tensors
++// Grid-stride loop over output elements
++__global__ void reflection_pad2d_uint8_kernel(
++    const uint8_t* __restrict__ input,
++    uint8_t* __restrict__ output,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t H_out, int64_t W_out,
++    int padding)
++{
++    int64_t total = N * C * H_out * W_out;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    for (int64_t linear = idx; linear < total; linear += stride) {
++        // Decompose linear index into (n, c, i_out, j_out)
++        int64_t j_out = linear % W_out;
++        int64_t tmp = linear / W_out;
++        int64_t i_out = tmp % H_out;
++        tmp /= H_out;
++        int64_t c = tmp % C;
++        int64_t n = tmp / C;
++
++        // Reflect indices for input coordinates
++        int64_t i_in = i_out - padding;
++        int64_t j_in = j_out - padding;
++
++        // Reflect function: reflect(t, M) = min(abs(t), 2*M-2-abs(t))
++        // t is in range [-padding, M-1+padding]
++        int64_t H_in_minus_1 = H_in - 1;
++        int64_t W_in_minus_1 = W_in - 1;
++
++        int64_t abs_i = i_in >= 0 ? i_in : -i_in;
++        int64_t reflect_i = abs_i;
++        int64_t two_H_minus_2 = 2 * H_in_minus_1;
++        int64_t reflect_candidate = two_H_minus_2 - abs_i;
++        reflect_i = reflect_i < reflect_candidate ? reflect_i : reflect_candidate;
++
++        int64_t abs_j = j_in >= 0 ? j_in : -j_in;
++        int64_t reflect_j = abs_j;
++        int64_t two_W_minus_2 = 2 * W_in_minus_1;
++        reflect_candidate = two_W_minus_2 - abs_j;
++        reflect_j = reflect_j < reflect_candidate ? reflect_j : reflect_candidate;
++
++        // Input index: ((n*C + c)*H_in + reflect_i)*W_in + reflect_j
++        int64_t input_idx = ((n * C + c) * H_in + reflect_i) * W_in + reflect_j;
++        output[linear] = input[input_idx];
++    }
++}
++
++// Bitwise XOR for uint8 tensors
++template <typename T>
++__global__ void bitwise_xor_kernel(
++    const T* __restrict__ a,
++    const T* __restrict__ b,
++    T* __restrict__ output,
++    int64_t total)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total; i += stride) {
++        output[i] = a[i] ^ b[i];
++    }
++}
++
++// Launcher for reflection_pad2d_uint8
++extern "C" void reflection_pad2d_uint8_launcher(
++    const uint8_t* input,
++    uint8_t* output,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t H_out, int64_t W_out,
++    int padding,
++    cudaStream_t stream)
++{
++    int64_t total = N * C * H_out * W_out;
++    int block_size = 256;
++    int grid_size = min((total + block_size - 1) / block_size, (int64_t)65535);
++    reflection_pad2d_uint8_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, N, C, H_in, W_in, H_out, W_out, padding);
++}
++
++// Launcher for bitwise_xor_uint8
++extern "C" void bitwise_xor_uint8_launcher(
++    const uint8_t* a,
++    const uint8_t* b,
++    uint8_t* output,
++    int64_t total,
++    cudaStream_t stream)
++{
++    int block_size = 256;
++    int grid_size = min((total + block_size - 1) / block_size, (int64_t)65535);
++    bitwise_xor_kernel<uint8_t><<<grid_size, block_size, 0, stream>>>(
++        a, b, output, total);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,87 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++#include <cstdint>
++
++// Declare launchers from custom_ops.cu
++extern "C" void reflection_pad2d_uint8_launcher(
++    const uint8_t* input,
++    uint8_t* output,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t H_out, int64_t W_out,
++    int padding,
++    cudaStream_t stream);
++
++extern "C" void bitwise_xor_uint8_launcher(
++    const uint8_t* a,
++    const uint8_t* b,
++    uint8_t* output,
++    int64_t total,
++    cudaStream_t stream);
++
++// ReflectionPad2d wrapper
++torch::Tensor reflection_pad2d_uint8(torch::Tensor input, int64_t padding) {
++    TORCH_CHECK(input.is_cuda(), "reflection_pad2d_uint8: input must be CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kUInt8, "reflection_pad2d_uint8: input must be uint8");
++    TORCH_CHECK(input.is_contiguous(), "reflection_pad2d_uint8: input must be contiguous");
++    TORCH_CHECK(input.dim() == 4, "reflection_pad2d_uint8: input must be 4D (N,C,H,W)");
++    TORCH_CHECK(padding >= 0, "reflection_pad2d_uint8: padding must be non-negative");
++
++    auto N = input.size(0);
++    auto C = input.size(1);
++    auto H_in = input.size(2);
++    auto W_in = input.size(3);
++    auto H_out = H_in + 2 * padding;
++    auto W_out = W_in + 2 * padding;
++
++    auto output = torch::empty({N, C, H_out, W_out}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    reflection_pad2d_uint8_launcher(
++        input.data_ptr<uint8_t>(),
++        output.data_ptr<uint8_t>(),
++        N, C, H_in, W_in, H_out, W_out,
++        static_cast<int>(padding),
++        stream);
++
++    return output;
++}
++
++// Bitwise XOR wrapper
++torch::Tensor bitwise_xor_uint8(torch::Tensor a, torch::Tensor b) {
++    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "bitwise_xor_uint8: tensors must be CUDA");
++    TORCH_CHECK(a.dtype() == torch::kUInt8 && b.dtype() == torch::kUInt8,
++                "bitwise_xor_uint8: tensors must be uint8");
++    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(),
++                "bitwise_xor_uint8: tensors must be contiguous");
++    TORCH_CHECK(a.sizes() == b.sizes(), "bitwise_xor_uint8: tensors must have identical shape");
++
++    auto output = torch::empty_like(a);
++    int64_t total = a.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    bitwise_xor_uint8_launcher(
++        a.data_ptr<uint8_t>(),
++        b.data_ptr<uint8_t>(),
++        output.data_ptr<uint8_t>(),
++        total,
++        stream);
++
++    return output;
++}
++
++// Register both operators
++void register_custom_ops(pybind11::module& m) {
++    m.def("reflection_pad2d_uint8", &reflection_pad2d_uint8,
++          "ReflectionPad2d for uint8 tensors",
++          py::arg("input"),
++          py::arg("padding"));
++    m.def("bitwise_xor_uint8", &bitwise_xor_uint8,
++          "Elementwise bitwise XOR for uint8 tensors",
++          py::arg("a"),
++          py::arg("b"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,27 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, padding):
++        super().__init__()
++        self.padding = padding
++
++    def forward(self, x, y):
++        # Apply ReflectionPad2d using custom CUDA operator
++        x = cuda_extension.reflection_pad2d_uint8(x, self.padding)
++        # Apply bitwise XOR using custom CUDA operator
++        x = cuda_extension.bitwise_xor_uint8(x, y)
++        return x
++
++    def debug_forward(self, *inputs):
++        x, y = inputs
++        # checkpoint step_001: input after reflection padding
++        x_padded = cuda_extension.reflection_pad2d_uint8(x, self.padding)
++        yield 'step_001', x_padded
++        # checkpoint step_002: after bitwise xor
++        x_out = cuda_extension.bitwise_xor_uint8(x_padded, y)
++        yield 'step_002', x_out
++        # checkpoint step_003: final return
++        yield 'step_003', x_out

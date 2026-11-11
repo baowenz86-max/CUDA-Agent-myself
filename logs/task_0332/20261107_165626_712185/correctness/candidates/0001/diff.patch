@@ -1,0 +1,923 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,545 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// CUDA error check helper
++#define CUDA_CHECK(call)                                                     \
++  do {                                                                       \
++    cudaError_t err = call;                                                  \
++    if (err != cudaSuccess) {                                                \
++      printf("CUDA error at %s:%d: %s\n", __FILE__, __LINE__,              \
++             cudaGetErrorString(err));                                       \
++      return;                                                                \
++    }                                                                        \
++  } while (0)
++
++// -----------------------------------------------------------------------------
++// AdaptiveAvgPool1d kernel
++// Input: x [batch, channels, input_length], output_size int
++// Output: y [batch, channels, output_size]
++// Each output element averages a contiguous segment of the input along last dim
++// -----------------------------------------------------------------------------
++__global__ void adaptive_avg_pool1d_kernel(const float* __restrict__ x,
++                                           float* __restrict__ y,
++                                           int batch,
++                                           int channels,
++                                           int input_length,
++                                           int output_size) {
++  int total = batch * channels * output_size;
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int stride = blockDim.x * gridDim.x;
++
++  for (int i = idx; i < total; i += stride) {
++    int oc = i % output_size;
++    int tmp = i / output_size;
++    int c = tmp % channels;
++    int b = tmp / channels;
++
++    int start = (int)((int64_t)oc * input_length / output_size);
++    int end = (int)((int64_t)(oc + 1) * input_length / output_size);
++    if (end <= start) end = start + 1;
++
++    const float* in_ptr = x + ((int64_t)b * channels + c) * input_length;
++    float sum = 0.0f;
++    for (int k = start; k < end; ++k) {
++      sum += in_ptr[k];
++    }
++    y[i] = sum / (float)(end - start);
++  }
++}
++
++extern "C" void adaptive_avg_pool1d_launcher(const float* x,
++                                             float* y,
++                                             int batch,
++                                             int channels,
++                                             int input_length,
++                                             int output_size,
++                                             cudaStream_t stream) {
++  int total = batch * channels * output_size;
++  int threads = 256;
++  int blocks = (total + threads - 1) / threads;
++  if (blocks > 1024) blocks = 1024;
++  adaptive_avg_pool1d_kernel<<<blocks, threads, 0, stream>>>(
++      x, y, batch, channels, input_length, output_size);
++  CUDA_CHECK(cudaGetLastError());
++}
++
++// -----------------------------------------------------------------------------
++// Transpose 1 <-> 2 kernel
++// Input: x [batch, dim1, dim2], output y [batch, dim2, dim1]
++// Handles arbitrary strides but assumes x is accessible via its strides
++// -----------------------------------------------------------------------------
++__global__ void transpose_1_2_kernel(const float* __restrict__ x,
++                                     float* __restrict__ y,
++                                     int batch,
++                                     int dim1,
++                                     int dim2,
++                                     int stride_batch_x,
++                                     int stride_dim1_x,
++                                     int stride_dim2_x) {
++  int total = batch * dim1 * dim2;
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int stride = blockDim.x * gridDim.x;
++
++  for (int i = idx; i < total; i += stride) {
++    int d2 = i % dim2;
++    int tmp = i / dim2;
++    int d1 = tmp % dim1;
++    int b = tmp / dim1;
++
++    int src_idx = b * stride_batch_x + d1 * stride_dim1_x + d2 * stride_dim2_x;
++    int dst_idx = (b * dim2 + d2) * dim1 + d1;
++    y[dst_idx] = x[src_idx];
++  }
++}
++
++extern "C" void transpose_1_2_launcher(const float* x,
++                                       float* y,
++                                       int batch,
++                                       int dim1,
++                                       int dim2,
++                                       int stride_batch_x,
++                                       int stride_dim1_x,
++                                       int stride_dim2_x,
++                                       cudaStream_t stream) {
++  int total = batch * dim1 * dim2;
++  int threads = 256;
++  int blocks = (total + threads - 1) / threads;
++  if (blocks > 1024) blocks = 1024;
++  transpose_1_2_kernel<<<blocks, threads, 0, stream>>>(
++      x, y, batch, dim1, dim2, stride_batch_x, stride_dim1_x, stride_dim2_x);
++  CUDA_CHECK(cudaGetLastError());
++}
++
++// -----------------------------------------------------------------------------
++// LSTM forward kernel (two layers, unidirectional)
++// Input: x [batch, seq_len, input_size]
++// Weights and biases for layer 0 and layer 1
++// Output: y [batch, seq_len, hidden_size]
++// Also writes h_n [2, batch, hidden_size], c_n [2, batch, hidden_size]
++// -----------------------------------------------------------------------------
++// Helper: sigmoid function
++__device__ __forceinline__ float sigmoidf(float x) {
++  return 1.0f / (1.0f + expf(-x));
++}
++
++// Kernel: each block processes one (batch, layer) pair for all time steps.
++// Shared memory stores h_prev and c_prev for that (batch, layer).
++// Grid: (batch, num_layers) blocks.
++__global__ void lstm_forward_kernel(
++    const float* __restrict__ x,        // layer0 input: [batch, seq, input_size]
++    const float* __restrict__ weight_ih_l0, // [4*hidden, input_size]
++    const float* __restrict__ weight_hh_l0, // [4*hidden, hidden]
++    const float* __restrict__ bias_l0,      // [4*hidden] combined bias
++    const float* __restrict__ weight_ih_l1, // [4*hidden, hidden]
++    const float* __restrict__ weight_hh_l1, // [4*hidden, hidden]
++    const float* __restrict__ bias_l1,      // [4*hidden] combined bias
++    float* __restrict__ y,             // output [batch, seq, hidden]
++    float* __restrict__ h_n,           // [2, batch, hidden]
++    float* __restrict__ c_n,           // [2, batch, hidden]
++    int batch,
++    int seq_len,
++    int input_size,
++    int hidden_size) {
++
++  extern __shared__ float smem[];
++  // Layout: h[hidden_size], c[hidden_size], then gates[HIDDEN]
++  int bid = blockIdx.x;   // batch index
++  int layer = blockIdx.y; // layer index (0 or 1)
++
++  // For layer 0, input feature dim = input_size; for layer 1, = hidden_size
++  int in_dim = (layer == 0) ? input_size : hidden_size;
++
++  // Determine weights and bias for this layer
++  const float* W_ih = (layer == 0) ? weight_ih_l0 : weight_ih_l1;
++  const float* W_hh = (layer == 0) ? weight_hh_l0 : weight_hh_l1;
++  const float* bias = (layer == 0) ? bias_l0 : bias_l1;
++
++  // Input pointer: for layer 0 use x[bid]; for layer 1 use y[bid] already computed? 
++  // Since layers are processed sequentially, we launch kernel with same grid, but 
++  // layer1 depends on layer0 output. We assume layer0 is computed first and __syncthreads 
++  // across blocks is not possible. Instead, we organize a single kernel with two phases, 
++  // or call kernel twice.
++  // Here we implement a single kernel that loops over layers internally, using global sync? 
++  // Too complex. Simpler: launch kernel once with gridDim.y = batch, and inside loop over time, 
++  // after each time step for layer0, we need to store output, then layer1 can read it.
++  // However, different blocks handle different batch, so no dependency across blocks.
++  // For a given batch, layer0 and layer1 of same time step can be computed sequentially within 
++  // the same block if we allocate separate shared memory? But hidden states for both layers needed.
++  // We can compute both layers within one block: process time step t: compute layer0 gates using x[t], 
++  // update h0,c0, write y0[t]; then compute layer1 gates using y0[t], update h1,c1, write y[t].
++  // This requires h0,c0 and h1,c1 stored in shared memory. We'll do that.
++  // Therefore gridDim = (batch) only, and we compute both layers per block.
++  // However, the kernel below currently assumes gridDim.y = num_layers; adjust to one block per batch.
++  // We'll rewrite appropriately.
++}
++
++// Launcher will call a kernel that processes both layers per batch block.
++extern "C" void lstm_forward_launcher(
++    const float* x,
++    const float* weight_ih_l0,
++    const float* weight_hh_l0,
++    const float* bias_ih_l0,
++    const float* bias_hh_l0,
++    const float* weight_ih_l1,
++    const float* weight_hh_l1,
++    const float* bias_ih_l1,
++    const float* bias_hh_l1,
++    float* y,
++    float* h_n,
++    float* c_n,
++    int batch,
++    int seq_len,
++    int input_size,
++    int hidden_size,
++    cudaStream_t stream) {
++  // Placeholder: not used, actual implementation below in separate kernel.
++}
++
++// Actual LSTM kernel: one block per batch, processes both layers.
++__global__ void lstm_forward_combined_kernel(
++    const float* __restrict__ x,
++    const float* __restrict__ weight_ih_l0, // [4H, input_size]
++    const float* __restrict__ weight_hh_l0, // [4H, H]
++    const float* __restrict__ bias_l0,      // [4H]
++    const float* __restrict__ weight_ih_l1, // [4H, H]
++    const float* __restrict__ weight_hh_l1, // [4H, H]
++    const float* __restrict__ bias_l1,      // [4H]
++    float* __restrict__ y,                  // [batch, seq, H]
++    float* __restrict__ h_n,                // [2, batch, H]
++    float* __restrict__ c_n,                // [2, batch, H]
++    int batch,
++    int seq_len,
++    int input_size,
++    int hidden_size) {
++
++  int bid = blockIdx.x;
++  if (bid >= batch) return;
++
++  const int H = hidden_size;
++  const int I = input_size;
++
++  // Shared memory: h0[H], c0[H], h1[H], c1[H]
++  extern __shared__ float smem[];
++  float* h0 = smem;
++  float* c0 = smem + H;
++  float* h1 = smem + 2 * H;
++  float* c1 = smem + 3 * H;
++
++  // Initialize hidden and cell states to zero
++  int tid = threadIdx.x;
++  int threads = blockDim.x;
++  for (int i = tid; i < H; i += threads) {
++    h0[i] = 0.0f;
++    c0[i] = 0.0f;
++    h1[i] = 0.0f;
++    c1[i] = 0.0f;
++  }
++  __syncthreads();
++
++  // Base pointers for this batch
++  const float* x_b = x + (int64_t)bid * seq_len * I;
++  float* y_b = y + (int64_t)bid * seq_len * H;
++
++  // Gate computation helpers (assume H threads to cover H, if blockDim < H, loop)
++  // We use blockDim threads, typically 256, and H=256, so one thread per hidden unit.
++
++  for (int t = 0; t < seq_len; ++t) {
++    // ----- Layer 0 -----
++    const float* x_t = x_b + t * I;
++    // gate arrays in shared memory: i, f, g, o (each size H)
++    // Reuse additional shared memory beyond h/c, need allocation in launcher
++    // For simplicity, compute each gate one by one using temporary thread-local registers? 
++    // Better: allocate gates in shared memory: i0,f0,g0,o0,i1,f1,g1,o1 => 8*H floats
++    // We'll declare shmem size accordingly in launcher.
++
++    // Since we already defined only 4 arrays for states, we'll place gates after.
++    // In this kernel, we assume shared memory size = (4 + 8) * H * sizeof(float).
++    float* i0 = smem + 4 * H;
++    float* f0 = smem + 5 * H;
++    float* g0 = smem + 6 * H;
++    float* o0 = smem + 7 * H;
++    float* i1 = smem + 8 * H;
++    float* f1 = smem + 9 * H;
++    float* g1 = smem + 10 * H;
++    float* o1 = smem + 11 * H;
++
++    // Compute gates for layer0: for each hidden index j (0..H-1)
++    for (int j = tid; j < H; j += threads) {
++      float pre_i = bias_l0[j];
++      float pre_f = bias_l0[H + j];
++      float pre_g = bias_l0[2 * H + j];
++      float pre_o = bias_l0[3 * H + j];
++
++      // Input contribution: sum over k
++      for (int k = 0; k < I; ++k) {
++        float x_val = x_t[k];
++        pre_i += weight_ih_l0[j * I + k] * x_val;
++        pre_f += weight_ih_l0[(H + j) * I + k] * x_val;
++        pre_g += weight_ih_l0[(2 * H + j) * I + k] * x_val;
++        pre_o += weight_ih_l0[(3 * H + j) * I + k] * x_val;
++      }
++      // Hidden contribution
++      for (int k = 0; k < H; ++k) {
++        float h_val = h0[k];
++        pre_i += weight_hh_l0[j * H + k] * h_val;
++        pre_f += weight_hh_l0[(H + j) * H + k] * h_val;
++        pre_g += weight_hh_l0[(2 * H + j) * H + k] * h_val;
++        pre_o += weight_hh_l0[(3 * H + j) * H + k] * h_val;
++      }
++
++      i0[j] = sigmoidf(pre_i);
++      f0[j] = sigmoidf(pre_f);
++      g0[j] = tanhf(pre_g);
++      o0[j] = sigmoidf(pre_o);
++    }
++    __syncthreads();
++
++    // Update c0 and h0 for layer0
++    for (int j = tid; j < H; j += threads) {
++      c0[j] = f0[j] * c0[j] + i0[j] * g0[j];
++      h0[j] = o0[j] * tanhf(c0[j]);
++      // Store layer0 output to y_b (this will be input to layer1)
++      y_b[t * H + j] = h0[j];
++    }
++    __syncthreads();
++
++    // ----- Layer 1 -----
++    // Input for layer1 is y_b[t * H + ...] which is h0
++    // We can read from shared h0 (already synchronized)
++    const float* in1 = h0; // alias to h0 (layer0 output at current time)
++
++    for (int j = tid; j < H; j += threads) {
++      float pre_i = bias_l1[j];
++      float pre_f = bias_l1[H + j];
++      float pre_g = bias_l1[2 * H + j];
++      float pre_o = bias_l1[3 * H + j];
++
++      for (int k = 0; k < H; ++k) {
++        float val = in1[k]; // h0[k]
++        pre_i += weight_ih_l1[j * H + k] * val;
++        pre_f += weight_ih_l1[(H + j) * H + k] * val;
++        pre_g += weight_ih_l1[(2 * H + j) * H + k] * val;
++        pre_o += weight_ih_l1[(3 * H + j) * H + k] * val;
++      }
++      for (int k = 0; k < H; ++k) {
++        float h_val = h1[k];
++        pre_i += weight_hh_l1[j * H + k] * h_val;
++        pre_f += weight_hh_l1[(H + j) * H + k] * h_val;
++        pre_g += weight_hh_l1[(2 * H + j) * H + k] * h_val;
++        pre_o += weight_hh_l1[(3 * H + j) * H + k] * h_val;
++      }
++
++      i1[j] = sigmoidf(pre_i);
++      f1[j] = sigmoidf(pre_f);
++      g1[j] = tanhf(pre_g);
++      o1[j] = sigmoidf(pre_o);
++    }
++    __syncthreads();
++
++    // Update c1 and h1 for layer1
++    for (int j = tid; j < H; j += threads) {
++      c1[j] = f1[j] * c1[j] + i1[j] * g1[j];
++      h1[j] = o1[j] * tanhf(c1[j]);
++      // Store final output y_b[t * H + j]
++      y_b[t * H + j] = h1[j];
++    }
++    __syncthreads();
++  }
++
++  // After all time steps, write final h_n and c_n for this batch (layer 0 and 1)
++  for (int j = tid; j < H; j += threads) {
++    h_n[0 * batch * H + bid * H + j] = h0[j];  // layer 0 h_n
++    c_n[0 * batch * H + bid * H + j] = c0[j];
++    h_n[1 * batch * H + bid * H + j] = h1[j];  // layer 1 h_n
++    c_n[1 * batch * H + bid * H + j] = c1[j];
++  }
++}
++
++// Launcher for LSTM: combines biases, launches kernel with appropriate shared memory.
++extern "C" void lstm_forward_launcher_actual(
++    const float* x,
++    const float* weight_ih_l0,
++    const float* weight_hh_l0,
++    const float* bias_ih_l0,
++    const float* bias_hh_l0,
++    const float* weight_ih_l1,
++    const float* weight_hh_l1,
++    const float* bias_ih_l1,
++    const float* bias_hh_l1,
++    float* y,
++    float* h_n,
++    float* c_n,
++    int batch,
++    int seq_len,
++    int input_size,
++    int hidden_size,
++    cudaStream_t stream) {
++
++  // Combine biases: bias = bias_ih + bias_hh
++  // We need to allocate temporary arrays for combined bias; do on host with cudaMalloc
++  float *bias_l0, *bias_l1;
++  cudaMalloc(&bias_l0, 4 * hidden_size * sizeof(float));
++  cudaMalloc(&bias_l1, 4 * hidden_size * sizeof(float));
++
++  // Simple kernel to combine
++  int total_bias = 4 * hidden_size;
++  int threads_bias = 256;
++  int blocks_bias = (total_bias + threads_bias - 1) / threads_bias;
++  // Launch a kernel to compute bias_l0 = bias_ih_l0 + bias_hh_l0
++  // We'll define a small kernel inline? Easier: use cudaMemcpyAsync? But we need sum on device.
++  // We'll create a small kernel combine_bias_kernel.
++  // To keep file concise, we define here.
++  {
++    __global__ void combine_bias_kernel(float* out, const float* a, const float* b, int n) {
++      int idx = blockIdx.x * blockDim.x + threadIdx.x;
++      if (idx < n) out[idx] = a[idx] + b[idx];
++    }
++    combine_bias_kernel<<<blocks_bias, threads_bias, 0, stream>>>(
++        bias_l0, bias_ih_l0, bias_hh_l0, total_bias);
++    combine_bias_kernel<<<blocks_bias, threads_bias, 0, stream>>>(
++        bias_l1, bias_ih_l1, bias_hh_l1, total_bias);
++  }
++
++  // Launch main LSTM kernel
++  int threads = hidden_size; // assume hidden_size <= 1024, here 256
++  if (threads > 1024) threads = 256; // fallback with loop
++  // Shared memory: states (4*H) + gates (8*H) = 12*H floats
++  size_t shmem = 12 * hidden_size * sizeof(float);
++  lstm_forward_combined_kernel<<<batch, threads, shmem, stream>>>(
++      x,
++      weight_ih_l0, weight_hh_l0, bias_l0,
++      weight_ih_l1, weight_hh_l1, bias_l1,
++      y, h_n, c_n,
++      batch, seq_len, input_size, hidden_size);
++
++  CUDA_CHECK(cudaGetLastError());
++  cudaFree(bias_l0);
++  cudaFree(bias_l1);
++}
++
++// -----------------------------------------------------------------------------
++// Reshape 2D kernel: copies data preserving order. 
++// Assumes output is contiguous with shape [dim0, dim1]. Input may have arbitrary strides.
++// -----------------------------------------------------------------------------
++__global__ void reshape_2d_kernel(const float* __restrict__ x,
++                                  float* __restrict__ y,
++                                  int64_t total,
++                                  int64_t stride_batch_x,
++                                  int64_t stride_dim1_x,
++                                  int64_t stride_dim2_x,
++                                  int dim1_x) {
++  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int64_t stride = blockDim.x * gridDim.x;
++  for (int64_t i = idx; i < total; i += stride) {
++    int64_t d2 = i % dim1_x;
++    int64_t tmp = i / dim1_x;
++    int64_t d1 = tmp % dim1_x; // Actually dim1_x is hidden_size? Need careful mapping.
++    int64_t b = tmp / dim1_x;
++    // Input 3D shape [batch, seq, hidden], flattened to [batch, seq*hidden]
++    // For linear index i in output flat [batch, seq*hidden], map to input coordinates:
++    int64_t b_out = i / (dim1_x * dim1_x); // wait dim1_x is seq? 
++    // We need input dims: batch, seq, hidden. Let's pass them explicitly.
++  }
++}
++
++extern "C" void reshape_2d_launcher(const float* x,
++                                    float* y,
++                                    int batch,
++                                    int seq_len,
++                                    int hidden_size,
++                                    int64_t stride_batch_x,
++                                    int64_t stride_seq_x,
++                                    int64_t stride_hidden_x,
++                                    cudaStream_t stream) {
++  int64_t total = (int64_t)batch * seq_len * hidden_size;
++  int threads = 256;
++  int64_t blocks64 = (total + threads - 1) / threads;
++  int blocks = (blocks64 > 1024) ? 1024 : (int)blocks64;
++  // Use a different kernel with explicit dimensions
++}
++
++// Actual reshape kernel with dimensions
++__global__ void reshape_2d_dim_kernel(const float* __restrict__ x,
++                                      float* __restrict__ y,
++                                      int batch,
++                                      int seq_len,
++                                      int hidden_size,
++                                      int64_t stride_batch_x,
++                                      int64_t stride_seq_x,
++                                      int64_t stride_hidden_x) {
++  int64_t total = (int64_t)batch * seq_len * hidden_size;
++  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int64_t stride = (int64_t)blockDim.x * gridDim.x;
++  for (int64_t i = idx; i < total; i += stride) {
++    int64_t h = i % hidden_size;
++    int64_t tmp = i / hidden_size;
++    int64_t s = tmp % seq_len;
++    int64_t b = tmp / seq_len;
++    int64_t src_idx = b * stride_batch_x + s * stride_seq_x + h * stride_hidden_x;
++    y[i] = x[src_idx];
++  }
++}
++
++extern "C" void reshape_2d_launcher_actual(const float* x,
++                                           float* y,
++                                           int batch,
++                                           int seq_len,
++                                           int hidden_size,
++                                           int64_t stride_batch_x,
++                                           int64_t stride_seq_x,
++                                           int64_t stride_hidden_x,
++                                           cudaStream_t stream) {
++  int64_t total = (int64_t)batch * seq_len * hidden_size;
++  int threads = 256;
++  int64_t blocks64 = (total + threads - 1) / threads;
++  int blocks = (blocks64 > 1024) ? 1024 : (int)blocks64;
++  reshape_2d_dim_kernel<<<blocks, threads, 0, stream>>>(
++      x, y, batch, seq_len, hidden_size,
++      stride_batch_x, stride_seq_x, stride_hidden_x);
++  CUDA_CHECK(cudaGetLastError());
++}
++
++// -----------------------------------------------------------------------------
++// Linear kernel: y = x @ W^T + b
++// x [batch, in_features], weight [out_features, in_features], bias [out_features]
++// -----------------------------------------------------------------------------
++__global__ void linear_kernel(const float* __restrict__ x,
++                              const float* __restrict__ weight,
++                              const float* __restrict__ bias,
++                              float* __restrict__ y,
++                              int batch,
++                              int in_features,
++                              int out_features) {
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int stride = blockDim.x * gridDim.x;
++  int total = batch * out_features;
++
++  for (int i = idx; i < total; i += stride) {
++    int out_idx = i % out_features;
++    int b = i / out_features;
++    const float* x_row = x + (int64_t)b * in_features;
++    const float* w_row = weight + (int64_t)out_idx * in_features;
++    float sum = (bias != nullptr) ? bias[out_idx] : 0.0f;
++    for (int k = 0; k < in_features; ++k) {
++      sum += x_row[k] * w_row[k];
++    }
++    y[i] = sum;
++  }
++}
++
++extern "C" void linear_launcher(const float* x,
++                                const float* weight,
++                                const float* bias, // may be null
++                                float* y,
++                                int batch,
++                                int in_features,
++                                int out_features,
++                                cudaStream_t stream) {
++  int total = batch * out_features;
++  int threads = 256;
++  int blocks = (total + threads - 1) / threads;
++  if (blocks > 1024) blocks = 1024;
++  linear_kernel<<<blocks, threads, 0, stream>>>(
++      x, weight, bias, y, batch, in_features, out_features);
++  CUDA_CHECK(cudaGetLastError());
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,312 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void adaptive_avg_pool1d_launcher(
++    const float* x,
++    float* y,
++    int batch,
++    int channels,
++    int input_length,
++    int output_size,
++    cudaStream_t stream);
++
++extern "C" void transpose_1_2_launcher(
++    const float* x,
++    float* y,
++    int batch,
++    int dim1,
++    int dim2,
++    int stride_batch_x,
++    int stride_dim1_x,
++    int stride_dim2_x,
++    cudaStream_t stream);
++
++extern "C" void lstm_forward_launcher_actual(
++    const float* x,
++    const float* weight_ih_l0,
++    const float* weight_hh_l0,
++    const float* bias_ih_l0,
++    const float* bias_hh_l0,
++    const float* weight_ih_l1,
++    const float* weight_hh_l1,
++    const float* bias_ih_l1,
++    const float* bias_hh_l1,
++    float* y,
++    float* h_n,
++    float* c_n,
++    int batch,
++    int seq_len,
++    int input_size,
++    int hidden_size,
++    cudaStream_t stream);
++
++extern "C" void reshape_2d_launcher_actual(
++    const float* x,
++    float* y,
++    int batch,
++    int seq_len,
++    int hidden_size,
++    int64_t stride_batch_x,
++    int64_t stride_seq_x,
++    int64_t stride_hidden_x,
++    cudaStream_t stream);
++
++extern "C" void linear_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    float* y,
++    int batch,
++    int in_features,
++    int out_features,
++    cudaStream_t stream);
++
++// -----------------------------------------------------------------------------
++// Binding: adaptive_avg_pool1d
++// -----------------------------------------------------------------------------
++torch::Tensor adaptive_avg_pool1d(torch::Tensor x, int64_t output_size) {
++    TORCH_CHECK(x.is_cuda(), "adaptive_avg_pool1d: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "adaptive_avg_pool1d: input must be float32");
++    TORCH_CHECK(x.dim() == 3, "adaptive_avg_pool1d: input must be 3D (batch, channels, length)");
++
++    int64_t batch = x.size(0);
++    int64_t channels = x.size(1);
++    int64_t input_length = x.size(2);
++
++    auto y = torch::empty({batch, channels, output_size}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    adaptive_avg_pool1d_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(channels),
++        static_cast<int>(input_length),
++        static_cast<int>(output_size),
++        stream);
++
++    return y;
++}
++
++// -----------------------------------------------------------------------------
++// Binding: transpose_1_2
++// -----------------------------------------------------------------------------
++torch::Tensor transpose_1_2(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "transpose_1_2: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "transpose_1_2: input must be float32");
++    TORCH_CHECK(x.dim() == 3, "transpose_1_2: input must be 3D (batch, dim1, dim2)");
++
++    int64_t batch = x.size(0);
++    int64_t dim1 = x.size(1);
++    int64_t dim2 = x.size(2);
++
++    // Transpose dim1 and dim2, output shape [batch, dim2, dim1]
++    auto y = torch::empty({batch, dim2, dim1}, x.options());
++
++    // Get strides of input (in elements, not bytes)
++    int64_t stride_batch_x = x.stride(0);
++    int64_t stride_dim1_x = x.stride(1);
++    int64_t stride_dim2_x = x.stride(2);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    transpose_1_2_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(dim1),
++        static_cast<int>(dim2),
++        static_cast<int>(stride_batch_x),
++        static_cast<int>(stride_dim1_x),
++        static_cast<int>(stride_dim2_x),
++        stream);
++
++    return y;
++}
++
++// -----------------------------------------------------------------------------
++// Binding: lstm_forward
++// -----------------------------------------------------------------------------
++std::tuple<torch::Tensor, std::tuple<torch::Tensor, torch::Tensor>> lstm_forward(
++    torch::Tensor x,
++    torch::Tensor weight_ih_l0,
++    torch::Tensor weight_hh_l0,
++    torch::Tensor bias_ih_l0,
++    torch::Tensor bias_hh_l0,
++    torch::Tensor weight_ih_l1,
++    torch::Tensor weight_hh_l1,
++    torch::Tensor bias_ih_l1,
++    torch::Tensor bias_hh_l1,
++    int64_t hidden_size,
++    int64_t num_layers) {
++
++    TORCH_CHECK(x.is_cuda(), "lstm_forward: input x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "lstm_forward: input x must be float32");
++    TORCH_CHECK(x.dim() == 3, "lstm_forward: input x must be 3D (batch, seq_len, input_size)");
++    TORCH_CHECK(num_layers == 2, "lstm_forward: only num_layers=2 is supported");
++
++    int64_t batch = x.size(0);
++    int64_t seq_len = x.size(1);
++    int64_t input_size = x.size(2);
++
++    // Check weight tensors
++    auto check_weight = [](const torch::Tensor& t, const char* name, int64_t rows, int64_t cols) {
++        TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++        TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++        TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++        TORCH_CHECK(t.dim() == 2 && t.size(0) == rows && t.size(1) == cols, name, " shape mismatch");
++    };
++
++    int64_t four_hidden = 4 * hidden_size;
++    check_weight(weight_ih_l0, "weight_ih_l0", four_hidden, input_size);
++    check_weight(weight_hh_l0, "weight_hh_l0", four_hidden, hidden_size);
++    check_weight(weight_ih_l1, "weight_ih_l1", four_hidden, hidden_size);
++    check_weight(weight_hh_l1, "weight_hh_l1", four_hidden, hidden_size);
++
++    auto check_bias = [](const torch::Tensor& t, const char* name, int64_t size) {
++        TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++        TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++        TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++        TORCH_CHECK(t.dim() == 1 && t.size(0) == size, name, " shape mismatch");
++    };
++
++    check_bias(bias_ih_l0, "bias_ih_l0", four_hidden);
++    check_bias(bias_hh_l0, "bias_hh_l0", four_hidden);
++    check_bias(bias_ih_l1, "bias_ih_l1", four_hidden);
++    check_bias(bias_hh_l1, "bias_hh_l1", four_hidden);
++
++    // Allocate outputs
++    auto y = torch::empty({batch, seq_len, hidden_size}, x.options());
++    auto h_n = torch::empty({num_layers, batch, hidden_size}, x.options());
++    auto c_n = torch::empty({num_layers, batch, hidden_size}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    lstm_forward_launcher_actual(
++        x.data_ptr<float>(),
++        weight_ih_l0.data_ptr<float>(),
++        weight_hh_l0.data_ptr<float>(),
++        bias_ih_l0.data_ptr<float>(),
++        bias_hh_l0.data_ptr<float>(),
++        weight_ih_l1.data_ptr<float>(),
++        weight_hh_l1.data_ptr<float>(),
++        bias_ih_l1.data_ptr<float>(),
++        bias_hh_l1.data_ptr<float>(),
++        y.data_ptr<float>(),
++        h_n.data_ptr<float>(),
++        c_n.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(seq_len),
++        static_cast<int>(input_size),
++        static_cast<int>(hidden_size),
++        stream);
++
++    return std::make_tuple(y, std::make_tuple(h_n, c_n));
++}
++
++// -----------------------------------------------------------------------------
++// Binding: reshape_2d
++// -----------------------------------------------------------------------------
++torch::Tensor reshape_2d(torch::Tensor x, int64_t dim0, int64_t dim1) {
++    TORCH_CHECK(x.is_cuda(), "reshape_2d: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "reshape_2d: input must be float32");
++    TORCH_CHECK(x.dim() == 3, "reshape_2d: input must be 3D (batch, seq_len, hidden_size)");
++
++    int64_t batch = x.size(0);
++    int64_t seq_len = x.size(1);
++    int64_t hidden_size = x.size(2);
++
++    TORCH_CHECK(dim0 == batch, "reshape_2d: dim0 must equal batch size");
++    TORCH_CHECK(dim1 == seq_len * hidden_size, "reshape_2d: dim1 must equal seq_len * hidden_size");
++
++    auto y = torch::empty({dim0, dim1}, x.options());
++
++    int64_t stride_batch_x = x.stride(0);
++    int64_t stride_seq_x = x.stride(1);
++    int64_t stride_hidden_x = x.stride(2);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    reshape_2d_launcher_actual(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(seq_len),
++        static_cast<int>(hidden_size),
++        stride_batch_x,
++        stride_seq_x,
++        stride_hidden_x,
++        stream);
++
++    return y;
++}
++
++// -----------------------------------------------------------------------------
++// Binding: linear
++// -----------------------------------------------------------------------------
++torch::Tensor linear(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
++    TORCH_CHECK(x.is_cuda(), "linear: input x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "linear: input x must be float32");
++    TORCH_CHECK(x.dim() == 2, "linear: input x must be 2D (batch, in_features)");
++    TORCH_CHECK(x.is_contiguous(), "linear: input x must be contiguous");
++
++    TORCH_CHECK(weight.is_cuda(), "linear: weight must be a CUDA tensor");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "linear: weight must be float32");
++    TORCH_CHECK(weight.dim() == 2, "linear: weight must be 2D (out_features, in_features)");
++    TORCH_CHECK(weight.is_contiguous(), "linear: weight must be contiguous");
++
++    int64_t batch = x.size(0);
++    int64_t in_features = x.size(1);
++    int64_t out_features = weight.size(0);
++    TORCH_CHECK(weight.size(1) == in_features, "linear: weight shape mismatch");
++
++    TORCH_CHECK(bias.is_cuda(), "linear: bias must be a CUDA tensor");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "linear: bias must be float32");
++    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == out_features, "linear: bias shape mismatch");
++    TORCH_CHECK(bias.is_contiguous(), "linear: bias must be contiguous");
++
++    auto y = torch::empty({batch, out_features}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    linear_launcher(
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        y.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(in_features),
++        static_cast<int>(out_features),
++        stream);
++
++    return y;
++}
++
++// -----------------------------------------------------------------------------
++// Register bindings
++// -----------------------------------------------------------------------------
++void register_custom_ops(pybind11::module& m) {
++    m.def("adaptive_avg_pool1d", &adaptive_avg_pool1d, "Adaptive average pooling 1D",
++          pybind11::arg("x"), pybind11::arg("output_size"));
++    m.def("transpose_1_2", &transpose_1_2, "Transpose dimensions 1 and 2",
++          pybind11::arg("x"));
++    m.def("lstm_forward", &lstm_forward, "LSTM forward (2 layers)",
++          pybind11::arg("x"),
++          pybind11::arg("weight_ih_l0"),
++          pybind11::arg("weight_hh_l0"),
++          pybind11::arg("bias_ih_l0"),
++          pybind11::arg("bias_hh_l0"),
++          pybind11::arg("weight_ih_l1"),
++          pybind11::arg("weight_hh_l1"),
++          pybind11::arg("bias_ih_l1"),
++          pybind11::arg("bias_hh_l1"),
++          pybind11::arg("hidden_size"),
++          pybind11::arg("num_layers"));
++    m.def("reshape_2d", &reshape_2d, "Reshape 3D to 2D",
++          pybind11::arg("x"), pybind11::arg("dim0"), pybind11::arg("dim1"));
++    m.def("linear", &linear, "Linear layer",
++          pybind11::arg("x"), pybind11::arg("weight"), pybind11::arg("bias"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,57 @@
++import torch
++import torch.nn as nn
++
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, hidden_size, num_layers, output_size, pooling_length):
++        super().__init__()
++        self.adaptive_avg_pool = nn.AdaptiveAvgPool1d(pooling_length)
++        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
++        self.fc = nn.Linear(hidden_size * pooling_length, output_size)
++
++    def forward(self, x):
++        x = cuda_extension.adaptive_avg_pool1d(x, self.pooling_length)
++        x = cuda_extension.transpose_1_2(x)
++        x, _hidden = cuda_extension.lstm_forward(
++            x,
++            self.lstm.weight_ih_l0,
++            self.lstm.weight_hh_l0,
++            self.lstm.bias_ih_l0,
++            self.lstm.bias_hh_l0,
++            self.lstm.weight_ih_l1,
++            self.lstm.weight_hh_l1,
++            self.lstm.bias_ih_l1,
++            self.lstm.bias_hh_l1,
++            self.hidden_size,
++            self.num_layers,
++        )
++        x = cuda_extension.reshape_2d(x, x.size(0), -1)
++        x = cuda_extension.linear(x, self.fc.weight, self.fc.bias)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.adaptive_avg_pool1d(x, self.pooling_length)
++        yield "step_001", x
++        x = cuda_extension.transpose_1_2(x)
++        yield "step_002", x
++        x, _hidden = cuda_extension.lstm_forward(
++            x,
++            self.lstm.weight_ih_l0,
++            self.lstm.weight_hh_l0,
++            self.lstm.bias_ih_l0,
++            self.lstm.bias_hh_l0,
++            self.lstm.weight_ih_l1,
++            self.lstm.weight_hh_l1,
++            self.lstm.bias_ih_l1,
++            self.lstm.bias_hh_l1,
++            self.hidden_size,
++            self.num_layers,
++        )
++        yield "step_003", (x, _hidden)
++        x = cuda_extension.reshape_2d(x, x.size(0), -1)
++        yield "step_004", x
++        x = cuda_extension.linear(x, self.fc.weight, self.fc.bias)
++        yield "step_005", x
++        yield "step_006", x

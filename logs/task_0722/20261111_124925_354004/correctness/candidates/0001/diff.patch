@@ -1,0 +1,292 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,123 @@
++#include <cuda_runtime.h>
++
++// -----------------------------------------------------------------------------
++// Utility: div_up
++// -----------------------------------------------------------------------------
++__host__ __device__ __forceinline__ int div_up(int a, int b) {
++    return (a + b - 1) / b;
++}
++
++// -----------------------------------------------------------------------------
++// Kernel: custom_mean_impl
++// Computes mean over dimension dim (0-indexed) for a 4D tensor of shape (N,C,H,W)
++// Requires keepdim = true, output shape (N,C,1,W)
++// Uses one thread per output element; each thread loops over reduction dim H.
++// Handles arbitrary strides through explicit index computation.
++// -----------------------------------------------------------------------------
++template <typename scalar_t>
++__global__ void custom_mean_kernel(
++    const scalar_t* __restrict__ input,
++    scalar_t* __restrict__ output,
++    int N, int C, int H, int W,
++    int in_stride_N, int in_stride_C, int in_stride_H, int in_stride_W,
++    int out_stride_N, int out_stride_C, int out_stride_W
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_outputs = N * C * W;  // since keepdim true, output shape N,C,1,W
++    if (idx >= total_outputs) return;
++
++    // Decompose idx into (n, c, w)
++    int w = idx % W;
++    int tmp = idx / W;
++    int c = tmp % C;
++    int n = tmp / C;
++
++    const scalar_t* base = input + n * in_stride_N + c * in_stride_C + w * in_stride_W;
++    float sum = 0.0f;
++    for (int h = 0; h < H; ++h) {
++        sum += static_cast<float>(base[h * in_stride_H]);
++    }
++    output[n * out_stride_N + c * out_stride_C + w * out_stride_W] = static_cast<scalar_t>(sum / H);
++}
++
++// -----------------------------------------------------------------------------
++// Launcher: custom_mean_launcher
++// Computes mean along dim for 4D float32 tensor, keepdim always true.
++// -----------------------------------------------------------------------------
++extern "C" void custom_mean_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int in_stride_N, int in_stride_C, int in_stride_H, int in_stride_W,
++    int out_stride_N, int out_stride_C, int out_stride_W,
++    cudaStream_t stream
++) {
++    int total_outputs = N * C * W;
++    int block = 256;
++    int grid = div_up(total_outputs, block);
++    custom_mean_kernel<float><<<grid, block, 0, stream>>>(
++        input, output,
++        N, C, H, W,
++        in_stride_N, in_stride_C, in_stride_H, in_stride_W,
++        out_stride_N, out_stride_C, out_stride_W
++    );
++}
++
++// -----------------------------------------------------------------------------
++// Kernel: custom_gt_impl
++// Computes input > other with broadcasting along dimension 2 (height).
++// Input shape (N,C,H,W), other shape (N,C,1,W), output bool shape (N,C,H,W).
++// One thread per output element; handles arbitrary strides.
++// -----------------------------------------------------------------------------
++template <typename scalar_t>
++__global__ void custom_gt_kernel(
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ other,
++    bool* __restrict__ output,
++    int N, int C, int H, int W,
++    int in_stride_N, int in_stride_C, int in_stride_H, int in_stride_W,
++    int other_stride_N, int other_stride_C, int other_stride_W,
++    int out_stride_N, int out_stride_C, int out_stride_H, int out_stride_W
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_elements = N * C * H * W;
++    if (idx >= total_elements) return;
++
++    int w = idx % W;
++    int tmp = idx / W;
++    int h = tmp % H;
++    tmp = tmp / H;
++    int c = tmp % C;
++    int n = tmp / C;
++
++    scalar_t input_val = input[n * in_stride_N + c * in_stride_C + h * in_stride_H + w * in_stride_W];
++    scalar_t other_val = other[n * other_stride_N + c * other_stride_C + w * other_stride_W];
++    output[n * out_stride_N + c * out_stride_C + h * out_stride_H + w * out_stride_W] =
++        (input_val > other_val);
++}
++
++// -----------------------------------------------------------------------------
++// Launcher: custom_gt_launcher
++// Performs broadcasting greater-than for float32 tensors.
++// -----------------------------------------------------------------------------
++extern "C" void custom_gt_launcher(
++    const float* input,
++    const float* other,
++    bool* output,
++    int N, int C, int H, int W,
++    int in_stride_N, int in_stride_C, int in_stride_H, int in_stride_W,
++    int other_stride_N, int other_stride_C, int other_stride_W,
++    int out_stride_N, int out_stride_C, int out_stride_H, int out_stride_W,
++    cudaStream_t stream
++) {
++    int total_elements = N * C * H * W;
++    int block = 256;
++    int grid = div_up(total_elements, block);
++    custom_gt_kernel<float><<<grid, block, 0, stream>>>(
++        input, other, output,
++        N, C, H, W,
++        in_stride_N, in_stride_C, in_stride_H, in_stride_W,
++        other_stride_N, other_stride_C, other_stride_W,
++        out_stride_N, out_stride_C, out_stride_H, out_stride_W
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,141 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declarations of launchers from custom_ops.cu
++extern "C" void custom_mean_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int in_stride_N, int in_stride_C, int in_stride_H, int in_stride_W,
++    int out_stride_N, int out_stride_C, int out_stride_W,
++    cudaStream_t stream
++);
++
++extern "C" void custom_gt_launcher(
++    const float* input,
++    const float* other,
++    bool* output,
++    int N, int C, int H, int W,
++    int in_stride_N, int in_stride_C, int in_stride_H, int in_stride_W,
++    int other_stride_N, int other_stride_C, int other_stride_W,
++    int out_stride_N, int out_stride_C, int out_stride_H, int out_stride_W,
++    cudaStream_t stream
++);
++
++// -----------------------------------------------------------------------------
++// custom_mean forward wrapper
++// -----------------------------------------------------------------------------
++torch::Tensor custom_mean_forward(torch::Tensor input, int64_t dim, bool keepdim) {
++    TORCH_CHECK(input.is_cuda(), "custom_mean: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_mean: input must be float32");
++    TORCH_CHECK(dim >= 0 && dim < input.dim(), "custom_mean: dim out of range");
++
++    // For this task, only dim=2 and keepdim=true are used; still check broadly.
++    TORCH_CHECK(keepdim, "custom_mean: keepdim=false is not supported by the current launcher");
++    TORCH_CHECK(input.dim() == 4, "custom_mean: only 4D tensors are supported");
++
++    auto sizes = input.sizes();
++    int64_t N = sizes[0];
++    int64_t C = sizes[1];
++    int64_t H = sizes[2];
++    int64_t W = sizes[3];
++
++    TORCH_CHECK(dim == 2, "custom_mean: only dim=2 is implemented");
++
++    auto output = torch::empty({N, C, 1, W}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_mean_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(input.stride(0)),
++        static_cast<int>(input.stride(1)),
++        static_cast<int>(input.stride(2)),
++        static_cast<int>(input.stride(3)),
++        static_cast<int>(output.stride(0)),
++        static_cast<int>(output.stride(1)),
++        static_cast<int>(output.stride(2)),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_mean launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// custom_gt forward wrapper
++// -----------------------------------------------------------------------------
++torch::Tensor custom_gt_forward(torch::Tensor input, torch::Tensor other) {
++    TORCH_CHECK(input.is_cuda(), "custom_gt: input must be a CUDA tensor");
++    TORCH_CHECK(other.is_cuda(), "custom_gt: other must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_gt: input must be float32");
++    TORCH_CHECK(other.dtype() == torch::kFloat32, "custom_gt: other must be float32");
++    TORCH_CHECK(input.dim() == 4, "custom_gt: input must be 4D");
++    TORCH_CHECK(other.dim() == 4, "custom_gt: other must be 4D");
++
++    // Check broadcast-compatible with specific shapes: input [N,C,H,W], other [N,C,1,W]
++    TORCH_CHECK(input.size(0) == other.size(0) && input.size(1) == other.size(1),
++                "custom_gt: N and C must match");
++    TORCH_CHECK(other.size(2) == 1, "custom_gt: other's dim=2 must be 1");
++    TORCH_CHECK(input.size(3) == other.size(3), "custom_gt: W must match");
++
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t H = input.size(2);
++    int64_t W = input.size(3);
++
++    auto output = torch::empty({N, C, H, W}, input.options().dtype(torch::kBool));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_gt_launcher(
++        input.data_ptr<float>(),
++        other.data_ptr<float>(),
++        output.data_ptr<bool>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(input.stride(0)),
++        static_cast<int>(input.stride(1)),
++        static_cast<int>(input.stride(2)),
++        static_cast<int>(input.stride(3)),
++        static_cast<int>(other.stride(0)),
++        static_cast<int>(other.stride(1)),
++        static_cast<int>(other.stride(2)),
++        static_cast<int>(output.stride(0)),
++        static_cast<int>(output.stride(1)),
++        static_cast<int>(output.stride(2)),
++        static_cast<int>(output.stride(3)),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_gt launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// Registration
++// -----------------------------------------------------------------------------
++void register_custom_ops_binding(pybind11::module& m) {
++    m.def("custom_mean", &custom_mean_forward,
++          "Custom mean along dim (only dim=2, keepdim=True)",
++          py::arg("input"), py::arg("dim"), py::arg("keepdim"));
++    m.def("custom_gt", &custom_gt_forward,
++          "Custom greater-than with broadcasting",
++          py::arg("input"), py::arg("other"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops_binding);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, mean_dim):
++        super().__init__()
++        self.mean_dim = mean_dim
++
++    def forward(self, x):
++        mean = cuda_extension.custom_mean(x, self.mean_dim, True)
++        x = cuda_extension.custom_gt(x, mean)
++        return x
++
++    def debug_forward(self, x):
++        mean = cuda_extension.custom_mean(x, self.mean_dim, True)
++        x = cuda_extension.custom_gt(x, mean)
++        yield 'step_001', x
++        yield 'step_002', x

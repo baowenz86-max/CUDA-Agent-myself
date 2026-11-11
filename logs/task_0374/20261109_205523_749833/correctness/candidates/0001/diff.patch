@@ -1,0 +1,354 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,136 @@
++// custom_ops.cu: CUDA kernels for custom_embedding_layernorm and custom_bucketize
++#include <cuda_runtime.h>
++
++// Kernel for embedding lookup + LayerNorm
++// Each thread processes one token (row of output [B*L, D])
++// indices: int64 array of shape [B*L]
++// embedding_weight: float [num_embeddings, D]
++// gamma, beta: float [D]
++// eps: float
++// output: float [B*L, D]
++__global__ void embedding_layernorm_kernel(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ embedding_weight,
++    const float* __restrict__ gamma,
++    const float* __restrict__ beta,
++    float eps,
++    int num_embeddings,
++    int D,
++    int total_tokens,
++    float* __restrict__ output
++) {
++    int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (token_idx >= total_tokens) return;
++
++    int64_t idx = indices[token_idx];
++    // In PyTorch, indices are guaranteed valid after validation in binding
++    // But we still clamp for safety (should not happen)
++    if (idx < 0) idx = 0;
++    if (idx >= num_embeddings) idx = num_embeddings - 1;
++
++    const float* row = embedding_weight + idx * D;
++    float* out_row = output + token_idx * D;
++
++    // Compute mean and variance (unbiased=False)
++    float mean = 0.0f;
++    for (int d = 0; d < D; ++d) {
++        mean += row[d];
++    }
++    mean /= D;
++
++    float var = 0.0f;
++    for (int d = 0; d < D; ++d) {
++        float diff = row[d] - mean;
++        var += diff * diff;
++    }
++    var /= D;
++
++    float inv_std = rsqrtf(var + eps);
++
++    // Normalize and scale/shift
++    for (int d = 0; d < D; ++d) {
++        out_row[d] = (row[d] - mean) * inv_std * gamma[d] + beta[d];
++    }
++}
++
++// Kernel for bucketize: output[i] = first index j such that boundaries[j] > input[i]
++// boundaries: sorted ascending float array of length num_boundaries
++// Input/output sizes: total_elements
++__global__ void bucketize_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ boundaries,
++    int num_boundaries,
++    int total_elements,
++    int64_t* __restrict__ output
++) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= total_elements) return;
++
++    float val = input[i];
++    // Binary search for upper_bound: first index where boundaries[idx] > val
++    int low = 0, high = num_boundaries; // high is exclusive
++    while (low < high) {
++        int mid = (low + high) >> 1;
++        if (boundaries[mid] <= val) {
++            low = mid + 1;
++        } else {
++            high = mid;
++        }
++    }
++    output[i] = (int64_t)low;
++}
++
++// Launcher for custom_embedding_layernorm
++// Parameters:
++//   indices: int64 pointer, shape [B*L]
++//   embedding_weight: float pointer, shape [num_embeddings, D]
++//   gamma, beta: float pointers, shape [D]
++//   eps: float
++//   num_embeddings: int
++//   embedding_dim: int
++//   total_tokens: int (B*L)
++//   output: float pointer, shape [B*L, D]
++//   stream: cudaStream_t
++extern "C" void custom_embedding_layernorm_launcher(
++    const int64_t* indices,
++    const float* embedding_weight,
++    const float* gamma,
++    const float* beta,
++    float eps,
++    int num_embeddings,
++    int embedding_dim,
++    int total_tokens,
++    float* output,
++    cudaStream_t stream
++) {
++    int threads = 256;
++    int blocks = (total_tokens + threads - 1) / threads;
++    // Optional grid-stride loop not needed if total_tokens < max blocks but launch as is.
++    embedding_layernorm_kernel<<<blocks, threads, 0, stream>>>(
++        indices, embedding_weight, gamma, beta, eps,
++        num_embeddings, embedding_dim, total_tokens, output
++    );
++}
++
++// Launcher for custom_bucketize
++// Parameters:
++//   input_values: float pointer, shape [total_elements]
++//   boundaries: float pointer, shape [num_boundaries]
++//   num_boundaries: int
++//   total_elements: int
++//   output: int64 pointer, shape [total_elements]
++//   stream: cudaStream_t
++extern "C" void custom_bucketize_launcher(
++    const float* input_values,
++    const float* boundaries,
++    int num_boundaries,
++    int total_elements,
++    int64_t* output,
++    cudaStream_t stream
++) {
++    int threads = 256;
++    int blocks = (total_elements + threads - 1) / threads;
++    bucketize_kernel<<<blocks, threads, 0, stream>>>(
++        input_values, boundaries, num_boundaries, total_elements, output
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,175 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++// Declare launchers exported from custom_ops.cu
++extern "C" void custom_embedding_layernorm_launcher(
++    const int64_t* indices,
++    const float* embedding_weight,
++    const float* gamma,
++    const float* beta,
++    float eps,
++    int num_embeddings,
++    int embedding_dim,
++    int total_tokens,
++    float* output,
++    cudaStream_t stream
++);
++
++extern "C" void custom_bucketize_launcher(
++    const float* input_values,
++    const float* boundaries,
++    int num_boundaries,
++    int total_elements,
++    int64_t* output,
++    cudaStream_t stream
++);
++
++namespace {
++
++torch::Tensor custom_embedding_layernorm_forward(
++    torch::Tensor indices,
++    torch::Tensor embedding_weight,
++    torch::Tensor gamma,
++    torch::Tensor beta,
++    double eps,
++    int64_t num_embeddings,
++    int64_t embedding_dim
++) {
++    // Validate indices
++    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
++    TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
++    TORCH_CHECK(indices.dim() == 2, "indices must be 2D [B, L]");
++
++    // Validate embedding weight
++    TORCH_CHECK(embedding_weight.is_cuda(), "embedding_weight must be a CUDA tensor");
++    TORCH_CHECK(embedding_weight.dtype() == torch::kFloat32, "embedding_weight must be float32");
++    TORCH_CHECK(embedding_weight.dim() == 2, "embedding_weight must be 2D");
++    TORCH_CHECK(embedding_weight.size(0) == num_embeddings, "embedding_weight row count mismatch");
++    TORCH_CHECK(embedding_weight.size(1) == embedding_dim, "embedding_weight column count mismatch");
++
++    // Validate gamma and beta
++    TORCH_CHECK(gamma.is_cuda(), "gamma must be a CUDA tensor");
++    TORCH_CHECK(gamma.dtype() == torch::kFloat32, "gamma must be float32");
++    TORCH_CHECK(gamma.dim() == 1, "gamma must be 1D");
++    TORCH_CHECK(gamma.size(0) == embedding_dim, "gamma size mismatch");
++
++    TORCH_CHECK(beta.is_cuda(), "beta must be a CUDA tensor");
++    TORCH_CHECK(beta.dtype() == torch::kFloat32, "beta must be float32");
++    TORCH_CHECK(beta.dim() == 1, "beta must be 1D");
++    TORCH_CHECK(beta.size(0) == embedding_dim, "beta size mismatch");
++
++    // Kernel requires contiguous int64 indices
++    auto indices_contig = indices.contiguous();
++    int64_t B = indices.size(0);
++    int64_t L = indices.size(1);
++    int64_t total_tokens = B * L;
++
++    // Check integer limits for kernel int parameters
++    TORCH_CHECK(num_embeddings > 0 && num_embeddings <= INT32_MAX, "num_embeddings out of range");
++    TORCH_CHECK(embedding_dim > 0 && embedding_dim <= INT32_MAX, "embedding_dim out of range");
++    TORCH_CHECK(total_tokens > 0 && total_tokens <= INT32_MAX, "total_tokens out of range");
++
++    // weight, gamma, beta must be contiguous for direct pointer use
++    auto weight_contig = embedding_weight.contiguous();
++    auto gamma_contig = gamma.contiguous();
++    auto beta_contig = beta.contiguous();
++
++    int num_embeddings_int = static_cast<int>(num_embeddings);
++    int embedding_dim_int = static_cast<int>(embedding_dim);
++    int total_tokens_int = static_cast<int>(total_tokens);
++
++    auto output = torch::empty({B, L, embedding_dim}, indices.options().dtype(torch::kFloat32));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_embedding_layernorm_launcher(
++        indices_contig.data_ptr<int64_t>(),
++        weight_contig.data_ptr<float>(),
++        gamma_contig.data_ptr<float>(),
++        beta_contig.data_ptr<float>(),
++        static_cast<float>(eps),
++        num_embeddings_int,
++        embedding_dim_int,
++        total_tokens_int,
++        output.data_ptr<float>(),
++        stream
++    );
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "custom_embedding_layernorm kernel launch failed");
++
++    return output;
++}
++
++torch::Tensor custom_bucketize_forward(
++    torch::Tensor input_values,
++    torch::Tensor boundaries
++) {
++    // Validate input_values
++    TORCH_CHECK(input_values.is_cuda(), "input_values must be a CUDA tensor");
++    TORCH_CHECK(input_values.dtype() == torch::kFloat32, "input_values must be float32");
++    TORCH_CHECK(input_values.dim() == 2, "input_values must be 2D [B, L]");
++
++    // Validate boundaries
++    TORCH_CHECK(boundaries.is_cuda(), "boundaries must be a CUDA tensor");
++    TORCH_CHECK(boundaries.dtype() == torch::kFloat32, "boundaries must be float32");
++    TORCH_CHECK(boundaries.dim() == 1, "boundaries must be 1D");
++    TORCH_CHECK(boundaries.size(0) > 0, "boundaries must not be empty");
++
++    auto input_contig = input_values.contiguous();
++    auto boundaries_contig = boundaries.contiguous();
++
++    int64_t B = input_values.size(0);
++    int64_t L = input_values.size(1);
++    int64_t total_elements = B * L;
++    int64_t num_boundaries = boundaries.size(0);
++
++    TORCH_CHECK(total_elements > 0 && total_elements <= INT32_MAX, "total_elements out of range");
++    TORCH_CHECK(num_boundaries > 0 && num_boundaries <= INT32_MAX, "num_boundaries out of range");
++
++    int total_elements_int = static_cast<int>(total_elements);
++    int num_boundaries_int = static_cast<int>(num_boundaries);
++
++    auto output = torch::empty({B, L}, input_values.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_bucketize_launcher(
++        input_contig.data_ptr<float>(),
++        boundaries_contig.data_ptr<float>(),
++        num_boundaries_int,
++        total_elements_int,
++        output.data_ptr<int64_t>(),
++        stream
++    );
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "custom_bucketize kernel launch failed");
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def(
++        "custom_embedding_layernorm",
++        &custom_embedding_layernorm_forward,
++        "Embedding lookup followed by LayerNorm",
++        py::arg("indices"),
++        py::arg("embedding_weight"),
++        py::arg("gamma"),
++        py::arg("beta"),
++        py::arg("eps"),
++        py::arg("num_embeddings"),
++        py::arg("embedding_dim")
++    );
++    m.def(
++        "custom_bucketize",
++        &custom_bucketize_forward,
++        "torch.bucketize equivalent with default right=False",
++        py::arg("input_values"),
++        py::arg("boundaries")
++    );
++}
++
++} // anonymous namespace
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,34 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim, bucketize_values):
++        super().__init__()
++        self.embedding = nn.Sequential(
++            nn.Embedding(num_embeddings, embedding_dim),
++            nn.LayerNorm(embedding_dim)
++        )
++        self.bucketize_values = nn.Parameter(torch.tensor(bucketize_values, dtype=torch.float32), requires_grad=False)
++        self.num_embeddings = num_embeddings
++        self.embedding_dim = embedding_dim
++
++    def forward(self, indices, input_values):
++        embedded = cuda_extension.custom_embedding_layernorm(
++            indices, self.embedding[0].weight, self.embedding[1].weight,
++            self.embedding[1].bias, 1e-05, self.num_embeddings, self.embedding_dim
++        )
++        bucketized = cuda_extension.custom_bucketize(input_values, self.bucketize_values)
++        return embedded, bucketized
++
++    def debug_forward(self, indices, input_values):
++        embedded = cuda_extension.custom_embedding_layernorm(
++            indices, self.embedding[0].weight, self.embedding[1].weight,
++            self.embedding[1].bias, 1e-05, self.num_embeddings, self.embedding_dim
++        )
++        yield 'step_001', embedded
++        bucketized = cuda_extension.custom_bucketize(input_values, self.bucketize_values)
++        yield 'step_002', bucketized
++        result = (embedded, bucketized)
++        yield 'step_003', result

@@ -1,0 +1,264 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -2,30 +2,27 @@
+ #include <math.h>
+ 
+ // Element-wise sigmoid: y = 1 / (1 + exp(-x))
+-// Supports arbitrary strides (non-contiguous input).
++// Supports arbitrary strides via scalar arguments.
+ __global__ void custom_sigmoid_kernel(
+     float* __restrict__ output,
+     const float* __restrict__ input,
+     int total_elements,
+-    int ndims,
+-    const int* __restrict__ in_strides,
+-    const int* __restrict__ out_strides,
+-    const int* __restrict__ shape)
++    int dim0, int dim1, int dim2, int dim3,
++    int in_stride0, int in_stride1, int in_stride2, int in_stride3,
++    int out_stride0, int out_stride1, int out_stride2, int out_stride3)
+ {
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int stride = blockDim.x * gridDim.x;
+     for (int linear = idx; linear < total_elements; linear += stride) {
+         // Convert linear index to multi-dimensional indices
+-        int remaining = linear;
+-        int in_offset = 0;
+-        int out_offset = 0;
+-        for (int d = 0; d < ndims; ++d) {
+-            int dim_size = shape[d];
+-            int coord = remaining % dim_size;
+-            remaining /= dim_size;
+-            in_offset += coord * in_strides[d];
+-            out_offset += coord * out_strides[d];
+-        }
++        int n = linear / (dim1 * dim2 * dim3);
++        int rem = linear % (dim1 * dim2 * dim3);
++        int c = rem / (dim2 * dim3);
++        rem %= dim2 * dim3;
++        int h = rem / dim3;
++        int w = rem % dim3;
++        int in_offset = n * in_stride0 + c * in_stride1 + h * in_stride2 + w * in_stride3;
++        int out_offset = n * out_stride0 + c * out_stride1 + h * out_stride2 + w * out_stride3;
+         float val = input[in_offset];
+         float sig = 1.0f / (1.0f + expf(-val));
+         output[out_offset] = sig;
+@@ -39,8 +36,8 @@
+     float* __restrict__ output,
+     const float* __restrict__ input,
+     int N, int C, int H, int W,
+-    const int* __restrict__ in_strides,
+-    const int* __restrict__ out_strides,
++    int in_stride0, int in_stride1, int in_stride2, int in_stride3,
++    int out_stride0, int out_stride1, int out_stride2, int out_stride3,
+     float eps)
+ {
+     int nc = blockIdx.x * blockDim.x + threadIdx.x; // index over N*C
+@@ -50,8 +47,8 @@
+     int c = nc % C;
+ 
+     // Compute base offset for this (n,c)
+-    int base_in_offset = n * in_strides[0] + c * in_strides[1];
+-    int base_out_offset = n * out_strides[0] + c * out_strides[1];
++    int base_in_offset = n * in_stride0 + c * in_stride1;
++    int base_out_offset = n * out_stride0 + c * out_stride1;
+ 
+     // Pass 1: compute mean
+     float mean = 0.0f;
+@@ -59,17 +56,17 @@
+     for (int hw = 0; hw < spatial_size; ++hw) {
+         int h = hw / W;
+         int w = hw % W;
+-        int in_offset = base_in_offset + h * in_strides[2] + w * in_strides[3];
++        int in_offset = base_in_offset + h * in_stride2 + w * in_stride3;
+         mean += input[in_offset];
+     }
+     mean /= (float)spatial_size;
+ 
+-    // Pass 2: compute variance (biased, as PyTorch InstanceNorm uses biased variance in training? Actually for evaluation with track_running_stats=False, it uses biased variance)
++    // Pass 2: compute variance (biased)
+     float var = 0.0f;
+     for (int hw = 0; hw < spatial_size; ++hw) {
+         int h = hw / W;
+         int w = hw % W;
+-        int in_offset = base_in_offset + h * in_strides[2] + w * in_strides[3];
++        int in_offset = base_in_offset + h * in_stride2 + w * in_stride3;
+         float diff = input[in_offset] - mean;
+         var += diff * diff;
+     }
+@@ -80,38 +77,39 @@
+     for (int hw = 0; hw < spatial_size; ++hw) {
+         int h = hw / W;
+         int w = hw % W;
+-        int in_offset = base_in_offset + h * in_strides[2] + w * in_strides[3];
+-        int out_offset = base_out_offset + h * out_strides[2] + w * out_strides[3];
++        int in_offset = base_in_offset + h * in_stride2 + w * in_stride3;
++        int out_offset = base_out_offset + h * out_stride2 + w * out_stride3;
+         float normalized = (input[in_offset] - mean) * inv_std;
+         output[out_offset] = normalized;
+     }
+ }
+ 
+ // Launcher for custom_sigmoid
+-extern "C" void custom_sigmoid_launcher(
++void custom_sigmoid_launcher(
+     float* output,
+     const float* input,
+     int total_elements,
+-    int ndims,
+-    const int* in_strides,
+-    const int* out_strides,
+-    const int* shape,
++    int dim0, int dim1, int dim2, int dim3,
++    int in_stride0, int in_stride1, int in_stride2, int in_stride3,
++    int out_stride0, int out_stride1, int out_stride2, int out_stride3,
+     cudaStream_t stream)
+ {
+-    // Use 256 threads per block, grid sized to cover elements but capped for grid-stride
+     int threads = 256;
+     int blocks = min((total_elements + threads - 1) / threads, 65535);
+     custom_sigmoid_kernel<<<blocks, threads, 0, stream>>>(
+-        output, input, total_elements, ndims, in_strides, out_strides, shape);
++        output, input, total_elements,
++        dim0, dim1, dim2, dim3,
++        in_stride0, in_stride1, in_stride2, in_stride3,
++        out_stride0, out_stride1, out_stride2, out_stride3);
+ }
+ 
+ // Launcher for custom_instance_norm2d
+-extern "C" void custom_instance_norm2d_launcher(
++void custom_instance_norm2d_launcher(
+     float* output,
+     const float* input,
+     int N, int C, int H, int W,
+-    const int* in_strides,
+-    const int* out_strides,
++    int in_stride0, int in_stride1, int in_stride2, int in_stride3,
++    int out_stride0, int out_stride1, int out_stride2, int out_stride3,
+     float eps,
+     cudaStream_t stream)
+ {
+@@ -119,5 +117,8 @@
+     int threads = 256;
+     int blocks = (total_instances + threads - 1) / threads;
+     custom_instance_norm2d_kernel<<<blocks, threads, 0, stream>>>(
+-        output, input, N, C, H, W, in_strides, out_strides, eps);
++        output, input, N, C, H, W,
++        in_stride0, in_stride1, in_stride2, in_stride3,
++        out_stride0, out_stride1, out_stride2, out_stride3,
++        eps);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -4,26 +4,22 @@
+ #include <cuda_runtime.h>
+ #include "../binding_registry.h"
+ 
+-// Declare launchers from custom_ops.cu
++// Declare launchers from custom_ops.cu (C linkage)
+ extern "C" void custom_sigmoid_launcher(
+     float* output,
+     const float* input,
+     int total_elements,
+-    int ndims,
+-    const int* in_strides,
+-    const int* out_strides,
+-    const int* shape,
++    int dim0, int dim1, int dim2, int dim3,
++    int in_stride0, int in_stride1, int in_stride2, int in_stride3,
++    int out_stride0, int out_stride1, int out_stride2, int out_stride3,
+     cudaStream_t stream);
+ 
+ extern "C" void custom_instance_norm2d_launcher(
+     float* output,
+     const float* input,
+-    int N,
+-    int C,
+-    int H,
+-    int W,
+-    const int* in_strides,
+-    const int* out_strides,
++    int N, int C, int H, int W,
++    int in_stride0, int in_stride1, int in_stride2, int in_stride3,
++    int out_stride0, int out_stride1, int out_stride2, int out_stride3,
+     float eps,
+     cudaStream_t stream);
+ 
+@@ -34,15 +30,18 @@
+ 
+     auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
+ 
+-    // Prepare host arrays for strides and shape
+-    int64_t in_strides[4];
+-    int64_t out_strides[4];
+-    int64_t shape[4];
+-    for (int i = 0; i < 4; ++i) {
+-        in_strides[i] = x.stride(i);
+-        out_strides[i] = output.stride(i);
+-        shape[i] = x.size(i);
+-    }
++    int64_t dim0 = x.size(0);
++    int64_t dim1 = x.size(1);
++    int64_t dim2 = x.size(2);
++    int64_t dim3 = x.size(3);
++    int64_t in_stride0 = x.stride(0);
++    int64_t in_stride1 = x.stride(1);
++    int64_t in_stride2 = x.stride(2);
++    int64_t in_stride3 = x.stride(3);
++    int64_t out_stride0 = output.stride(0);
++    int64_t out_stride1 = output.stride(1);
++    int64_t out_stride2 = output.stride(2);
++    int64_t out_stride3 = output.stride(3);
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+@@ -50,10 +49,9 @@
+         output.data_ptr<float>(),
+         x.data_ptr<float>(),
+         static_cast<int>(x.numel()),
+-        4,
+-        reinterpret_cast<int*>(in_strides),
+-        reinterpret_cast<int*>(out_strides),
+-        reinterpret_cast<int*>(shape),
++        static_cast<int>(dim0), static_cast<int>(dim1), static_cast<int>(dim2), static_cast<int>(dim3),
++        static_cast<int>(in_stride0), static_cast<int>(in_stride1), static_cast<int>(in_stride2), static_cast<int>(in_stride3),
++        static_cast<int>(out_stride0), static_cast<int>(out_stride1), static_cast<int>(out_stride2), static_cast<int>(out_stride3),
+         stream);
+ 
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+@@ -72,24 +70,23 @@
+ 
+     auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
+ 
+-    int64_t in_strides[4];
+-    int64_t out_strides[4];
+-    for (int i = 0; i < 4; ++i) {
+-        in_strides[i] = x.stride(i);
+-        out_strides[i] = output.stride(i);
+-    }
++    int64_t in_stride0 = x.stride(0);
++    int64_t in_stride1 = x.stride(1);
++    int64_t in_stride2 = x.stride(2);
++    int64_t in_stride3 = x.stride(3);
++    int64_t out_stride0 = output.stride(0);
++    int64_t out_stride1 = output.stride(1);
++    int64_t out_stride2 = output.stride(2);
++    int64_t out_stride3 = output.stride(3);
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     custom_instance_norm2d_launcher(
+         output.data_ptr<float>(),
+         x.data_ptr<float>(),
+-        static_cast<int>(N),
+-        static_cast<int>(C),
+-        static_cast<int>(H),
+-        static_cast<int>(W),
+-        reinterpret_cast<int*>(in_strides),
+-        reinterpret_cast<int*>(out_strides),
++        static_cast<int>(N), static_cast<int>(C), static_cast<int>(H), static_cast<int>(W),
++        static_cast<int>(in_stride0), static_cast<int>(in_stride1), static_cast<int>(in_stride2), static_cast<int>(in_stride3),
++        static_cast<int>(out_stride0), static_cast<int>(out_stride1), static_cast<int>(out_stride2), static_cast<int>(out_stride3),
+         static_cast<float>(eps),
+         stream);
+ 

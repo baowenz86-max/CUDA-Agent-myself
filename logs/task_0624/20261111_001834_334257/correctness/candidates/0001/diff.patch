@@ -1,0 +1,247 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,112 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// -----------------------------------------------------------------------------
++// channel_sum: sum over dimension 1 (channels) for a 4D tensor.
++// Input: x with shape [B, C, H, W] and strides [sB, sC, sH, sW].
++// Output: y with shape [B, H, W] and strides [out_sB, out_sH, out_sW].
++// For continuous input, sC >= sH >= sW, but kernel uses strides directly.
++// Each thread handles one (b, h, w) position after grid-stride loop.
++//
++// Grid: blocks determined by total output elements, blockDim fixed 256.
++// -----------------------------------------------------------------------------
++__global__ void channel_sum_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    int B,
++    int C,
++    int H,
++    int W,
++    long long sB,  // use long long for potentially large strides (int may overflow for 512*512*3)
++    long long sC,
++    long long sH,
++    long long sW,
++    long long out_sB,
++    long long out_sH,
++    long long out_sW,
++    long long total_out
++) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < total_out; idx += stride) {
++        // Decompose idx into b, h, w.
++        int w = idx % W;
++        long long rem = idx / W;
++        int h = rem % H;
++        int b = rem / H;
++
++        const float* base = x + b * sB + h * sH + w * sW;
++        float sum = 0.0f;
++        for (int c = 0; c < C; ++c) {
++            sum += base[c * sC];
++        }
++        y[b * out_sB + h * out_sH + w * out_sW] = sum;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// exp: element-wise natural exponential using __expf for speed.
++// Input and output share shape and strides, but launcher uses actual pointers.
++// -----------------------------------------------------------------------------
++__global__ void exp_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    long long total
++) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < total; idx += stride) {
++        y[idx] = __expf(x[idx]);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Launchers (C interface for binding)
++// -----------------------------------------------------------------------------
++extern "C" void channel_sum_launcher(
++    const float* x,
++    float* y,
++    int B,
++    int C,
++    int H,
++    int W,
++    long long sB,
++    long long sC,
++    long long sH,
++    long long sW,
++    long long out_sB,
++    long long out_sH,
++    long long out_sW,
++    cudaStream_t stream
++) {
++    long long total_out = (long long)B * H * W;
++    if (total_out <= 0) return;
++
++    const int block = 256;
++    int grid = (int)((total_out + block - 1) / block);
++    if (grid > 1048576) grid = 1048576; // practical grid cap
++
++    channel_sum_kernel<<<grid, block, 0, stream>>>(
++        x, y, B, C, H, W,
++        sB, sC, sH, sW,
++        out_sB, out_sH, out_sW,
++        total_out
++    );
++}
++
++extern "C" void exp_launcher(
++    const float* x,
++    float* y,
++    long long total,
++    cudaStream_t stream
++) {
++    if (total <= 0) return;
++
++    const int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 1048576) grid = 1048576;
++
++    exp_kernel<<<grid, block, 0, stream>>>(x, y, total);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,100 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// 前向声明来自 custom_ops.cu 的 launcher（extern "C"）
++extern "C" void channel_sum_launcher(
++    const float* x,
++    float* y,
++    int B,
++    int C,
++    int H,
++    int W,
++    long long sB,
++    long long sC,
++    long long sH,
++    long long sW,
++    long long out_sB,
++    long long out_sH,
++    long long out_sW,
++    cudaStream_t stream
++);
++
++extern "C" void exp_launcher(
++    const float* x,
++    float* y,
++    long long total,
++    cudaStream_t stream
++);
++
++// channel_sum: 沿 dim=1 求和，输出形状 [B, H, W]
++torch::Tensor channel_sum(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "channel_sum: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "channel_sum: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "channel_sum: input must be 4D");
++
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // 输出形状 [B, H, W]
++    auto y = torch::empty({B, H, W}, x.options());
++
++    // 获取当前 CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // 使用输入的 strides（以元素为单位，与 launcher 的 long long 类型匹配）
++    channel_sum_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        B, C, H, W,
++        (long long)x.stride(0),
++        (long long)x.stride(1),
++        (long long)x.stride(2),
++        (long long)x.stride(3),
++        (long long)y.stride(0),
++        (long long)y.stride(1),
++        (long long)y.stride(2),
++        stream
++    );
++
++    // 检查 kernel launch 错误
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "channel_sum kernel launch failed: ", cudaGetErrorString(err));
++
++    return y;
++}
++
++// exp: 逐元素指数
++torch::Tensor exp(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "exp: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "exp: input must be float32");
++
++    auto y = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    exp_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        (long long)x.numel(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "exp kernel launch failed: ", cudaGetErrorString(err));
++
++    return y;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("channel_sum", &channel_sum, "Sum over channel dimension (dim=1)",
++          py::arg("x"));
++    m.def("exp", &exp, "Element-wise exponential",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels):
++        super().__init__()
++        # The reference constructor stores no parameters or buffers.
++
++    def forward(self, x):
++        # Step 1: sum along channel dimension (dim=1)
++        x = cuda_extension.channel_sum(x)
++        # Step 2: element-wise exponential
++        x = cuda_extension.exp(x)
++        return x
++
++    def debug_forward(self, x):
++        # Debug path mirrors the reference computation exactly.
++        sum_result = cuda_extension.channel_sum(x)
++        yield 'step_001', sum_result
++
++        exp_result = cuda_extension.exp(sum_result)
++        yield 'step_002', exp_result
++
++        yield 'step_003', exp_result

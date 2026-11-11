@@ -1,0 +1,187 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,58 @@
++#include <cuda_runtime.h>
++
++// Elementwise max with scalar: output[i] = max(input[i], max_val)
++__global__ void clamp_max_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 int64_t numel,
++                                 float max_val) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float v = input[i];
++        output[i] = fmaxf(v, max_val);
++    }
++}
++
++// PReLU: for element at linear index i in shape [N,C,H,W], 
++// c = (i / (H*W)) % C, output = x if x>=0 else weight[c]*x
++__global__ void prelu_kernel(const float* __restrict__ input,
++                             float* __restrict__ output,
++                             int64_t numel,
++                             int C,
++                             int64_t HW,
++                             const float* __restrict__ weight) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float v = input[i];
++        int c = static_cast<int>((i / HW) % C);
++        float w = weight[c];
++        output[i] = (v >= 0.0f) ? v : (w * v);
++    }
++}
++
++// Launcher for custom_clamp_max: x (float*), max_val (double), stream
++extern "C" void custom_clamp_max_launcher(const float* input,
++                                          float* output,
++                                          int64_t numel,
++                                          float max_val,
++                                          cudaStream_t stream) {
++    int threads = 256;
++    int blocks = static_cast<int>((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid limit for large tensors, grid-stride loop handles rest
++    clamp_max_kernel<<<blocks, threads, 0, stream>>>(input, output, numel, max_val);
++}
++
++// Launcher for custom_prelu: x (float*), weight (float*), output, sizes
++extern "C" void custom_prelu_launcher(const float* input,
++                                       float* output,
++                                       int64_t numel,
++                                       int C,
++                                       int64_t HW,
++                                       const float* weight,
++                                       cudaStream_t stream) {
++    int threads = 256;
++    int blocks = static_cast<int>((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    prelu_kernel<<<blocks, threads, 0, stream>>>(input, output, numel, C, HW, weight);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,82 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_clamp_max_launcher(const float* input,
++                                          float* output,
++                                          int64_t numel,
++                                          float max_val,
++                                          cudaStream_t stream);
++
++extern "C" void custom_prelu_launcher(const float* input,
++                                       float* output,
++                                       int64_t numel,
++                                       int C,
++                                       int64_t HW,
++                                       const float* weight,
++                                       cudaStream_t stream);
++
++// custom_clamp_max: elementwise max with scalar
++torch::Tensor custom_clamp_max(torch::Tensor x, double max_val) {
++    TORCH_CHECK(x.is_cuda(), "custom_clamp_max: x must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "custom_clamp_max: x must be float32");
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_clamp_max_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        static_cast<float>(max_val),
++        stream
++    );
++
++    return output;
++}
++
++// custom_prelu: PReLU activation with channel-wise weight
++torch::Tensor custom_prelu(torch::Tensor x, torch::Tensor weight) {
++    TORCH_CHECK(x.is_cuda(), "custom_prelu: x must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "custom_prelu: weight must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "custom_prelu: x must be float32");
++    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "custom_prelu: weight must be float32");
++    TORCH_CHECK(x.dim() == 4, "custom_prelu: x must be 4D (N,C,H,W)");
++    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == x.size(1), "custom_prelu: weight must be 1D of size C");
++    TORCH_CHECK(weight.is_contiguous(), "custom_prelu: weight must be contiguous");
++
++    auto output = torch::empty_like(x);
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t HW = x.size(2) * x.size(3);
++    int64_t numel = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_prelu_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        static_cast<int>(C),
++        HW,
++        weight.data_ptr<float>(),
++        stream
++    );
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_clamp_max", &custom_clamp_max,
++          "Elementwise max with scalar",
++          py::arg("x"), py::arg("max_val"));
++    m.def("custom_prelu", &custom_prelu,
++          "PReLU activation",
++          py::arg("x"), py::arg("weight"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,38 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, channel_num, negative_slope, max_value):
++        super(ModelNew, self).__init__()
++        self.prelu = nn.PReLU(channel_num, init=negative_slope)
++        self.max_value = max_value
++
++    def forward(self, x):
++        x = cuda_extension.custom_clamp_max(x, self.max_value)
++        x = cuda_extension.custom_prelu(x, self.prelu.weight)
++        return x
++
++    def debug_forward(self, x):
++        max_value_tensor = torch.full_like(x, self.max_value)
++        yield 'step_001', max_value_tensor
++        clamped = cuda_extension.custom_clamp_max(x, self.max_value)
++        yield 'step_002', clamped
++        prelu_out = cuda_extension.custom_prelu(clamped, self.prelu.weight)
++        yield 'step_003', prelu_out
++        yield 'step_004', prelu_out
++
++
++batch_size = 512
++channels = 64
++height = 64
++width = 64
++
++
++def get_inputs():
++    return [torch.randn(batch_size, channels, height, width)]
++
++
++def get_init_inputs():
++    return [64, 0.25, 2.0]

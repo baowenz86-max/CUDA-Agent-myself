@@ -1,0 +1,232 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,108 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// custom_sum_dim1: reduce tensor x of shape [B, C, H, W] along dimension 1.
++// Output shape [B, H, W]. Supports arbitrary strides.
++__global__ void custom_sum_dim1_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int64_t B,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t stride_b,
++    int64_t stride_c,
++    int64_t stride_h,
++    int64_t stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_h,
++    int64_t out_stride_w)
++{
++    int64_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t total_out = B * H * W;
++    if (out_idx >= total_out) return;
++
++    // decompose output index to (b, h, w)
++    int64_t b = out_idx / (H * W);
++    int64_t rem = out_idx - b * (H * W);
++    int64_t h = rem / W;
++    int64_t w = rem - h * W;
++
++    float sum = 0.0f;
++    const float* base = x + b * stride_b + h * stride_h + w * stride_w;
++    for (int64_t c = 0; c < C; ++c) {
++        sum += base[c * stride_c];
++    }
++
++    out[b * out_stride_b + h * out_stride_h + w * out_stride_w] = sum;
++}
++
++// custom_fmod: elementwise fmod of input tensor of shape [N] with divisor.
++// Supports arbitrary strides.
++__global__ void custom_fmod_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int64_t n,
++    int64_t in_stride,
++    int64_t out_stride,
++    float divisor)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= n) return;
++
++    float val = x[idx * in_stride];
++    out[idx * out_stride] = fmodf(val, divisor);
++}
++
++// Launcher for custom_sum_dim1
++// x: input tensor [B,C,H,W] (contiguous or not)
++// out: output tensor [B,H,W]
++// strides: input strides for b,c,h,w; output strides for b,h,w
++// stream: CUDA stream
++void custom_sum_dim1_launcher(
++    const float* x,
++    float* out,
++    int64_t B,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t stride_b,
++    int64_t stride_c,
++    int64_t stride_h,
++    int64_t stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_h,
++    int64_t out_stride_w,
++    cudaStream_t stream)
++{
++    int64_t total_out = B * H * W;
++    int block_size = 256;
++    int grid_size = (int)((total_out + block_size - 1) / block_size);
++    custom_sum_dim1_kernel<<<grid_size, block_size, 0, stream>>>(
++        x, out, B, C, H, W,
++        stride_b, stride_c, stride_h, stride_w,
++        out_stride_b, out_stride_h, out_stride_w);
++}
++
++// Launcher for custom_fmod
++// x: input tensor [N] (contiguous or not)
++// out: output tensor [N]
++// divisor: scalar divisor (double)
++// stream: CUDA stream
++void custom_fmod_launcher(
++    const float* x,
++    float* out,
++    int64_t n,
++    int64_t in_stride,
++    int64_t out_stride,
++    double divisor,
++    cudaStream_t stream)
++{
++    // C++ standard fmodf is not available in device code? Actually fmodf is supported.
++    // Cast divisor to float for device.
++    float fdivisor = (float)divisor;
++    int block_size = 256;
++    int grid_size = (int)((n + block_size - 1) / block_size);
++    custom_fmod_kernel<<<grid_size, block_size, 0, stream>>>(
++        x, out, n, in_stride, out_stride, fdivisor);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,94 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Launcher declarations from custom_ops.cu
++extern "C" void custom_sum_dim1_launcher(
++    const float* x,
++    float* out,
++    int64_t B,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t stride_b,
++    int64_t stride_c,
++    int64_t stride_h,
++    int64_t stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_h,
++    int64_t out_stride_w,
++    cudaStream_t stream);
++
++extern "C" void custom_fmod_launcher(
++    const float* x,
++    float* out,
++    int64_t n,
++    int64_t in_stride,
++    int64_t out_stride,
++    double divisor,
++    cudaStream_t stream);
++
++// PyTorch wrapper for custom_sum_dim1
++torch::Tensor custom_sum_dim1(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "custom_sum_dim1: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "custom_sum_dim1: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "custom_sum_dim1: input must be 4D [B, C, H, W]");
++
++    auto B = x.size(0);
++    auto C = x.size(1);
++    auto H = x.size(2);
++    auto W = x.size(3);
++
++    auto out = torch::empty({B, H, W}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_sum_dim1_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        B, C, H, W,
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        out.stride(0), out.stride(1), out.stride(2),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_sum_dim1 launch failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// PyTorch wrapper for custom_fmod
++torch::Tensor custom_fmod(torch::Tensor x, double divisor) {
++    TORCH_CHECK(x.is_cuda(), "custom_fmod: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "custom_fmod: input must be float32");
++    TORCH_CHECK(x.dim() > 0, "custom_fmod: input cannot be empty");
++
++    auto out = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_fmod_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        x.numel(),
++        x.stride(0),
++        out.stride(0),
++        divisor,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_fmod launch failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_sum_dim1", &custom_sum_dim1, "Sum over dimension 1", py::arg("x"));
++    m.def("custom_fmod", &custom_fmod, "Elementwise fmod with scalar divisor", py::arg("x"), py::arg("divisor"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, fmod_divisor):
++        super(ModelNew, self).__init__()
++        self.fmod_divisor = fmod_divisor
++
++    def forward(self, x):
++        x = cuda_extension.custom_sum_dim1(x)
++        x = cuda_extension.custom_fmod(x, self.fmod_divisor)
++        return x
++
++    def debug_forward(self, x):
++        y1 = cuda_extension.custom_sum_dim1(x)
++        yield ('step_001', y1)
++        y2 = cuda_extension.custom_fmod(y1, self.fmod_divisor)
++        yield ('step_002', y2)
++        yield ('step_003', y2)

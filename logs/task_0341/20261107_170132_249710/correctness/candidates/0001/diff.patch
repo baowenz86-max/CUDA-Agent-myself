@@ -1,0 +1,263 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,106 @@
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// embedding_forward: output[b,h,e] = weight[input[b,h], e]
++// input: int64 [B,H], weight: float [V,E], output: float [B,H,E]
++__global__ void embedding_lookup_kernel(
++    const int64_t* __restrict__ input,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int B, int H, int E,
++    long long total_elements) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (; idx < total_elements; idx += stride) {
++        int e = (int)(idx % E);
++        long long tmp = idx / E;
++        int h = (int)(tmp % H);
++        int b = (int)(tmp / H);
++        // input is contiguous [B,H]
++        int64_t token = input[(long long)b * H + h];
++        output[idx] = weight[token * E + e];
++    }
++}
++
++// avg_pool1d_forward: average pooling over last dim (length L)
++// input shape [B,C,L], output shape [B,C,outL]
++// kernel_size K, stride S, padding P (P=0 in this task)
++// input may be non-contiguous with arbitrary strides: in_stride_b, in_stride_c, in_stride_l
++// output is contiguous
++__global__ void avg_pool1d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int B, int C, int L,
++    int K, int S, int P,
++    int outL,
++    long long in_stride_b,
++    long long in_stride_c,
++    long long in_stride_l) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long total = (long long)B * C * outL;
++    long long grid_stride = (long long)gridDim.x * blockDim.x;
++    float inv_k = 1.0f / (float)K;
++    for (; idx < total; idx += grid_stride) {
++        int ol = (int)(idx % outL);
++        long long tmp = idx / outL;
++        int c = (int)(tmp % C);
++        int b = (int)(tmp / C);
++
++        // input start index along length: ol * S - P
++        int l_start = ol * S - P;
++        float sum = 0.0f;
++        // exactly K elements are always included when padding=0 and valid output positions
++        // For general P, some positions may include padding zeros; we simply skip negative indices
++        int valid_count = 0;
++        for (int k = 0; k < K; ++k) {
++            int l = l_start + k;
++            if (l >= 0 && l < L) {
++                const float* in_ptr = input + (long long)b * in_stride_b + (long long)c * in_stride_c + (long long)l * in_stride_l;
++                sum += *in_ptr;
++                valid_count++;
++            }
++        }
++        // In PyTorch AvgPool1d, count_include_pad=True by default, so divisor is K even if padding zeros included
++        // However, if valid_count < K due to padding, we still divide by K to match semantics.
++        // For safety, if K == 0 (invalid), avoid division by zero.
++        float avg = (K > 0) ? (sum * inv_k) : 0.0f;
++        output[idx] = avg;
++    }
++}
++
++// Launcher for embedding_forward
++extern "C" void embedding_forward_launcher(
++    const int64_t* input,
++    const float* weight,
++    float* output,
++    int B, int H, int E,
++    cudaStream_t stream) {
++    long long total = (long long)B * H * E;
++    int block = 256;
++    // grid dim limited to avoid overflow; use enough blocks to cover but not exceed 2^31-1
++    long long max_blocks = 2147483647LL; // 2^31 - 1
++    long long needed = (total + block - 1) / block;
++    int grid = (int)(needed < max_blocks ? needed : max_blocks);
++    embedding_lookup_kernel<<<grid, block, 0, stream>>>(input, weight, output, B, H, E, total);
++}
++
++// Launcher for avg_pool1d_forward
++extern "C" void avg_pool1d_forward_launcher(
++    const float* input,
++    float* output,
++    int B, int C, int L,
++    int kernel_size, int stride, int padding,
++    int outL,
++    long long in_stride_b,
++    long long in_stride_c,
++    long long in_stride_l,
++    cudaStream_t stream) {
++    long long total = (long long)B * C * outL;
++    int block = 256;
++    long long max_blocks = 2147483647LL;
++    long long needed = (total + block - 1) / block;
++    int grid = (int)(needed < max_blocks ? needed : max_blocks);
++    avg_pool1d_kernel<<<grid, block, 0, stream>>>(
++        input, output, B, C, L, kernel_size, stride, padding, outL,
++        in_stride_b, in_stride_c, in_stride_l);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,122 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void embedding_forward_launcher(
++    const int64_t* input,
++    const float* weight,
++    float* output,
++    int B, int H, int E,
++    cudaStream_t stream);
++
++extern "C" void avg_pool1d_forward_launcher(
++    const float* input,
++    float* output,
++    int B, int C, int L,
++    int kernel_size, int stride, int padding,
++    int outL,
++    long long in_stride_b,
++    long long in_stride_c,
++    long long in_stride_l,
++    cudaStream_t stream);
++
++// embedding_forward: input int64 [B,H], weight float32 [V,E] -> output float32 [B,H,E]
++torch::Tensor embedding_forward(torch::Tensor input, torch::Tensor weight) {
++    TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kInt64, "input must be int64");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(input.dim() == 2, "input must be 2D [B,H]");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [V,E]");
++
++    int B = input.size(0);
++    int H = input.size(1);
++    int E = weight.size(1);
++    int V = weight.size(0);
++    TORCH_CHECK(V > 0, "weight rows must be >0");
++
++    auto output = torch::empty({B, H, E}, input.options().dtype(torch::kFloat32));
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    embedding_forward_launcher(
++        input.data_ptr<int64_t>(),
++        weight.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B, H, E,
++        stream);
++    return output;
++}
++
++// transpose_forward: return a view with swapped dim0 and dim1 (no computation)
++torch::Tensor transpose_forward(torch::Tensor input, int64_t dim0, int64_t dim1) {
++    TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() > 0, "input must have positive rank");
++    int64_t ndim = input.dim();
++    // Normalize negative dims
++    if (dim0 < 0) dim0 += ndim;
++    if (dim1 < 0) dim1 += ndim;
++    TORCH_CHECK(dim0 >= 0 && dim0 < ndim, "dim0 out of range");
++    TORCH_CHECK(dim1 >= 0 && dim1 < ndim, "dim1 out of range");
++    // PyTorch transpose returns a view, no data movement
++    return input.transpose(dim0, dim1);
++}
++
++// avg_pool1d_forward: input [B,C,L] (possibly non-contiguous), kernel_size/stride/padding ints
++torch::Tensor avg_pool1d_forward(torch::Tensor input, int64_t kernel_size, int64_t stride, int64_t padding) {
++    TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() == 3, "input must be 3D [B,C,L]");
++    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++
++    int B = input.size(0);
++    int C = input.size(1);
++    int L = input.size(2);
++    int K = static_cast<int>(kernel_size);
++    int S = static_cast<int>(stride);
++    int P = static_cast<int>(padding);
++
++    // Compute output length as PyTorch does: floor((L + 2*P - K) / S) + 1
++    int outL = (L + 2*P - K) / S + 1;
++    TORCH_CHECK(outL > 0, "output length must be positive");
++
++    // Allocate contiguous output [B,C,outL]
++    auto output = torch::empty({B, C, outL}, input.options());
++
++    // Get strides for input in terms of elements (long long to avoid overflow)
++    auto strides = input.strides();
++    long long in_stride_b = strides[0];
++    long long in_stride_c = strides[1];
++    long long in_stride_l = strides[2];
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    avg_pool1d_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B, C, L,
++        K, S, P,
++        outL,
++        in_stride_b, in_stride_c, in_stride_l,
++        stream);
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("embedding_forward", &embedding_forward,
++          "Embedding lookup forward",
++          py::arg("input"), py::arg("weight"));
++    m.def("transpose_forward", &transpose_forward,
++          "Transpose dimensions (view)",
++          py::arg("input"), py::arg("dim0"), py::arg("dim1"));
++    m.def("avg_pool1d_forward", &avg_pool1d_forward,
++          "1D average pooling forward",
++          py::arg("input"), py::arg("kernel_size"), py::arg("stride"), py::arg("padding"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim, pooling_kernel_size):
++        super().__init__()
++        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
++        self.avg_pooling = nn.AvgPool1d(pooling_kernel_size)
++
++    def forward(self, x):
++        x = cuda_extension.embedding_forward(x, self.embedding.weight)
++        x = cuda_extension.transpose_forward(x, 1, 2)
++        x = cuda_extension.avg_pool1d_forward(x, 3, 3, 0)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.embedding_forward(x, self.embedding.weight)
++        yield ('step_001', x)
++        x = cuda_extension.transpose_forward(x, 1, 2)
++        yield ('step_002', x)
++        x = cuda_extension.avg_pool1d_forward(x, 3, 3, 0)
++        yield ('step_003', x)
++        yield ('step_004', x)

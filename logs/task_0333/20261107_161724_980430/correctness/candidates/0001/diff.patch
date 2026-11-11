@@ -1,0 +1,191 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,72 @@
++#include <cuda_runtime.h>
++
++// CUDA kernel for Local Response Normalization across channel dimension.
++// Each thread computes one output element at position (n,c,h,w).
++// Input and output are assumed to be 4D float32 tensors with arbitrary strides.
++// We compute sum of squares of neighboring channels within [c - size//2, c + size//2]
++// and produce: y = x / (k + alpha * sum)^beta
++__global__ void lrn_forward_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    int N, int C, int H, int W,
++    int stride_n, int stride_c, int stride_h, int stride_w,
++    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w,
++    int size, float alpha, float beta, float k)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * H * W;
++    if (idx >= total) return;
++
++    // decompose linear index into n,c,h,w
++    int n = idx / (C * H * W);
++    int rem = idx % (C * H * W);
++    int c = rem / (H * W);
++    rem = rem % (H * W);
++    int h = rem / W;
++    int w = rem % W;
++
++    const float* x_base = x + n * stride_n + c * stride_c + h * stride_h + w * stride_w;
++    float val = *x_base;
++
++    int half = size / 2;
++    int c_start = max(0, c - half);
++    int c_end = min(C - 1, c + half);
++
++    float sum_sq = 0.0f;
++    for (int cc = c_start; cc <= c_end; ++cc) {
++        const float* ptr = x + n * stride_n + cc * stride_c + h * stride_h + w * stride_w;
++        float v = *ptr;
++        sum_sq += v * v;
++    }
++
++    float denom = k + alpha * sum_sq;
++    float out = val * powf(denom, -beta);
++
++    float* y_ptr = y + n * out_stride_n + c * out_stride_c + h * out_stride_h + w * out_stride_w;
++    *y_ptr = out;
++}
++
++// Launcher function to be called from C++ binding.
++// All parameters are raw pointers and scalars.
++extern "C" void lrn_forward_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    int stride_n, int stride_c, int stride_h, int stride_w,
++    int out_stride_n, int out_stride_c, int out_stride_h, int out_stride_w,
++    int size, float alpha, float beta, float k,
++    cudaStream_t stream)
++{
++    int total = N * C * H * W;
++    if (total == 0) return;
++
++    // Choose block size.
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    lrn_forward_kernel<<<blocks, threads, 0, stream>>>(
++        x, y, N, C, H, W,
++        stride_n, stride_c, stride_h, stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w,
++        size, alpha, beta, k);
++}--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,94 @@
++// PyTorch C++ binding for custom LRN CUDA kernel
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Forward declaration of launcher from custom_ops.cu
++extern "C" void lrn_forward_launcher(
++    const float* x,
++    float* y,
++    int N,
++    int C,
++    int H,
++    int W,
++    int stride_n,
++    int stride_c,
++    int stride_h,
++    int stride_w,
++    int out_stride_n,
++    int out_stride_c,
++    int out_stride_h,
++    int out_stride_w,
++    int size,
++    float alpha,
++    float beta,
++    float k,
++    cudaStream_t stream);
++
++torch::Tensor lrn_forward(
++    torch::Tensor x,
++    int64_t size,
++    double alpha,
++    double beta,
++    double k) {
++  // Input validation
++  TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++  TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++  TORCH_CHECK(x.dim() == 4, "Input must be 4D (N,C,H,W)");
++
++  // Allocate output with same shape and properties
++  auto y = torch::empty_like(x);
++
++  // Get dimensions
++  int N = static_cast<int>(x.size(0));
++  int C = static_cast<int>(x.size(1));
++  int H = static_cast<int>(x.size(2));
++  int W = static_cast<int>(x.size(3));
++
++  // Get strides (elements)
++  int stride_n = static_cast<int>(x.stride(0));
++  int stride_c = static_cast<int>(x.stride(1));
++  int stride_h = static_cast<int>(x.stride(2));
++  int stride_w = static_cast<int>(x.stride(3));
++
++  int out_stride_n = static_cast<int>(y.stride(0));
++  int out_stride_c = static_cast<int>(y.stride(1));
++  int out_stride_h = static_cast<int>(y.stride(2));
++  int out_stride_w = static_cast<int>(y.stride(3));
++
++  // Get current CUDA stream
++  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++  // Call launcher
++  lrn_forward_launcher(
++      x.data_ptr<float>(),
++      y.data_ptr<float>(),
++      N, C, H, W,
++      stride_n, stride_c, stride_h, stride_w,
++      out_stride_n, out_stride_c, out_stride_h, out_stride_w,
++      static_cast<int>(size),
++      static_cast<float>(alpha),
++      static_cast<float>(beta),
++      static_cast<float>(k),
++      stream);
++
++  // Check for CUDA errors after launch
++  cudaError_t err = cudaGetLastError();
++  TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++  return y;
++}
++
++void register_lrn_forward(pybind11::module& m) {
++  m.def("lrn_forward", &lrn_forward,
++        "Local Response Normalization forward (CUDA)",
++        py::arg("x"),
++        py::arg("size"),
++        py::arg("alpha"),
++        py::arg("beta"),
++        py::arg("k"));
++}
++
++REGISTER_BINDING(lrn_forward, register_lrn_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,17 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_channels: int, size: int, alpha: float, beta: float, k: float):
++        super().__init__()
++        self.local_response_norm = nn.LocalResponseNorm(size, alpha, beta, k)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.lrn_forward(x, self.local_response_norm.size, self.local_response_norm.alpha, self.local_response_norm.beta, self.local_response_norm.k)
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        y = cuda_extension.lrn_forward(x, self.local_response_norm.size, self.local_response_norm.alpha, self.local_response_norm.beta, self.local_response_norm.k)
++        yield 'step_001', y

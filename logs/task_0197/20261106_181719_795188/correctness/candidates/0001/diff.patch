@@ -1,0 +1,224 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,84 @@
++#include <cuda_runtime.h>
++
++// AvgPool2d kernel: kernel_size=2, stride=2, padding=0
++// Input: [N, C, H, W] contiguous float32
++// Output: [N, C, H_out, W_out] where H_out = H/2, W_out = W/2
++__global__ void avgpool2d_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 int N, int C, int H, int W,
++                                 int H_out, int W_out) {
++    int total = N * C * H_out * W_out;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < total; i += stride) {
++        // Decode output linear index into n, c, h_out, w_out
++        int w_out = i % W_out;
++        int tmp = i / W_out;
++        int h_out = tmp % H_out;
++        tmp /= H_out;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        // Input indices for 2x2 pooling window
++        int h_in = h_out * 2;
++        int w_in = w_out * 2;
++
++        // Base pointer for this (n,c) plane
++        const float* in_plane = input + (n * C + c) * H * W;
++        float sum = 0.0f;
++
++        sum += in_plane[h_in * W + w_in];
++        sum += in_plane[h_in * W + w_in + 1];
++        sum += in_plane[(h_in + 1) * W + w_in];
++        sum += in_plane[(h_in + 1) * W + w_in + 1];
++
++        float avg = sum * 0.25f;
++        output[i] = avg;
++    }
++}
++
++// ReLU kernel: elementwise max(x, 0)
++__global__ void relu_kernel(const float* __restrict__ input,
++                            float* __restrict__ output,
++                            int total) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < total; i += stride) {
++        float val = input[i];
++        output[i] = val > 0.0f ? val : 0.0f;
++    }
++}
++
++// Host launcher for AvgPool2d
++extern "C" void avgpool2d_forward_launcher(const float* input,
++                                           float* output,
++                                           int N, int C, int H, int W,
++                                           int kernel_size, int stride, int padding,
++                                           cudaStream_t stream) {
++    // Only support kernel_size=2, stride=2, padding=0 for this model
++    // Compute output dimensions
++    int H_out = (H + 2 * padding - kernel_size) / stride + 1;
++    int W_out = (W + 2 * padding - kernel_size) / stride + 1;
++
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    // Grid-stride loop handles any size; cap blocks to a reasonable number
++    if (blocks > 1024) blocks = 1024;
++
++    avgpool2d_kernel<<<blocks, threads, 0, stream>>>(input, output, N, C, H, W, H_out, W_out);
++}
++
++// Host launcher for ReLU
++extern "C" void relu_forward_launcher(const float* input,
++                                      float* output,
++                                      int total,
++                                      cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 1024) blocks = 1024;
++
++    relu_kernel<<<blocks, threads, 0, stream>>>(input, output, total);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,109 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void avgpool2d_forward_launcher(const float* input,
++                                           float* output,
++                                           int N, int C, int H, int W,
++                                           int kernel_size, int stride, int padding,
++                                           cudaStream_t stream);
++
++extern "C" void relu_forward_launcher(const float* input,
++                                      float* output,
++                                      int total,
++                                      cudaStream_t stream);
++
++// Wrapper for AvgPool2d
++torch::Tensor avgpool2d_forward(torch::Tensor input, int64_t kernel_size, int64_t stride, int64_t padding) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() == 4, "input must have shape [N, C, H, W]");
++
++    int N = input.size(0);
++    int C = input.size(1);
++    int H = input.size(2);
++    int W = input.size(3);
++
++    // Compute output spatial dimensions
++    // Matches torch.nn.functional.avg_pool2d
++    int H_out = (H + 2 * static_cast<int>(padding) - static_cast<int>(kernel_size)) / static_cast<int>(stride) + 1;
++    int W_out = (W + 2 * static_cast<int>(padding) - static_cast<int>(kernel_size)) / static_cast<int>(stride) + 1;
++
++    TORCH_CHECK(H_out > 0 && W_out > 0, "kernel_size/stride/padding invalid for input size");
++
++    auto output = torch::empty({N, C, H_out, W_out}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    avgpool2d_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for ReLU
++torch::Tensor relu_forward(torch::Tensor input, bool inplace) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++
++    // For this task, inplace is always False; but we respect parameter.
++    // If inplace is true, we would modify input and return input. However,
++    // contract only exercises inplace=False. We still implement it correctly
++    // to avoid undefined behavior if someone passes True.
++    if (inplace) {
++        cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++        relu_forward_launcher(
++            input.data_ptr<float>(),
++            input.data_ptr<float>(),
++            input.numel(),
++            stream
++        );
++        cudaError_t err = cudaGetLastError();
++        TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++        return input;
++    } else {
++        auto output = torch::empty_like(input);
++        cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++        relu_forward_launcher(
++            input.data_ptr<float>(),
++            output.data_ptr<float>(),
++            input.numel(),
++            stream
++        );
++        cudaError_t err = cudaGetLastError();
++        TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++        return output;
++    }
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("avgpool2d_forward", &avgpool2d_forward,
++          "AvgPool2d forward (CUDA)",
++          pybind11::arg("input"),
++          pybind11::arg("kernel_size"),
++          pybind11::arg("stride"),
++          pybind11::arg("padding") = 0);
++
++    m.def("relu_forward", &relu_forward,
++          "ReLU forward (CUDA)",
++          pybind11::arg("input"),
++          pybind11::arg("inplace") = false);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++        # No parameters, but keep for potential state_dict compatibility
++        self.avgpool = nn.AvgPool2d(kernel_size=2, stride=2)
++        self.relu = nn.ReLU()
++
++    def forward(self, x):
++        x = cuda_extension.avgpool2d_forward(x, 2, 2, 0)
++        x = cuda_extension.relu_forward(x, False)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.avgpool2d_forward(x, 2, 2, 0)
++        yield 'step_001', x
++        x = cuda_extension.relu_forward(x, False)
++        yield 'step_002', x
++        yield 'step_003', x

@@ -1,0 +1,134 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,55 @@
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// Element-wise abs(x) then divide by integer divisor.
++// This kernel is launched with a 1D grid-stride loop over total element count.
++// It assumes input is contiguous in memory; binding.cpp is responsible for
++// making the input contiguous and allocating the output tensor.
++__global__ void abs_div_kernel(const float* __restrict__ input,
++                               float* __restrict__ output,
++                               int64_t divisor,
++                               int64_t total_elements) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++
++    // Convert divisor to float once. For integer divisor, float division is
++    // sufficient and matches torch.div semantics for float32 input.
++    float divisor_f = static_cast<float>(divisor);
++
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        float val = input[i];
++        // Compute absolute value, handling -0.0 correctly (fabsf(-0.0) = 0.0)
++        float abs_val = fabsf(val);
++        // Divide by divisor. Multiplication by reciprocal could be used, but
++        // direct division is clearer and has the same numerical behavior within
++        // tolerance. We avoid division by zero if divisor == 0; torch raises an
++        // error for integer division by zero, but here divisor may be zero and
++        // the expected behavior is not specified. We follow standard float
++        // division semantics.
++        output[i] = abs_val / divisor_f;
++    }
++}
++
++extern "C" void abs_div_forward_launcher(const float* input,
++                                         float* output,
++                                         int64_t divisor,
++                                         int64_t total_elements,
++                                         cudaStream_t stream) {
++    // Launch configuration: use 256 threads per block and enough blocks to
++    // cover the data, but avoid launching more than necessary. Grid-stride
++    // loop handles overflow.
++    const int threads = 256;
++    int64_t blocks64 = (total_elements + threads - 1) / threads;
++    // Cap blocks to a reasonable maximum (e.g., 65535*2) for grid-stride
++    // efficiency, but since we have a grid-stride loop, we can use a fixed
++    // maximum grid size. This is especially important for very large tensors.
++    // Here total_elements = 2048*256*512 = 268,435,456, so blocks64 = 1,048,576
++    // which exceeds the maximum grid dimension in x (2^31-1 for 1D) and also
++    // might be suboptimal. We cap at 65535 * 2 to use multiple waves.
++    int max_blocks = 65535 * 2;
++    int blocks = static_cast<int>(blocks64 > max_blocks ? max_blocks : blocks64);
++    
++    if (blocks > 0) {
++        abs_div_kernel<<<blocks, threads, 0, stream>>>(input, output, divisor, total_elements);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,51 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void abs_div_forward_launcher(const float* input,
++                                         float* output,
++                                         int64_t divisor,
++                                         int64_t total_elements,
++                                         cudaStream_t stream);
++
++// PyTorch tensor wrapper
++torch::Tensor abs_div_forward(torch::Tensor x, int64_t divisor) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    // Ensure input is contiguous; launcher assumes contiguous memory
++    auto x_contig = x.contiguous();
++
++    // Allocate output tensor with same shape and options
++    auto output = torch::empty_like(x_contig);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    abs_div_forward_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        divisor,
++        x_contig.numel(),
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++void register_abs_div_forward(pybind11::module& m) {
++    m.def("abs_div_forward", &abs_div_forward,
++          "Element-wise abs(x) then divide by divisor",
++          py::arg("x"),
++          py::arg("divisor"));
++}
++
++// Auto-register
++REGISTER_BINDING(abs_div_forward, register_abs_div_forward);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, divisor: int = 1):
++        super().__init__()
++        self.divisor = divisor
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.abs_div_forward(x, self.divisor)
++
++    def debug_forward(self, x: torch.Tensor):
++        # Debug interface yields the same checkpoints as reference_steps
++        abs_x = cuda_extension.abs_div_forward(x, 1)  # divisor=1 gives only abs
++        yield 'step_001', abs_x
++        div_x = cuda_extension.abs_div_forward(x, self.divisor)
++        yield 'step_002', div_x
++        yield 'step_003', div_x

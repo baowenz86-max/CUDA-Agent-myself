@@ -1,0 +1,212 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,77 @@
++#include <cuda_runtime.h>
++#include <cmath>
++
++// Kernel: einsum 'bhwc->bwh'
++// output shape: [batch, width, height]
++// input shape: [batch, height, width, channels]
++// For each output element (b, w, h), sum_{c=0}^{C-1} input[b, h, w, c]
++__global__ void einsum_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int batch,
++    int height,
++    int width,
++    int channels,
++    long long input_batch_stride,
++    long long input_height_stride,
++    long long input_width_stride,
++    long long input_channel_stride)
++{
++    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (out_idx >= batch * width * height) return;
++
++    int b = out_idx / (width * height);
++    int rem = out_idx - b * (width * height);
++    int w = rem / height;
++    int h = rem - w * height;
++
++    const float* base = input + b * input_batch_stride + h * input_height_stride + w * input_width_stride;
++    float sum = 0.0f;
++    for (int c = 0; c < channels; ++c) {
++        sum += base[c * input_channel_stride];
++    }
++    output[out_idx] = sum;
++}
++
++// Kernel: elementwise absolute value
++__global__ void abs_kernel(float* __restrict__ output, const float* __restrict__ input, long long num_elements)
++{
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < num_elements) {
++        output[idx] = fabsf(input[idx]);
++    }
++}
++
++// Launchers
++extern "C" void einsum_bhwc_to_bwh_launcher(
++    float* output,
++    const float* input,
++    int batch,
++    int height,
++    int width,
++    int channels,
++    long long input_batch_stride,
++    long long input_height_stride,
++    long long input_width_stride,
++    long long input_channel_stride,
++    cudaStream_t stream)
++{
++    long long total = (long long)batch * width * height;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    einsum_kernel<<<grid, block, 0, stream>>>(
++        output, input, batch, height, width, channels,
++        input_batch_stride, input_height_stride, input_width_stride, input_channel_stride);
++}
++
++extern "C" void abs_forward_launcher(
++    float* output,
++    const float* input,
++    long long num_elements,
++    cudaStream_t stream)
++{
++    int block = 256;
++    long long grid_ll = (num_elements + block - 1) / block;
++    int grid = (int)grid_ll;
++    abs_kernel<<<grid, block, 0, stream>>>(output, input, num_elements);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,105 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// External launcher declarations from custom_ops.cu
++extern "C" void einsum_bhwc_to_bwh_launcher(
++    float* output,
++    const float* input,
++    int batch,
++    int height,
++    int width,
++    int channels,
++    long long input_batch_stride,
++    long long input_height_stride,
++    long long input_width_stride,
++    long long input_channel_stride,
++    cudaStream_t stream);
++
++extern "C" void abs_forward_launcher(
++    float* output,
++    const float* input,
++    long long num_elements,
++    cudaStream_t stream);
++
++// Binding function for einsum_bhwc_to_bwh
++torch::Tensor einsum_bhwc_to_bwh(torch::Tensor input) {
++    // Validate input tensor
++    TORCH_CHECK(input.is_cuda(), "einsum_bhwc_to_bwh: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "einsum_bhwc_to_bwh: input must be float32");
++    TORCH_CHECK(input.dim() == 4, "einsum_bhwc_to_bwh: input must be 4-dimensional [batch, height, width, channels]");
++    
++    int batch = input.size(0);
++    int height = input.size(1);
++    int width = input.size(2);
++    int channels = input.size(3);
++    
++    TORCH_CHECK(channels > 0, "einsum_bhwc_to_bwh: channels dimension must be positive");
++    
++    // Get strides (in elements, not bytes) as long long for launcher
++    long long input_batch_stride = static_cast<long long>(input.stride(0));
++    long long input_height_stride = static_cast<long long>(input.stride(1));
++    long long input_width_stride = static_cast<long long>(input.stride(2));
++    long long input_channel_stride = static_cast<long long>(input.stride(3));
++    
++    // Allocate output tensor [batch, width, height]
++    auto output = torch::empty({batch, width, height}, input.options());
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    
++    einsum_bhwc_to_bwh_launcher(
++        output.data_ptr<float>(),
++        input.data_ptr<float>(),
++        batch, height, width, channels,
++        input_batch_stride, input_height_stride, input_width_stride, input_channel_stride,
++        stream);
++    
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "einsum_bhwc_to_bwh: CUDA kernel launch failed: ", cudaGetErrorString(err));
++    
++    return output;
++}
++
++// Binding function for abs_forward
++torch::Tensor abs_forward(torch::Tensor input) {
++    // Validate input tensor
++    TORCH_CHECK(input.is_cuda(), "abs_forward: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "abs_forward: input must be float32");
++    
++    // Allocate output with same shape and options
++    auto output = torch::empty_like(input);
++    
++    // If input is not contiguous, we currently rely on the launcher to handle strided access;
++    // but abs_kernel assumes contiguous (uses linear indexing). To be safe, we make input contiguous
++    // only if needed. However, contract says input is expected contiguous after einsum, but we support
++    // any strided input by making a contiguous copy before kernel. This matches PyTorch semantics
++    // because torch.abs operates element-wise on logical order; output is contiguous.
++    if (!input.is_contiguous()) {
++        input = input.contiguous();
++    }
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    long long num_elements = static_cast<long long>(input.numel());
++    
++    abs_forward_launcher(
++        output.data_ptr<float>(),
++        input.data_ptr<float>(),
++        num_elements,
++        stream);
++    
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "abs_forward: CUDA kernel launch failed: ", cudaGetErrorString(err));
++    
++    return output;
++}
++
++// Register bindings
++void register_custom_ops(pybind11::module& m) {
++    m.def("einsum_bhwc_to_bwh", &einsum_bhwc_to_bwh, "einsum bhwc->bwh", py::arg("input"));
++    m.def("abs_forward", &abs_forward, "absolute value", py::arg("input"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import cuda_extension
++
++
++class ModelNew(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.einsum_input = "bhwc->bwh"
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.einsum_bhwc_to_bwh(x)
++        x = cuda_extension.abs_forward(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.einsum_bhwc_to_bwh(x)
++        yield ("step_001", x)
++        x = cuda_extension.abs_forward(x)
++        yield ("step_002", x)
++        yield ("step_003", x)

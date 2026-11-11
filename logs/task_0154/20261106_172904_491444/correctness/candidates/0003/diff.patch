@@ -1,0 +1,549 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,10 +1,5 @@
+-// kernels/custom_ops.cu
+-// CUDA kernels and launchers for custom ops, no torch dependencies.
+-// Conv2d uses cuDNN; other ops use custom kernels or cuFFT.
+-
+ #include <cuda_runtime.h>
+ #include <cufft.h>
+-#include <cudnn.h>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cmath>
+@@ -17,14 +12,6 @@
+     }
+ }
+ 
+-#define CUDNN_CHECK(ans) { cudnnAssert((ans), __FILE__, __LINE__); }
+-inline void cudnnAssert(cudnnStatus_t status, const char *file, int line, bool abort=true) {
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        fprintf(stderr, "cuDNN error: %s %s %d\n", cudnnGetErrorString(status), file, line);
+-        if (abort) exit(status);
+-    }
+-}
+-
+ #define CUFFT_CHECK(ans) { cufftAssert((ans), __FILE__, __LINE__); }
+ inline void cufftAssert(cufftResult_t result, const char *file, int line, bool abort=true) {
+     if (result != CUFFT_SUCCESS) {
+@@ -36,12 +23,11 @@
+ // -----------------------------------------------------------------------------
+ // STFT kernel: computes short-time Fourier transform.
+ // Input: float* input: [batch, sequence_length]
+-// Output: cuComplex* output: [batch, freq_bins, frames] (complex64)
+-// The launcher uses cuFFT for each frame.
++// Output: float2* output: [batch, freq_bins, frames] (complex64, interpreted as float2)
+ // -----------------------------------------------------------------------------
+ extern "C" void stft_forward_launcher(
+     const float* input,
+-    cuComplex* output,
++    float2* output,
+     int batch,
+     int sequence_length,
+     int n_fft,
+@@ -53,11 +39,11 @@
+ // -----------------------------------------------------------------------------
+ // view_as_real_permute kernel: converts complex input to two-channel float output
+ // with permute(0,3,1,2).
+-// Input: const cuComplex* input: [batch, freq_bins, frames]
++// Input: const float2* input: [batch, freq_bins, frames]
+ // Output: float* output: [batch, 2, freq_bins, frames]
+ // -----------------------------------------------------------------------------
+ __global__ void view_as_real_permute_kernel(
+-    const cuComplex* __restrict__ input,
++    const float2* __restrict__ input,
+     float* __restrict__ output,
+     int batch,
+     int freq_bins,
+@@ -70,16 +56,14 @@
+         int fb = (idx / frames) % freq_bins;
+         int b = idx / (frames * freq_bins);
+ 
+-        cuComplex val = input[b * freq_bins * frames + fb * frames + f];
+-        // output layout: [batch, 2, freq_bins, frames]
+-        // real part at [b,0,fb,f], imag at [b,1,fb,f]
++        float2 val = input[b * freq_bins * frames + fb * frames + f];
+         output[b * 2 * freq_bins * frames + 0 * freq_bins * frames + fb * frames + f] = val.x;
+         output[b * 2 * freq_bins * frames + 1 * freq_bins * frames + fb * frames + f] = val.y;
+     }
+ }
+ 
+ extern "C" void view_as_real_permute_launcher(
+-    const cuComplex* input,
++    const float2* input,
+     float* output,
+     int batch,
+     int freq_bins,
+@@ -154,8 +138,6 @@
+ // -----------------------------------------------------------------------------
+ // STFT implementation using cuFFT
+ // -----------------------------------------------------------------------------
+-// Helper kernel to apply window and center padding/reflection.
+-// We'll do the padding in a kernel that copies input to a padded buffer.
+ __global__ void stft_pad_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ padded,
+@@ -174,7 +156,7 @@
+             val = input[src_idx];
+         } else if (src_idx < 0) {
+             // reflect left
+-            val = input[-src_idx]; // since reflection at boundary, index -src_idx
++            val = input[-src_idx];
+         } else {
+             // reflect right
+             int reflect_idx = sequence_length - 1 - (src_idx - sequence_length);
+@@ -185,10 +167,51 @@
+     }
+ }
+ 
+-// STFT launcher
++__global__ void stft_frames_kernel(
++    const float* __restrict__ padded,
++    float* __restrict__ windowed_frames,
++    int frames,
++    int n_fft,
++    int hop_length,
++    int win_length
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = frames * n_fft;
++    if (idx < total) {
++        int frame = idx / n_fft;
++        int sample = idx % n_fft;
++        int padded_idx = frame * hop_length + sample;
++        float val = padded[padded_idx];
++        int offset = (n_fft - win_length) / 2;
++        float window_val = 0.0f;
++        if (sample >= offset && sample < offset + win_length) {
++            int w_idx = sample - offset;
++            double phase = 2.0 * M_PI * w_idx / (win_length - 1);
++            window_val = 0.5 * (1.0 - cos(phase));
++        }
++        windowed_frames[idx] = val * window_val;
++    }
++}
++
++__global__ void stft_copy_out_kernel(
++    const float2* __restrict__ spectrum, // [frames, freq_bins]
++    float2* __restrict__ output,          // [freq_bins, frames]
++    int freq_bins,
++    int frames
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = freq_bins * frames;
++    if (idx < total) {
++        int f = idx % frames;
++        int fb = idx / frames;
++        float2 val = spectrum[f * freq_bins + fb];
++        output[fb * frames + f] = val;
++    }
++}
++
+ void stft_forward_launcher(
+     const float* input,
+-    cuComplex* output,
++    float2* output,
+     int batch,
+     int sequence_length,
+     int n_fft,
+@@ -200,38 +223,23 @@
+     int pad_left = n_fft / 2;
+     int pad_right = n_fft - pad_left;
+     int padded_len = sequence_length + pad_left + pad_right;
+-    int frames = 1 + (padded_len - n_fft) / hop_length; // center=True
+-
+-    // Each frame is n_fft points; we need a temporary workspace for each batch frame
+-    // We'll allocate a per-batch workspace of size n_fft * frames (float) for real input after windowing
+-    // Also need complex spectrum for n_fft (or freq_bins)
+-
+-    // For simplicity, we call cuFFT for each frame per batch, using a separate stream? Use current stream.
++    int frames = 1 + (padded_len - n_fft) / hop_length;
++
+     cufftHandle plan;
+     CUFFT_CHECK(cufftCreate(&plan));
+     CUFFT_CHECK(cufftSetStream(plan, stream));
+-    CUFFT_CHECK(cufftPlan1d(&plan, n_fft, CUFFT_R2C, batch * frames)); // batch dimension separate? Actually plan for many
+-    // But we need to handle window and center padding.
+-
+-    // Approach: allocate device memory for padded input per batch, then extract frames into a contiguous buffer of length n_fft * frames, apply window, then batched FFT.
+-    // To save memory, we can process one batch at a time.
++    CUFFT_CHECK(cufftPlan1d(&plan, n_fft, CUFFT_R2C, batch * frames));
+ 
+     float *d_padded, *d_windowed_frames;
+-    cuComplex *d_spectrum;
++    float2 *d_spectrum;
+ 
+     CUDA_CHECK(cudaMalloc(&d_padded, padded_len * sizeof(float)));
+     CUDA_CHECK(cudaMalloc(&d_windowed_frames, frames * n_fft * sizeof(float)));
+-    CUDA_CHECK(cudaMalloc(&d_spectrum, frames * freq_bins * sizeof(cuComplex)));
+-
+-    // Create Hann window on device? For simplicity, generate on host and copy, or compute in kernel.
+-    // We'll create window on device via kernel that computes Hann each time.
+-    // But window size = win_length (<= n_fft). If win_length < n_fft, pad zeros in middle.
+-    // We'll compute window in kernel when applying.
++    CUDA_CHECK(cudaMalloc(&d_spectrum, frames * freq_bins * sizeof(float2)));
+ 
+     for (int b = 0; b < batch; ++b) {
+         const float* input_b = input + b * sequence_length;
+ 
+-        // 1. Pad with reflection
+         int total_pad = padded_len;
+         int threads = 256;
+         int blocks = (total_pad + threads - 1) / threads;
+@@ -240,29 +248,16 @@
+         );
+         CUDA_CHECK(cudaGetLastError());
+ 
+-        // 2. Extract frames and apply window
+-        // We'll use a kernel to fill d_windowed_frames (frames * n_fft)
+-        // Kernel: for each frame f and sample i within n_fft, compute window value and multiply with padded value.
+         int total_frames_samples = frames * n_fft;
+         blocks = (total_frames_samples + threads - 1) / threads;
+-        // Use a kernel to perform this.
+-        // We'll define a lambda-free kernel below.
+-        // But to avoid code duplication, define another global kernel outside.
+-        // For now, we'll inline via a separate kernel defined earlier or later.
+-        // We'll call stft_frames_kernel defined below.
+-        // We'll define it after this function.
+         stft_frames_kernel<<<blocks, threads, 0, stream>>>(
+             d_padded, d_windowed_frames, frames, n_fft, hop_length, win_length
+         );
+         CUDA_CHECK(cudaGetLastError());
+ 
+-        // 3. Batched cuFFT R2C on frames
+-        CUFFT_CHECK(cufftExecR2C(plan, d_windowed_frames, d_spectrum));
+-
+-        // 4. Copy spectrum (freq_bins per frame) to output slice [b, freq_bins, frames]
+-        // Output layout: [batch, freq_bins, frames] contiguous.
+-        // We need to transpose from [frames, freq_bins] to [freq_bins, frames].
+-        // We can use a kernel to copy with transpose.
++        // Note: cufftExecR2C expects cuComplex* but float2* is equivalent
++        CUFFT_CHECK(cufftExecR2C(plan, d_windowed_frames, reinterpret_cast<cuComplex*>(d_spectrum)));
++
+         int total_out = freq_bins * frames;
+         blocks = (total_out + threads - 1) / threads;
+         stft_copy_out_kernel<<<blocks, threads, 0, stream>>>(
+@@ -277,62 +272,64 @@
+     CUFFT_CHECK(cufftDestroy(plan));
+ }
+ 
+-// Kernels used by STFT
+-__global__ void stft_frames_kernel(
+-    const float* __restrict__ padded,   // padded_len
+-    float* __restrict__ windowed_frames, // frames * n_fft
+-    int frames,
+-    int n_fft,
+-    int hop_length,
+-    int win_length
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = frames * n_fft;
+-    if (idx < total) {
+-        int frame = idx / n_fft;
+-        int sample = idx % n_fft;
+-        int padded_idx = frame * hop_length + sample;
+-        float val = padded[padded_idx];
+-        // Hann window of length win_length, centered in n_fft as in torch.stft default.
+-        // torch.stft uses center=True and pads window to n_fft if win_length < n_fft.
+-        // The window is centered, meaning zeros before/after.
+-        int offset = (n_fft - win_length) / 2;
+-        float window_val = 0.0f;
+-        if (sample >= offset && sample < offset + win_length) {
+-            int w_idx = sample - offset;
+-            // Hann window: 0.5 * (1 - cos(2*pi*w_idx/(win_length-1)))
+-            double phase = 2.0 * M_PI * w_idx / (win_length - 1);
+-            window_val = 0.5 * (1.0 - cos(phase));
++// -----------------------------------------------------------------------------
++// Conv2d via custom CUDA kernel (replacing cuDNN)
++// -----------------------------------------------------------------------------
++__global__ void conv2d_kernel(
++    const float* __restrict__ input,   // [batch, in_channels, in_height, in_width]
++    const float* __restrict__ weight,  // [out_channels, in_channels, kernel_h, kernel_w]
++    const float* __restrict__ bias,    // [out_channels] (optional)
++    float* __restrict__ output,        // [batch, out_channels, out_height, out_width]
++    int batch,
++    int in_channels,
++    int in_height,
++    int in_width,
++    int out_channels,
++    int kernel_h,
++    int kernel_w,
++    int stride_h,
++    int stride_w,
++    int padding_h,
++    int padding_w,
++    int dilation_h,
++    int dilation_w
++) {
++    int out_width = (in_width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
++    int out_height = (in_height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
++    int total = batch * out_channels * out_height * out_width;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < total) {
++        int ow = idx % out_width;
++        int oh = (idx / out_width) % out_height;
++        int oc = (idx / (out_width * out_height)) % out_channels;
++        int b = idx / (out_width * out_height * out_channels);
++
++        float sum = 0.0f;
++        for (int ic = 0; ic < in_channels; ++ic) {
++            for (int kh = 0; kh < kernel_h; ++kh) {
++                for (int kw = 0; kw < kernel_w; ++kw) {
++                    int ih = oh * stride_h - padding_h + kh * dilation_h;
++                    int iw = ow * stride_w - padding_w + kw * dilation_w;
++                    if (ih >= 0 && ih < in_height && iw >= 0 && iw < in_width) {
++                        float input_val = input[((b * in_channels + ic) * in_height + ih) * in_width + iw];
++                        float weight_val = weight[((oc * in_channels + ic) * kernel_h + kh) * kernel_w + kw];
++                        sum += input_val * weight_val;
++                    }
++                }
++            }
+         }
+-        windowed_frames[idx] = val * window_val;
+-    }
+-}
+-
+-__global__ void stft_copy_out_kernel(
+-    const cuComplex* __restrict__ spectrum, // [frames, freq_bins]
+-    cuComplex* __restrict__ output,          // [freq_bins, frames]
+-    int freq_bins,
+-    int frames
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = freq_bins * frames;
+-    if (idx < total) {
+-        int f = idx % frames;
+-        int fb = idx / frames;
+-        // spectrum is [frames, freq_bins] row-major
+-        cuComplex val = spectrum[f * freq_bins + fb];
+-        output[fb * frames + f] = val;
+-    }
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Conv2d via cuDNN
+-// -----------------------------------------------------------------------------
++        if (bias != nullptr) {
++            sum += bias[oc];
++        }
++        output[idx] = sum;
++    }
++}
++
+ extern "C" void conv2d_forward_launcher(
+-    const float* input,       // [batch, in_channels, in_height, in_width]
+-    const float* weight,      // [out_channels, in_channels, kernel_h, kernel_w]
+-    const float* bias,        // [out_channels] (can be null)
+-    float* output,            // [batch, out_channels, out_height, out_width]
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
+     int batch,
+     int in_channels,
+     int in_height,
+@@ -348,75 +345,16 @@
+     int dilation_w,
+     cudaStream_t stream
+ ) {
+-    cudnnHandle_t cudnn;
+-    CUDNN_CHECK(cudnnCreate(&cudnn));
+-    CUDNN_CHECK(cudnnSetStream(cudnn, stream));
+-
+-    cudnnTensorDescriptor_t input_desc, output_desc, bias_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&input_desc));
+-    CUDNN_CHECK(cudnnCreateFilterDescriptor(&filter_desc));
+-    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&conv_desc));
+-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&bias_desc));
+-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&output_desc));
+-
+-    // Set input descriptor: NCHW
+-    CUDNN_CHECK(cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                           batch, in_channels, in_height, in_width));
+-    // Set filter descriptor
+-    CUDNN_CHECK(cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+-                                           out_channels, in_channels, kernel_h, kernel_w));
+-    // Set convolution descriptor
+-    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(conv_desc,
+-                                                padding_h, padding_w,
+-                                                stride_h, stride_w,
+-                                                dilation_h, dilation_w,
+-                                                CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+-
+-    // Determine output dimensions
+     int out_height = (in_height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
+     int out_width = (in_width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
+-
+-    CUDNN_CHECK(cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                           batch, out_channels, out_height, out_width));
+-    // Set bias descriptor: one bias per channel, shape [1, out_channels, 1, 1]
+-    CUDNN_CHECK(cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                           1, out_channels, 1, 1));
+-
+-    // Choose algorithm
+-    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+-    size_t workspace_size = 0;
+-    CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(cudnn, input_desc, filter_desc, conv_desc,
+-                                                        output_desc, algo, &workspace_size));
+-    void* d_workspace = nullptr;
+-    if (workspace_size > 0) {
+-        CUDA_CHECK(cudaMalloc(&d_workspace, workspace_size));
+-    }
+-
+-    float alpha = 1.0f, beta = 0.0f;
+-    CUDNN_CHECK(cudnnConvolutionForward(cudnn,
+-                                        &alpha,
+-                                        input_desc, input,
+-                                        filter_desc, weight,
+-                                        conv_desc, algo,
+-                                        d_workspace, workspace_size,
+-                                        &beta,
+-                                        output_desc, output));
+-
+-    // Add bias if present
+-    if (bias != nullptr) {
+-        // Use cudnnAddTensor
+-        float alpha_bias = 1.0f, beta_bias = 1.0f;
+-        CUDNN_CHECK(cudnnAddTensor(cudnn, &alpha_bias, bias_desc, bias, &beta_bias, output_desc, output));
+-    }
+-
+-    if (d_workspace) CUDA_CHECK(cudaFree(d_workspace));
+-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(input_desc));
+-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(output_desc));
+-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(bias_desc));
+-    CUDNN_CHECK(cudnnDestroyFilterDescriptor(filter_desc));
+-    CUDNN_CHECK(cudnnDestroyConvolutionDescriptor(conv_desc));
+-    CUDNN_CHECK(cudnnDestroy(cudnn));
+-}
++    int total = batch * out_channels * out_height * out_width;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    conv2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, weight, bias, output,
++        batch, in_channels, in_height, in_width, out_channels,
++        kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w,
++        dilation_h, dilation_w
++    );
++    CUDA_CHECK(cudaGetLastError());
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -3,12 +3,13 @@
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cstdint>
++#include <vector>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+ extern "C" void stft_forward_launcher(
+     const float* input,
+-    cuComplex* output,
++    float2* output,
+     int batch,
+     int sequence_length,
+     int n_fft,
+@@ -18,7 +19,7 @@
+ );
+ 
+ extern "C" void view_as_real_permute_launcher(
+-    const cuComplex* input,
++    const float2* input,
+     float* output,
+     int batch,
+     int freq_bins,
+@@ -60,12 +61,10 @@
+     cudaStream_t stream
+ );
+ 
+-// Helper to get current CUDA stream
+ static cudaStream_t getCurrentStream() {
+     return c10::cuda::getCurrentCUDAStream().stream();
+ }
+ 
+-// STFT forward
+ static torch::Tensor stft_forward(torch::Tensor input, int64_t n_fft, int64_t win_length, int64_t hop_length) {
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+@@ -80,14 +79,13 @@
+     int padded_len = sequence_length + pad_left + pad_right;
+     int frames = 1 + (padded_len - n_fft) / hop_length; // center=True
+ 
+-    // Allocate output: complex64 [batch, freq_bins, frames]
+     auto options = torch::TensorOptions().dtype(torch::kComplex64).device(input.device());
+     auto output = torch::empty({batch, freq_bins, frames}, options);
+ 
+     cudaStream_t stream = getCurrentStream();
+     stft_forward_launcher(
+         input.data_ptr<float>(),
+-        reinterpret_cast<cuComplex*>(output.data_ptr<c10::complex<float>>()),
++        reinterpret_cast<float2*>(output.data_ptr<c10::complex<float>>()),
+         batch,
+         sequence_length,
+         static_cast<int>(n_fft),
+@@ -96,14 +94,12 @@
+         stream
+     );
+ 
+-    // Check for kernel launch error
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "stft_forward kernel launch failed: ", cudaGetErrorString(err));
+ 
+     return output;
+ }
+ 
+-// view_as_real_permute forward
+ static torch::Tensor view_as_real_permute_forward(torch::Tensor input) {
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+@@ -114,13 +110,12 @@
+     int freq_bins = input.size(1);
+     int frames = input.size(2);
+ 
+-    // Allocate output: float32 [batch, 2, freq_bins, frames]
+     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+     auto output = torch::empty({batch, 2, freq_bins, frames}, options);
+ 
+     cudaStream_t stream = getCurrentStream();
+     view_as_real_permute_launcher(
+-        reinterpret_cast<const cuComplex*>(input.data_ptr<c10::complex<float>>()),
++        reinterpret_cast<const float2*>(input.data_ptr<c10::complex<float>>()),
+         output.data_ptr<float>(),
+         batch,
+         freq_bins,
+@@ -134,7 +129,6 @@
+     return output;
+ }
+ 
+-// conv2d forward
+ static torch::Tensor conv2d_forward(
+     torch::Tensor input,
+     torch::Tensor weight,
+@@ -158,7 +152,7 @@
+     TORCH_CHECK(input.dim() == 4, "input must be 4D (N,C,H,W)");
+     TORCH_CHECK(weight.dim() == 4, "weight must be 4D (K,C,R,S)");
+ 
+-    // Input may not be contiguous due to permute; cuDNN can handle strides but for simplicity we ensure contiguous
++    // cuDNN can handle strides, but custom kernel requires contiguous for simplicity
+     auto input_contig = input.contiguous();
+ 
+     int batch = input_contig.size(0);
+@@ -210,7 +204,6 @@
+     return output;
+ }
+ 
+-// index_select forward
+ static torch::Tensor index_select_forward(torch::Tensor input, int64_t dim, torch::Tensor index) {
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(index.is_cuda(), "index must be a CUDA tensor");
+@@ -227,7 +220,6 @@
+     int frames = input.size(3);
+     int num_indices = index.numel();
+ 
+-    // Output shape: [batch, channels, num_indices, frames]
+     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+     auto output = torch::empty({batch, channels, num_indices, frames}, options);
+ 

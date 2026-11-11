@@ -1,0 +1,146 @@
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <cstdint>
+
+// Kernel: compute max along dim=1 with keepdim=True
+// input shape: [N, C, H, W], output values/indices shape: [N, 1, H, W]
+// Each thread computes one output element (n, h, w) by reducing over C.
+__global__ void max_reduce_dim1_kernel(
+    float* __restrict__ values,
+    int64_t* __restrict__ indices,
+    const float* __restrict__ input,
+    int N, int C, int H, int W
+) {
+    int total = N * H * W;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    // Decode index: idx = n * (H * W) + h * W + w
+    int w = idx % W;
+    int tmp = idx / W;
+    int h = tmp % H;
+    int n = tmp / H;
+
+    // Pointer to first channel at (n, 0, h, w)
+    const float* base = input + ((size_t)n * C + 0) * H * W + h * W + w;
+    
+    float max_val = base[0];
+    int64_t max_idx = 0;
+    for (int c = 1; c < C; ++c) {
+        float val = base[(size_t)c * H * W];
+        if (val > max_val) {
+            max_val = val;
+            max_idx = c;
+        }
+    }
+    values[idx] = max_val;
+    indices[idx] = max_idx;
+}
+
+// Kernel: L2 normalize along dimension dim (expected dim=2 for this task)
+// input shape: [N, 1, H, W] (C=1 per contract after max)
+// output same shape. For dim=2, reduce over H.
+__global__ void l2_normalize_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ input,
+    int N, int C, int H, int W,
+    int dim
+) {
+    // We assume C==1 for custom_normalize input (shape [128,1,1024,256])
+    // Calculate total output elements: N*C*H*W
+    int total = N * C * H * W;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    // Decode idx into n, c, h, w where strides are C*H*W, H*W, W, 1
+    int w = idx % W;
+    int tmp = idx / W;
+    int h = tmp % H;
+    tmp /= H;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    // For dim=2, reduce over h (height). For other dim, fallback to no reduction? Contract only requires dim=2.
+    // Implement generic reduction over given dim, but only dim=2 is used.
+    float sum_sq = 0.0f;
+    if (dim == 2) {
+        // Sum over H for fixed n,c,w
+        const float* base = input + ((size_t)n * C + c) * H * W + 0 * W + w;
+        for (int hh = 0; hh < H; ++hh) {
+            float val = base[(size_t)hh * W];
+            sum_sq += val * val;
+        }
+    } else if (dim == 1) {
+        // Sum over C for fixed n,h,w (not used in current task)
+        const float* base = input + ((size_t)n * C) * H * W + h * W + w;
+        for (int cc = 0; cc < C; ++cc) {
+            float val = base[(size_t)cc * H * W];
+            sum_sq += val * val;
+        }
+    } else if (dim == 3) {
+        // Sum over W for fixed n,c,h
+        const float* base = input + ((size_t)n * C + c) * H * W + h * W;
+        for (int ww = 0; ww < W; ++ww) {
+            float val = base[ww];
+            sum_sq += val * val;
+        }
+    } else {
+        // unsupported dim, write input unchanged (should not happen)
+        output[idx] = input[idx];
+        return;
+    }
+
+    float norm = sqrtf(sum_sq);
+    // F.normalize uses eps=1e-12 by default, but contract doesn't mention eps.
+    // To match exactly, use eps=1e-12? PyTorch F.normalize(x, p=2, dim) default eps=1e-12.
+    // We'll apply same eps for numerical stability.
+    float eps = 1e-12f;
+    float denom = fmaxf(norm, eps);
+    output[idx] = input[idx] / denom;
+}
+
+// Launcher for custom_max_dim1
+extern "C" void custom_max_dim1_launcher(
+    float* values,
+    int64_t* indices,
+    const float* input,
+    int N,
+    int C,
+    int H,
+    int W,
+    cudaStream_t stream
+) {
+    int total = N * H * W;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    max_reduce_dim1_kernel<<<grid, block, 0, stream>>>(
+        values, indices, input, N, C, H, W
+    );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        // In a real binding we would throw, but here just ignore; binding layer can check after call
+    }
+}
+
+// Launcher for custom_normalize
+extern "C" void custom_normalize_launcher(
+    float* output,
+    const float* input,
+    int N,
+    int C,
+    int H,
+    int W,
+    int dim,
+    cudaStream_t stream
+) {
+    int total = N * C * H * W;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    l2_normalize_kernel<<<grid, block, 0, stream>>>(
+        output, input, N, C, H, W, dim
+    );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        // ignore
+    }
+}

@@ -1,0 +1,229 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -6,7 +6,7 @@
+ // out: 输出连续数据指针
+ // shape: 输入形状数组（维度数 ndim）
+ // strides: 输入步长数组（元素个数）
+-// out_shape: 输出形状数组
++// out_shape: 输出形状数组 (compact, 不包含 dim 维度)
+ // ndim: 维度数
+ // dim: 要归约的维度
+ // reduce_size: 归约维度的长度
+@@ -17,29 +17,34 @@
+                             const int64_t* __restrict__ out_shape,
+                             int ndim,
+                             int dim,
+-                            int64_t reduce_size) {
+-    int64_t total_out = 1;
+-    for (int i = 0; i < ndim; ++i) {
+-        if (i != dim) total_out *= out_shape[i];
+-    }
+-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++                            int64_t reduce_size,
++                            int64_t total_out) {
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * gridDim.x;
+     for (int64_t linear = idx; linear < total_out; linear += stride) {
+         // 将线性索引映射到输出多维坐标（跳过 dim 维度）
+         int64_t tmp = linear;
++        // out_coords 存储非归约维度的坐标，长度为 ndim
+         int64_t out_coords[8];
+-        int64_t in_coords[8];
+         int out_ndim = 0;
++        int64_t out_sizes[8];
+         for (int i = 0; i < ndim; ++i) {
+             if (i == dim) continue;
+-            int64_t size = out_shape[i];
+-            out_coords[i] = tmp % size;
+-            tmp /= size;
++            out_sizes[out_ndim] = out_shape[out_ndim];
++            out_coords[out_ndim] = tmp % out_sizes[out_ndim];
++            tmp /= out_sizes[out_ndim];
++            out_ndim++;
+         }
+         // 填充 in_coords: 非归约维度复制，归约维度置 0 起始
++        int64_t in_coords[8];
++        int out_idx = 0;
+         for (int i = 0; i < ndim; ++i) {
+-            if (i == dim) in_coords[i] = 0;
+-            else in_coords[i] = out_coords[i];
++            if (i == dim) {
++                in_coords[i] = 0;
++            } else {
++                in_coords[i] = out_coords[out_idx];
++                out_idx++;
++            }
+         }
+         int64_t base_offset = 0;
+         for (int i = 0; i < ndim; ++i) {
+@@ -58,7 +63,7 @@
+ // out: 输出连续数据指针
+ // shape: 输入形状数组
+ // strides: 输入步长数组
+-// out_shape: 输出形状数组（本实现中与 shape 相同，但保留参数）
++// out_shape: 输出形状数组（与 shape 相同）
+ // ndim: 维度数
+ // dim: softmax 维度
+ // dim_size: softmax 维度长度
+@@ -69,10 +74,9 @@
+                                const int64_t* __restrict__ out_shape,
+                                int ndim,
+                                int dim,
+-                               int64_t dim_size) {
+-    int64_t total_out = 1;
+-    for (int i = 0; i < ndim; ++i) total_out *= out_shape[i];
+-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++                               int64_t dim_size,
++                               int64_t total_out) {
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * gridDim.x;
+     for (int64_t linear = idx; linear < total_out; linear += stride) {
+         // 将线性索引映射到输出多维坐标
+@@ -82,21 +86,19 @@
+             coords[i] = tmp % out_shape[i];
+             tmp /= out_shape[i];
+         }
+-        // 计算 base_offset 和 stride for softmax dim
++        // 计算 base_offset: 非 softmax 维度的偏移
+         int64_t base_offset = 0;
+         for (int i = 0; i < ndim; ++i) {
+-            base_offset += coords[i] * strides[i];
++            if (i != dim) {
++                base_offset += coords[i] * strides[i];
++            }
+         }
+-        // 减去 dim 维度的步长贡献，因为我们要沿该维度迭代
+-        base_offset -= coords[dim] * strides[dim];
+-
+-        // 找最大值（数值稳定性）
++        // 沿 dim 维度迭代
+         float max_val = -FLT_MAX;
+         for (int64_t k = 0; k < dim_size; ++k) {
+             float val = x[base_offset + k * strides[dim]];
+             if (val > max_val) max_val = val;
+         }
+-        // 计算分母
+         float sum = 0.0f;
+         for (int64_t k = 0; k < dim_size; ++k) {
+             float val = __expf(x[base_offset + k * strides[dim]] - max_val);
+@@ -113,7 +115,7 @@
+ // Launcher for custom_mean: 沿 dim 求均值
+ // 输入: x (float*, 任意 stride), shape, strides, ndim, dim
+ // 输出: out (float*, 连续)
+-// 假设 out_shape 已由调用者计算，且 out 内存已分配
++// 由调用者计算 total_out 并传入
+ // 使用当前 stream
+ extern "C" void custom_mean_launcher(
+     const float* x,
+@@ -123,22 +125,19 @@
+     const int64_t* out_shape,
+     int ndim,
+     int64_t dim,
++    int64_t total_out,
+     cudaStream_t stream) {
+     int64_t reduce_size = shape[dim];
+-    int64_t total_out = 1;
+-    for (int i = 0; i < ndim; ++i) {
+-        if (i != dim) total_out *= out_shape[i];
+-    }
+     int threads = 256;
+     int blocks = (int)((total_out + threads - 1) / threads);
+     if (blocks > 65535) blocks = 65535;
+-    mean_kernel<<<blocks, threads, 0, stream>>>(x, out, shape, strides, out_shape, ndim, (int)dim, reduce_size);
++    mean_kernel<<<blocks, threads, 0, stream>>>(x, out, shape, strides, out_shape, ndim, (int)dim, reduce_size, total_out);
+ }
+ 
+ // Launcher for custom_softmax: 沿 dim 计算 softmax
+ // 输入: x (float*, 任意 stride), shape, strides, ndim, dim
+ // 输出: out (float*, 连续)
+-// out_shape 与 shape 相同，但保留参数
++// out_shape 与 shape 相同
+ extern "C" void custom_softmax_launcher(
+     const float* x,
+     float* out,
+@@ -147,12 +146,11 @@
+     const int64_t* out_shape,
+     int ndim,
+     int64_t dim,
++    int64_t total_out,
+     cudaStream_t stream) {
+     int64_t dim_size = shape[dim];
+-    int64_t total_out = 1;
+-    for (int i = 0; i < ndim; ++i) total_out *= out_shape[i];
+     int threads = 256;
+     int blocks = (int)((total_out + threads - 1) / threads);
+     if (blocks > 65535) blocks = 65535;
+-    softmax_kernel<<<blocks, threads, 0, stream>>>(x, out, shape, strides, out_shape, ndim, (int)dim, dim_size);
++    softmax_kernel<<<blocks, threads, 0, stream>>>(x, out, shape, strides, out_shape, ndim, (int)dim, dim_size, total_out);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -14,6 +14,7 @@
+     const int64_t* out_shape,
+     int ndim,
+     int64_t dim,
++    int64_t total_out,
+     cudaStream_t stream);
+ 
+ extern "C" void custom_softmax_launcher(
+@@ -24,6 +25,7 @@
+     const int64_t* out_shape,
+     int ndim,
+     int64_t dim,
++    int64_t total_out,
+     cudaStream_t stream);
+ 
+ torch::Tensor custom_mean_forward(torch::Tensor x, int64_t dim) {
+@@ -33,17 +35,21 @@
+     TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
+ 
+     int ndim = x.dim();
+-    // Normalize negative dim
++    // Normalize negative dim (already checked non-negative, but keep)
+     if (dim < 0) dim += ndim;
+ 
+     // Prepare shape, strides, out_shape vectors
+     std::vector<int64_t> shape(ndim);
+     std::vector<int64_t> strides(ndim);
+     std::vector<int64_t> out_shape;
++    int64_t total_out = 1;
+     for (int i = 0; i < ndim; ++i) {
+         shape[i] = x.size(i);
+         strides[i] = x.stride(i);
+-        if (i != dim) out_shape.push_back(x.size(i));
++        if (i != dim) {
++            out_shape.push_back(x.size(i));
++            total_out *= x.size(i);
++        }
+     }
+ 
+     // Allocate output tensor (contiguous)
+@@ -61,6 +67,7 @@
+         out_shape.data(),
+         ndim,
+         dim,
++        total_out,
+         stream);
+ 
+     // Check for kernel launch errors
+@@ -81,10 +88,12 @@
+     std::vector<int64_t> shape(ndim);
+     std::vector<int64_t> strides(ndim);
+     std::vector<int64_t> out_shape(ndim);
++    int64_t total_out = 1;
+     for (int i = 0; i < ndim; ++i) {
+         shape[i] = x.size(i);
+         strides[i] = x.stride(i);
+         out_shape[i] = x.size(i);
++        total_out *= x.size(i);
+     }
+ 
+     auto out = torch::empty(out_shape, x.options());
+@@ -99,6 +108,7 @@
+         out_shape.data(),
+         ndim,
+         dim,
++        total_out,
+         stream);
+ 
+     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "custom_softmax kernel launch failed");

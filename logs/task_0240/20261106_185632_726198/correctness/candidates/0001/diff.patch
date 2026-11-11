@@ -1,0 +1,234 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,122 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Elementwise binary cross entropy with logits for float32.
++// Formula: max(x,0) - x*y + log1p(exp(-abs(x)))
++// Inputs may have arbitrary strides; output has same strides as y_pred (assumed same as y_true per contract).
++// Grid-stride loop handles any numel.
++__global__ void bce_with_logits_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ y_pred,
++    const float* __restrict__ y_true,
++    int64_t numel,
++    int64_t pred_stride_0,
++    int64_t pred_stride_1,
++    int64_t pred_stride_2,
++    int64_t pred_stride_3,
++    int64_t true_stride_0,
++    int64_t true_stride_1,
++    int64_t true_stride_2,
++    int64_t true_stride_3,
++    int64_t out_stride_0,
++    int64_t out_stride_1,
++    int64_t out_stride_2,
++    int64_t out_stride_3)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        // Compute linear index to 4D coordinates with shape [N,1,H,W] (special case for dim1=1)
++        // More general: decode using known dimensions? We only know strides and numel.
++        // We assume shape is [128,1,1024,1024] per contract, but to be safe we can compute coordinates from linear index assuming dim1=1.
++        // But we don't have actual dimensions, only strides. For arbitrary shape with dims [d0,d1,d2,d3], linear index i = ((i0*d1 + i1)*d2 + i2)*d3 + i3.
++        // We can decode if we know d1,d2,d3. We only have strides, not dimensions. However we can use the fact that strides give the mapping: i0 = i / stride0? Not generally.
++        // Better approach: pass the actual dimensions as additional parameters, or use a generic function that computes pointer from linear index if strides are contiguous? 
++        // For correctness, we should pass dimensions or use the fact that the tensor has 4 dims and we can compute coordinates by successive division if we know dims.
++        // Contract says shape [128,1,1024,1024], so we can hardcode dimensions? That would break other shapes. We need a general kernel.
++        // The launcher can compute dims and pass them. We'll add dim0, dim1, dim2, dim3 parameters.
++    }
++}
++
++// We'll need dims to decode linear index. Modify kernel signature to include dims.
++// Actually we can avoid decoding by using per-dimension loops if we pass dims and strides. But grid-stride on linear index requires decode.
++// Let's rewrite kernel with dimensions passed.
++
++__global__ void bce_with_logits_kernel_dims(
++    float* __restrict__ output,
++    const float* __restrict__ y_pred,
++    const float* __restrict__ y_true,
++    int64_t dim0,
++    int64_t dim1,
++    int64_t dim2,
++    int64_t dim3,
++    int64_t pred_stride_0,
++    int64_t pred_stride_1,
++    int64_t pred_stride_2,
++    int64_t pred_stride_3,
++    int64_t true_stride_0,
++    int64_t true_stride_1,
++    int64_t true_stride_2,
++    int64_t true_stride_3,
++    int64_t out_stride_0,
++    int64_t out_stride_1,
++    int64_t out_stride_2,
++    int64_t out_stride_3)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t total = dim0 * dim1 * dim2 * dim3;
++    if (idx >= total) return;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total; i += stride) {
++        int64_t i0 = i / (dim1 * dim2 * dim3);
++        int64_t rem = i % (dim1 * dim2 * dim3);
++        int64_t i1 = rem / (dim2 * dim3);
++        rem %= (dim2 * dim3);
++        int64_t i2 = rem / dim3;
++        int64_t i3 = rem % dim3;
++
++        float x = y_pred[i0 * pred_stride_0 + i1 * pred_stride_1 + i2 * pred_stride_2 + i3 * pred_stride_3];
++        float y = y_true[i0 * true_stride_0 + i1 * true_stride_1 + i2 * true_stride_2 + i3 * true_stride_3];
++        float max_val = fmaxf(x, 0.0f);
++        float loss = max_val - x * y + log1pf(expf(-fabsf(x)));
++        output[i0 * out_stride_0 + i1 * out_stride_1 + i2 * out_stride_2 + i3 * out_stride_3] = loss;
++    }
++}
++
++// Host launcher called from binding (extern "C")
++extern "C" void bce_with_logits_forward_launcher(
++    float* output,
++    const float* y_pred,
++    const float* y_true,
++    int64_t dim0,
++    int64_t dim1,
++    int64_t dim2,
++    int64_t dim3,
++    int64_t pred_stride_0,
++    int64_t pred_stride_1,
++    int64_t pred_stride_2,
++    int64_t pred_stride_3,
++    int64_t true_stride_0,
++    int64_t true_stride_1,
++    int64_t true_stride_2,
++    int64_t true_stride_3,
++    int64_t out_stride_0,
++    int64_t out_stride_1,
++    int64_t out_stride_2,
++    int64_t out_stride_3,
++    cudaStream_t stream)
++{
++    int64_t total = dim0 * dim1 * dim2 * dim3;
++    if (total == 0) return;
++    const int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    // Grid cap: 2^31-1 blocks, but we can use a smaller grid and grid-stride loop handles rest.
++    // For total up to ~1.3e8, blocks ~524288 which is fine.
++    if (blocks > 65535) blocks = 65535; // optional cap
++    bce_with_logits_kernel_dims<<<blocks, threads, 0, stream>>>(
++        output, y_pred, y_true,
++        dim0, dim1, dim2, dim3,
++        pred_stride_0, pred_stride_1, pred_stride_2, pred_stride_3,
++        true_stride_0, true_stride_1, true_stride_2, true_stride_3,
++        out_stride_0, out_stride_1, out_stride_2, out_stride_3);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,87 @@
++// Binding for bce_with_logits_forward
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void bce_with_logits_forward_launcher(
++    float* output,
++    const float* y_pred,
++    const float* y_true,
++    int64_t dim0,
++    int64_t dim1,
++    int64_t dim2,
++    int64_t dim3,
++    int64_t pred_stride_0,
++    int64_t pred_stride_1,
++    int64_t pred_stride_2,
++    int64_t pred_stride_3,
++    int64_t true_stride_0,
++    int64_t true_stride_1,
++    int64_t true_stride_2,
++    int64_t true_stride_3,
++    int64_t out_stride_0,
++    int64_t out_stride_1,
++    int64_t out_stride_2,
++    int64_t out_stride_3,
++    cudaStream_t stream);
++
++torch::Tensor bce_with_logits_forward(torch::Tensor y_pred, torch::Tensor y_true) {
++    // Input validation
++    TORCH_CHECK(y_pred.is_cuda(), "y_pred must be a CUDA tensor");
++    TORCH_CHECK(y_true.is_cuda(), "y_true must be a CUDA tensor");
++    TORCH_CHECK(y_pred.dtype() == torch::kFloat32, "y_pred must be float32");
++    TORCH_CHECK(y_true.dtype() == torch::kFloat32, "y_true must be float32");
++    TORCH_CHECK(y_pred.sizes() == y_true.sizes(), "y_pred and y_true must have the same shape");
++    TORCH_CHECK(y_pred.dim() == 4, "y_pred must be 4D");
++
++    int64_t dim0 = y_pred.size(0);
++    int64_t dim1 = y_pred.size(1);
++    int64_t dim2 = y_pred.size(2);
++    int64_t dim3 = y_pred.size(3);
++
++    // Allocate output with same shape and strides as y_pred (contract says output shape same as y_pred)
++    auto output = torch::empty_strided(y_pred.sizes(), y_pred.strides(), y_pred.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Get strides
++    int64_t pred_stride_0 = y_pred.stride(0);
++    int64_t pred_stride_1 = y_pred.stride(1);
++    int64_t pred_stride_2 = y_pred.stride(2);
++    int64_t pred_stride_3 = y_pred.stride(3);
++
++    int64_t true_stride_0 = y_true.stride(0);
++    int64_t true_stride_1 = y_true.stride(1);
++    int64_t true_stride_2 = y_true.stride(2);
++    int64_t true_stride_3 = y_true.stride(3);
++
++    int64_t out_stride_0 = output.stride(0);
++    int64_t out_stride_1 = output.stride(1);
++    int64_t out_stride_2 = output.stride(2);
++    int64_t out_stride_3 = output.stride(3);
++
++    // Call launcher
++    bce_with_logits_forward_launcher(
++        output.data_ptr<float>(),
++        y_pred.data_ptr<float>(),
++        y_true.data_ptr<float>(),
++        dim0, dim1, dim2, dim3,
++        pred_stride_0, pred_stride_1, pred_stride_2, pred_stride_3,
++        true_stride_0, true_stride_1, true_stride_2, true_stride_3,
++        out_stride_0, out_stride_1, out_stride_2, out_stride_3,
++        stream);
++
++    return output;
++}
++
++void register_custom_ops_binding(pybind11::module& m) {
++    m.def("bce_with_logits_forward", &bce_with_logits_forward,
++          "Binary cross entropy with logits (elementwise, no reduction)",
++          py::arg("y_pred"), py::arg("y_true"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,16 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.bce_with_logits_forward(y_pred, y_true)
++
++    def debug_forward(self, *inputs):
++        y_pred, y_true = inputs
++        out = cuda_extension.bce_with_logits_forward(y_pred, y_true)
++        yield "step_001", out

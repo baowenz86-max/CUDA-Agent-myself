@@ -1,0 +1,149 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,54 @@
++#include <cuda_runtime.h>
++
++// Embedding forward kernel
++// indices: int64_t pointer, may have arbitrary strides specified by caller via linearized mapping
++// weight: float pointer, shape [num_embeddings, embedding_dim], contiguous
++// output: float pointer, shape [total_indices, embedding_dim], contiguous
++// total_indices: number of index elements (product of indices shape)
++// embedding_dim: dimension of embedding vectors
++__global__ void embedding_forward_kernel(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int64_t total_indices,
++    int64_t embedding_dim)
++{
++    int64_t global_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++
++    for (int64_t flat = global_idx; flat < total_indices; flat += stride) {
++        int64_t idx = indices[flat];
++        // PyTorch embedding treats out-of-range indices as undefined, but contract says valid indices.
++        // We skip safety to match contract; caller ensures indices in range.
++        const float* src = weight + idx * embedding_dim;
++        float* dst = output + flat * embedding_dim;
++        for (int64_t j = 0; j < embedding_dim; ++j) {
++            dst[j] = src[j];
++        }
++    }
++}
++
++// Launcher for embedding forward. Accepts raw pointers and stream.
++// The binding layer is responsible for ensuring tensors are on CUDA and appropriate dtypes.
++// It should pass contiguous indices/weight/output pointers. The binding layer may call
++// .contiguous() if needed.
++extern "C" void embedding_forward_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int64_t total_indices,
++    int64_t embedding_dim,
++    cudaStream_t stream)
++{
++    if (total_indices <= 0 || embedding_dim <= 0) {
++        return; // nothing to do for empty tensors
++    }
++
++    const int threads = 256;
++    int64_t blocks64 = (total_indices + threads - 1) / threads;
++    // Cap blocks to avoid excessive grid size for small inputs
++    int blocks = (int)min(blocks64, (int64_t)65535);
++
++    embedding_forward_kernel<<<blocks, threads, 0, stream>>>(
++        indices, weight, output, total_indices, embedding_dim);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,67 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void embedding_forward_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int64_t total_indices,
++    int64_t embedding_dim,
++    cudaStream_t stream);
++
++// PyTorch wrapper for embedding lookup
++torch::Tensor embedding_forward(torch::Tensor indices, torch::Tensor weight) {
++    // Validate device
++    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++
++    // Validate dtypes
++    TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++
++    // Ensure weight is contiguous
++    auto weight_contig = weight.contiguous();
++
++    // Ensure indices is contiguous; if not, make contiguous
++    auto indices_contig = indices.contiguous();
++
++    // Get dimensions
++    int64_t total_indices = indices_contig.numel();
++    int64_t embedding_dim = weight_contig.size(1);
++
++    // Allocate output tensor with shape indices.shape + [embedding_dim]
++    std::vector<int64_t> output_shape(indices_contig.sizes().begin(), indices_contig.sizes().end());
++    output_shape.push_back(embedding_dim);
++    auto output = torch::empty(output_shape, indices_contig.options().dtype(torch::kFloat32));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    embedding_forward_launcher(
++        indices_contig.data_ptr<int64_t>(),
++        weight_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total_indices,
++        embedding_dim,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_embedding_forward(pybind11::module& m) {
++    m.def("embedding_forward", &embedding_forward,
++          "Embedding forward pass",
++          py::arg("indices"), py::arg("weight"));
++}
++
++REGISTER_BINDING(embedding_forward, register_embedding_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,19 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim):
++        super().__init__()
++        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
++
++    def forward(self, x):
++        x = cuda_extension.embedding_forward(x, self.embedding.weight)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.embedding_forward(x, self.embedding.weight)
++        yield 'step_001', x
++        yield 'step_002', x
++        yield 'step_003', x

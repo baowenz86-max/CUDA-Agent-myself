@@ -1,0 +1,161 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,56 @@
++#include <cuda_runtime.h>
++
++// ELU kernel: f(x) = x if x > 0 else alpha * (expf(x) - 1.f)
++__global__ void elu_kernel(const float* __restrict__ input,
++                           float* __restrict__ output,
++                           long long n,
++                           float alpha) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (long long i = idx; i < n; i += stride) {
++        float x = input[i];
++        output[i] = (x > 0.0f) ? x : alpha * (expf(x) - 1.0f);
++    }
++}
++
++// ReLU kernel: f(x) = max(x, 0)
++__global__ void relu_kernel(const float* __restrict__ input,
++                            float* __restrict__ output,
++                            long long n) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (long long i = idx; i < n; i += stride) {
++        float x = input[i];
++        output[i] = (x > 0.0f) ? x : 0.0f;
++    }
++}
++
++// Launcher for ELU
++extern "C" cudaError_t custom_elu_launcher(const float* input,
++                                            float* output,
++                                            long long n,
++                                            double alpha,
++                                            cudaStream_t stream) {
++    if (n <= 0) return cudaSuccess;
++    const int threads = 256;
++    // 确保 grid 大小足够，同时避免整数溢出
++    long long blocks_ll = (n + threads - 1) / threads;
++    // 限制 grid 大小为 2^31-1，但通常不会超过（n ≈ 2e8，blocks ≈ 786k）
++    int blocks = (int)blocks_ll;
++    float alpha_f = (float)alpha;
++    elu_kernel<<<blocks, threads, 0, stream>>>(input, output, n, alpha_f);
++    return cudaGetLastError();
++}
++
++// Launcher for ReLU
++extern "C" cudaError_t custom_relu_launcher(const float* input,
++                                             float* output,
++                                             long long n,
++                                             cudaStream_t stream) {
++    if (n <= 0) return cudaSuccess;
++    const int threads = 256;
++    long long blocks_ll = (n + threads - 1) / threads;
++    int blocks = (int)blocks_ll;
++    relu_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
++    return cudaGetLastError();
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,70 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" cudaError_t custom_elu_launcher(const float* input,
++                                            float* output,
++                                            long long n,
++                                            double alpha,
++                                            cudaStream_t stream);
++
++extern "C" cudaError_t custom_relu_launcher(const float* input,
++                                             float* output,
++                                             long long n,
++                                             cudaStream_t stream);
++
++torch::Tensor custom_elu(torch::Tensor input, double alpha) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Input must be float32");
++    
++    // Ensure contiguous tensor for launcher (launcher assumes contiguous data)
++    auto input_contig = input.contiguous();
++    
++    auto output = torch::empty_like(input_contig);
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    
++    auto status = custom_elu_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input_contig.numel(),
++        alpha,
++        stream
++    );
++    TORCH_CHECK(status == cudaSuccess, "custom_elu_launcher failed with error: ", cudaGetErrorString(status));
++    
++    return output;
++}
++
++torch::Tensor custom_relu(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Input must be float32");
++    
++    auto input_contig = input.contiguous();
++    
++    auto output = torch::empty_like(input_contig);
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    
++    auto status = custom_relu_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input_contig.numel(),
++        stream
++    );
++    TORCH_CHECK(status == cudaSuccess, "custom_relu_launcher failed with error: ", cudaGetErrorString(status));
++    
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_elu", &custom_elu, "Custom ELU forward",
++          py::arg("input"), py::arg("alpha"));
++    m.def("custom_relu", &custom_relu, "Custom ReLU forward",
++          py::arg("input"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_channels):
++        super().__init__()
++        # 参考模型没有参数，无需保存 input_channels
++
++    def forward(self, x):
++        # 输入 x 来自 get_inputs，位于 CPU，需要转移到 CUDA
++        # 参考模型在 CUDA 上执行，因此这里显式转移
++        x = x.to('cuda')
++        x = cuda_extension.custom_elu(x, 1.0)
++        x = cuda_extension.custom_relu(x)
++        return x
++
++    def debug_forward(self, x):
++        # 与 forward 相同，输出各检查点
++        x = x.to('cuda')
++        x = cuda_extension.custom_elu(x, 1.0)
++        yield 'step_001', x
++        x = cuda_extension.custom_relu(x)
++        yield 'step_002', x
++        yield 'step_003', x

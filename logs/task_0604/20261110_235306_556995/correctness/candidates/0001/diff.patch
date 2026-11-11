@@ -1,0 +1,108 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,31 @@
++// Custom CUDA kernels for abs(ReLU6) fusion
++#include <cuda_runtime.h>
++
++// Elementwise abs then ReLU6: min(max(abs(x), 0), 6)
++// input/output are float32 CUDA pointers, contiguous or arbitrary stride handled by caller
++// numel: total number of elements
++__global__ void abs_relu6_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 long long numel) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (; idx < numel; idx += stride) {
++        float val = fabsf(input[idx]);
++        val = fminf(fmaxf(val, 0.0f), 6.0f);
++        output[idx] = val;
++    }
++}
++
++// Launcher: no PyTorch dependencies, takes raw pointers and CUDA stream
++// Used by the C++ binding layer
++extern "C" void abs_relu6_forward_launcher(const float* input,
++                                          float* output,
++                                          long long numel,
++                                          cudaStream_t stream) {
++    const int block_size = 256;
++    long long blocks_ll = (numel + block_size - 1) / block_size;
++    // Cap blocks to avoid exceeding grid dimension limit (2^31-1); kernel uses grid-stride loop,
++    // so sufficient blocks are checked. For typical numel <= 2^31, blocks_ll is within limit.
++    int blocks = (blocks_ll > 2147483647LL) ? 2147483647 : (int)blocks_ll;
++    abs_relu6_kernel<<<blocks, block_size, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,47 @@
++// Binding for abs_relu6_forward custom CUDA kernel
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declaration from custom_ops.cu
++extern "C" void abs_relu6_forward_launcher(const float* input,
++                                          float* output,
++                                          long long numel,
++                                          cudaStream_t stream);
++
++// PyTorch wrapper function
++torch::Tensor abs_relu6_forward(torch::Tensor input) {
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++
++    // Allocate output tensor with same shape and options
++    auto output = torch::empty_like(input);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call the launcher
++    abs_relu6_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input.numel(),
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++void register_abs_relu6_forward(pybind11::module& m) {
++    m.def("abs_relu6_forward", &abs_relu6_forward,
++          "Applies abs then ReLU6 elementwise",
++          pybind11::arg("input"));
++}
++
++// Auto-register
++REGISTER_BINDING(abs_relu6_forward, register_abs_relu6_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        return cuda_extension.abs_relu6_forward(x)
++
++    def debug_forward(self, x):
++        # Step 1: torch.abs(x)
++        x_abs = cuda_extension.abs_relu6_forward(x)
++        yield ('step_001', x_abs)
++        # Step 2: nn.ReLU6()(x)
++        x_relu6 = cuda_extension.abs_relu6_forward(x_abs)
++        yield ('step_002', x_relu6)
++        # Step 3: return x
++        yield ('step_003', x_relu6)

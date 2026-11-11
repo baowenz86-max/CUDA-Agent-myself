@@ -1,0 +1,272 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,121 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel for max reduction over dimension 1 (channels) with keepdim=True.
++// Input: x of shape [B, C, H, W] contiguous, output values [B,1,H,W] float, indices [B,1,H,W] int64
++// dim is always 1 according to contract, but we implement generic enough for dim=1.
++// keepdim is always true, but we handle it if false by adjusting output shape (not used in current model).
++// We assume contiguous tensors as per contract.
++__global__ void max_dim1_kernel(const float* __restrict__ x,
++                                float* __restrict__ values,
++                                int64_t* __restrict__ indices,
++                                int B, int C, int H, int W) {
++    int64_t total = (int64_t)B * H * W;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t linear = idx; linear < total; linear += stride) {
++        int w = linear % W;
++        int h = (linear / W) % H;
++        int b = linear / (W * H);
++        // Compute max across C
++        const float* base = x + (((int64_t)b * C) * H + h) * W + w;
++        float max_val = base[0];
++        int64_t max_idx = 0;
++        for (int c = 1; c < C; ++c) {
++            float val = base[(int64_t)c * H * W];
++            if (val > max_val) {
++                max_val = val;
++                max_idx = c;
++            }
++            // ties keep first index, as done by sequential scan
++        }
++        values[linear] = max_val;
++        indices[linear] = max_idx;
++    }
++}
++
++// Kernel for MSE loss: mean((input - target)^2) over all elements.
++// input: [B,1,H,W] contiguous, target: [B,1,1,1] contiguous.
++// Broadcast target along H and W.
++// Output: scalar float (1 element).
++__global__ void mse_loss_kernel(const float* __restrict__ input,
++                                const float* __restrict__ target,
++                                float* __restrict__ output,
++                                int B, int H, int W,
++                                int64_t num_elements) {
++    // Each thread computes partial sum over its assigned elements.
++    double local_sum = 0.0;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < num_elements; i += stride) {
++        // map i to b, h, w
++        int w = i % W;
++        int h = (i / W) % H;
++        int b = i / (W * H);
++        float diff = input[i] - target[b];
++        local_sum += (double)diff * diff;
++    }
++    // Reduce within block using shared memory
++    __shared__ double smem[256];
++    int tid = threadIdx.x;
++    smem[tid] = local_sum;
++    __syncthreads();
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            smem[tid] += smem[tid + s];
++        }
++        __syncthreads();
++    }
++    // First thread of each block atomically adds to global sum
++    if (tid == 0) {
++        atomicAdd(output, (float)smem[0]);
++    }
++}
++
++// Launcher for custom_max_dim
++// Parameters: x pointer, values pointer, indices pointer, dim, keepdim, B, C, H, W, stream
++extern "C" void custom_max_dim_launcher(const float* x,
++                                        float* values,
++                                        int64_t* indices,
++                                        int64_t dim,
++                                        bool keepdim,
++                                        int64_t B,
++                                        int64_t C,
++                                        int64_t H,
++                                        int64_t W,
++                                        cudaStream_t stream) {
++    // Only dim=1 supported here, but we can have a generic dim kernel later if needed.
++    // For safety, assert dim==1 and keepdim==true.
++    if (dim != 1 || !keepdim) {
++        // Invalid, handle by filling zeros? Better to return error? But we cannot throw here.
++        // Since contract guarantees dim=1 and keepdim=true, we can just proceed.
++        // If not, we could still run but with incorrect output shape. We'll ignore.
++    }
++    int64_t total = B * H * W;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // Cap grid size, kernel uses grid-stride loop
++    max_dim1_kernel<<<blocks, threads, 0, stream>>>(x, values, indices, (int)B, (int)C, (int)H, (int)W);
++}
++
++// Launcher for custom_mse_loss
++// Parameters: input pointer, target pointer, output pointer, B, H, W, num_elements, stream
++extern "C" void custom_mse_loss_launcher(const float* input,
++                                          const float* target,
++                                          float* output,
++                                          int64_t B,
++                                          int64_t H,
++                                          int64_t W,
++                                          int64_t num_elements,
++                                          cudaStream_t stream) {
++    // Initialize output to 0 before kernel
++    cudaMemsetAsync(output, 0, sizeof(float), stream);
++    int threads = 256;
++    // Use multiple blocks to improve parallelism, but limited by shared memory size (256 floats).
++    // We can use grid-stride loop within each block to cover all elements, then each block reduces its sum and atomically adds.
++    // Choose reasonable grid size: up to 256 blocks? We'll use enough to cover elements but cap.
++    int blocks = (int)((num_elements + threads - 1) / threads);
++    if (blocks > 1024) blocks = 1024; // cap to avoid excessive blocks
++    if (blocks == 0) blocks = 1;
++    mse_loss_kernel<<<blocks, threads, 0, stream>>>(input, target, output, (int)B, (int)H, (int)W, num_elements);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,122 @@
++// Binding for custom max_dim and mse_loss operators
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_max_dim_launcher(const float* x,
++                                        float* values,
++                                        int64_t* indices,
++                                        int64_t dim,
++                                        bool keepdim,
++                                        int64_t B,
++                                        int64_t C,
++                                        int64_t H,
++                                        int64_t W,
++                                        cudaStream_t stream);
++
++extern "C" void custom_mse_loss_launcher(const float* input,
++                                          const float* target,
++                                          float* output,
++                                          int64_t B,
++                                          int64_t H,
++                                          int64_t W,
++                                          int64_t num_elements,
++                                          cudaStream_t stream);
++
++std::tuple<torch::Tensor, torch::Tensor> custom_max_dim(torch::Tensor x, int64_t dim, bool keepdim) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (B, C, H, W)");
++    TORCH_CHECK(dim == 1, "only dim=1 supported");
++    TORCH_CHECK(keepdim == true, "only keepdim=true supported");
++
++    int64_t B = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    // Allocate output tensors with shape [B, 1, H, W]
++    auto values = torch::empty({B, 1, H, W}, x.options());
++    auto indices = torch::empty({B, 1, H, W}, x.options().dtype(torch::kInt64));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_max_dim_launcher(
++        x.data_ptr<float>(),
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        dim,
++        keepdim,
++        B,
++        C,
++        H,
++        W,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_max_dim kernel launch failed: ", cudaGetErrorString(err));
++
++    return std::make_tuple(values, indices);
++}
++
++torch::Tensor custom_mse_loss(torch::Tensor input, torch::Tensor target) {
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(target.is_cuda(), "target must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(target.dtype() == torch::kFloat32, "target must be float32");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(target.is_contiguous(), "target must be contiguous");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (B, 1, H, W)");
++    TORCH_CHECK(target.dim() == 4, "target must be 4D (B, 1, 1, 1)");
++    TORCH_CHECK(input.size(0) == target.size(0), "batch size mismatch");
++    TORCH_CHECK(input.size(1) == 1, "input channel must be 1");
++    TORCH_CHECK(target.size(1) == 1 && target.size(2) == 1 && target.size(3) == 1, "target must have shape [B,1,1,1]");
++
++    int64_t B = input.size(0);
++    int64_t H = input.size(2);
++    int64_t W = input.size(3);
++    int64_t num_elements = B * H * W;
++
++    // Allocate scalar output tensor
++    auto output = torch::empty({}, input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher (launcher will initialize output to 0 via cudaMemsetAsync)
++    custom_mse_loss_launcher(
++        input.data_ptr<float>(),
++        target.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B,
++        H,
++        W,
++        num_elements,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_mse_loss kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_max_dim", &custom_max_dim, "Custom max over dim=1 with keepdim=true",
++          py::arg("x"), py::arg("dim"), py::arg("keepdim"));
++    m.def("custom_mse_loss", &custom_mse_loss, "Custom MSE loss",
++          py::arg("input"), py::arg("target"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
++        max_val, _ = cuda_extension.custom_max_dim(x, 1, True)
++        loss = cuda_extension.custom_mse_loss(max_val, y)
++        return loss
++
++    def debug_forward(self, x: torch.Tensor, y: torch.Tensor):
++        max_val, _ = cuda_extension.custom_max_dim(x, 1, True)
++        yield 'step_001', (max_val, _)
++        loss = cuda_extension.custom_mse_loss(max_val, y)
++        yield 'step_002', loss
++        yield 'step_003', loss

@@ -1,0 +1,309 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,143 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// ----------------------------------------------------------------------------
++// avg_pool2d kernel
++// Computes 2D average pooling with kernel_size x kernel_size, stride, padding.
++// Input: (B, C, H, W) float32, arbitrary strides
++// Output: (B, C, outH, outW) float32, contiguous (allocated by binding)
++// Semantics match torch.nn.AvgPool2d with count_include_pad=True (default),
++// i.e. divisor is kernel_size*kernel_size, padded zeros included.
++// ----------------------------------------------------------------------------
++__global__ void avg_pool2d_forward_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int B, int C, int H, int W,
++    int KH, int KW,
++    int stride_h, int stride_w,
++    int pad_h, int pad_w,
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_height_stride,
++    long long input_width_stride)
++{
++    int outH = (H + 2 * pad_h - KH) / stride_h + 1;
++    int outW = (W + 2 * pad_w - KW) / stride_w + 1;
++    int total = B * C * outH * outW;
++
++    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
++        int ow = idx % outW;
++        int oh = (idx / outW) % outH;
++        int c = (idx / (outW * outH)) % C;
++        int b = idx / (outW * outH * C);
++
++        const float* in_c = input + b * input_batch_stride + c * input_channel_stride;
++
++        float sum = 0.0f;
++        int h_start = oh * stride_h - pad_h;
++        int w_start = ow * stride_w - pad_w;
++
++        for (int kh = 0; kh < KH; ++kh) {
++            int ih = h_start + kh;
++            if (ih < 0 || ih >= H) continue;
++            for (int kw = 0; kw < KW; ++kw) {
++                int iw = w_start + kw;
++                if (iw < 0 || iw >= W) continue;
++                sum += in_c[ih * input_height_stride + iw * input_width_stride];
++            }
++        }
++        output[idx] = sum / (float)(KH * KW);
++    }
++}
++
++// ----------------------------------------------------------------------------
++// min over dimension 1 (channels)
++// Input: (B, C, H, W) float32, arbitrary strides
++// Output: (B, H, W) float32, contiguous
++// dim must be 1; output index maps (b, h, w) -> minimum over c
++// ----------------------------------------------------------------------------
++__global__ void min_dim1_forward_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int B, int C, int H, int W,
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_height_stride,
++    long long input_width_stride)
++{
++    int total = B * H * W;
++
++    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
++        int w = idx % W;
++        int h = (idx / W) % H;
++        int b = idx / (W * H);
++
++        const float* base = input + b * input_batch_stride + h * input_height_stride + w * input_width_stride;
++        float min_val = base[0 * input_channel_stride];  // channel 0
++        for (int c = 1; c < C; ++c) {
++            float val = base[c * input_channel_stride];
++            if (val < min_val) min_val = val;
++        }
++        output[idx] = min_val;
++    }
++}
++
++// ----------------------------------------------------------------------------
++// Host launchers (no PyTorch dependencies, raw pointers + cudaStream_t)
++// ----------------------------------------------------------------------------
++extern "C" void avg_pool2d_launcher(
++    float* output,
++    const float* input,
++    int B, int C, int H, int W,
++    int kernel_size, int stride, int padding,
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_height_stride,
++    long long input_width_stride,
++    cudaStream_t stream)
++{
++    // Assume kernel_size is square (KH=KW)
++    int KH = kernel_size;
++    int KW = kernel_size;
++    int stride_h = stride;
++    int stride_w = stride;
++    int pad_h = padding;
++    int pad_w = padding;
++
++    int outH = (H + 2 * pad_h - KH) / stride_h + 1;
++    int outW = (W + 2 * pad_w - KW) / stride_w + 1;
++    int total = B * C * outH * outW;
++
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    // cap grid to avoid excessive blocks, but ensure coverage via grid-stride loop
++    if (grid > 65535) grid = 65535;
++
++    avg_pool2d_forward_kernel<<<grid, block, 0, stream>>>(
++        output, input, B, C, H, W,
++        KH, KW, stride_h, stride_w, pad_h, pad_w,
++        input_batch_stride, input_channel_stride, input_height_stride, input_width_stride);
++}
++
++extern "C" void min_dim_launcher(
++    float* output,
++    const float* input,
++    int B, int C, int H, int W,
++    int dim,
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_height_stride,
++    long long input_width_stride,
++    cudaStream_t stream)
++{
++    // Only dim=1 is used according to contract; if dim != 1, we still compute min over channels
++    // but for safety, we ignore dim and assume 1. The binding should validate.
++    int total = B * H * W;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    if (grid > 65535) grid = 65535;
++
++    min_dim1_forward_kernel<<<grid, block, 0, stream>>>(
++        output, input, B, C, H, W,
++        input_batch_stride, input_channel_stride, input_height_stride, input_width_stride);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,125 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void avg_pool2d_launcher(
++    float* output,
++    const float* input,
++    int B, int C, int H, int W,
++    int kernel_size, int stride, int padding,
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_height_stride,
++    long long input_width_stride,
++    cudaStream_t stream);
++
++extern "C" void min_dim_launcher(
++    float* output,
++    const float* input,
++    int B, int C, int H, int W,
++    int dim,
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_height_stride,
++    long long input_width_stride,
++    cudaStream_t stream);
++
++// Wrapper for avg_pool2d_forward
++torch::Tensor avg_pool2d_forward(torch::Tensor x, int64_t kernel_size, int64_t stride, int64_t padding) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (B, C, H, W)");
++
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Validate kernel_size, stride, padding
++    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++
++    int outH = (H + 2 * padding - kernel_size) / stride + 1;
++    int outW = (W + 2 * padding - kernel_size) / stride + 1;
++    TORCH_CHECK(outH > 0 && outW > 0, "Invalid output size");
++
++    auto output = torch::empty({B, C, outH, outW}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    avg_pool2d_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        B, C, H, W,
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        static_cast<int>(padding),
++        x.stride(0),
++        x.stride(1),
++        x.stride(2),
++        x.stride(3),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for min_dim_forward
++torch::Tensor min_dim_forward(torch::Tensor x, int64_t dim) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (B, C, H, W)");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported");
++
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    auto output = torch::empty({B, H, W}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    min_dim_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        B, C, H, W,
++        static_cast<int>(dim),
++        x.stride(0),
++        x.stride(1),
++        x.stride(2),
++        x.stride(3),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("avg_pool2d_forward", &avg_pool2d_forward,
++          "Average pooling 2D forward",
++          py::arg("x"),
++          py::arg("kernel_size"),
++          py::arg("stride"),
++          py::arg("padding"));
++
++    m.def("min_dim_forward", &min_dim_forward,
++          "Minimum over dimension 1",
++          py::arg("x"),
++          py::arg("dim"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,32 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
++        super().__init__()
++        # 保留参数结构，避免 state_dict 差异
++        self.avg_pool = nn.AvgPool2d(kernel_size, stride=stride, padding=padding)
++
++    def forward(self, x):
++        x = cuda_extension.avg_pool2d_forward(
++            x,
++            kernel_size=self.avg_pool.kernel_size,
++            stride=self.avg_pool.stride,
++            padding=self.avg_pool.padding
++        )
++        x = cuda_extension.min_dim_forward(x, dim=1)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x_pool = cuda_extension.avg_pool2d_forward(
++            x,
++            kernel_size=self.avg_pool.kernel_size,
++            stride=self.avg_pool.stride,
++            padding=self.avg_pool.padding
++        )
++        yield "step_001", x_pool
++        result = cuda_extension.min_dim_forward(x_pool, dim=1)
++        yield "step_002", result

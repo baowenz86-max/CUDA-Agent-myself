@@ -1,0 +1,264 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,115 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// -----------------------------------------------------------------------------
++// prod_channel_keepdim kernel
++// 计算 x 张量的通道维(dim=1)乘积，保持维度。
++// 输入 x 形状: [N, C, H, W]，输出形状: [N, 1, H, W]
++// 布局支持任意 stride。
++// -----------------------------------------------------------------------------
++__global__ void prod_channel_keepdim_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    long long in_stride_n, long long in_stride_c, long long in_stride_h, long long in_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w)
++{
++    int hw_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_hw = H * W;
++    if (hw_idx >= total_hw) return;
++
++    int h = hw_idx / W;
++    int w = hw_idx - h * W;
++
++    for (int n = 0; n < N; ++n) {
++        const float* in_base = input + n * in_stride_n + h * in_stride_h + w * in_stride_w;
++        float prod = in_base[0];
++        for (int c = 1; c < C; ++c) {
++            prod *= in_base[c * in_stride_c];
++        }
++        float* out_ptr = output + n * out_stride_n + h * out_stride_h + w * out_stride_w;
++        *out_ptr = prod;
++    }
++}
++
++extern "C" void prod_channel_keepdim_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    long long in_stride_n, long long in_stride_c, long long in_stride_h, long long in_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
++    cudaStream_t stream)
++{
++    int total_hw = H * W;
++    int block = 256;
++    int grid = (total_hw + block - 1) / block;
++    prod_channel_keepdim_kernel<<<grid, block, 0, stream>>>(
++        input, output, N, C, H, W,
++        in_stride_n, in_stride_c, in_stride_h, in_stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w);
++}
++
++// -----------------------------------------------------------------------------
++// max_pool2d kernel
++// 2D 最大池化，kernel_size=(kh, kw), stride=(sh, sw), padding=(ph, pw), dilation=1
++// 输入形状: [N, C, H_in, W_in]，输出形状: [N, C, H_out, W_out]
++// 支持任意 stride，使用 input_stride 访问。
++// -----------------------------------------------------------------------------
++__global__ void max_pool2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H_in, int W_in, int H_out, int W_out,
++    int kh, int kw, int sh, int sw, int ph, int pw,
++    long long in_stride_n, long long in_stride_c, long long in_stride_h, long long in_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * H_out * W_out;
++    if (idx >= total) return;
++
++    int w_out = idx % W_out;
++    int tmp = idx / W_out;
++    int h_out = tmp % H_out;
++    tmp /= H_out;
++    int c = tmp % C;
++    int n = tmp / C;
++
++    int h_start = h_out * sh - ph;
++    int w_start = w_out * sw - pw;
++
++    const float* in_base = input + n * in_stride_n + c * in_stride_c;
++    float max_val = -3.402823466e+38f; // -FLT_MAX
++
++    for (int i = 0; i < kh; ++i) {
++        int h_in = h_start + i;
++        if (h_in < 0 || h_in >= H_in) continue;
++        for (int j = 0; j < kw; ++j) {
++            int w_in = w_start + j;
++            if (w_in < 0 || w_in >= W_in) continue;
++            float val = in_base[h_in * in_stride_h + w_in * in_stride_w];
++            if (val > max_val) max_val = val;
++        }
++    }
++
++    float* out_ptr = output + n * out_stride_n + c * out_stride_c + h_out * out_stride_h + w_out * out_stride_w;
++    *out_ptr = max_val;
++}
++
++extern "C" void max_pool2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in, int H_out, int W_out,
++    int kh, int kw, int sh, int sw, int ph, int pw,
++    long long in_stride_n, long long in_stride_c, long long in_stride_h, long long in_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
++    cudaStream_t stream)
++{
++    int total = N * C * H_out * W_out;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    max_pool2d_kernel<<<grid, block, 0, stream>>>(
++        input, output, N, C, H_in, W_in, H_out, W_out,
++        kh, kw, sh, sw, ph, pw,
++        in_stride_n, in_stride_c, in_stride_h, in_stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,109 @@
++#include <torch/types.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void prod_channel_keepdim_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    long long in_stride_n, long long in_stride_c, long long in_stride_h, long long in_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
++    cudaStream_t stream);
++
++extern "C" void max_pool2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in, int H_out, int W_out,
++    int kh, int kw, int sh, int sw, int ph, int pw,
++    long long in_stride_n, long long in_stride_c, long long in_stride_h, long long in_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
++    cudaStream_t stream);
++
++static torch::Tensor prod_channel_keepdim(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "prod_channel_keepdim: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "prod_channel_keepdim: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "prod_channel_keepdim: input must be 4D (N,C,H,W)");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    auto out = torch::empty({N, 1, H, W}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    prod_channel_keepdim_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        N, C, H, W,
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
++        stream
++    );
++
++    return out;
++}
++
++static torch::Tensor max_pool2d(torch::Tensor x,
++                                int64_t kernel_h,
++                                int64_t kernel_w,
++                                int64_t stride,
++                                int64_t pad_h,
++                                int64_t pad_w) {
++    TORCH_CHECK(x.is_cuda(), "max_pool2d: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "max_pool2d: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "max_pool2d: input must be 4D (N,C,H,W)");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H_in = x.size(2);
++    int W_in = x.size(3);
++
++    int kh = static_cast<int>(kernel_h);
++    int kw = static_cast<int>(kernel_w);
++    int sh = static_cast<int>(stride);
++    int sw = static_cast<int>(stride);
++    int ph = static_cast<int>(pad_h);
++    int pw = static_cast<int>(pad_w);
++
++    int H_out = (H_in + 2 * ph - kh) / sh + 1;
++    int W_out = (W_in + 2 * pw - kw) / sw + 1;
++
++    auto out = torch::empty({N, C, H_out, W_out}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    max_pool2d_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        N, C, H_in, W_in, H_out, W_out,
++        kh, kw, sh, sw, ph, pw,
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
++        stream
++    );
++
++    return out;
++}
++
++static void register_custom_ops(pybind11::module& m) {
++    m.def("prod_channel_keepdim", &prod_channel_keepdim,
++          "prod_channel_keepdim(x) -> Tensor\n"
++          "Compute product over channel dimension (dim=1) keeping dimension size 1",
++          pybind11::arg("x"));
++
++    m.def("max_pool2d", &max_pool2d,
++          "max_pool2d(x, kernel_h, kernel_w, stride, pad_h, pad_w) -> Tensor\n"
++          "2D max pooling",
++          pybind11::arg("x"),
++          pybind11::arg("kernel_h") = 3,
++          pybind11::arg("kernel_w") = 5,
++          pybind11::arg("stride") = 1,
++          pybind11::arg("pad_h") = 1,
++          pybind11::arg("pad_w") = 2);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,31 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
++        super().__init__()
++        self.max_pool = nn.MaxPool2d(kernel_size, stride=stride, padding=padding)
++        # 以下属性仅为记住池化参数，便于扩展调用，不参与状态
++        self.kernel_size = kernel_size
++        self.stride = stride
++        self.padding = padding
++
++    def forward(self, x):
++        x = cuda_extension.prod_channel_keepdim(x)
++        kh, kw = self.kernel_size
++        sh = sw = self.stride if isinstance(self.stride, int) else self.stride[0]
++        ph, pw = self.padding
++        x = cuda_extension.max_pool2d(x, kh, kw, sh, ph, pw)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.prod_channel_keepdim(x)
++        yield 'step_001', x
++        kh, kw = self.kernel_size
++        sh = sw = self.stride if isinstance(self.stride, int) else self.stride[0]
++        ph, pw = self.padding
++        x = cuda_extension.max_pool2d(x, kh, kw, sh, ph, pw)
++        yield 'step_002', x
++        yield 'step_003', x

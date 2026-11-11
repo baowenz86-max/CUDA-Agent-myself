@@ -1,0 +1,101 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,28 @@
++#include <cuda_runtime.h>
++
++// Elementwise hardtanh: y = clamp(x, -1.0f, 1.0f)
++// Supports arbitrary strides: only numel matters.
++__global__ void hardtanh_kernel(const float* __restrict__ input,
++                                float* __restrict__ output,
++                                int64_t numel) {
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float v = input[i];
++        v = fminf(fmaxf(v, -1.0f), 1.0f);
++        output[i] = v;
++    }
++}
++
++// C interface launcher (no PyTorch dependencies)
++extern "C" void hardtanh_forward_launcher(float* output,
++                                          const float* input,
++                                          int64_t numel,
++                                          cudaStream_t stream) {
++    const int block = 256;
++    // Cap grid to avoid exceeding maximum grid dimensions, use grid-stride loop.
++    int64_t grid64 = (numel + block - 1) / block;
++    if (grid64 > 1073741824LL) grid64 = 1073741824LL; // 2^30 max grid in x dimension
++    int grid = (int)grid64;
++    hardtanh_kernel<<<grid, block, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,48 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Forward declaration of the CUDA launcher from custom_ops.cu
++extern "C" void hardtanh_forward_launcher(float* output,
++                                          const float* input,
++                                          int64_t numel,
++                                          cudaStream_t stream);
++
++// PyTorch binding for hardtanh forward
++torch::Tensor hardtanh_forward(torch::Tensor x) {
++    // Validate input
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    // Ensure input is contiguous; if not, make it contiguous
++    auto x_contig = x.contiguous();
++    
++    // Allocate output with same shape as input, preserving strides via empty_like
++    auto output = torch::empty_like(x_contig);
++    
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    
++    // Call launcher with raw pointers
++    hardtanh_forward_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        x_contig.numel(),
++        stream
++    );
++    
++    // Return output (contiguous). The model expects output with same shape/dtype/device,
++    // and since input from model is contiguous, output will match.
++    return output;
++}
++
++// Registration function
++void register_hardtanh(pybind11::module& m) {
++    m.def("hardtanh_forward", &hardtanh_forward, 
++          "HardTanh forward (clamp to [-1,1])",
++          pybind11::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(hardtanh, register_hardtanh);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,16 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.hardtanh_forward(x)
++
++    def debug_forward(self, x: torch.Tensor):
++        x = cuda_extension.hardtanh_forward(x)
++        yield 'step_001', x
++        yield 'step_002', x

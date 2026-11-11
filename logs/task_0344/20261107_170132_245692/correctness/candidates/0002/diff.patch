@@ -1,0 +1,389 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,8 +1,6 @@
+ #include <cuda_runtime.h>
+ 
+-// Reflection padding kernel for 4D tensor (N, C, H, W) with padding on H and W only.
+-// Input and output are assumed to be float32, with arbitrary strides supported.
+-// Output is contiguous (stride as standard contiguous layout).
++// Kernel for reflection padding
+ __global__ void reflection_pad2d_float_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+@@ -16,7 +14,6 @@
+     int64_t total_elements = (int64_t)N * C * H_out * W_out;
+     if (idx >= total_elements) return;
+ 
+-    // Decompose linear index to output coordinates (n, c, h_out, w_out)
+     int w_out = idx % W_out;
+     int64_t tmp = idx / W_out;
+     int h_out = tmp % H_out;
+@@ -24,7 +21,6 @@
+     int c = tmp % C;
+     int n = tmp / C;
+ 
+-    // Compute reflected input coordinates
+     int h_in = h_out - pad_h;
+     if (h_in < 0) h_in = -h_in;
+     if (h_in >= H_in) h_in = 2 * (H_in - 1) - h_in;
+@@ -41,9 +37,7 @@
+     output[idx] = input[input_offset];
+ }
+ 
+-// Gather kernel along dim=1. Input x has shape (N, C_x, H, W) with arbitrary strides.
+-// indices has shape (N, C_out, H, W) with arbitrary strides, int64_t.
+-// output shape (N, C_out, H, W) contiguous.
++// Kernel for gather along dim=1
+ __global__ void gather_dim1_float_kernel(
+     const float* __restrict__ input,
+     const int64_t* __restrict__ indices,
+@@ -71,7 +65,6 @@
+                          + (long long)w * idx_stride_w;
+     int c_in = (int)indices[idx_offset];
+ 
+-    // Assume indices are in valid range [0, C_x-1], no clamp needed for performance.
+     long long in_offset = (long long)n * in_stride_n
+                         + (long long)c_in * in_stride_c
+                         + (long long)h * in_stride_h
+@@ -80,10 +73,47 @@
+     output[idx] = input[in_offset];
+ }
+ 
+-// Launcher for reflection_pad2d_forward.
+-// Input: x (float32 CUDA tensor), padding (int, symmetric on both H and W)
+-// Output: new tensor of shape [N, C, H+2*padding, W+2*padding] contiguous.
+-// The binding layer is responsible for allocation and device checks.
++// Kernel for 2D convolution with bias (NCHW, float32)
++// weight shape: [C_out, C_in, K_h, K_w]
++// input shape: [N, C_in, H_in, W_in]
++// output shape: [N, C_out, H_out, W_out]
++// stride = 1, padding = 0 (as required by task)
++__global__ void conv2d_forward_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int K_h, int K_w,
++    int H_out, int W_out)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t total_elements = (int64_t)N * C_out * H_out * W_out;
++    if (idx >= total_elements) return;
++
++    int w_out = idx % W_out;
++    int64_t tmp = idx / W_out;
++    int h_out = tmp % H_out;
++    tmp /= H_out;
++    int c_out = tmp % C_out;
++    int n = tmp / C_out;
++
++    float sum = bias[c_out];
++    for (int c_in = 0; c_in < C_in; ++c_in) {
++        for (int kh = 0; kh < K_h; ++kh) {
++            for (int kw = 0; kw < K_w; ++kw) {
++                int h_in = h_out + kh;
++                int w_in = w_out + kw;
++                // No padding, so h_in, w_in are within bounds
++                sum += input[((n * C_in + c_in) * H_in + h_in) * W_in + w_in] *
++                       weight[((c_out * C_in + c_in) * K_h + kh) * K_w + kw];
++            }
++        }
++    }
++    output[idx] = sum;
++}
++
++// Launcher for reflection_pad2d_forward
+ extern "C" void reflection_pad2d_forward_launcher(
+     const float* input,
+     float* output,
+@@ -106,11 +136,7 @@
+     }
+ }
+ 
+-// Launcher for gather_custom_forward along dim=1.
+-// dim is assumed to be 1 (as per reference). If dim != 1, behavior is undefined.
+-// Input x: float32 CUDA tensor, shape [N, C_x, H, W], arbitrary strides.
+-// indices: int64 CUDA tensor, shape [N, C_out, H, W], arbitrary strides.
+-// output: allocated tensor shape [N, C_out, H, W] contiguous.
++// Launcher for gather_custom_forward
+ extern "C" void gather_custom_forward_launcher(
+     const float* input,
+     const int64_t* indices,
+@@ -133,3 +159,25 @@
+             idx_stride_n, idx_stride_c, idx_stride_h, idx_stride_w);
+     }
+ }
++
++// Launcher for conv2d forward (no padding, stride=1)
++extern "C" void conv2d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int K_h, int K_w,
++    int H_out, int W_out,
++    cudaStream_t stream)
++{
++    int64_t total_elements = (int64_t)N * C_out * H_out * W_out;
++    int block_size = 256;
++    int64_t grid_size = (total_elements + block_size - 1) / block_size;
++    if (grid_size > 0) {
++        conv2d_forward_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
++            input, weight, bias, output,
++            N, C_in, H_in, W_in,
++            C_out, K_h, K_w, H_out, W_out);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,7 +2,6 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include "../binding_registry.h"
+ 
+@@ -27,18 +26,23 @@
+     long long idx_stride_h, long long idx_stride_w,
+     cudaStream_t stream);
+ 
++extern "C" void conv2d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int K_h, int K_w,
++    int H_out, int W_out,
++    cudaStream_t stream);
++
+ // 辅助函数：检查 CUDA 错误
+ static void checkCudaError(cudaError_t err, const char* msg) {
+     TORCH_CHECK(err == cudaSuccess, msg, ": ", cudaGetErrorString(err));
+ }
+ 
+-static void checkCudnnError(cudnnStatus_t status, const char* msg) {
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, msg, ": ", cudnnGetErrorString(status));
+-}
+-
+ // reflection_pad2d_forward 包装
+ static torch::Tensor reflection_pad2d_forward_cpp(torch::Tensor x, int64_t padding) {
+-    // 输入检查
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(x.dim() == 4, "x must be 4D");
+@@ -49,14 +53,12 @@
+     int H_in = x.size(2);
+     int W_in = x.size(3);
+ 
+-    // 确保输入是 contiguous，如果不是则先 contiguous，简化 stride 处理
+     auto x_contig = x.contiguous();
+-    
++
+     int H_out = H_in + 2 * (int)padding;
+     int W_out = W_in + 2 * (int)padding;
+     auto output = torch::empty({N, C, H_out, W_out}, x.options());
+ 
+-    // 获取 strides（contiguous 后）
+     long long in_stride_n = x_contig.stride(0);
+     long long in_stride_c = x_contig.stride(1);
+     long long in_stride_h = x_contig.stride(2);
+@@ -77,7 +79,7 @@
+     return output;
+ }
+ 
+-// conv2d_cudnn_forward 包装
++// conv2d_cudnn_forward 包装（实际使用自定义 kernel 替代 cuDNN，因为环境中缺少 cuDNN 头文件）
+ static torch::Tensor conv2d_cudnn_forward_cpp(
+     torch::Tensor x,
+     torch::Tensor weight,
+@@ -85,7 +87,6 @@
+     int64_t stride,
+     int64_t padding) {
+ 
+-    // 参数检查
+     TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+     TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+     TORCH_CHECK(bias.is_cuda(), "bias must be CUDA");
+@@ -95,8 +96,8 @@
+     TORCH_CHECK(x.dim() == 4, "x must be 4D");
+     TORCH_CHECK(weight.dim() == 4, "weight must be 4D");
+     TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+-    TORCH_CHECK(stride >= 1, "stride must be at least 1");
+-    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++    TORCH_CHECK(stride == 1, "only stride=1 supported");
++    TORCH_CHECK(padding == 0, "only padding=0 supported");
+ 
+     int N = x.size(0);
+     int C_in = x.size(1);
+@@ -107,121 +108,33 @@
+     int K_h = weight.size(2);
+     int K_w = weight.size(3);
+ 
+-    // 确保 weight 和 bias 是 contiguous
+     auto weight_contig = weight.contiguous();
+     auto bias_contig = bias.contiguous();
+ 
+-    // 计算输出尺寸
+     int H_out = (H_in + 2 * (int)padding - K_h) / (int)stride + 1;
+     int W_out = (W_in + 2 * (int)padding - K_w) / (int)stride + 1;
+ 
+     auto output = torch::empty({N, C_out, H_out, W_out}, x.options());
+ 
+-    // 获取 stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // 创建 cuDNN 句柄
+-    cudnnHandle_t cudnn_handle;
+-    checkCudnnError(cudnnCreate(&cudnn_handle), "cudnnCreate failed");
+-    checkCudnnError(cudnnSetStream(cudnn_handle, stream), "cudnnSetStream failed");
+-
+-    // 创建张量描述符
+-    cudnnTensorDescriptor_t x_desc, y_desc;
+-    cudnnFilterDescriptor_t w_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    checkCudnnError(cudnnCreateTensorDescriptor(&x_desc), "cudnnCreateTensorDescriptor x failed");
+-    checkCudnnError(cudnnCreateTensorDescriptor(&y_desc), "cudnnCreateTensorDescriptor y failed");
+-    checkCudnnError(cudnnCreateFilterDescriptor(&w_desc), "cudnnCreateFilterDescriptor failed");
+-    checkCudnnError(cudnnCreateConvolutionDescriptor(&conv_desc), "cudnnCreateConvolutionDescriptor failed");
+-
+-    // 设置张量描述符，使用 NCHW 格式
+-    checkCudnnError(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                               N, C_in, H_in, W_in), "cudnnSetTensor4dDescriptor x failed");
+-    checkCudnnError(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                               N, C_out, H_out, W_out), "cudnnSetTensor4dDescriptor y failed");
+-
+-    // 设置 filter 描述符
+-    checkCudnnError(cudnnSetFilter4dDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+-                                              C_out, C_in, K_h, K_w), "cudnnSetFilter4dDescriptor failed");
+-
+-    // 设置卷积描述符
+-    checkCudnnError(cudnnSetConvolution2dDescriptor(conv_desc,
+-                                                    (int)padding, (int)padding,
+-                                                    (int)stride, (int)stride,
+-                                                    1, 1,
+-                                                    CUDNN_CROSS_CORRELATION,
+-                                                    CUDNN_DATA_FLOAT),
+-                    "cudnnSetConvolution2dDescriptor failed");
+-
+-    // 查找最快的算法
+-    int requested_algo_count = 1;
+-    int returned_algo_count = -1;
+-    cudnnConvolutionFwdAlgoPerf_t perf_results[1];
+-    checkCudnnError(cudnnFindConvolutionForwardAlgorithm(
+-                        cudnn_handle,
+-                        x_desc, w_desc, conv_desc, y_desc,
+-                        requested_algo_count, &returned_algo_count, perf_results),
+-                    "cudnnFindConvolutionForwardAlgorithm failed");
+-    cudnnConvolutionFwdAlgo_t algo = perf_results[0].algo;
+-
+-    // 获取 workspace 大小
+-    size_t workspace_size = 0;
+-    checkCudnnError(cudnnGetConvolutionForwardWorkspaceSize(
+-                        cudnn_handle, x_desc, w_desc, conv_desc, y_desc, algo, &workspace_size),
+-                    "cudnnGetConvolutionForwardWorkspaceSize failed");
+-
+-    // 分配 workspace
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        checkCudaError(cudaMalloc(&workspace, workspace_size), "cudaMalloc workspace failed");
+-    }
+-
+-    // 执行卷积
+-    const float alpha = 1.0f;
+-    const float beta = 0.0f;  // output 初始为零
+-    checkCudnnError(cudnnConvolutionForward(
+-                        cudnn_handle,
+-                        &alpha,
+-                        x_desc, x.data_ptr<float>(),
+-                        w_desc, weight_contig.data_ptr<float>(),
+-                        conv_desc, algo,
+-                        workspace, workspace_size,
+-                        &beta,
+-                        y_desc, output.data_ptr<float>()),
+-                    "cudnnConvolutionForward failed");
+-
+-    // 添加 bias
+-    if (bias.numel() > 0) {
+-        // 使用 cudnnAddTensor 或手动 kernel，这里使用 cudnnAddTensor
+-        cudnnTensorDescriptor_t bias_desc;
+-        checkCudnnError(cudnnCreateTensorDescriptor(&bias_desc), "cudnnCreateTensorDescriptor bias failed");
+-        // bias 是 C_out 维，需要扩展为 NCHW；cudnnAddTensor 支持 broadcast，但需要设置正确的 strides
+-        checkCudnnError(cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                                   1, C_out, 1, 1), "cudnnSetTensor4dDescriptor bias failed");
+-        const float alpha_bias = 1.0f;
+-        const float beta_bias = 1.0f;
+-        checkCudnnError(cudnnAddTensor(cudnn_handle, &alpha_bias, bias_desc, bias_contig.data_ptr<float>(),
+-                                       &beta_bias, y_desc, output.data_ptr<float>()),
+-                        "cudnnAddTensor bias failed");
+-        cudnnDestroyTensorDescriptor(bias_desc);
+-    }
+-
+-    // 清理
+-    if (workspace) cudaFree(workspace);
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyFilterDescriptor(w_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn_handle);
+-
+-    checkCudaError(cudaGetLastError(), "cuda error after conv2d_cudnn_forward");
++    conv2d_forward_launcher(
++        x.data_ptr<float>(),
++        weight_contig.data_ptr<float>(),
++        bias_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C_in, H_in, W_in,
++        C_out, K_h, K_w,
++        H_out, W_out,
++        stream
++    );
++
++    checkCudaError(cudaGetLastError(), "conv2d_forward_launcher failed");
+     return output;
+ }
+ 
+ // gather_custom_forward 包装
+ static torch::Tensor gather_custom_forward_cpp(torch::Tensor x, int64_t dim, torch::Tensor indices) {
+-    // 参数检查
+     TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+     TORCH_CHECK(indices.is_cuda(), "indices must be CUDA");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+@@ -236,18 +149,15 @@
+     int W = x.size(3);
+ 
+     int C_out = indices.size(1);
+-    // 检查其他维度匹配
+     TORCH_CHECK(indices.size(0) == N, "batch size mismatch");
+     TORCH_CHECK(indices.size(2) == H, "height mismatch");
+     TORCH_CHECK(indices.size(3) == W, "width mismatch");
+ 
+-    // 确保 x 和 indices contiguous
+     auto x_contig = x.contiguous();
+     auto indices_contig = indices.contiguous();
+ 
+     auto output = torch::empty({N, C_out, H, W}, x.options());
+ 
+-    // 获取 strides
+     long long in_stride_n = x_contig.stride(0);
+     long long in_stride_c = x_contig.stride(1);
+     long long in_stride_h = x_contig.stride(2);
+@@ -280,7 +190,7 @@
+           "reflection pad 2d forward",
+           py::arg("x"), py::arg("padding"));
+     m.def("conv2d_cudnn_forward", &conv2d_cudnn_forward_cpp,
+-          "conv2d cudnn forward",
++          "conv2d cudnn forward (using custom kernel fallback)",
+           py::arg("x"), py::arg("weight"), py::arg("bias"),
+           py::arg("stride") = 1, py::arg("padding") = 0);
+     m.def("gather_custom_forward", &gather_custom_forward_cpp,
+@@ -288,5 +198,4 @@
+           py::arg("x"), py::arg("dim"), py::arg("indices"));
+ }
+ 
+-// 自动注册
+ REGISTER_BINDING(custom_ops, register_custom_ops);

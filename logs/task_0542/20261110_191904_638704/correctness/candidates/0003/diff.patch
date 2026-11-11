@@ -1,0 +1,324 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -18,8 +18,6 @@
+     int seq_len,
+     int embedding_dim
+ ) {
+-    // Each thread computes one output element (row = b, col = e)
+-    // Total elements = batch_size * seq_len * embedding_dim
+     int total = batch_size * seq_len * embedding_dim;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int stride = gridDim.x * blockDim.x;
+@@ -31,7 +29,6 @@
+         int b = tmp / seq_len;
+         
+         int64_t token = indices[b * seq_len + s];
+-        // Assume valid index, no padding_idx support needed
+         output[i] = weight[token * embedding_dim + e];
+     }
+ }
+@@ -43,10 +40,6 @@
+ // batch2: float, shape [batch, K, N]
+ // output: float, shape [batch, M, N]
+ // ---------------------------------------------------------------------
+-// Block size: 16x16 threads, each computes one output element.
+-// Shared memory tiles:
+-//   sA: 16 x 16 float (batch1 tile)
+-//   sB: 16 x 16 float (batch2 tile)
+ #define TILE_DIM 16
+ #define BLOCK_ROWS 16
+ #define BLOCK_COLS 16
+@@ -56,9 +49,9 @@
+     const float* __restrict__ batch1,
+     const float* __restrict__ batch2,
+     float* __restrict__ output,
+-    int M,      // seq_len
+-    int N,      // embedding_dim
+-    int K       // input_dim
++    int M,
++    int N,
++    int K
+ ) {
+     __shared__ float sA[BLOCK_ROWS][TILE_DIM];
+     __shared__ float sB[TILE_DIM][BLOCK_COLS];
+@@ -77,7 +70,6 @@
+ 
+     int num_tiles = (K + TILE_DIM - 1) / TILE_DIM;
+     for (int t = 0; t < num_tiles; ++t) {
+-        // Load tile from batch1: shape M x K
+         int k_start = t * TILE_DIM;
+         int k = k_start + threadIdx.x;
+         if (row < M && k < K) {
+@@ -86,7 +78,6 @@
+             sA[threadIdx.y][threadIdx.x] = 0.0f;
+         }
+ 
+-        // Load tile from batch2: shape K x N (transposed in shared memory)
+         int k_row = k_start + threadIdx.y;
+         if (k_row < K && col < N) {
+             sB[threadIdx.y][threadIdx.x] = batch2[batch * K * N + k_row * N + col];
+@@ -116,14 +107,18 @@
+ // ---------------------------------------------------------------------
+ 
+ // custom_embedding launcher:
+-//   indices_cpu: int64_t pointer on CPU, shape [batch_size * seq_len]
+-//   weight_cpu: float pointer on CPU, shape [num_embeddings * embedding_dim]
+-//   output_gpu: float pointer on GPU, shape [batch_size * seq_len * embedding_dim] (preallocated)
+-//   batch_size, seq_len, embedding_dim, num_embeddings: int scalars
++//   indices_ptr: int64_t pointer (CPU or GPU)
++//   indices_is_cpu: true if indices_ptr is on CPU
++//   weight_ptr: float pointer (CPU or GPU)
++//   weight_is_cpu: true if weight_ptr is on CPU
++//   output_gpu: float pointer on GPU, preallocated
++//   batch_size, seq_len, embedding_dim, num_embeddings
+ //   stream: cudaStream_t
+ extern "C" void custom_embedding_launcher(
+-    const int64_t* indices_cpu,
+-    const float* weight_cpu,
++    const int64_t* indices_ptr,
++    bool indices_is_cpu,
++    const float* weight_ptr,
++    bool weight_is_cpu,
+     float* output_gpu,
+     int batch_size,
+     int seq_len,
+@@ -134,43 +129,43 @@
+     size_t indices_bytes = (size_t)batch_size * seq_len * sizeof(int64_t);
+     size_t weight_bytes = (size_t)num_embeddings * embedding_dim * sizeof(float);
+     
+-    // Allocate temporary GPU buffers for indices and weight
+     int64_t* indices_gpu;
+     float* weight_gpu;
+     cudaMalloc(&indices_gpu, indices_bytes);
+     cudaMalloc(&weight_gpu, weight_bytes);
+     
+-    // Copy inputs from CPU to GPU asynchronously on stream
+-    cudaMemcpyAsync(indices_gpu, indices_cpu, indices_bytes, cudaMemcpyHostToDevice, stream);
+-    cudaMemcpyAsync(weight_gpu, weight_cpu, weight_bytes, cudaMemcpyHostToDevice, stream);
+-    
+-    // Launch kernel
++    cudaMemcpyKind indices_kind = indices_is_cpu ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
++    cudaMemcpyKind weight_kind = weight_is_cpu ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
++    
++    cudaMemcpyAsync(indices_gpu, indices_ptr, indices_bytes, indices_kind, stream);
++    cudaMemcpyAsync(weight_gpu, weight_ptr, weight_bytes, weight_kind, stream);
++    
+     int total = batch_size * seq_len * embedding_dim;
+     int block_size = 256;
+     int grid_size = (total + block_size - 1) / block_size;
+-    // Cap grid size to avoid huge launches, but use grid-stride loop
+     if (grid_size > 65535) grid_size = 65535;
+     embedding_lookup_kernel<<<grid_size, block_size, 0, stream>>>(
+         indices_gpu, weight_gpu, output_gpu,
+         batch_size, seq_len, embedding_dim
+     );
+     
+-    // Free temporary GPU buffers after kernel completes (on stream)
+     cudaFreeAsync(indices_gpu, stream);
+     cudaFreeAsync(weight_gpu, stream);
+ }
+ 
+ // custom_baddbmm launcher:
+-//   x_gpu: float pointer on GPU, shape [batch * M * N]
+-//   batch1_cpu: float pointer on CPU, shape [batch * M * K]
+-//   batch2_cpu: float pointer on CPU, shape [batch * K * N]
+-//   output_gpu: float pointer on GPU, shape [batch * M * N] (preallocated)
+-//   batch, M, N, K: int scalars
+-//   stream: cudaStream_t
++//   x_gpu: float pointer on GPU
++//   batch1_ptr: float pointer (CPU or GPU)
++//   batch1_is_cpu: true if batch1_ptr on CPU
++//   batch2_ptr: float pointer (CPU or GPU)
++//   batch2_is_cpu: true if batch2_ptr on CPU
++//   output_gpu: float pointer on GPU, preallocated
+ extern "C" void custom_baddbmm_launcher(
+     const float* x_gpu,
+-    const float* batch1_cpu,
+-    const float* batch2_cpu,
++    const float* batch1_ptr,
++    bool batch1_is_cpu,
++    const float* batch2_ptr,
++    bool batch2_is_cpu,
+     float* output_gpu,
+     int batch,
+     int M,
+@@ -181,19 +176,18 @@
+     size_t batch1_bytes = (size_t)batch * M * K * sizeof(float);
+     size_t batch2_bytes = (size_t)batch * K * N * sizeof(float);
+     
+-    // Allocate temporary GPU buffers for batch1 and batch2
+     float* batch1_gpu;
+     float* batch2_gpu;
+     cudaMalloc(&batch1_gpu, batch1_bytes);
+     cudaMalloc(&batch2_gpu, batch2_bytes);
+     
+-    // Copy batch1 and batch2 from CPU to GPU asynchronously
+-    cudaMemcpyAsync(batch1_gpu, batch1_cpu, batch1_bytes, cudaMemcpyHostToDevice, stream);
+-    cudaMemcpyAsync(batch2_gpu, batch2_cpu, batch2_bytes, cudaMemcpyHostToDevice, stream);
+-    
+-    // Launch kernel
+-    dim3 block(BLOCK_COLS, BLOCK_ROWS);  // 16x16 threads
+-    // grid: x-dim for N tiles, y-dim for M tiles, z-dim for batch
++    cudaMemcpyKind batch1_kind = batch1_is_cpu ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
++    cudaMemcpyKind batch2_kind = batch2_is_cpu ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
++    
++    cudaMemcpyAsync(batch1_gpu, batch1_ptr, batch1_bytes, batch1_kind, stream);
++    cudaMemcpyAsync(batch2_gpu, batch2_ptr, batch2_bytes, batch2_kind, stream);
++    
++    dim3 block(BLOCK_COLS, BLOCK_ROWS);
+     int grid_x = (N + BLOCK_COLS - 1) / BLOCK_COLS;
+     int grid_y = (M + BLOCK_ROWS - 1) / BLOCK_ROWS;
+     dim3 grid(grid_x, grid_y, batch);
+@@ -203,7 +197,6 @@
+         M, N, K
+     );
+     
+-    // Free temporary GPU buffers after kernel completes
+     cudaFreeAsync(batch1_gpu, stream);
+     cudaFreeAsync(batch2_gpu, stream);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -6,8 +6,10 @@
+ 
+ // Declare launchers from custom_ops.cu
+ extern "C" void custom_embedding_launcher(
+-    const int64_t* indices_cpu,
+-    const float* weight_cpu,
++    const int64_t* indices_ptr,
++    bool indices_is_cpu,
++    const float* weight_ptr,
++    bool weight_is_cpu,
+     float* output_gpu,
+     int batch_size,
+     int seq_len,
+@@ -18,8 +20,10 @@
+ 
+ extern "C" void custom_baddbmm_launcher(
+     const float* x_gpu,
+-    const float* batch1_cpu,
+-    const float* batch2_cpu,
++    const float* batch1_ptr,
++    bool batch1_is_cpu,
++    const float* batch2_ptr,
++    bool batch2_is_cpu,
+     float* output_gpu,
+     int batch,
+     int M,
+@@ -30,17 +34,11 @@
+ 
+ // ====================== custom_embedding ======================
+ torch::Tensor custom_embedding_forward(torch::Tensor indices, torch::Tensor weight) {
+-    // Check indices
+-    TORCH_CHECK(indices.is_cpu(), "indices must be a CPU tensor");
+     TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
+     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
+-
+-    // Check weight
+-    TORCH_CHECK(weight.is_cpu(), "weight must be a CPU tensor");
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+ 
+-    // Extract dimensions
+     TORCH_CHECK(indices.dim() == 2, "indices must be 2D [batch_size, seq_len]");
+     int64_t batch_size = indices.size(0);
+     int64_t seq_len = indices.size(1);
+@@ -48,17 +46,19 @@
+     int64_t num_embeddings = weight.size(0);
+     int64_t embedding_dim = weight.size(1);
+ 
+-    // Allocate output on CUDA
+     auto output = torch::empty({batch_size, seq_len, embedding_dim},
+                                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Call launcher
++    bool indices_is_cpu = indices.is_cpu();
++    bool weight_is_cpu = weight.is_cpu();
++
+     custom_embedding_launcher(
+         indices.data_ptr<int64_t>(),
++        indices_is_cpu,
+         weight.data_ptr<float>(),
++        weight_is_cpu,
+         output.data_ptr<float>(),
+         static_cast<int>(batch_size),
+         static_cast<int>(seq_len),
+@@ -67,30 +67,20 @@
+         stream
+     );
+ 
+-    // Check for CUDA errors
+     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "custom_embedding_launcher failed");
+-
+     return output;
+ }
+ 
+ // ====================== custom_baddbmm ======================
+ torch::Tensor custom_baddbmm_forward(torch::Tensor x, torch::Tensor batch1, torch::Tensor batch2) {
+-    // Check x
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+-
+-    // Check batch1
+-    TORCH_CHECK(batch1.is_cpu(), "batch1 must be a CPU tensor");
+     TORCH_CHECK(batch1.dtype() == torch::kFloat32, "batch1 must be float32");
+     TORCH_CHECK(batch1.is_contiguous(), "batch1 must be contiguous");
+-
+-    // Check batch2
+-    TORCH_CHECK(batch2.is_cpu(), "batch2 must be a CPU tensor");
+     TORCH_CHECK(batch2.dtype() == torch::kFloat32, "batch2 must be float32");
+     TORCH_CHECK(batch2.is_contiguous(), "batch2 must be contiguous");
+ 
+-    // Extract dimensions
+     TORCH_CHECK(x.dim() == 3, "x must be 3D [batch, M, N]");
+     int64_t batch = x.size(0);
+     int64_t M = x.size(1);
+@@ -103,17 +93,18 @@
+     int64_t K = batch1.size(2);
+     TORCH_CHECK(batch2.size(1) == K, "batch2 K dimension mismatch");
+ 
+-    // Allocate output on CUDA (same shape as x)
+     auto output = torch::empty_like(x);
+-
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Call launcher
++    bool batch1_is_cpu = batch1.is_cpu();
++    bool batch2_is_cpu = batch2.is_cpu();
++
+     custom_baddbmm_launcher(
+         x.data_ptr<float>(),
+         batch1.data_ptr<float>(),
++        batch1_is_cpu,
+         batch2.data_ptr<float>(),
++        batch2_is_cpu,
+         output.data_ptr<float>(),
+         static_cast<int>(batch),
+         static_cast<int>(M),
+@@ -122,19 +113,17 @@
+         stream
+     );
+ 
+-    // Check for CUDA errors
+     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "custom_baddbmm_launcher failed");
+-
+     return output;
+ }
+ 
+ // ====================== Registration ======================
+ void register_custom_ops(pybind11::module& m) {
+     m.def("custom_embedding", &custom_embedding_forward,
+-          "Custom embedding lookup (indices: int64 CPU, weight: float32 CPU) -> float32 CUDA",
++          "Custom embedding lookup (indices: int64, weight: float32) -> float32 CUDA",
+           py::arg("indices"), py::arg("weight"));
+     m.def("custom_baddbmm", &custom_baddbmm_forward,
+-          "Custom batched matrix multiply-add (x: CUDA, batch1/batch2: CPU) -> float32 CUDA",
++          "Custom batched matrix multiply-add (x: CUDA, batch1/batch2) -> float32 CUDA",
+           py::arg("x"), py::arg("batch1"), py::arg("batch2"));
+ }
+ 

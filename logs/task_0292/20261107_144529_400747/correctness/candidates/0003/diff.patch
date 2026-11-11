@@ -1,0 +1,369 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,116 +1,9 @@
+ // kernels/custom_ops.cu
+-// All CUDA kernels and launchers for the model.
+-// Conv2d is implemented with cuDNN, so no hand-written convolution kernel.
+-// Non-convolution ops are simple elementwise/broadcast kernels.
++// All CUDA kernels and launchers for non-convolution ops.
++// Conv2d is implemented in the binding file using cuDNN.
+ 
+ #include <cuda_runtime.h>
+-#include <cudnn.h>
+ #include <cstdint>
+-
+-// -----------------------------------------------------------------------------
+-// Utility: get current cuDNN handle
+-// -----------------------------------------------------------------------------
+-static cudnnHandle_t get_cudnn_handle() {
+-    static cudnnHandle_t handle = nullptr;
+-    if (handle == nullptr) {
+-        cudnnCreate(&handle);
+-    }
+-    return handle;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Launcher: conv2d_no_bias
+-// Input: x (N,C,H,W) float32, weight (K,C,R,S) float32
+-// Output: y (N,K,H_out,W_out) float32, bias absent
+-// Uses cuDNN 2D convolution with stride=1, padding=1, dilation=1, groups=1.
+-// Supports arbitrary input/weight strides by using cuDNN tensor descriptors
+-// with explicit stride parameters.
+-// -----------------------------------------------------------------------------
+-extern "C" void conv2d_no_bias_launcher(
+-    const float* x, const float* weight, float* y,
+-    int N, int C, int H, int W,
+-    int K, int R, int S,
+-    int stride_h, int stride_w,
+-    int pad_h, int pad_w,
+-    int dilation_h, int dilation_w,
+-    int group,
+-    cudaStream_t stream)
+-{
+-    cudnnHandle_t handle = get_cudnn_handle();
+-    cudnnSetStream(handle, stream);
+-
+-    // Set up tensor descriptors
+-    cudnnTensorDescriptor_t x_desc, y_desc;
+-    cudnnFilterDescriptor_t w_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    cudnnCreateTensorDescriptor(&x_desc);
+-    cudnnCreateTensorDescriptor(&y_desc);
+-    cudnnCreateFilterDescriptor(&w_desc);
+-    cudnnCreateConvolutionDescriptor(&conv_desc);
+-
+-    // cuDNN tensor format: NCHW
+-    cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                               N, C, H, W);
+-    // Output dims
+-    int H_out = (H + 2 * pad_h - dilation_h * (R - 1) - 1) / stride_h + 1;
+-    int W_out = (W + 2 * pad_w - dilation_w * (S - 1) - 1) / stride_w + 1;
+-    cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                               N, K, H_out, W_out);
+-
+-    // Filter descriptor: K, C, R, S
+-    cudnnSetFilter4dDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+-                               K, C, R, S);
+-
+-    // Convolution descriptor
+-    cudnnSetConvolution2dDescriptor(conv_desc,
+-                                    pad_h, pad_w,
+-                                    stride_h, stride_w,
+-                                    dilation_h, dilation_w,
+-                                    CUDNN_CONVOLUTION, CUDNN_DATA_FLOAT);
+-    cudnnSetConvolutionGroupCount(conv_desc, group);
+-
+-    // Find algorithm (we use deterministic algorithm for reproducibility)
+-    const int requested_algo_count = 1;
+-    int returned_algo_count = 0;
+-    cudnnConvolutionFwdAlgoPerf_t perf_results[1];
+-    cudnnFindConvolutionForwardAlgorithm(
+-        handle, x_desc, w_desc, conv_desc, y_desc,
+-        requested_algo_count, &returned_algo_count, perf_results);
+-
+-    cudnnConvolutionFwdAlgo_t algo = perf_results[0].algo;
+-
+-    // Workspace size
+-    size_t workspace_size = 0;
+-    cudnnGetConvolutionForwardWorkspaceSize(handle, x_desc, w_desc, conv_desc,
+-                                            y_desc, algo, &workspace_size);
+-
+-    // Allocate workspace
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaMalloc(&workspace, workspace_size);
+-    }
+-
+-    float alpha = 1.0f, beta = 0.0f;  // No bias, beta=0 overwrites output
+-    cudnnConvolutionForward(handle,
+-                            &alpha,
+-                            x_desc, x,
+-                            w_desc, weight,
+-                            conv_desc, algo,
+-                            workspace, workspace_size,
+-                            &beta,
+-                            y_desc, y);
+-
+-    if (workspace) {
+-        cudaFree(workspace);
+-    }
+-
+-    // Cleanup descriptors
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyFilterDescriptor(w_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-}
+ 
+ // -----------------------------------------------------------------------------
+ // Kernel: batch_norm2d_inference
+@@ -197,14 +90,7 @@
+ // -----------------------------------------------------------------------------
+ // Kernel: add_bias_broadcast
+ // y[n,c,h,w] = x[n,c,h,w] + bias[c,0,0] where bias has shape [C,1,1]
+-// Input x may have arbitrary strides, but y is assumed contiguous (as allocated
+-// by binding layer with torch::empty_like). We compute output index and read
+-// x with same logical index via pointer arithmetic: x[n*C*HW + c*HW + hw].
+-// Since binding may pass non-contiguous x, we require x to be contiguous for
+-// simplicity, but the contract says supports strides; we can handle arbitrary
+-// strides by passing x_stride_n, x_stride_c, etc. The binding layer should
+-// ensure contiguity or pass strides. Here we assume contiguous for performance,
+-// but to be safe we accept strides and use them in the kernel.
++// Input x is assumed contiguous (binding ensures contiguity).
+ // -----------------------------------------------------------------------------
+ __global__ void add_bias_broadcast_kernel(
+     float* __restrict__ y,
+@@ -212,10 +98,7 @@
+     const float* __restrict__ bias,
+     int C,
+     int HW,
+-    int64_t total_elements,
+-    int64_t x_stride_n,   // stride in elements for N dimension
+-    int64_t x_stride_c,   // stride in elements for C dimension
+-    int64_t x_stride_hw)  // stride in elements for HW dimension (usually 1)
++    int64_t total_elements)
+ {
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * gridDim.x;
+@@ -224,8 +107,8 @@
+         int rem = i % (C * HW);
+         int c = rem / HW;
+         int hw = rem % HW;
+-        int64_t x_idx = n * x_stride_n + c * x_stride_c + hw * x_stride_hw;
+-        y[i] = x[x_idx] + bias[c];
++        // x is contiguous: index = n*C*HW + c*HW + hw = i
++        y[i] = x[i] + bias[c];
+     }
+ }
+ 
+@@ -235,9 +118,6 @@
+     const float* x,
+     const float* bias,
+     int N, int C, int H, int W,
+-    int64_t x_stride_n,
+-    int64_t x_stride_c,
+-    int64_t x_stride_hw,
+     cudaStream_t stream)
+ {
+     int HW = H * W;
+@@ -245,5 +125,5 @@
+     int threads = 256;
+     int blocks = (int)min((int64_t)65535, (total + threads - 1) / threads);
+     add_bias_broadcast_kernel<<<blocks, threads, 0, stream>>>(
+-        y, x, bias, C, HW, total, x_stride_n, x_stride_c, x_stride_hw);
++        y, x, bias, C, HW, total);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,19 +2,11 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
++#include <cudnn.h>
++#include <cstdint>
+ #include "../binding_registry.h"
+ 
+-// Declare CUDA launchers from custom_ops.cu
+-extern "C" void conv2d_no_bias_launcher(
+-    const float* x, const float* weight, float* y,
+-    int N, int C, int H, int W,
+-    int K, int R, int S,
+-    int stride_h, int stride_w,
+-    int pad_h, int pad_w,
+-    int dilation_h, int dilation_w,
+-    int group,
+-    cudaStream_t stream);
+-
++// Declare CUDA launchers from custom_ops.cu (non-conv ops)
+ extern "C" void batch_norm2d_inference_launcher(
+     float* y,
+     const float* x,
+@@ -38,9 +30,6 @@
+     const float* x,
+     const float* bias,
+     int N, int C, int H, int W,
+-    int64_t x_stride_n,
+-    int64_t x_stride_c,
+-    int64_t x_stride_hw,
+     cudaStream_t stream);
+ 
+ // Helper to check CUDA tensor properties
+@@ -50,7 +39,104 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// conv2d_no_bias
++// conv2d_no_bias (cuDNN implementation in binding file)
++// -----------------------------------------------------------------------------
++static cudnnHandle_t get_cudnn_handle() {
++    static cudnnHandle_t handle = nullptr;
++    if (handle == nullptr) {
++        cudnnCreate(&handle);
++    }
++    return handle;
++}
++
++extern "C" void conv2d_no_bias_launcher(
++    const float* x, const float* weight, float* y,
++    int N, int C, int H, int W,
++    int K, int R, int S,
++    int stride_h, int stride_w,
++    int pad_h, int pad_w,
++    int dilation_h, int dilation_w,
++    int group,
++    cudaStream_t stream)
++{
++    cudnnHandle_t handle = get_cudnn_handle();
++    cudnnSetStream(handle, stream);
++
++    // Set up tensor descriptors
++    cudnnTensorDescriptor_t x_desc, y_desc;
++    cudnnFilterDescriptor_t w_desc;
++    cudnnConvolutionDescriptor_t conv_desc;
++
++    cudnnCreateTensorDescriptor(&x_desc);
++    cudnnCreateTensorDescriptor(&y_desc);
++    cudnnCreateFilterDescriptor(&w_desc);
++    cudnnCreateConvolutionDescriptor(&conv_desc);
++
++    // cuDNN tensor format: NCHW
++    cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
++                               N, C, H, W);
++    // Output dims
++    int H_out = (H + 2 * pad_h - dilation_h * (R - 1) - 1) / stride_h + 1;
++    int W_out = (W + 2 * pad_w - dilation_w * (S - 1) - 1) / stride_w + 1;
++    cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
++                               N, K, H_out, W_out);
++
++    // Filter descriptor: K, C, R, S
++    cudnnSetFilter4dDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
++                               K, C, R, S);
++
++    // Convolution descriptor
++    cudnnSetConvolution2dDescriptor(conv_desc,
++                                    pad_h, pad_w,
++                                    stride_h, stride_w,
++                                    dilation_h, dilation_w,
++                                    CUDNN_CONVOLUTION, CUDNN_DATA_FLOAT);
++    cudnnSetConvolutionGroupCount(conv_desc, group);
++
++    // Find algorithm (deterministic)
++    const int requested_algo_count = 1;
++    int returned_algo_count = 0;
++    cudnnConvolutionFwdAlgoPerf_t perf_results[1];
++    cudnnFindConvolutionForwardAlgorithm(
++        handle, x_desc, w_desc, conv_desc, y_desc,
++        requested_algo_count, &returned_algo_count, perf_results);
++
++    cudnnConvolutionFwdAlgo_t algo = perf_results[0].algo;
++
++    // Workspace size
++    size_t workspace_size = 0;
++    cudnnGetConvolutionForwardWorkspaceSize(handle, x_desc, w_desc, conv_desc,
++                                            y_desc, algo, &workspace_size);
++
++    // Allocate workspace
++    void* workspace = nullptr;
++    if (workspace_size > 0) {
++        cudaMalloc(&workspace, workspace_size);
++    }
++
++    float alpha = 1.0f, beta = 0.0f;
++    cudnnConvolutionForward(handle,
++                            &alpha,
++                            x_desc, x,
++                            w_desc, weight,
++                            conv_desc, algo,
++                            workspace, workspace_size,
++                            &beta,
++                            y_desc, y);
++
++    if (workspace) {
++        cudaFree(workspace);
++    }
++
++    // Cleanup descriptors
++    cudnnDestroyTensorDescriptor(x_desc);
++    cudnnDestroyTensorDescriptor(y_desc);
++    cudnnDestroyFilterDescriptor(w_desc);
++    cudnnDestroyConvolutionDescriptor(conv_desc);
++}
++
++// -----------------------------------------------------------------------------
++// conv2d_no_bias wrapper
+ // -----------------------------------------------------------------------------
+ torch::Tensor conv2d_no_bias(torch::Tensor x, torch::Tensor weight) {
+     check_cuda_float32(x, "x");
+@@ -120,7 +206,6 @@
+     TORCH_CHECK(running_mean.dim() == 1, "running_mean must be 1D");
+     TORCH_CHECK(running_var.dim() == 1, "running_var must be 1D");
+ 
+-    // weight and bias may be undefined (None) or tensors; if defined, check CUDA/float32
+     float* weight_ptr = nullptr;
+     float* bias_ptr = nullptr;
+     if (weight.defined()) {
+@@ -134,12 +219,9 @@
+         bias_ptr = bias.data_ptr<float>();
+     }
+ 
+-    // launcher assumes contiguous x; ensure contiguous
+     auto x_contig = x.contiguous();
+     auto running_mean_contig = running_mean.contiguous();
+     auto running_var_contig = running_var.contiguous();
+-    // weight/bias may be non-contiguous, make contiguous if defined
+-    // (but they are typically contiguous; doing so is safe)
+     torch::Tensor weight_contig;
+     torch::Tensor bias_contig;
+     if (weight.defined()) weight_contig = weight.contiguous();
+@@ -203,7 +285,6 @@
+     TORCH_CHECK(x.dim() == 4, "x must be 4D (N,C,H,W)");
+     TORCH_CHECK(bias.dim() == 3, "bias must be 3D (C,1,1)");
+ 
+-    // launcher assumes contiguous x; bias is also contiguous
+     auto x_contig = x.contiguous();
+     auto bias_contig = bias.contiguous();
+ 
+@@ -216,11 +297,6 @@
+ 
+     auto y = torch::empty_like(x_contig);
+ 
+-    // compute strides for contiguous x (in elements)
+-    int64_t x_stride_n = (int64_t)C * H * W;
+-    int64_t x_stride_c = (int64_t)H * W;
+-    int64_t x_stride_hw = 1;
+-
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     add_bias_broadcast_launcher(
+@@ -228,9 +304,6 @@
+         x_contig.data_ptr<float>(),
+         bias_contig.data_ptr<float>(),
+         N, C, H, W,
+-        x_stride_n,
+-        x_stride_c,
+-        x_stride_hw,
+         stream
+     );
+ 

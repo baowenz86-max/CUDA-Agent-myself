@@ -1,0 +1,136 @@
+#include <cuda_runtime.h>
+#include <cstdint>
+
+// 逐元素符号函数 kernel，支持任意维度和 strides。
+// 每个线程处理一个线性索引，将线性索引转换为多维索引，
+// 然后根据输入和输出的 strides 计算实际内存偏移量。
+__global__ void sign_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ input,
+    int64_t numel,
+    const int64_t* __restrict__ input_strides,
+    const int64_t* __restrict__ output_strides,
+    const int64_t* __restrict__ shape,
+    int ndim
+) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    for (int64_t linear = idx; linear < numel; linear += stride) {
+        // 将线性索引转换为多维坐标
+        int64_t rem = linear;
+        int64_t in_offset = 0;
+        int64_t out_offset = 0;
+        for (int d = ndim - 1; d >= 0; --d) {
+            int64_t coord = rem % shape[d];
+            rem /= shape[d];
+            in_offset += coord * input_strides[d];
+            out_offset += coord * output_strides[d];
+        }
+
+        float val = input[in_offset];
+        float result;
+        if (isnan(val)) {
+            result = val;
+        } else if (val > 0.0f) {
+            result = 1.0f;
+        } else if (val < 0.0f) {
+            result = -1.0f;
+        } else {
+            result = 0.0f;
+        }
+        output[out_offset] = result;
+    }
+}
+
+// C 接口 launcher，供 binding 文件调用。
+// 参数：
+//   output: 输出指针，需与输入具有相同的 strides
+//   input: 输入指针
+//   numel: 元素总数
+//   input_strides: 输入 strides 数组（长度 ndim）
+//   output_strides: 输出 strides 数组（长度 ndim）
+//   shape: 形状数组（长度 ndim）
+//   ndim: 维度数
+//   stream: CUDA stream
+// 注意：shape 数组可以是 host 或 device 指针，但这里使用 host 指针，
+//       因为 kernel 需要读取 shape 信息，但若 shape 在 host 上则需先复制到 device。
+//       为简单，我们要求调用方在 device 上分配 shape 数组，或者使用常量？
+//       实际上我们可以直接将 shape 作为 kernel 参数传递，但需要将其复制到 device。
+//       为了简化，我们修改 launcher 接口，要求传入 device 指针 shape，
+//       而 binding 文件需要负责分配 device 内存并复制 shape 数据。
+//       但是 binding 文件不能调用 CUDA 内存管理函数，因此我们将 shape 数组
+//       作为 kernel 的参数直接传递，但必须保证在 device 上。
+//       由于 shape 通常很小（ndim <= 8），我们可以将其作为 kernel 参数直接传递，
+//       而无需通过指针，但 kernel 参数有数量限制。
+//       更好的方法是使用常量内存或直接传递每个维度，但为了通用性，我们使用 device 指针。
+//       因此，在 launcher 中需要将 shape 复制到 device，但 launcher 不能分配内存。
+//       一种方法是在 launcher 中使用固定大小的共享内存？不行。
+//       为了保持简单，我们假设 ndim 最大为 8，并且 shape 值很小，
+//       我们可以将 shape 作为值传递给 kernel，而不使用指针。
+//       但这样需要为不同 ndim 特化，或者使用模板。
+//       我们采用一个简单方案：将 shape 数组作为 kernel 参数直接传递，
+//       但通过值传递数组是不可能的。
+//       因此，我们修改方案：在 launcher 中，我们使用一个固定大小的数组，
+//       将其声明为 __constant__ 或者直接初始化？
+//       实际上，最简单可靠的方式是让 binding 文件在 host 上准备 shape 数据，
+//       然后 launcher 通过参数传递 shape 指针，但该指针必须指向 device 内存。
+//       但是 binding 文件不能分配 device 内存，所以我们可以在 launcher 内部
+//       使用 cudaMalloc 和 cudaMemcpyAsync，但这样会引入额外开销。
+//       考虑到本任务只涉及简单的 sign 操作，输入通常连续，我们可以简化：
+//       直接连续处理，不支持非连续 strides。
+//       但 contract 明确要求支持 strides。因此，我们需要正确处理 strides。
+//       为了避免复杂化，我们采用以下方案：
+//       - 在 .cu 中定义一个 __device__ 函数，使用统一的方式遍历。
+//       - 在 launcher 中，我们将 shape 数组作为 kernel 参数传递，
+//         但使用一个固定大小的数组，例如 int64_t shape[8];
+//         如果 ndim > 8，则报错。
+//       实际上，我们可以在 launcher 中接收 shape_host 数组（host 内存），
+//       然后使用 cudaMemcpyToSymbolAsync 将 shape 复制到常量内存，
+//       或者使用 cudaMemcpyAsync 复制到 device 全局内存。
+//       但 launcher 内部可以分配临时 device 内存吗？允许使用 cudaMalloc。
+//       考虑到性能不是首要问题，我们选择在 launcher 中分配 device 内存。
+//       然而，binding 文件不能调用 CUDA 内存管理，但 launcher 可以。
+//       因此，我们在 launcher 中声明 shape 数组为 kernel 参数，
+//       但 shape 数组必须位于 device 上。我们将 shape 数据作为 kernel 参数直接传递，
+//       但通过值传递数组是不可能的，所以我们需要使用指针。
+//       我们最终选择：launcher 接收 shape 数组指针（host 指针），
+//       在 launcher 内部使用 cudaMalloc 和 cudaMemcpyAsync 复制到 device，
+//       然后传递给 kernel。但这样会增加开销，不过对于 sign 操作，
+//       每个元素仅需一次内存访问，复制 shape 的开销可以忽略。
+//       为了简化，我们直接要求 binding 文件传递 shape 数组的 device 指针？
+//       但 binding 文件不能分配 device 内存，所以它必须借助 torch 或 c10 的 API。
+//       实际上，在 binding 文件中，我们可以使用 torch::from_blob 或直接使用
+//       torch::empty 来分配一个小的 CUDA tensor 存放 shape，然后获取其 data_ptr。
+//       这完全允许，因为 binding 文件可以使用 torch 的分配功能。
+//       因此，我们修改 binding 文件，使其分配一个 shape tensor（CUDA），
+//       并将 shape 数据复制进去，然后将其 data_ptr 传递给 launcher。
+//       但是，binding 文件当前没有这样做，它只传递了 strides，没有 shape。
+//       我们需要修改 binding 文件并确保 launcher 签名包含 shape。
+//       在本次修复中，我们统一修改 .cu 和 binding 文件。
+//       在 .cu 中，launcher 签名包含 shape 指针（device 内存）。
+//       在 binding 文件中，我们分配一个 int64 的 CUDA tensor 保存 shape，
+//       使用 cudaMemcpy 或 torch 的 copy_ 方法将数据复制到 device。
+//       然后调用 launcher。
+
+extern "C" void sign_launcher(
+    float* output,
+    const float* input,
+    int64_t numel,
+    const int64_t* input_strides,
+    const int64_t* output_strides,
+    const int64_t* shape,
+    int ndim,
+    cudaStream_t stream
+) {
+    // 配置 grid 和 block
+    const int block_size = 256;
+    int64_t num_blocks = (numel + block_size - 1) / block_size;
+    // 限制 grid 大小
+    if (num_blocks > 2147483647) num_blocks = 2147483647;
+    
+    // 启动 kernel
+    sign_kernel<<<(int)num_blocks, block_size, 0, stream>>>(
+        output, input, numel, input_strides, output_strides, shape, ndim
+    );
+}

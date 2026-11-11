@@ -1,0 +1,220 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,103 @@
++#include <cuda_runtime.h>
++
++// ============================================================================
++// custom_mean_dim1: computes mean over channel dimension (dim=1) with keepdim.
++// Input: x (float*) with shape [N, C, H, W] and strides (batch_stride, channel_stride, height_stride, width_stride).
++// Output: out (float*) with shape [N, 1, H, W] (contiguous, N*H*W elements).
++// Each thread computes one output element: sum over C, divide by C.
++// ============================================================================
++__global__ void mean_dim1_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int N, int C, int H, int W,
++    long long batch_stride, long long channel_stride,
++    long long height_stride, long long width_stride,
++    long long total_out) {
++
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < total_out; idx += stride) {
++        // Decompose idx into n, h, w (output has shape N x 1 x H x W)
++        long long n = idx / ((long long)H * W);
++        long long rem = idx - n * ((long long)H * W);
++        long long h = rem / W;
++        long long w = rem - h * W;
++
++        float sum = 0.0f;
++        const float* base = x + n * batch_stride + h * height_stride + w * width_stride;
++        for (int c = 0; c < C; ++c) {
++            sum += base[c * channel_stride];
++        }
++        out[idx] = sum / (float)C;
++    }
++}
++
++// Launcher for custom_mean_dim1. Returns cudaError_t; caller should check.
++extern "C" cudaError_t custom_mean_dim1_launcher(
++    const float* x,
++    float* out,
++    int N, int C, int H, int W,
++    long long batch_stride, long long channel_stride,
++    long long height_stride, long long width_stride,
++    cudaStream_t stream) {
++
++    long long total_out = (long long)N * H * W;
++    if (total_out == 0) {
++        return cudaSuccess;
++    }
++
++    const int threads = 256;
++    long long blocks_ll = (total_out + threads - 1) / threads;
++    // Cap grid dimension to 2^31-1; kernel has grid-stride loop so this is safe.
++    int blocks = (int)min(blocks_ll, (long long)2147483647);
++
++    mean_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        x, out, N, C, H, W,
++        batch_stride, channel_stride, height_stride, width_stride,
++        total_out);
++
++    return cudaGetLastError();
++}
++
++// ============================================================================
++// custom_leaky_relu: elementwise LeakyReLU y = x if x > 0 else slope*x.
++// Input: x contiguous float* with 'numel' elements.
++// Output: out contiguous float* with same numel elements.
++// ============================================================================
++__global__ void leaky_relu_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    long long numel,
++    float negative_slope) {
++
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    for (; idx < numel; idx += stride) {
++        float v = x[idx];
++        out[idx] = (v > 0.0f) ? v : (negative_slope * v);
++    }
++}
++
++// Launcher for custom_leaky_relu. Returns cudaError_t; caller should check.
++extern "C" cudaError_t custom_leaky_relu_launcher(
++    const float* x,
++    float* out,
++    long long numel,
++    double negative_slope,
++    cudaStream_t stream) {
++
++    if (numel == 0) {
++        return cudaSuccess;
++    }
++
++    const int threads = 256;
++    long long blocks_ll = (numel + threads - 1) / threads;
++    int blocks = (int)min(blocks_ll, (long long)2147483647);
++
++    leaky_relu_kernel<<<blocks, threads, 0, stream>>>(
++        x, out, numel, (float)negative_slope);
++
++    return cudaGetLastError();
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,86 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" cudaError_t custom_mean_dim1_launcher(
++    const float* x,
++    float* out,
++    int N, int C, int H, int W,
++    long long batch_stride, long long channel_stride,
++    long long height_stride, long long width_stride,
++    cudaStream_t stream);
++
++extern "C" cudaError_t custom_leaky_relu_launcher(
++    const float* x,
++    float* out,
++    long long numel,
++    double negative_slope,
++    cudaStream_t stream);
++
++// custom_mean_dim1: mean over dim=1 with keepdim=True
++torch::Tensor custom_mean_dim1_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D [N, C, H, W]");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Compute strides (long long to match launcher)
++    long long batch_stride = x.stride(0);
++    long long channel_stride = x.stride(1);
++    long long height_stride = x.stride(2);
++    long long width_stride = x.stride(3);
++
++    auto out = torch::empty({N, 1, H, W}, x.options());
++    // Ensure contiguous output
++    out = out.contiguous();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    cudaError_t err = custom_mean_dim1_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        N, C, H, W,
++        batch_stride, channel_stride, height_stride, width_stride,
++        stream
++    );
++    TORCH_CHECK(err == cudaSuccess, "custom_mean_dim1_launcher failed with error ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// custom_leaky_relu: elementwise leaky ReLU
++torch::Tensor custom_leaky_relu_forward(torch::Tensor x, double negative_slope) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    // Output shape same as input; use empty_like to preserve layout
++    auto out = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    cudaError_t err = custom_leaky_relu_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        x.numel(),
++        negative_slope,
++        stream
++    );
++    TORCH_CHECK(err == cudaSuccess, "custom_leaky_relu_launcher failed with error ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_mean_dim1", &custom_mean_dim1_forward, "Mean over dim=1 keepdim=True",
++          py::arg("x"));
++    m.def("custom_leaky_relu", &custom_leaky_relu_forward, "LeakyReLU elementwise",
++          py::arg("x"), py::arg("negative_slope"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_channels, leaky_relu_slope):
++        super().__init__()
++        self.leaky_relu_slope = leaky_relu_slope
++
++    def forward(self, x):
++        x = cuda_extension.custom_mean_dim1(x)
++        x = cuda_extension.custom_leaky_relu(x, self.leaky_relu_slope)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_mean_dim1(x)
++        yield 'step_001', x
++        x = cuda_extension.custom_leaky_relu(x, self.leaky_relu_slope)
++        yield 'step_002', x
++        yield 'step_003', x
++

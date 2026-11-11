@@ -1,0 +1,177 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -61,69 +61,69 @@
+     int64_t stride_x_n, int64_t stride_x_c, int64_t stride_x_h, int64_t stride_x_w,
+     int64_t stride_y_n, int64_t stride_y_c, int64_t stride_y_h, int64_t stride_y_w)
+ {
+-    // Each block handles one spatial location (n, h, w)
+-    int64_t flat_spatial = blockIdx.x; // index in [0, N*H*W)
+-    if (flat_spatial >= N * H * W) return;
++    // Grid-stride loop over spatial locations (n, h, w)
++    int64_t total_spatial = N * H * W;
++    for (int64_t flat_spatial = blockIdx.x; flat_spatial < total_spatial; flat_spatial += gridDim.x) {
++        // decompose flat_spatial into n, h, w
++        int64_t w = flat_spatial % W;
++        int64_t tmp = flat_spatial / W;
++        int64_t h = tmp % H;
++        int64_t n = tmp / H;
+ 
+-    // decompose flat_spatial into n, h, w
+-    int64_t w = flat_spatial % W;
+-    int64_t tmp = flat_spatial / W;
+-    int64_t h = tmp % H;
+-    int64_t n = tmp / H;
++        const float* x_base = x + n * stride_x_n + h * stride_x_h + w * stride_x_w;
++        float* y_base = y + n * stride_y_n + h * stride_y_h + w * stride_y_w;
+ 
+-    const float* x_base = x + n * stride_x_n + h * stride_x_h + w * stride_x_w;
+-    float* y_base = y + n * stride_y_n + h * stride_y_h + w * stride_y_w;
++        // Step 1: find max over c
++        float max_val = -INFINITY;
++        for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
++            float val = x_base[c * stride_x_c];
++            if (val > max_val) max_val = val;
++        }
+ 
+-    // Step 1: find max over c
+-    float max_val = -INFINITY;
+-    for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+-        float val = x_base[c * stride_x_c];
+-        if (val > max_val) max_val = val;
+-    }
++        // Block reduction to get global max in thread 0
++        __shared__ float smem[1024];
++        int tid = threadIdx.x;
++        smem[tid] = max_val;
++        __syncthreads();
+ 
+-    // Warp/block reduction to get global max in thread 0
+-    // Since blockDim.x <= 1024, use shared memory reduction
+-    __shared__ float smem[1024];
+-    if (blockDim.x > 1024) return; // not expected
+-    int tid = threadIdx.x;
+-    smem[tid] = max_val;
+-    __syncthreads();
++        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++            if (tid < s) {
++                float other = smem[tid + s];
++                if (other > smem[tid]) smem[tid] = other;
++            }
++            __syncthreads();
++        }
++        float block_max = smem[0];
++        __syncthreads();
+ 
+-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) {
+-            float other = smem[tid + s];
+-            if (other > smem[tid]) smem[tid] = other;
++        // Step 2: compute sum of exp(x - max)
++        float sum = 0.0f;
++        for (int64_t c = tid; c < C; c += blockDim.x) {
++            float val = x_base[c * stride_x_c];
++            sum += expf(val - block_max);
+         }
++
++        // Reduce sum
++        smem[tid] = sum;
+         __syncthreads();
+-    }
+-    float block_max = smem[0];
+-    __syncthreads();
++        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++            if (tid < s) {
++                smem[tid] += smem[tid + s];
++            }
++            __syncthreads();
++        }
++        float block_sum = smem[0];
++        __syncthreads();
+ 
+-    // Step 2: compute sum of exp(x - max)
+-    float sum = 0.0f;
+-    for (int64_t c = tid; c < C; c += blockDim.x) {
+-        float val = x_base[c * stride_x_c];
+-        sum += expf(val - block_max);
+-    }
+-
+-    // Reduce sum
+-    smem[tid] = sum;
+-    __syncthreads();
+-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) {
+-            smem[tid] += smem[tid + s];
++        // Step 3: compute softmax and write out
++        // Avoid division by zero (if sum == 0, output 0)
++        for (int64_t c = tid; c < C; c += blockDim.x) {
++            float val = x_base[c * stride_x_c];
++            float prob = (block_sum > 0.0f) ? expf(val - block_max) / block_sum : 0.0f;
++            y_base[c * stride_y_c] = prob;
+         }
++        // Synchronize before next spatial iteration to avoid shared memory race
+         __syncthreads();
+-    }
+-    float block_sum = smem[0];
+-    __syncthreads();
+-
+-    // Step 3: compute softmax and write out
+-    // Avoid division by zero (if sum == 0, output 0)
+-    for (int64_t c = tid; c < C; c += blockDim.x) {
+-        float val = x_base[c * stride_x_c];
+-        float prob = (block_sum > 0.0f) ? expf(val - block_max) / block_sum : 0.0f;
+-        y_base[c * stride_y_c] = prob;
+     }
+ }
+ 
+@@ -145,7 +145,6 @@
+     if (total <= 0) return;
+ 
+     const int block_size = 256;
+-    // grid size capped at 65535, use grid-stride loop
+     int64_t grid = (total + block_size - 1) / block_size;
+     if (grid > 65535) grid = 65535;
+ 
+@@ -168,36 +167,18 @@
+     int64_t num_spatial = N * H * W;
+     if (num_spatial <= 0 || C <= 0) return;
+ 
+-    // choose block size: use 256 threads unless C is smaller
+-    int block_size = (int)std::min<int64_t>(C, 256);
++    // Choose block size: use at most 256 threads, but not more than C (power of 2 for reduction)
++    int block_size = 1;
++    int max_threads = (int)std::min<int64_t>(C, 256);
++    while (block_size * 2 <= max_threads) block_size *= 2;
+     if (block_size < 1) block_size = 1;
+-    // Ensure block_size is power of two for reduction? reduction works with any, loops use bit shifts, requires power of 2 for s >>= 1; but if not power of 2, the reduction loop with s=blockDim.x/2 then s>>=1 assumes power of 2.
+-    // Force block_size to next power of two <= 1024 and >=1
+-    // For C=512, block_size=256 power of 2 ok.
+-    // For other C, use block_size = min(1024, next pow2 >= C) maybe? But we want threads <= C to avoid idle? We'll set block_size = min(1024, C) rounded down to power of 2.
+-    // To be safe, we can use a reduction that works for non-power-of-2 blockDim by using __syncthreads and tree, but we'll assume blockDim is power of two. Contract C=512, so fine.
+-    // But for generality, compute highest power of 2 <= min(C, 1024)
+-    int max_threads = (int)std::min<int64_t>(C, 1024);
+-    block_size = 1;
+-    while (block_size * 2 <= max_threads) block_size *= 2;
+ 
+-    int grid = (int)num_spatial;
+-    if (grid > 65535) grid = 65535; // but each block handles one spatial location, if grid smaller some spatial locations unprocessed; need grid-stride over spatial blocks or launch enough blocks; adjust kernel to handle multiple spatial via grid stride? Simpler: use grid = min(num_spatial, 65535) and in kernel have loop over spatial locations. Let's modify kernel to support grid-stride over spatial locations.
+-    // For now in kernel, we had flat_spatial = blockIdx.x; that would skip if grid < num_spatial. So we need grid-stride loop over spatial locations inside kernel. We'll update kernel accordingly.
+-    // We'll rewrite softmax_channel_kernel to loop over spatial with stride = gridDim.x.
+-    // For simplicity, we can launch enough blocks but grid limit is 65535 per dimension, but we can use 2D grid or just use grid = num_spatial if <= 65535, else launch multiple kernels? num_spatial = 16*100*100 = 160,000 > 65535. So need grid-stride.
+-    // So modify kernel.
++    // Grid size capped at 65535; kernel uses grid-stride loop over spatial locations
++    int grid_size = (int)std::min<int64_t>(num_spatial, 65535);
++    if (grid_size < 1) grid_size = 1;
+ 
+-    // Actually, the current kernel implementation does not have grid-stride loop for spatial. Let's fix by changing kernel to allow each block handle multiple spatial locations.
+-    // We'll update kernel below.
+-
+-    // We'll set grid = min(num_spatial, 65535) and inside kernel loop.
+-    int grid_size = (int)std::min<int64_t>(num_spatial, 65535);
+     softmax_channel_kernel<<<grid_size, block_size, 0, stream>>>(
+         y, x, N, C, H, W,
+         stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+         stride_y_n, stride_y_c, stride_y_h, stride_y_w);
+ }
+-
+-// We need to modify softmax_channel_kernel to have grid-stride over spatial locations.
+-// Let's define a new version and replace above. For simplicity, we'll produce final code with corrected kernel.

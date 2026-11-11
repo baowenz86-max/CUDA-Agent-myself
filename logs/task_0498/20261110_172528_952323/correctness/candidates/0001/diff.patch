@@ -1,0 +1,238 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,126 @@
++#include <cuda_runtime.h>
++
++// Custom CUDA kernels for model_new.py
++// gelu_forward: element-wise GELU activation (approximate='none')
++// prod_dim1_keepdim_forward: product along dimension 1 with keepdim=True
++
++// GELU kernel: y = x * 0.5 * (1 + erf(x / sqrt(2)))
++__global__ void gelu_forward_kernel(float* __restrict__ output,
++                                    const float* __restrict__ input,
++                                    long long total_elements) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (long long i = idx; i < total_elements; i += stride) {
++        float x = input[i];
++        float y = x * 0.5f * (1.0f + erff(x * 0.70710678118654752440f)); // 1/sqrt(2)
++        output[i] = y;
++    }
++}
++
++// Product along dimension 1 with keepdim=True
++// Input shape: [B, C, H, W] = [16, 128, 512, 256]
++// Output shape: [B, 1, H, W]
++// Each output location is product over C for a fixed (b, h, w).
++// We use a two-phase approach:
++// Phase 1: compute per-(b,h,w) product into a temporary contiguous buffer of size B*H*W.
++// Phase 2: copy product into output tensor with shape [B,1,H,W] (which is same underlying size).
++// This avoids atomics and preserves order (though product order is mathematically commutative).
++
++// Phase 1 kernel: one thread per output location (or grid-stride over B*H*W)
++__global__ void prod_dim1_partial_kernel(float* __restrict__ temp_product,
++                                         const float* __restrict__ input,
++                                         int B, int C, int H, int W) {
++    long long total = (long long)B * H * W;
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (long long i = idx; i < total; i += stride) {
++        // i corresponds to linear index over B,H,W
++        int b = i / (H * W);
++        int rem = i % (H * W);
++        int h = rem / W;
++        int w = rem % W;
++
++        // Base index in input for dimension (b, 0, h, w)
++        long long base = ((long long)b * C + 0) * H * W + (long long)h * W + w;
++        float prod_val = input[base];
++        long long channel_stride = (long long)H * W;
++        for (int c = 1; c < C; ++c) {
++            prod_val *= input[base + (long long)c * channel_stride];
++        }
++        temp_product[i] = prod_val;
++    }
++}
++
++// Phase 2 kernel: copy temp_product to output with keepdim shape [B,1,H,W]
++// Output tensor is also contiguous with B*1*H*W elements,
++// so we can copy element-wise.
++__global__ void copy_to_keepdim_kernel(float* __restrict__ output,
++                                       const float* __restrict__ temp_product,
++                                       long long total_elements) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (long long i = idx; i < total_elements; i += stride) {
++        output[i] = temp_product[i];
++    }
++}
++
++// Launcher functions (extern "C" so binding can call them)
++
++extern "C" void gelu_forward_launcher(float* output,
++                                      const float* input,
++                                      long long total_elements,
++                                      cudaStream_t stream) {
++    if (total_elements == 0 || output == nullptr || input == nullptr) {
++        return;
++    }
++    int threads = 256;
++    // Cap grid to some reasonable max (e.g., 65535*64) and use grid-stride loop.
++    // For total_elements up to 2^31, we can use 32-bit block count, but use long long for safety.
++    long long blocks_ll = (total_elements + threads - 1) / threads;
++    // Limit grid dimension to maximum allowed (2^31-1) but we can't launch that many blocks due to resource limits.
++    // Use grid-stride with a max grid of 65535 * 64 = ~4.2M blocks, enough for parallelism.
++    long long max_blocks = 65535LL * 64;
++    if (blocks_ll > max_blocks) {
++        blocks_ll = max_blocks;
++    }
++    int blocks = (int)blocks_ll;
++    gelu_forward_kernel<<<blocks, threads, 0, stream>>>(output, input, total_elements);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In binding layer, we could check and throw; here we just ignore but ensure no silent failure?
++        // Ideally we would not have error handling in .cu, but we can leave this for correctness.
++    }
++}
++
++extern "C" void prod_dim1_keepdim_launcher(float* output,
++                                            const float* input,
++                                            float* temp_product,
++                                            int B, int C, int H, int W,
++                                            cudaStream_t stream) {
++    if (output == nullptr || input == nullptr || temp_product == nullptr || B == 0 || C == 0 || H == 0 || W == 0) {
++        return;
++    }
++    long long total_locations = (long long)B * H * W;
++    int threads = 256;
++    long long blocks_ll = (total_locations + threads - 1) / threads;
++    long long max_blocks = 65535LL * 64;
++    if (blocks_ll > max_blocks) {
++        blocks_ll = max_blocks;
++    }
++    int blocks = (int)blocks_ll;
++    prod_dim1_partial_kernel<<<blocks, threads, 0, stream>>>(temp_product, input, B, C, H, W);
++
++    // Copy kernel
++    long long total_elements_out = (long long)B * 1 * H * W;
++    blocks_ll = (total_elements_out + threads - 1) / threads;
++    if (blocks_ll > max_blocks) {
++        blocks_ll = max_blocks;
++    }
++    blocks = (int)blocks_ll;
++    copy_to_keepdim_kernel<<<blocks, threads, 0, stream>>>(output, temp_product, total_elements_out);
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Ignore in .cu, binding can check after call
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,83 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void gelu_forward_launcher(float* output,
++                                      const float* input,
++                                      long long total_elements,
++                                      cudaStream_t stream);
++
++extern "C" void prod_dim1_keepdim_launcher(float* output,
++                                            const float* input,
++                                            float* temp_product,
++                                            int B, int C, int H, int W,
++                                            cudaStream_t stream);
++
++// PyTorch wrapper for gelu_forward
++torch::Tensor gelu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "gelu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "gelu_forward: input must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "gelu_forward: input must be float32");
++
++    auto output = torch::empty_like(x);
++    long long total_elements = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    gelu_forward_launcher(output.data_ptr<float>(),
++                          x.data_ptr<float>(),
++                          total_elements,
++                          stream);
++
++    // Check for launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "gelu_forward: CUDA launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// PyTorch wrapper for prod_dim1_keepdim_forward
++torch::Tensor prod_dim1_keepdim_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "prod_dim1_keepdim_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "prod_dim1_keepdim_forward: input must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "prod_dim1_keepdim_forward: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "prod_dim1_keepdim_forward: input must be 4D");
++
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Allocate output with keepdim shape [B, 1, H, W]
++    auto output = torch::empty({B, 1, H, W}, x.options());
++    // Allocate temporary contiguous buffer for products: B*H*W floats
++    auto temp_product = torch::empty({B * H * W}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    prod_dim1_keepdim_launcher(output.data_ptr<float>(),
++                               x.data_ptr<float>(),
++                               temp_product.data_ptr<float>(),
++                               B, C, H, W,
++                               stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "prod_dim1_keepdim_forward: CUDA launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("gelu_forward", &gelu_forward,
++          "GELU activation (approximate='none')",
++          py::arg("x"));
++    m.def("prod_dim1_keepdim_forward", &prod_dim1_keepdim_forward,
++          "Product along dim=1 with keepdim=True",
++          py::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        x = cuda_extension.gelu_forward(x)
++        x = cuda_extension.prod_dim1_keepdim_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.gelu_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.prod_dim1_keepdim_forward(x)
++        yield 'step_002', x
++        yield 'step_003', x

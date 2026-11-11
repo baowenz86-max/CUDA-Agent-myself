@@ -1,0 +1,389 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,241 @@
++#include <cuda_runtime.h>
++#include <cfloat>
++
++// Launcher for custom_mean_dim
++// Input: float* input, int dim (0-based)
++// Input shape: int* in_shape (4D), int* in_strides (4D)
++// Output shape: int* out_shape (4D), int* out_strides (4D)
++// Output: float* output
++// Stream: cudaStream_t
++extern "C" void custom_mean_dim_launcher(
++    const float* input,
++    float* output,
++    const int64_t* in_shape,
++    const int64_t* in_strides,
++    const int64_t* out_shape,
++    const int64_t* out_strides,
++    int64_t dim,
++    int64_t ndim,
++    cudaStream_t stream)
++{
++    // We assume 4D tensors for this model, but write generic code for ndim up to 4.
++    // Reduction is over dim. Since keepdim=True, output shape has out_shape[dim] = 1.
++    // We launch one thread per output element.
++    int64_t total_out = 1;
++    for (int64_t i = 0; i < ndim; ++i) {
++        total_out *= out_shape[i];
++    }
++
++    // Kernel: each thread computes one output element
++    int threads = 256;
++    int blocks = (int)((total_out + threads - 1) / threads);
++
++    // Use lambda-like kernel via a templated helper? We'll define a __global__ kernel.
++    // Since we cannot use dynamic shared memory easily, we use simple loop.
++    // We'll launch a generic kernel that handles 1D indexing over output and inner reduction.
++    // Dimensions: we need to map output linear index to coordinates in output space,
++    // then reduce over dim by iterating over input coordinate combinations.
++
++    // We'll create a kernel that accepts pointers to shape/stride arrays (must be in device or constant memory).
++    // For simplicity, pass shape/stride as kernel arguments by value if ndim <= 4.
++    // But ndim may vary; we'll use a templated kernel for max_dims=4.
++    // We'll copy shape/stride to __device__ constant? Better: pass as kernel arguments.
++    // We'll define a kernel with fixed max dims 4, and unused dims set to 1.
++
++    // Prepare padded shape/stride arrays to size 4
++    int64_t is[4] = {1,1,1,1}, iss[4] = {0,0,0,0}, os[4] = {1,1,1,1}, oss[4] = {0,0,0,0};
++    for (int64_t i=0; i<ndim; ++i) {
++        is[i] = in_shape[i];
++        iss[i] = in_strides[i];
++        os[i] = out_shape[i];
++        oss[i] = out_strides[i];
++    }
++    // dim must be within ndim, but we'll keep as int64_t
++    int red_dim = (int)dim;
++
++    // Launch kernel
++    // We'll define a kernel with 4D shape/stride as value parameters.
++    // The kernel will compute one output element.
++    // We'll use a 1D grid of blocks.
++    dim3 grid(blocks);
++    dim3 block(threads);
++
++    // Define a generic kernel via template? We'll define a single kernel.
++    // Since we cannot put __global__ inside function, we define separately.
++    // We'll define a kernel named mean_dim_kernel with fixed 4D arrays.
++    // We'll pass is[4], iss[4], os[4], oss[4], and red_dim.
++    mean_dim_kernel<<<grid, block, 0, stream>>>(
++        input, output,
++        is[0], is[1], is[2], is[3],
++        iss[0], iss[1], iss[2], iss[3],
++        os[0], os[1], os[2], os[3],
++        oss[0], oss[1], oss[2], oss[3],
++        red_dim, total_out);
++}
++
++// Kernel for mean over dim=1 (or any dim) with keepdim
++__global__ void mean_dim_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t is0, int64_t is1, int64_t is2, int64_t is3,
++    int64_t iss0, int64_t iss1, int64_t iss2, int64_t iss3,
++    int64_t os0, int64_t os1, int64_t os2, int64_t os3,
++    int64_t oss0, int64_t oss1, int64_t oss2, int64_t oss3,
++    int red_dim,
++    int64_t total_out)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total_out) return;
++
++    // Determine output coordinates
++    int64_t out_coords[4];
++    int64_t tmp = idx;
++    // We assume row-major order for output linear index (from strides)
++    // But output may be non-contiguous? In our case it is contiguous, but we use strides anyway.
++    for (int d = 3; d >= 0; --d) {
++        // compute coordinate based on shape, but we can't divide by zero shape, shapes are >=1
++        if (oss[d] != 0) {
++            out_coords[d] = tmp % os[d];
++            tmp /= os[d];
++        } else {
++            out_coords[d] = 0;
++        }
++    }
++
++    // Compute input base offset: out_coords with dim index set to 0 (since only one in output)
++    int64_t in_offset = 0;
++    for (int d = 0; d < 4; ++d) {
++        if (d == red_dim) {
++            in_offset += 0; // start at 0 for reduction dimension
++        } else {
++            in_offset += out_coords[d] * iss[d];
++        }
++    }
++
++    // Reduce over dimension red_dim
++    float sum = 0.0f;
++    int64_t red_size = is[red_dim];
++    for (int64_t i = 0; i < red_size; ++i) {
++        sum += input[in_offset + i * iss[red_dim]];
++    }
++    float mean = sum / (float)red_size;
++
++    // Compute output offset using out_strides
++    int64_t out_offset = 0;
++    for (int d = 0; d < 4; ++d) {
++        out_offset += out_coords[d] * oss[d];
++    }
++    output[out_offset] = mean;
++}
++
++// Launcher for custom_softmax_lastdim
++// Input: float* input, shape [B,1,H,W] (4D), strides arbitrary
++// Output: float* output with same shape
++// Stream: cudaStream_t
++extern "C" void custom_softmax_lastdim_launcher(
++    const float* input,
++    float* output,
++    const int64_t* in_shape,
++    const int64_t* in_strides,
++    int64_t ndim,
++    cudaStream_t stream)
++{
++    // For this model, ndim=4, last dim size = in_shape[3]
++    int64_t outer_size = 1;
++    for (int64_t i = 0; i < ndim-1; ++i) {
++        outer_size *= in_shape[i];
++    }
++    int64_t W = in_shape[ndim-1];
++    if (W <= 0 || outer_size <= 0) return;
++
++    // We process one row (length W) per thread block for simplicity.
++    // Each block handles one outer index.
++    int threads = 256;
++    // grid = outer_size blocks
++    dim3 grid((unsigned int)outer_size);
++    dim3 block(threads);
++
++    // Kernel: each block reduces max and computes softmax for one row.
++    softmax_lastdim_kernel<<<grid, block, 0, stream>>>(
++        input, output, in_shape[0], in_shape[1], in_shape[2], in_shape[3],
++        in_strides[0], in_strides[1], in_strides[2], in_strides[3],
++        outer_size, W);
++}
++
++// Softmax kernel: one block per row (outer index), threads cooperate.
++__global__ void softmax_lastdim_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t s0, int64_t s1, int64_t s2, int64_t s3,
++    int64_t str0, int64_t str1, int64_t str2, int64_t str3,
++    int64_t outer_size,
++    int64_t W)
++{
++    int64_t row = blockIdx.x;
++    if (row >= outer_size) return;
++
++    // Compute base offset for this row: shape [B,1,H,W]
++    // Decode row into coordinates: b = row / (1*H), h = row % H? Wait, shape[1] may be >1, but here it's 1.
++    // General: compute coordinates from row linear index in the (ndim-1) leading dimensions, assuming contiguous row-major order of those dims.
++    int64_t coords[3]; // b, c, h (up to 3 dims)
++    int64_t tmp = row;
++    // Assuming 4D, but we can handle up to 3 leading dims.
++    // For this model, leading dims are (B,1,H), so total = B*1*H.
++    int64_t b = tmp / (s1 * s2);
++    tmp %= (s1 * s2);
++    int64_t c = tmp / s2;
++    int64_t h = tmp % s2;
++
++    // Input base offset = b*str0 + c*str1 + h*str2 (last dim stride str3)
++    int64_t base = b * str0 + c * str1 + h * str2;
++    const float* row_ptr = input + base;
++    float* out_row_ptr = output + base;
++
++    // Find max using block reduction
++    __shared__ float s_max;
++    __shared__ float s_sum;
++
++    float thread_max = -FLT_MAX;
++    // Stride loop over W with block threads
++    for (int64_t i = threadIdx.x; i < W; i += blockDim.x) {
++        float val = row_ptr[i * str3];
++        if (val > thread_max) thread_max = val;
++    }
++    // Block reduce max
++    // Use shared memory reduction
++    __shared__ float smem[256];
++    smem[threadIdx.x] = thread_max;
++    __syncthreads();
++    for (int s = blockDim.x/2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) {
++            smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + s]);
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) s_max = smem[0];
++    __syncthreads();
++    float max_val = s_max;
++
++    // Compute exp sum
++    float thread_sum = 0.0f;
++    for (int64_t i = threadIdx.x; i < W; i += blockDim.x) {
++        thread_sum += __expf(row_ptr[i * str3] - max_val);
++    }
++    smem[threadIdx.x] = thread_sum;
++    __syncthreads();
++    for (int s = blockDim.x/2; s > 0; s >>= 1) {
++        if (threadIdx.x < s) {
++            smem[threadIdx.x] += smem[threadIdx.x + s];
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) s_sum = smem[0];
++    __syncthreads();
++    float sum = s_sum;
++
++    // Write output
++    for (int64_t i = threadIdx.x; i < W; i += blockDim.x) {
++        float val = __expf(row_ptr[i * str3] - max_val) / sum;
++        out_row_ptr[i * str3] = val;
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,117 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_mean_dim_launcher(
++    const float* input,
++    float* output,
++    const int64_t* in_shape,
++    const int64_t* in_strides,
++    const int64_t* out_shape,
++    const int64_t* out_strides,
++    int64_t dim,
++    int64_t ndim,
++    cudaStream_t stream);
++
++extern "C" void custom_softmax_lastdim_launcher(
++    const float* input,
++    float* output,
++    const int64_t* in_shape,
++    const int64_t* in_strides,
++    int64_t ndim,
++    cudaStream_t stream);
++
++// Helper to copy int64_t shape/stride from Tensor to std::vector
++static std::vector<int64_t> get_shape(const torch::Tensor& t) {
++    return std::vector<int64_t>(t.sizes().begin(), t.sizes().end());
++}
++
++static std::vector<int64_t> get_strides(const torch::Tensor& t) {
++    return std::vector<int64_t>(t.strides().begin(), t.strides().end());
++}
++
++// PyTorch wrapper for custom_mean_dim
++torch::Tensor custom_mean_dim(torch::Tensor input, int64_t dim) {
++    TORCH_CHECK(input.is_cuda(), "custom_mean_dim: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_mean_dim: input must be float32");
++    TORCH_CHECK(input.dim() > 0, "custom_mean_dim: input must have at least one dimension");
++    TORCH_CHECK(dim >= -input.dim() && dim < input.dim(), "custom_mean_dim: dim out of range");
++
++    // Normalize dim to positive (0-based)
++    if (dim < 0) {
++        dim += input.dim();
++    }
++
++    auto in_shape = get_shape(input);
++    auto in_strides = get_strides(input);
++
++    // Compute output shape: same as input but dim size = 1
++    std::vector<int64_t> out_shape = in_shape;
++    out_shape[dim] = 1;
++
++    // Allocate output tensor with same options as input
++    auto output = torch::empty(out_shape, input.options());
++
++    auto out_strides = get_strides(output); // contiguous strides
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_mean_dim_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        in_shape.data(),
++        in_strides.data(),
++        out_shape.data(),
++        out_strides.data(),
++        dim,
++        input.dim(),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_mean_dim: CUDA error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// PyTorch wrapper for custom_softmax_lastdim
++torch::Tensor custom_softmax_lastdim(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "custom_softmax_lastdim: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_softmax_lastdim: input must be float32");
++    TORCH_CHECK(input.dim() > 0, "custom_softmax_lastdim: input must have at least one dimension");
++
++    auto in_shape = get_shape(input);
++    auto in_strides = get_strides(input);
++
++    // Output has same shape as input
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_softmax_lastdim_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        in_shape.data(),
++        in_strides.data(),
++        input.dim(),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_softmax_lastdim: CUDA error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Register both ops
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_mean_dim", &custom_mean_dim,
++          "Compute mean along a dimension with keepdim=True",
++          py::arg("input"), py::arg("dim"));
++    m.def("custom_softmax_lastdim", &custom_softmax_lastdim,
++          "Compute softmax along the last dimension",
++          py::arg("input"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, dim):
++        super().__init__()
++        self.dim = dim
++
++    def forward(self, x):
++        x = cuda_extension.custom_mean_dim(x, self.dim)
++        x = cuda_extension.custom_softmax_lastdim(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.custom_mean_dim(x, self.dim)
++        yield 'step_001', x
++        x = cuda_extension.custom_softmax_lastdim(x)
++        yield 'step_002', x
++        yield 'step_003', x

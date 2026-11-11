@@ -1,0 +1,253 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,115 @@
++#include <cuda_runtime.h>
++#include <cmath>
++
++// Softplus forward kernel: y = log(1 + exp(x)), with threshold handling
++__global__ void softplus_kernel(const float* __restrict__ input, float* __restrict__ output, int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float x = input[i];
++        // PyTorch Softplus with beta=1, threshold=20: if x > 20, return x; else log1p(exp(x))
++        output[i] = (x > 20.0f) ? x : log1pf(expf(x));
++    }
++}
++
++// SiLU forward kernel: y = x * sigmoid(x)
++__global__ void silu_kernel(const float* __restrict__ input, float* __restrict__ output, int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float x = input[i];
++        output[i] = x / (1.0f + expf(-x));
++    }
++}
++
++// ReflectionPad2d kernel: applies reflection padding with given pad values (left, right, top, bottom)
++// Input is assumed contiguous, shape: [N, C, H, W]
++// Output shape: [N, C, H+top+bottom, W+left+right]
++__global__ void reflection_pad2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t pad_left, int64_t pad_right, int64_t pad_top, int64_t pad_bottom,
++    int64_t H_out, int64_t W_out, int64_t total_elements)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t linear = idx; linear < total_elements; linear += stride) {
++        // Decompose linear index into n, c, h_out, w_out (assuming contiguous output)
++        int64_t tmp = linear;
++        int64_t w_out = tmp % W_out;
++        tmp /= W_out;
++        int64_t h_out = tmp % H_out;
++        tmp /= H_out;
++        int64_t c = tmp % C;
++        int64_t n = tmp / C;
++
++        // Compute source indices with reflection
++        int64_t w_in = w_out - pad_left;
++        if (w_in < 0) {
++            w_in = -w_in;  // reflection for left padding: index -1 -> 1, -2 -> 2, etc.
++        } else if (w_in >= W_in) {
++            w_in = 2 * W_in - 2 - w_in;  // reflection for right padding
++        }
++
++        int64_t h_in = h_out - pad_top;
++        if (h_in < 0) {
++            h_in = -h_in;
++        } else if (h_in >= H_in) {
++            h_in = 2 * H_in - 2 - h_in;
++        }
++
++        // Clamp to valid range (reflection formula may yield edge cases when pad exceeds size)
++        if (w_in < 0) w_in = 0;
++        if (w_in >= W_in) w_in = W_in - 1;
++        if (h_in < 0) h_in = 0;
++        if (h_in >= H_in) h_in = H_in - 1;
++
++        int64_t input_idx = ((n * C + c) * H_in + h_in) * W_in + w_in;
++        output[linear] = input[input_idx];
++    }
++}
++
++// Launchers (extern "C" for binding layer)
++extern "C" void softplus_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    const int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    // Cap blocks to avoid grid limit and use grid-stride loop inside kernel
++    if (blocks > 65535) blocks = 65535;
++    softplus_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++extern "C" void silu_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    const int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    silu_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++extern "C" void reflection_pad2d_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t pad_left, int64_t pad_right, int64_t pad_top, int64_t pad_bottom,
++    int64_t H_out, int64_t W_out,
++    cudaStream_t stream)
++{
++    int64_t total_elements = N * C * H_out * W_out;
++    const int threads = 256;
++    int blocks = (int)((total_elements + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    reflection_pad2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H_in, W_in,
++        pad_left, pad_right, pad_top, pad_bottom,
++        H_out, W_out, total_elements);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,103 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declarations from custom_ops.cu
++extern "C" void softplus_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void silu_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void reflection_pad2d_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t pad_left, int64_t pad_right, int64_t pad_top, int64_t pad_bottom,
++    int64_t H_out, int64_t W_out,
++    cudaStream_t stream);
++
++// Softplus wrapper
++torch::Tensor softplus_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    auto output = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    softplus_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        stream);
++    return output;
++}
++
++// SiLU wrapper
++torch::Tensor silu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    auto output = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    silu_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        stream);
++    return output;
++}
++
++// ReflectionPad2d wrapper
++torch::Tensor reflection_pad2d_forward(
++    torch::Tensor x,
++    int64_t pad_left,
++    int64_t pad_right,
++    int64_t pad_top,
++    int64_t pad_bottom) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H_in = x.size(2);
++    int64_t W_in = x.size(3);
++    int64_t H_out = H_in + pad_top + pad_bottom;
++    int64_t W_out = W_in + pad_left + pad_right;
++
++    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    reflection_pad2d_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H_in, W_in,
++        pad_left, pad_right, pad_top, pad_bottom,
++        H_out, W_out,
++        stream);
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("softplus_forward", &softplus_forward, "Softplus forward", py::arg("x"));
++    m.def("silu_forward", &silu_forward, "SiLU forward", py::arg("x"));
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "ReflectionPad2d forward",
++          py::arg("x"),
++          py::arg("pad_left"),
++          py::arg("pad_right"),
++          py::arg("pad_top"),
++          py::arg("pad_bottom"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, kernel_size, padding_size):
++        super().__init__()
++        self.softplus = nn.Softplus()
++        self.padding = nn.ReflectionPad2d(padding_size)
++        self.silu = nn.SiLU()
++
++    def forward(self, x):
++        x = cuda_extension.softplus_forward(x)
++        x = cuda_extension.reflection_pad2d_forward(x, 1, 2, 1, 2)
++        x = cuda_extension.silu_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        step_001 = cuda_extension.softplus_forward(x)
++        yield 'step_001', step_001
++        step_002 = cuda_extension.reflection_pad2d_forward(step_001, 1, 2, 1, 2)
++        yield 'step_002', step_002
++        step_003 = cuda_extension.silu_forward(step_002)
++        yield 'step_003', step_003
++        yield 'step_004', step_003

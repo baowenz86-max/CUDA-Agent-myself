@@ -1,0 +1,137 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -7,11 +7,7 @@
+ // ------------------- Unfold kernel -------------------
+ // Implements nn.Unfold for a 4D input (N, C, H, W) with
+ // kernel_size (kh, kw), dilation (dh, dw), padding (ph, pw), stride (sh, sw).
+-// Output shape: (N, C*kh*kw, L) where L = out_h * out_w.
+-//
+-// The kernel is written as a 1D grid over total output elements.
+-// Each thread computes one output element, using 64-bit indexing to avoid overflow.
+-
++// Output shape: (N, C_out, L) where C_out = C * kh * kw, L = out_h * out_w.
+ __global__ void unfold_kernel_float(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+@@ -22,30 +18,27 @@
+     int64_t sh, int64_t sw,
+     int64_t out_h, int64_t out_w,
+     int64_t L,
++    int64_t C_out,
+     int64_t total_output)
+ {
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int64_t stride = blockDim.x * gridDim.x;
+ 
+     for (int64_t linear_idx = idx; linear_idx < total_output; linear_idx += stride) {
+-        // Decompose linear index: (n, c, l) where l = out_h * out_w
++        // Decompose linear index: (n, c, l)
+         int64_t l = linear_idx % L;
+         int64_t tmp = linear_idx / L;
+-        int64_t c = tmp % C;
+-        int64_t n = tmp / C;
++        int64_t c = tmp % C_out;   // fixed: use C_out not C
++        int64_t n = tmp / C_out;   // fixed
+ 
+-        // Within output channel c, we have (kh*kw) values corresponding to each kernel position.
+-        // Let k = c % (kh*kw), and the original input channel = c / (kh*kw).
+         int64_t kk = c % (kh * kw);
+         int64_t in_c = c / (kh * kw);
+         int64_t k_h = kk / kw;
+         int64_t k_w = kk % kw;
+ 
+-        // Output spatial position (out_i, out_j)
+         int64_t out_i = l / out_w;
+         int64_t out_j = l % out_w;
+ 
+-        // Input spatial position
+         int64_t in_i = out_i * sh - ph + k_h * dh;
+         int64_t in_j = out_j * sw - pw + k_w * dw;
+ 
+@@ -58,34 +51,22 @@
+ }
+ 
+ // ------------------- Cat kernel -------------------
+-// Concatenates two tensors along dim=1.
+-// This specialized version assumes both tensors have identical shapes,
+-// are contiguous, and concatenation duplicates along the channel dimension.
+-// It writes tensor_a to the first half and tensor_b to the second half.
+ __global__ void cat_duplicate_kernel_float(
+     const float* __restrict__ tensor_a,
+     const float* __restrict__ tensor_b,
+     float* __restrict__ output,
+-    int64_t total_elements_per_tensor,
+-    int64_t total_output,
+-    int64_t chunk_size) // chunk_size = total_elements_per_tensor (since concatenating two identical tensors)
++    int64_t total_elements_per_tensor)
+ {
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int64_t stride = blockDim.x * gridDim.x;
+ 
+-    // Copy first half from tensor_a
+-    for (int64_t i = idx; i < chunk_size; i += stride) {
++    for (int64_t i = idx; i < total_elements_per_tensor; i += stride) {
+         output[i] = tensor_a[i];
+-    }
+-    // Copy second half from tensor_b
+-    for (int64_t i = idx; i < chunk_size; i += stride) {
+-        output[chunk_size + i] = tensor_b[i];
++        output[total_elements_per_tensor + i] = tensor_b[i];
+     }
+ }
+ 
+ // ------------------- Launchers -------------------
+-// Extern "C" functions to be called by binding.cpp (not included in this file)
+-
+ extern "C" void unfold_forward_launcher(
+     const float* input,
+     float* output,
+@@ -104,12 +85,12 @@
+ 
+     const int threads = 256;
+     int64_t blocks = (total_output + threads - 1) / threads;
+-    if (blocks > 2147483647LL) blocks = 2147483647LL; // grid dimension limit
++    if (blocks > 2147483647LL) blocks = 2147483647LL;
+     if (total_output > 0) {
+         unfold_kernel_float<<<(unsigned int)blocks, threads, 0, stream>>>(
+             input, output, N, C, H, W,
+             kh, kw, dh, dw, ph, pw, sh, sw,
+-            out_h, out_w, L, total_output);
++            out_h, out_w, L, C_out, total_output);
+     }
+ }
+ 
+@@ -126,6 +107,6 @@
+     if (blocks > 2147483647LL) blocks = 2147483647LL;
+     if (total_output > 0) {
+         cat_duplicate_kernel_float<<<(unsigned int)blocks, threads, 0, stream>>>(
+-            tensor_a, tensor_b, output, total_elements_per_tensor, total_output, total_elements_per_tensor);
++            tensor_a, tensor_b, output, total_elements_per_tensor);
+     }
+-}
++}--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -8,7 +8,6 @@
+ 
+ namespace py = pybind11;
+ 
+-// Declare launchers from custom_ops.cu
+ extern "C" void unfold_forward_launcher(
+     const float* input,
+     float* output,
+@@ -26,9 +25,6 @@
+     int64_t total_elements_per_tensor,
+     cudaStream_t stream);
+ 
+-// Unpack a packed int64_t produced by Python helper _pack_int.
+-// If low 32 bits are all 0xffffffff, it's a single int, so both values = high.
+-// Otherwise, high and low are two distinct ints.
+ static inline void unpack_pair(int64_t packed, int64_t& first, int64_t& second) {
+     int64_t low = packed & 0xffffffffLL;
+     int64_t high = packed >> 32;
+@@ -136,4 +132,4 @@
+           py::arg("dim"));
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);
++REGISTER_BINDING(custom_ops, register_custom_ops);

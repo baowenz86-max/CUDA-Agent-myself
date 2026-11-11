@@ -1,0 +1,164 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -4,7 +4,7 @@
+ // Input: float32 tensor of shape [N, C, H, W], contiguous
+ // Output: float32 tensor of shape [N, C, outH, outW]
+ // scale_factor: float, output size = floor(input_size * scale_factor)
+-// For each output element, compute source coordinates and interpolate.
++// This kernel uses a 2D grid over output pixels to avoid complex index decomposition.
+ __global__ void upsample_bilinear_2d_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+@@ -12,63 +12,53 @@
+     int outH, int outW,
+     float scale_factor)
+ {
+-    int total = N * C * outH * outW;
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int stride = blockDim.x * gridDim.x;
++    // Map blockIdx and threadIdx to output pixel (ow, oh) and batch/channel
++    // Grid dimensions: x = outW, y = outH, z = N*C (or we can use blockIdx.z)
++    int ow = blockIdx.x * blockDim.x + threadIdx.x;
++    int oh = blockIdx.y * blockDim.y + threadIdx.y;
++    int nc = blockIdx.z; // nc = n*C + c, but we need to map to n and c
+ 
+-    // grid-stride loop to ensure all elements covered
+-    for (int i = idx; i < total; i += stride) {
+-        // Decompose linear index into n, c, oh, ow
+-        int ow = i % outW;
+-        int tmp = i / outW;
+-        int oh = tmp % outH;
+-        tmp /= outH;
+-        int c = tmp % C;
+-        int n = tmp / C;
++    if (ow >= outW || oh >= outH || nc >= N * C) return;
+ 
+-        // Source coordinate mapping: src = (dst + 0.5) / scale - 0.5
+-        float src_y = (oh + 0.5f) / scale_factor - 0.5f;
+-        float src_x = (ow + 0.5f) / scale_factor - 0.5f;
++    int n = nc / C;
++    int c = nc - n * C;
+ 
+-        // Clamp to [0, H-1] and [0, W-1]
+-        if (src_y < 0.0f) src_y = 0.0f;
+-        if (src_x < 0.0f) src_x = 0.0f;
+-        if (src_y > H - 1.0f) src_y = H - 1.0f;
+-        if (src_x > W - 1.0f) src_x = W - 1.0f;
++    // Source coordinate mapping: src = (dst + 0.5) / scale - 0.5
++    double src_y = (oh + 0.5) / (double)scale_factor - 0.5;
++    double src_x = (ow + 0.5) / (double)scale_factor - 0.5;
+ 
+-        int y0 = (int)src_y;
+-        int x0 = (int)src_x;
+-        int y1 = y0 + 1;
+-        int x1 = x0 + 1;
+-        if (y1 >= H) y1 = H - 1;
+-        if (x1 >= W) x1 = W - 1;
++    // Clamp to input bounds to avoid extrapolation
++    if (src_y < 0.0) src_y = 0.0;
++    if (src_x < 0.0) src_x = 0.0;
++    if (src_y > H - 1.0) src_y = H - 1.0;
++    if (src_x > W - 1.0) src_x = W - 1.0;
+ 
+-        float ly = src_y - y0;
+-        float lx = src_x - x0;
++    int y0 = (int)floor((float)src_y);
++    int x0 = (int)floor((float)src_x);
++    int y1 = y0 + 1;
++    int x1 = x0 + 1;
++    if (y1 >= H) y1 = H - 1;
++    if (x1 >= W) x1 = W - 1;
+ 
+-        // Four corners
+-        float v00 = input[((n * C + c) * H + y0) * W + x0];
+-        float v01 = input[((n * C + c) * H + y0) * W + x1];
+-        float v10 = input[((n * C + c) * H + y1) * W + x0];
+-        float v11 = input[((n * C + c) * H + y1) * W + x1];
++    float ly = (float)(src_y - y0);
++    float lx = (float)(src_x - x0);
+ 
+-        // Bilinear interpolation
+-        float top = v00 * (1.0f - lx) + v01 * lx;
+-        float bottom = v10 * (1.0f - lx) + v11 * lx;
+-        float value = top * (1.0f - ly) + bottom * ly;
++    // Four corners
++    const float* base = input + ((n * C + c) * H) * W; // pointer to the input slice
++    float v00 = base[y0 * W + x0];
++    float v01 = base[y0 * W + x1];
++    float v10 = base[y1 * W + x0];
++    float v11 = base[y1 * W + x1];
+ 
+-        output[i] = value;
+-    }
++    // Bilinear interpolation
++    float top = v00 * (1.0f - lx) + v01 * lx;
++    float bottom = v10 * (1.0f - lx) + v11 * lx;
++    float value = top * (1.0f - ly) + bottom * ly;
++
++    output[((n * C + c) * outH + oh) * outW + ow] = value;
+ }
+ 
+ // Launcher called from C++ binding (extern "C")
+-// Parameters:
+-//   input: pointer to input tensor data (float32, contiguous)
+-//   output: pointer to output tensor data (pre-allocated, size N*C*outH*outW)
+-//   N, C, H, W: input dimensions
+-//   scale_factor: float scale factor (positive)
+-//   stream: CUDA stream
+-// Output dimensions computed as floor(H*scale) and floor(W*scale)
+ extern "C" void upsample_bilinear_2d_launcher(
+     const float* input,
+     float* output,
+@@ -86,14 +76,12 @@
+         return;
+     }
+ 
+-    int total = N * C * outH * outW;
+-    // Choose block size and grid size (grid-stride loop handles large total)
+-    int block_size = 256;
+-    int grid_size = (total + block_size - 1) / block_size;
+-    // Limit grid size to avoid exceeding max, but grid-stride loop covers rest
+-    int max_grid = 65535; // common max for dimension 0; could be lower on some GPUs, but safe
+-    if (grid_size > max_grid) grid_size = max_grid;
++    // Use 2D block and 3D grid for clarity
++    dim3 block(16, 16); // 256 threads per block
++    dim3 grid((outW + block.x - 1) / block.x,
++              (outH + block.y - 1) / block.y,
++              N * C); // one block z per slice, up to 65535 slices in z, but N*C=48, safe
+ 
+-    upsample_bilinear_2d_kernel<<<grid_size, block_size, 0, stream>>>(
++    upsample_bilinear_2d_kernel<<<grid, block, 0, stream>>>(
+         input, output, N, C, H, W, outH, outW, scale_factor);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -17,7 +17,7 @@
+     TORCH_CHECK(x.dim() == 4, "Input must have 4 dimensions (N,C,H,W)");
+     TORCH_CHECK(scale_factor > 0.0, "scale_factor must be positive");
+     
+-    // Input may have arbitrary strides; make contiguous for kernel.
++    // Ensure input is contiguous (already done in model_new.py, but keep for safety)
+     auto x_contig = x.contiguous();
+     int N = x_contig.size(0);
+     int C = x_contig.size(1);
+@@ -28,6 +28,7 @@
+     int outW = static_cast<int>(W * scale_factor);
+     TORCH_CHECK(outH > 0 && outW > 0, "Invalid output dimensions");
+     
++    // Allocate output with same options (dtype, device)
+     auto output = torch::empty({N, C, outH, outW}, x_contig.options());
+     
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+--- before/model_new.py
++++ after/model_new.py
+@@ -9,6 +9,10 @@
+         self.scale_factor = float(scale_factor)
+ 
+     def forward(self, x):
++        # Ensure input is on CUDA and contiguous
++        if not x.is_cuda:
++            x = x.cuda()
++        x = x.contiguous()
+         return cuda_extension.upsample_bilinear_2d(x, self.scale_factor)
+ 
+     def debug_forward(self, x):

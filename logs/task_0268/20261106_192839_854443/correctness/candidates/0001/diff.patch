@@ -1,0 +1,195 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,80 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// Kernel to compute log_softmax along dim=0
++// Input shape: rows x cols, reduction over rows (dim=0)
++// Each block processes one column (or a group of columns)
++__global__ void log_softmax_dim0_kernel(const float* __restrict__ input,
++                                         float* __restrict__ output,
++                                         int rows, int cols) {
++    int col = blockIdx.x * blockDim.x + threadIdx.x;
++    if (col >= cols) return;
++
++    // Step 1: find max in column
++    float max_val = -INFINITY;
++    for (int r = 0; r < rows; ++r) {
++        float v = input[r * cols + col];
++        if (v > max_val) max_val = v;
++    }
++
++    // Step 2: compute sum of exp(x - max) using double for stability
++    double sum = 0.0;
++    for (int r = 0; r < rows; ++r) {
++        float v = input[r * cols + col];
++        sum += expf(v - max_val);
++    }
++    double log_sum = log(sum);
++
++    // Step 3: write output = x - max - log_sum
++    for (int r = 0; r < rows; ++r) {
++        float v = input[r * cols + col];
++        output[r * cols + col] = (float)(v - max_val - log_sum);
++    }
++}
++
++// Kernel to concatenate two tensors along dim=0
++// Output shape: rows_a + rows_b, cols (same cols)
++__global__ void cat_dim0_kernel(const float* __restrict__ input_a,
++                                 const float* __restrict__ input_b,
++                                 float* __restrict__ output,
++                                 int rows_a, int rows_b, int cols) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_a = rows_a * cols;
++    int total_b = rows_b * cols;
++    int total_out = total_a + total_b;
++    if (idx >= total_out) return;
++
++    if (idx < total_a) {
++        output[idx] = input_a[idx];
++    } else {
++        output[idx] = input_b[idx - total_a];
++    }
++}
++
++// Launcher for log_softmax along dim=0
++extern "C" void log_softmax_dim_launcher(const float* input,
++                                          float* output,
++                                          int rows, int cols,
++                                          cudaStream_t stream) {
++    if (rows <= 0 || cols <= 0) return;
++
++    int block_size = 256;
++    int grid_size = (cols + block_size - 1) / block_size;
++    log_softmax_dim0_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, rows, cols);
++}
++
++// Launcher for cat along dim=0
++extern "C" void cat_dim_launcher(const float* input_a,
++                                  const float* input_b,
++                                  float* output,
++                                  int rows_a, int rows_b, int cols,
++                                  cudaStream_t stream) {
++    if (rows_a <= 0 || rows_b <= 0 || cols <= 0) return;
++
++    int total_out = (rows_a + rows_b) * cols;
++    int block_size = 256;
++    int grid_size = (total_out + block_size - 1) / block_size;
++    cat_dim0_kernel<<<grid_size, block_size, 0, stream>>>(
++        input_a, input_b, output, rows_a, rows_b, cols);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,84 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void log_softmax_dim_launcher(const float* input,
++                                          float* output,
++                                          int rows, int cols,
++                                          cudaStream_t stream);
++
++extern "C" void cat_dim_launcher(const float* input_a,
++                                  const float* input_b,
++                                  float* output,
++                                  int rows_a, int rows_b, int cols,
++                                  cudaStream_t stream);
++
++// Wrapper for log_softmax along dim=0
++torch::Tensor log_softmax_dim(torch::Tensor input, int64_t dim) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dim() == 2, "Input must be 2D");
++    TORCH_CHECK(dim == 0, "Only dim=0 is supported for log_softmax");
++
++    int rows = input.size(0);
++    int cols = input.size(1);
++
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    log_softmax_dim_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        rows, cols,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "log_softmax_dim kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for concatenation along dim=0
++torch::Tensor cat_dim(torch::Tensor input_a, torch::Tensor input_b, int64_t dim) {
++    TORCH_CHECK(input_a.is_cuda() && input_b.is_cuda(), "Inputs must be CUDA tensors");
++    TORCH_CHECK(input_a.dtype() == torch::kFloat32 && input_b.dtype() == torch::kFloat32, "Inputs must be float32");
++    TORCH_CHECK(input_a.is_contiguous() && input_b.is_contiguous(), "Inputs must be contiguous");
++    TORCH_CHECK(input_a.dim() == 2 && input_b.dim() == 2, "Inputs must be 2D");
++    TORCH_CHECK(dim == 0, "Only dim=0 is supported for cat");
++    TORCH_CHECK(input_a.size(1) == input_b.size(1), "Inputs must have same number of columns");
++
++    int rows_a = input_a.size(0);
++    int rows_b = input_b.size(0);
++    int cols = input_a.size(1);
++
++    auto output = torch::empty({rows_a + rows_b, cols}, input_a.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    cat_dim_launcher(
++        input_a.data_ptr<float>(),
++        input_b.data_ptr<float>(),
++        output.data_ptr<float>(),
++        rows_a, rows_b, cols,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "cat_dim kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("log_softmax_dim", &log_softmax_dim, "Log softmax along dim=0",
++          pybind11::arg("input"), pybind11::arg("dim"));
++    m.def("cat_dim", &cat_dim, "Concatenate along dim=0",
++          pybind11::arg("input_a"), pybind11::arg("input_b"), pybind11::arg("dim"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, cat_dim):
++        super().__init__()
++        self.cat_dim = cat_dim
++
++    def forward(self, x, y):
++        x = cuda_extension.log_softmax_dim(x, self.cat_dim)
++        y = cuda_extension.log_softmax_dim(y, self.cat_dim)
++        return cuda_extension.cat_dim(x, y, self.cat_dim)
++
++    def debug_forward(self, x, y):
++        x = cuda_extension.log_softmax_dim(x, self.cat_dim)
++        yield 'step_001', x
++        y = cuda_extension.log_softmax_dim(y, self.cat_dim)
++        yield 'step_002', y
++        out = cuda_extension.cat_dim(x, y, self.cat_dim)
++        yield 'step_003', out

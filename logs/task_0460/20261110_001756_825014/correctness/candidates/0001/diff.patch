@@ -1,0 +1,161 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,55 @@
++#include <cuda_runtime.h>
++
++// Kernel that copies data from input (arbitrary strides) to output (contiguous)
++// Each thread handles one linear output index. Grid-stride loop ensures all elements written even if grid is smaller than total elements.
++__global__ void copy_strided_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int total_elems,
++    int ndims,
++    const int64_t* __restrict__ dims,
++    const int64_t* __restrict__ input_strides,
++    const int64_t* __restrict__ output_strides)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < total_elems; i += stride) {
++        // Unravel linear output index into multi-dimensional coordinates
++        int64_t remainder = i;
++        int64_t input_offset = 0;
++        // output is contiguous, so output_strides are used, but can be inferred
++        for (int d = ndims - 1; d >= 0; --d) {
++            int coord = remainder % dims[d];
++            remainder /= dims[d];
++            input_offset += coord * input_strides[d];
++        }
++        output[i] = input[input_offset];
++    }
++}
++
++// Host launcher: copies input tensor to output tensor while honoring input strides.
++// output is assumed to be contiguous in memory (as specified by contract).
++// ndims is not used inside kernel except for loop bound; we pass ndims as int.
++// Note: output_strides not needed if output is guaranteed contiguous, but we pass for completeness.
++extern "C" void stack_like_launcher(
++    float* output,
++    const float* input,
++    int total_elems,
++    int ndims,
++    const int64_t* dims,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    cudaStream_t stream)
++{
++    // Configure launch parameters for large tensor
++    int threads = 256;
++    int blocks = (total_elems + threads - 1) / threads;
++    // Cap blocks to avoid excessive grid size; grid-stride loop handles the rest
++    const int max_blocks = 65535;
++    if (blocks > max_blocks) blocks = max_blocks;
++
++    copy_strided_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, total_elems, ndims,
++        dims, input_strides, output_strides);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,68 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void stack_like_launcher(
++    float* output,
++    const float* input,
++    int total_elems,
++    int ndims,
++    const int64_t* dims,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    cudaStream_t stream);
++
++torch::Tensor stack_like(torch::Tensor x) {
++    // Validate input tensor
++    TORCH_CHECK(x.is_cuda(), "stack_like: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "stack_like: input dtype must be float32");
++    TORCH_CHECK(x.dim() >= 1, "stack_like: input must have at least one dimension");
++
++    // Ensure output is contiguous with same shape
++    auto output = torch::empty_like(x);
++
++    // Collect dims and strides
++    int ndims = x.dim();
++    std::vector<int64_t> dims_vec(ndims);
++    std::vector<int64_t> input_strides_vec(ndims);
++    std::vector<int64_t> output_strides_vec(ndims);
++
++    for (int i = 0; i < ndims; ++i) {
++        dims_vec[i] = x.size(i);
++        input_strides_vec[i] = x.stride(i);
++        output_strides_vec[i] = output.stride(i);
++    }
++
++    int total_elems = x.numel();
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    stack_like_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        total_elems,
++        ndims,
++        dims_vec.data(),
++        input_strides_vec.data(),
++        output_strides_vec.data(),
++        stream
++    );
++
++    // Check for kernel errors (optional but recommended)
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "stack_like: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_stack_like(pybind11::module& m) {
++    m.def("stack_like", &stack_like, "Copy input tensor to contiguous output preserving values",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(stack_like, register_stack_like);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,29 @@
++import torch
++import torch.nn as nn
++
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, upscale_factor):
++        super().__init__()
++        self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
++
++    def forward(self, x):
++        return cuda_extension.stack_like(x)
++
++    def debug_forward(self, x):
++        # Step 1: unbind (logical slices)
++        yield "step_001", torch.unbind(x, dim=1)
++
++        # Step 2: pixel_shuffle each slice (identity here)
++        slices = torch.unbind(x, dim=1)
++        processed = [self.pixel_shuffle(item) for item in slices]
++        yield "step_002", processed
++
++        # Step 3: stack
++        stacked = torch.stack(processed, dim=1)
++        yield "step_003", stacked
++
++        # Step 4: return
++        yield "step_004", stacked

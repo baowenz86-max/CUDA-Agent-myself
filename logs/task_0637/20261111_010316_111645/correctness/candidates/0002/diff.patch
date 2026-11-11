@@ -1,0 +1,120 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,5 +1,6 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
++#include <limits>
+ 
+ // CUDA kernel for computing max along a specified dimension for a contiguous tensor.
+ // Each thread block handles a contiguous range of output elements (one per slice).
+@@ -22,10 +23,9 @@
+     // Each block is responsible for one or more output indices, depending on grid-stride.
+     // Total output elements = outer_size * inner_size.
+     int64_t total_outputs = outer_size * inner_size;
+-    int64_t global_output_start = blockIdx.x * (int64_t)blockDim.x; // We'll use a block-level stride
+     int64_t block_stride = (int64_t)gridDim.x * blockDim.x;
+ 
+-    // For each output element assigned to this block (using thread 0 as coordinator)
++    // For each output element assigned to this thread (grid-stride loop)
+     for (int64_t out_idx_linear = blockIdx.x * blockDim.x + threadIdx.x;
+          out_idx_linear < total_outputs;
+          out_idx_linear += block_stride)
+@@ -38,16 +38,10 @@
+         int64_t base = (outer * reduce_size) * inner_size + inner;
+ 
+         // Initialize reduction in registers
+-        float local_max = -CUDART_INF_F; // negative infinity
++        float local_max = -std::numeric_limits<float>::infinity();
+         int64_t local_max_idx = 0;
+ 
+-        // Thread-local reduction over the reduce dimension using grid-stride within the block?
+-        // Simpler: each thread handles a subset of reduce elements and then we do shared memory reduction.
+-        // Use shared memory for block reduction.
+-        __shared__ float smem_values[BLOCK_SIZE];
+-        __shared__ int64_t smem_indices[BLOCK_SIZE];
+-
+-        // Each thread processes multiple elements of the reduction dimension
++        // Thread-local reduction over the reduce dimension
+         for (int64_t r = threadIdx.x; r < reduce_size; r += BLOCK_SIZE)
+         {
+             float val = input[base + r * inner_size];
+@@ -57,36 +51,9 @@
+             }
+         }
+ 
+-        // Write thread-local results to shared memory
+-        smem_values[threadIdx.x] = local_max;
+-        smem_indices[threadIdx.x] = local_max_idx;
+-        __syncthreads();
+-
+-        // Tree reduction in shared memory
+-        for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1)
+-        {
+-            if (threadIdx.x < stride)
+-            {
+-                float other_val = smem_values[threadIdx.x + stride];
+-                int64_t other_idx = smem_indices[threadIdx.x + stride];
+-                if (other_val > smem_values[threadIdx.x] ||
+-                    (other_val == smem_values[threadIdx.x] && other_idx < smem_indices[threadIdx.x]))
+-                {
+-                    smem_values[threadIdx.x] = other_val;
+-                    smem_indices[threadIdx.x] = other_idx;
+-                }
+-            }
+-            __syncthreads();
+-        }
+-
+-        // Thread 0 writes the result
+-        if (threadIdx.x == 0)
+-        {
+-            values[out_idx_linear] = smem_values[0];
+-            indices[out_idx_linear] = smem_indices[0];
+-        }
+-        // Need to sync before next iteration to reuse shared memory safely.
+-        __syncthreads();
++        // Each thread writes its result directly; no shared memory needed since each thread handles one output element.
++        values[out_idx_linear] = local_max;
++        indices[out_idx_linear] = local_max_idx;
+     }
+ }
+ 
+@@ -118,9 +85,6 @@
+     if (total_outputs == 0) return;
+ 
+     constexpr int BLOCK_SIZE = 256;
+-    // Choose grid size: enough blocks to cover total_outputs / BLOCK_SIZE (each block can process at least one output element),
+-    // but not exceed a reasonable limit (e.g., 65535*2 or use grid-stride). We'll use enough blocks to ensure all outputs are covered,
+-    // with each block capable of handling multiple outputs via grid-stride loop.
+     int64_t blocks_needed = (total_outputs + BLOCK_SIZE - 1) / BLOCK_SIZE;
+     int grid_size = (int)min(blocks_needed, (int64_t)65535 * 32); // cap to avoid excessive grid size; grid-stride handles the rest
+     if (grid_size < 1) grid_size = 1;
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,6 +2,7 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cuda_runtime.h>
++#include <tuple>
+ #include "../binding_registry.h"
+ 
+ // Declaration of the launcher implemented in custom_ops.cu
+@@ -15,8 +16,8 @@
+     bool keepdim,
+     cudaStream_t stream);
+ 
+-// Wrapper function matching the contract: torch.return_types.max max_forward(torch::Tensor x, int64_t dim, bool keepdim)
+-torch::return_types::max max_forward(torch::Tensor x, int64_t dim, bool keepdim) {
++// Wrapper function matching the contract: returns a tuple (values, indices) that pybind converts to torch.return_types.max
++std::tuple<torch::Tensor, torch::Tensor> max_forward(torch::Tensor x, int64_t dim, bool keepdim) {
+     TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
+     TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input dtype must be float32");
+ 
+@@ -78,7 +79,7 @@
+           "    dim (int): dimension to reduce\n"
+           "    keepdim (bool): whether to keep the reduced dimension\n"
+           "Returns:\n"
+-          "    torch.return_types.max: (values, indices)",
++          "    tuple (values, indices)",
+           py::arg("x"), py::arg("dim"), py::arg("keepdim"));
+ }
+ 

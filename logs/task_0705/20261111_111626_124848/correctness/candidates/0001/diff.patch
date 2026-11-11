@@ -1,0 +1,364 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,143 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// -----------------------------------------------------------------------------
++// argmax_dim: 对输入 [batch, length, channels] 沿 dim 求最大值和索引
++// 此处 dim 固定为 1 (由契约保证), 但代码按 dim 参数处理, 但仅支持 dim=1
++// 输出 values 与 indices 形状为 [batch, channels]
++// -----------------------------------------------------------------------------
++
++__global__ void argmax_dim_kernel(
++    const float* __restrict__ input,
++    int64_t* __restrict__ indices,
++    float* __restrict__ values,
++    int batch,
++    int length,
++    int channels)
++{
++    int64_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t total_outputs = (int64_t)batch * channels;
++    if (out_idx >= total_outputs) return;
++
++    int b = out_idx / channels;
++    int c = out_idx % channels;
++
++    const float* in_ptr = input + ((int64_t)b * length + 0) * channels + c;
++    float best_val = -INFINITY;
++    int64_t best_idx = 0;
++
++    // 使用 grid-stride 循环处理超长 length
++    for (int i = 0; i < length; ++i) {
++        float val = in_ptr[(int64_t)i * channels];
++        if (val > best_val) {
++            best_val = val;
++            best_idx = i;
++        }
++    }
++
++    values[out_idx] = best_val;
++    indices[out_idx] = best_idx;
++}
++
++extern "C" void argmax_dim_launcher(
++    const float* input,
++    int64_t* indices,
++    float* values,
++    int batch,
++    int length,
++    int channels,
++    int dim,
++    cudaStream_t stream)
++{
++    // 本任务只支持 dim=1，但根据参考调用 dim=1
++    if (dim != 1) {
++        // 不支持，但为了避免未定义，留空
++    }
++    int64_t total_outputs = (int64_t)batch * channels;
++    if (total_outputs <= 0) return;
++
++    int threads = 256;
++    int64_t blocks64 = (total_outputs + threads - 1) / threads;
++    int blocks = (blocks64 > INT32_MAX) ? INT32_MAX : (int)blocks64;
++
++    argmax_dim_kernel<<<blocks, threads, 0, stream>>>(
++        input, indices, values, batch, length, channels);
++}
++
++// -----------------------------------------------------------------------------
++// float_cast: int64 -> float32 逐元素转换
++// -----------------------------------------------------------------------------
++
++__global__ void float_cast_kernel(
++    const int64_t* __restrict__ input,
++    float* __restrict__ output,
++    int64_t n)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < n) {
++        output[idx] = (float)input[idx];
++    }
++}
++
++extern "C" void float_cast_launcher(
++    const int64_t* input,
++    float* output,
++    int64_t n,
++    cudaStream_t stream)
++{
++    if (n <= 0) return;
++    int threads = 256;
++    int64_t blocks64 = (n + threads - 1) / threads;
++    int blocks = (blocks64 > INT32_MAX) ? INT32_MAX : (int)blocks64;
++    float_cast_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
++}
++
++// -----------------------------------------------------------------------------
++// batch_norm_eval: y = (x - mean) / sqrt(var + eps) * weight + bias
++// x: [batch, channels], 参数: [channels]
++// -----------------------------------------------------------------------------
++
++__global__ void batch_norm_eval_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    float eps,
++    float* __restrict__ output,
++    int batch,
++    int channels)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = batch * channels;
++    if (idx >= total) return;
++
++    int c = idx % channels;
++    float mean = running_mean[c];
++    float var = running_var[c];
++    float w = weight[c];
++    float b = bias[c];
++    float inv_std = rsqrtf(var + eps);
++    float val = (input[idx] - mean) * inv_std * w + b;
++    output[idx] = val;
++}
++
++extern "C" void batch_norm_eval_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    double eps,
++    float* output,
++    int batch,
++    int channels,
++    cudaStream_t stream)
++{
++    int total = batch * channels;
++    if (total <= 0) return;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    batch_norm_eval_kernel<<<blocks, threads, 0, stream>>>(
++        input, weight, bias, running_mean, running_var, (float)eps, output, batch, channels);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,173 @@
++// Binding for custom CUDA kernels: argmax_dim, float_cast, batch_norm_eval
++// This file contains no CUDA kernels, only launcher wrappers and pybind registration.
++
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cstdint>
++
++#include "../binding_registry.h"
++
++// ---- Declare launchers from custom_ops.cu ----
++extern "C" void argmax_dim_launcher(
++    const float* input,
++    int64_t* indices,
++    float* values,
++    int batch,
++    int length,
++    int channels,
++    int dim,
++    cudaStream_t stream);
++
++extern "C" void float_cast_launcher(
++    const int64_t* input,
++    float* output,
++    int64_t n,
++    cudaStream_t stream);
++
++extern "C" void batch_norm_eval_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    double eps,
++    float* output,
++    int batch,
++    int channels,
++    cudaStream_t stream);
++
++// ---- Helper: ensure CUDA tensor, dtype, contiguous ----
++static torch::Tensor ensure_cuda_float32_contiguous(const torch::Tensor& t, const char* name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    if (!t.is_contiguous()) {
++        return t.contiguous();
++    }
++    return t;
++}
++
++static torch::Tensor ensure_cuda_int64_contiguous(const torch::Tensor& t, const char* name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kInt64, name, " must be int64");
++    if (!t.is_contiguous()) {
++        return t.contiguous();
++    }
++    return t;
++}
++
++// ---- argmax_dim wrapper: returns torch.return_types.max ----
++torch::return_types::max argmax_dim_forward(torch::Tensor x, int64_t dim) {
++    // Validate input shape: expected [batch, length, channels]
++    TORCH_CHECK(x.dim() == 3, "argmax_dim: input must be 3D [batch, length, channels]");
++    TORCH_CHECK(dim == 1, "argmax_dim: only dim=1 is supported");
++
++    // Ensure contiguous and correct dtype
++    x = ensure_cuda_float32_contiguous(x, "argmax_dim input");
++
++    int batch = static_cast<int>(x.size(0));
++    int length = static_cast<int>(x.size(1));
++    int channels = static_cast<int>(x.size(2));
++
++    // Allocate outputs: [batch, channels] float32 and int64
++    auto values = torch::empty({batch, channels}, x.options().dtype(torch::kFloat32));
++    auto indices = torch::empty({batch, channels}, x.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    argmax_dim_launcher(
++        x.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        values.data_ptr<float>(),
++        batch,
++        length,
++        channels,
++        static_cast<int>(dim),
++        stream
++    );
++
++    // Return torch.return_types.max container
++    return {std::move(values), std::move(indices)};
++}
++
++// ---- float_cast wrapper ----
++torch::Tensor float_cast_forward(torch::Tensor x) {
++    TORCH_CHECK(x.dim() == 2, "float_cast: input must be 2D [batch, channels]");
++    x = ensure_cuda_int64_contiguous(x, "float_cast input");
++
++    auto output = torch::empty_like(x, x.options().dtype(torch::kFloat32));
++
++    int64_t n = x.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    float_cast_launcher(
++        x.data_ptr<int64_t>(),
++        output.data_ptr<float>(),
++        n,
++        stream
++    );
++
++    return output;
++}
++
++// ---- batch_norm_eval wrapper ----
++torch::Tensor batch_norm_eval_forward(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    torch::Tensor running_mean,
++    torch::Tensor running_var,
++    double eps) {
++
++    TORCH_CHECK(input.dim() == 2, "batch_norm_eval: input must be 2D [batch, channels]");
++    input = ensure_cuda_float32_contiguous(input, "batch_norm_eval input");
++    weight = ensure_cuda_float32_contiguous(weight, "batch_norm_eval weight");
++    bias = ensure_cuda_float32_contiguous(bias, "batch_norm_eval bias");
++    running_mean = ensure_cuda_float32_contiguous(running_mean, "batch_norm_eval running_mean");
++    running_var = ensure_cuda_float32_contiguous(running_var, "batch_norm_eval running_var");
++
++    int batch = static_cast<int>(input.size(0));
++    int channels = static_cast<int>(input.size(1));
++
++    // Ensure parameter tensors have size [channels]
++    TORCH_CHECK(weight.numel() == channels, "batch_norm_eval: weight size mismatch");
++    TORCH_CHECK(bias.numel() == channels, "batch_norm_eval: bias size mismatch");
++    TORCH_CHECK(running_mean.numel() == channels, "batch_norm_eval: running_mean size mismatch");
++    TORCH_CHECK(running_var.numel() == channels, "batch_norm_eval: running_var size mismatch");
++
++    auto output = torch::empty_like(input);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    batch_norm_eval_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        running_mean.data_ptr<float>(),
++        running_var.data_ptr<float>(),
++        eps,
++        output.data_ptr<float>(),
++        batch,
++        channels,
++        stream
++    );
++
++    return output;
++}
++
++// ---- Registration ----
++void register_custom_ops(pybind11::module& m) {
++    m.def("argmax_dim", &argmax_dim_forward,
++          "argmax_dim: torch.max(x, dim=1) returning torch.return_types.max",
++          py::arg("x"), py::arg("dim"));
++    m.def("float_cast", &float_cast_forward,
++          "float_cast: cast int64 tensor to float32",
++          py::arg("x"));
++    m.def("batch_norm_eval", &batch_norm_eval_forward,
++          "batch_norm_eval: apply eval-mode BatchNorm1d",
++          py::arg("input"), py::arg("weight"), py::arg("bias"),
++          py::arg("running_mean"), py::arg("running_var"), py::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,40 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features: int, dim: int):
++        super().__init__()
++        self.bn = nn.BatchNorm1d(num_features)
++        self.dim = dim
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        max_result = cuda_extension.argmax_dim(x, self.dim)
++        indices = max_result.indices
++        indices_float = cuda_extension.float_cast(indices)
++        x = cuda_extension.batch_norm_eval(
++            indices_float,
++            self.bn.weight,
++            self.bn.bias,
++            self.bn.running_mean,
++            self.bn.running_var,
++            self.bn.eps
++        )
++        return x
++
++    def debug_forward(self, x: torch.Tensor):
++        max_result = cuda_extension.argmax_dim(x, self.dim)
++        yield ('step_001', max_result)
++        indices = max_result.indices
++        indices_float = cuda_extension.float_cast(indices)
++        out = cuda_extension.batch_norm_eval(
++            indices_float,
++            self.bn.weight,
++            self.bn.bias,
++            self.bn.running_mean,
++            self.bn.running_var,
++            self.bn.eps
++        )
++        yield ('step_002', out)
++        yield ('step_003', out)

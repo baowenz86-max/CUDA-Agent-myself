@@ -1,0 +1,254 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,114 @@
++#include <cuda_runtime.h>
++
++// embedding_forward kernel: output[b, s, d] = weight[indices[b, s] * embedding_dim + d]
++// indices shape: [batch, seq_len] int64
++// weight shape: [num_embeddings, embedding_dim] float
++// output shape: [batch, seq_len, embedding_dim] float
++__global__ void embedding_forward_kernel(
++    const float* __restrict__ weight,
++    const int64_t* __restrict__ indices,
++    float* __restrict__ output,
++    int num_embeddings,
++    int embedding_dim,
++    int batch,
++    int seq_len)
++{
++    int64_t total = (int64_t)batch * seq_len * embedding_dim;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int d = i % embedding_dim;
++        int64_t tmp = i / embedding_dim;
++        int s = tmp % seq_len;
++        int b = tmp / seq_len;
++        int64_t row = indices[(int64_t)b * seq_len + s];
++        // 边界检查（调用方保证索引合法，但这里仍做防御）
++        if (row < 0 || row >= num_embeddings) {
++            output[i] = 0.0f;
++        } else {
++            output[i] = weight[row * embedding_dim + d];
++        }
++    }
++}
++
++// amax_dim1_keepdim kernel: output[b, 0, d] = max over s of input[b, s, d]
++// input shape: [batch, seq_len, embedding_dim] float
++// output shape: [batch, 1, embedding_dim] float
++// 每个 block 处理一个 (b, d) 对，使用 shared memory 归约
++__global__ void amax_dim1_keepdim_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int batch,
++    int seq_len,
++    int embedding_dim)
++{
++    extern __shared__ float smem[]; // 大小 = blockDim.x
++
++    int b = blockIdx.x;
++    int d = blockIdx.y;
++    int tid = threadIdx.x;
++    int block_size = blockDim.x;
++
++    float max_val = -3.402823466e+38f; // -FLT_MAX
++    const float* base = input + ((int64_t)b * seq_len + 0) * embedding_dim + d;
++    // 每个线程处理多个 s
++    for (int s = tid; s < seq_len; s += block_size) {
++        float val = base[(int64_t)s * embedding_dim];
++        if (val > max_val) max_val = val;
++    }
++
++    smem[tid] = max_val;
++    __syncthreads();
++
++    // 归约
++    for (int stride = block_size / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            float other = smem[tid + stride];
++            if (other > smem[tid]) smem[tid] = other;
++        }
++        __syncthreads();
++    }
++
++    if (tid == 0) {
++        output[(int64_t)b * embedding_dim + d] = smem[0];
++    }
++}
++
++extern "C" void embedding_forward_launcher(
++    const float* weight,
++    const int64_t* indices,
++    float* output,
++    int num_embeddings,
++    int embedding_dim,
++    int batch,
++    int seq_len,
++    cudaStream_t stream)
++{
++    int total_threads = batch * seq_len * embedding_dim;
++    int block_size = 256;
++    int blocks = (total_threads + block_size - 1) / block_size;
++    if (blocks > 65535) {
++        blocks = 65535;
++    }
++    embedding_forward_kernel<<<blocks, block_size, 0, stream>>>(
++        weight, indices, output,
++        num_embeddings, embedding_dim, batch, seq_len);
++}
++
++extern "C" void amax_dim1_keepdim_launcher(
++    const float* input,
++    float* output,
++    int batch,
++    int seq_len,
++    int embedding_dim,
++    cudaStream_t stream)
++{
++    dim3 blocks(batch, embedding_dim);
++    int block_size = 256;
++    // 限制 block 大小不超过 seq_len，但 seq_len=1024，256 即可
++    if (block_size > seq_len) block_size = seq_len;
++    int smem_size = block_size * sizeof(float);
++    amax_dim1_keepdim_kernel<<<blocks, block_size, smem_size, stream>>>(
++        input, output, batch, seq_len, embedding_dim);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,100 @@
++// kernels/custom_ops_binding.cpp
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declarations from custom_ops.cu
++extern "C" void embedding_forward_launcher(
++    const float* weight,
++    const int64_t* indices,
++    float* output,
++    int num_embeddings,
++    int embedding_dim,
++    int batch,
++    int seq_len,
++    cudaStream_t stream);
++
++extern "C" void amax_dim1_keepdim_launcher(
++    const float* input,
++    float* output,
++    int batch,
++    int seq_len,
++    int embedding_dim,
++    cudaStream_t stream);
++
++static inline void check_cuda_error(const char* msg) {
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, msg, ": ", cudaGetErrorString(err));
++}
++
++torch::Tensor embedding_forward(torch::Tensor weight, torch::Tensor indices) {
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [num_embeddings, embedding_dim]");
++    TORCH_CHECK(indices.dim() == 2, "indices must be 2D [batch, seq_len]");
++
++    // 处理 strides：weight 可能非连续，做 contiguous
++    auto weight_contig = weight.contiguous();
++    auto indices_contig = indices.contiguous();
++
++    int num_embeddings = weight_contig.size(0);
++    int embedding_dim = weight_contig.size(1);
++    int batch = indices_contig.size(0);
++    int seq_len = indices_contig.size(1);
++
++    auto output = torch::empty({batch, seq_len, embedding_dim}, weight_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    embedding_forward_launcher(
++        weight_contig.data_ptr<float>(),
++        indices_contig.data_ptr<int64_t>(),
++        output.data_ptr<float>(),
++        num_embeddings,
++        embedding_dim,
++        batch,
++        seq_len,
++        stream
++    );
++    check_cuda_error("embedding_forward_launcher failed");
++
++    return output;
++}
++
++torch::Tensor amax_dim1_keepdim(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(x.dim() == 3, "input must be 3D [batch, seq_len, embedding_dim]");
++
++    auto x_contig = x.contiguous();
++    int batch = x_contig.size(0);
++    int seq_len = x_contig.size(1);
++    int embedding_dim = x_contig.size(2);
++
++    auto output = torch::empty({batch, 1, embedding_dim}, x_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    amax_dim1_keepdim_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch,
++        seq_len,
++        embedding_dim,
++        stream
++    );
++    check_cuda_error("amax_dim1_keepdim_launcher failed");
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("embedding_forward", &embedding_forward, "Embedding forward (CUDA)",
++          py::arg("weight"), py::arg("indices"));
++    m.def("amax_dim1_keepdim", &amax_dim1_keepdim, "Amax over dim=1 with keepdim (CUDA)",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,31 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim):
++        super().__init__()
++        self.embed = nn.Embedding(num_embeddings, embedding_dim)
++
++    def forward(self, x):
++        if not x.is_cuda:
++            x = x.cuda()
++        weight = self.embed.weight
++        if not weight.is_cuda:
++            weight = weight.cuda()
++        emb = cuda_extension.embedding_forward(weight, x)
++        amax = cuda_extension.amax_dim1_keepdim(emb)
++        return amax
++
++    def debug_forward(self, x):
++        if not x.is_cuda:
++            x = x.cuda()
++        weight = self.embed.weight
++        if not weight.is_cuda:
++            weight = weight.cuda()
++        emb = cuda_extension.embedding_forward(weight, x)
++        yield 'step_001', emb
++        amax = cuda_extension.amax_dim1_keepdim(emb)
++        yield 'step_002', amax
++        yield 'step_003', amax

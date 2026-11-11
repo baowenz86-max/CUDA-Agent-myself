@@ -1,0 +1,315 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,6 +1,5 @@
+ // custom_ops.cu
+ // CUDA kernels and launchers for maxpool3d and prod_dim operations.
+-// No cuDNN dependency; maxpool3d is implemented as a custom kernel.
+ 
+ #include <cuda_runtime.h>
+ #include <cstdint>
+@@ -8,9 +7,9 @@
+ // -----------------------------------------------------------------------------
+ // maxpool3d_forward: 3D max pooling kernel
+ // -----------------------------------------------------------------------------
+-// Input: NCDHW format, float32, possibly non-contiguous (binding ensures contiguous)
++// Input: NCDHW format, float32, contiguous (binding ensures contiguous)
+ // Output: NCDHW format, float32, allocated by binding
+-// Parameters: kernel_size, stride, padding, dilation (assumed same for all dims)
++// Parameters: kernel_size, stride, padding, dilation (per dimension)
+ // ceil_mode is ignored (only False is supported per contract)
+ 
+ __global__ void maxpool3d_kernel(
+@@ -24,12 +23,11 @@
+     int output_depth,
+     int output_height,
+     int output_width,
+-    int kernel_size,
+-    int stride,
+-    int padding,
+-    int dilation)
++    int kernel_d, int kernel_h, int kernel_w,
++    int stride_d, int stride_h, int stride_w,
++    int padding_d, int padding_h, int padding_w,
++    int dilation_d, int dilation_h, int dilation_w)
+ {
+-    // Total number of output elements: N*C*D_out*H_out*W_out
+     long long total_output = (long long)batch_size * channels * output_depth * output_height * output_width;
+     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+     long long grid_size = (long long)gridDim.x * blockDim.x;
+@@ -45,22 +43,20 @@
+         int c = tmp % channels;
+         int n = tmp / channels;
+ 
+-        // Compute input start indices for pooling window
+-        int in_d_start = od * stride - padding;
+-        int in_h_start = oh * stride - padding;
+-        int in_w_start = ow * stride - padding;
++        int in_d_start = od * stride_d - padding_d;
++        int in_h_start = oh * stride_h - padding_h;
++        int in_w_start = ow * stride_w - padding_w;
+ 
+-        float max_val = -1e30f; // very negative value
+-        for (int kd = 0; kd < kernel_size; ++kd) {
+-            int id = in_d_start + kd * dilation;
++        float max_val = -1e30f;
++        for (int kd = 0; kd < kernel_d; ++kd) {
++            int id = in_d_start + kd * dilation_d;
+             if (id < 0 || id >= input_depth) continue;
+-            for (int kh = 0; kh < kernel_size; ++kh) {
+-                int ih = in_h_start + kh * dilation;
++            for (int kh = 0; kh < kernel_h; ++kh) {
++                int ih = in_h_start + kh * dilation_h;
+                 if (ih < 0 || ih >= input_height) continue;
+-                for (int kw = 0; kw < kernel_size; ++kw) {
+-                    int iw = in_w_start + kw * dilation;
++                for (int kw = 0; kw < kernel_w; ++kw) {
++                    int iw = in_w_start + kw * dilation_w;
+                     if (iw < 0 || iw >= input_width) continue;
+-                    // Input index in NCDHW layout
+                     long long input_idx = (((long long)n * channels + c) * input_depth
+                                          + id) * input_height * input_width
+                                          + ih * input_width + iw;
+@@ -70,8 +66,6 @@
+             }
+         }
+ 
+-        // Output index: same ordering N,C,D_out,H_out,W_out
+-        // Since output is contiguous, idx directly maps to output index
+         output[idx] = max_val;
+     }
+ }
+@@ -84,41 +78,30 @@
+     int input_depth,
+     int input_height,
+     int input_width,
+-    int kernel_size,
+-    int stride,
+-    int padding,
+-    int dilation,
+-    int ceil_mode,
++    int kernel_d, int kernel_h, int kernel_w,
++    int stride_d, int stride_h, int stride_w,
++    int padding_d, int padding_h, int padding_w,
++    int dilation_d, int dilation_h, int dilation_w,
+     cudaStream_t stream)
+ {
+-    // Compute output dimensions (floor formula, same as PyTorch)
+-    int output_depth = (input_depth + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+-    int output_height = (input_height + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+-    int output_width = (input_width + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
++    int output_depth = (input_depth + 2 * padding_d - dilation_d * (kernel_d - 1) - 1) / stride_d + 1;
++    int output_height = (input_height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
++    int output_width = (input_width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
+ 
+-    // Total output elements
+     long long total_output = (long long)batch_size * in_channels * output_depth * output_height * output_width;
+ 
+-    // Configure grid and block
+     int threads = 256;
+     int blocks = (int)((total_output + threads - 1) / threads);
+-    if (blocks > 65535) {
+-        // Use max grid dimension for x (2^31-1 in CUDA 9+)
+-        blocks = 65535; // cap to avoid overflow; grid-stride loop handles rest
+-    }
+-    // Actually grid dimension can be larger, but for safety we use a reasonable cap
+-    // For this task total_output ~ 55M, blocks ~ 215k, which exceeds 65535 for dim x.
+-    // We can use dim3 grid with y dimension if needed, but simplest: use a 1D grid with max blocks.
+-    // However, CUDA supports gridDim.x up to 2^31-1, so 65535 is not the actual limit. It's 2147483647.
+-    // So we can set blocks as calculated, no capping needed (but ensure int doesn't overflow).
+-    // Since total_output fits in 64-bit, blocks fits in int for this size.
+ 
+     maxpool3d_kernel<<<blocks, threads, 0, stream>>>(
+         input, output,
+         batch_size, in_channels,
+         input_depth, input_height, input_width,
+         output_depth, output_height, output_width,
+-        kernel_size, stride, padding, dilation);
++        kernel_d, kernel_h, kernel_w,
++        stride_d, stride_h, stride_w,
++        padding_d, padding_h, padding_w,
++        dilation_d, dilation_h, dilation_w);
+ }
+ 
+ // -----------------------------------------------------------------------------
+@@ -145,7 +128,6 @@
+         int d = tmp % depth;
+         int b = tmp / depth;
+ 
+-        // Input base index for (b, 0, d, h, w) assuming contiguous NCDHW
+         long long base = ((long long)b * channels) * depth * height * width
+                        + d * height * width + h * width + w;
+ 
+@@ -154,7 +136,6 @@
+             prod *= input[base + (long long)c * depth * height * width];
+         }
+ 
+-        // Output index: b * depth * height * width + d * height * width + h * width + w
+         long long out_idx = (long long)b * depth * height * width
+                           + (long long)d * height * width + (long long)h * width + w;
+         output[out_idx] = prod;
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,6 +2,8 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
++#include <vector>
++#include <cstdint>
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+@@ -13,11 +15,10 @@
+     int input_depth,
+     int input_height,
+     int input_width,
+-    int kernel_size,
+-    int stride,
+-    int padding,
+-    int dilation,
+-    int ceil_mode,
++    int kernel_d, int kernel_h, int kernel_w,
++    int stride_d, int stride_h, int stride_w,
++    int padding_d, int padding_h, int padding_w,
++    int dilation_d, int dilation_h, int dilation_w,
+     cudaStream_t stream);
+ 
+ extern "C" void prod_dim_forward_launcher(
+@@ -30,23 +31,42 @@
+     int width,
+     cudaStream_t stream);
+ 
++// Helper to convert pybind11 iterable to std::vector<int64_t>
++static std::vector<int64_t> to_int_vector(const pybind11::object& obj) {
++    std::vector<int64_t> vec;
++    for (auto item : obj) {
++        vec.push_back(item.cast<int64_t>());
++    }
++    return vec;
++}
++
+ // -----------------------------------------------------------------------------
+ // maxpool3d_forward
+ // -----------------------------------------------------------------------------
+ torch::Tensor maxpool3d_forward(
+     torch::Tensor input,
+-    int64_t kernel_size,
+-    int64_t stride,
+-    int64_t padding,
++    pybind11::object kernel_size_obj,
++    pybind11::object stride_obj,
++    pybind11::object padding_obj,
+     int64_t dilation,
+     bool ceil_mode)
+ {
+-    // Input validation
+     TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(input.dim() == 5, "Input must be 5D (N, C, D, H, W)");
+ 
+-    // Ensure contiguous for cuDNN (cuDNN requires contiguous in NCDHW)
++    // Convert kernel_size, stride, padding to vectors (support scalar or tuple)
++    std::vector<int64_t> kernel_size = to_int_vector(kernel_size_obj);
++    std::vector<int64_t> stride = to_int_vector(stride_obj);
++    std::vector<int64_t> padding = to_int_vector(padding_obj);
++
++    TORCH_CHECK(kernel_size.size() == 3, "kernel_size must have 3 elements");
++    TORCH_CHECK(stride.size() == 3, "stride must have 3 elements");
++    TORCH_CHECK(padding.size() == 3, "padding must have 3 elements");
++
++    // dilation is scalar, replicate to 3 elements
++    int64_t dilation_vals[3] = {dilation, dilation, dilation};
++
+     input = input.contiguous();
+ 
+     int batch_size = input.size(0);
+@@ -55,20 +75,16 @@
+     int input_height = input.size(3);
+     int input_width = input.size(4);
+ 
+-    // Compute output dimensions (same formula as cuDNN/ PyTorch floor)
+-    int output_depth = (input_depth + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+-    int output_height = (input_height + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+-    int output_width = (input_width + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
++    int output_depth = (input_depth + 2 * padding[0] - dilation_vals[0] * (kernel_size[0] - 1) - 1) / stride[0] + 1;
++    int output_height = (input_height + 2 * padding[1] - dilation_vals[1] * (kernel_size[1] - 1) - 1) / stride[1] + 1;
++    int output_width = (input_width + 2 * padding[2] - dilation_vals[2] * (kernel_size[2] - 1) - 1) / stride[2] + 1;
+ 
+     TORCH_CHECK(output_depth > 0 && output_height > 0 && output_width > 0, "Invalid pooling output dimensions");
+ 
+-    // Allocate output
+     auto output = torch::empty({batch_size, in_channels, output_depth, output_height, output_width}, input.options());
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Call launcher
+     maxpool3d_forward_launcher(
+         input.data_ptr<float>(),
+         output.data_ptr<float>(),
+@@ -77,14 +93,12 @@
+         input_depth,
+         input_height,
+         input_width,
+-        static_cast<int>(kernel_size),
+-        static_cast<int>(stride),
+-        static_cast<int>(padding),
+-        static_cast<int>(dilation),
+-        static_cast<int>(ceil_mode),
++        static_cast<int>(kernel_size[0]), static_cast<int>(kernel_size[1]), static_cast<int>(kernel_size[2]),
++        static_cast<int>(stride[0]), static_cast<int>(stride[1]), static_cast<int>(stride[2]),
++        static_cast<int>(padding[0]), static_cast<int>(padding[1]), static_cast<int>(padding[2]),
++        static_cast<int>(dilation_vals[0]), static_cast<int>(dilation_vals[1]), static_cast<int>(dilation_vals[2]),
+         stream);
+ 
+-    // Check for kernel launch errors
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "maxpool3d_forward_launcher failed: ", cudaGetErrorString(err));
+ 
+@@ -99,16 +113,13 @@
+     int64_t dim,
+     bool keepdim)
+ {
+-    // Input validation
+     TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(input.dim() == 5, "Input must be 5D (N, C, D, H, W)");
+ 
+-    // In this task, dim must be 1 and keepdim true
+     TORCH_CHECK(dim == 1, "Only dim=1 is supported");
+     TORCH_CHECK(keepdim == true, "Only keepdim=True is supported");
+ 
+-    // Ensure contiguous for simple product kernel
+     input = input.contiguous();
+ 
+     int batch_size = input.size(0);
+@@ -117,13 +128,10 @@
+     int height = input.size(3);
+     int width = input.size(4);
+ 
+-    // Allocate output: [batch_size, 1, depth, height, width]
+     auto output = torch::empty({batch_size, 1, depth, height, width}, input.options());
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Call launcher
+     prod_dim_forward_launcher(
+         input.data_ptr<float>(),
+         output.data_ptr<float>(),
+@@ -134,7 +142,6 @@
+         width,
+         stream);
+ 
+-    // Check for kernel launch errors
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "prod_dim_forward_launcher failed: ", cudaGetErrorString(err));
+ 
+@@ -146,7 +153,7 @@
+ // -----------------------------------------------------------------------------
+ void register_custom_ops(pybind11::module& m) {
+     m.def("maxpool3d_forward", &maxpool3d_forward,
+-          "3D max pooling forward (cuDNN)",
++          "3D max pooling forward",
+           pybind11::arg("input"),
+           pybind11::arg("kernel_size"),
+           pybind11::arg("stride"),

@@ -1,0 +1,402 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -6,8 +6,8 @@
+ #include <cuda_runtime.h>
+ 
+ // Helper device function to compute linear index from multi-dimensional index given shape.
+-// ndim <= 4 is assumed (though general code works for any ndim up to 32; using 4 for speed).
+-__device__ __forceinline__ int64_t idx_to_linear(const int64_t* idx, const int64_t* shape, int ndim) {
++// ndim is assumed to be 3 or 4 in this task; we use a fixed max dims 4 for speed.
++__device__ __forceinline__ int64_t idx_to_linear4(const int64_t idx[4], const int64_t shape[4], int ndim) {
+     int64_t linear = idx[0];
+     #pragma unroll
+     for (int i = 1; i < ndim; ++i) {
+@@ -18,28 +18,23 @@
+ 
+ // Fused flip+cat kernel: output is concatenation of flipped x1 and flipped x2 along dim.
+ // Each thread writes one output element.
+-// shape: input shape (both inputs same shape), ndim: number of dims, dim: flip/cat dim (0-indexed, < ndim)
+-// out: output tensor, x1: first input, x2: second input, total_out: total number of output elements
++// shape array (fixed to 4 int64_t values) contains input shape; ndim is number of dimensions used (<=4);
++// dim is flip/cat dim (0-indexed).
++// out: output tensor, x1: first input, x2: second input, total_out: total number of output elements.
+ template <int BLOCK_SIZE>
+ __global__ void flip_cat_kernel(
+     float* __restrict__ out,
+     const float* __restrict__ x1,
+     const float* __restrict__ x2,
+     int64_t total_out,
+-    const int64_t* __restrict__ shape,
++    const int64_t* __restrict__ shape,  // device pointer (not used now; we'll pass by value? Actually we pass scalar args below)
+     int ndim,
+     int64_t dim
+ ) {
+-    // Grid-stride loop for large tensors
++    // Grid-stride loop
+     for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x; linear < total_out; linear += gridDim.x * blockDim.x) {
+-        // Compute output multi-dimensional index
+-        int64_t idx[4]; // max dims 4 in this task; could be extended
+-        int64_t remaining = linear;
+-        // Compute strides: output shape is same as input except dim doubled, so we need to decompose
+-        // We'll construct output shape on the fly: shape[dim] * 2
+-        // For simplicity, precompute output shape in constant memory? We'll just compute indices manually.
+-        // Since ndim is fixed (4 in this task), we can hardcode for speed, but keep general for flexibility.
+-        // We'll use a small loop.
++        // Compute output multi-dimensional index using output shape (with dim doubled)
++        int64_t idx[4];
+         int64_t out_shape[4];
+         #pragma unroll
+         for (int d = 0; d < ndim; ++d) {
+@@ -47,9 +42,7 @@
+         }
+         out_shape[dim] = shape[dim] * 2;
+ 
+-        // Decompose linear into multi-index with output shape
+-        // Use column-major? We'll use row-major as PyTorch default.
+-        int64_t temp = remaining;
++        int64_t temp = linear;
+         for (int d = ndim - 1; d >= 0; --d) {
+             idx[d] = temp % out_shape[d];
+             temp /= out_shape[d];
+@@ -59,7 +52,7 @@
+         bool from_x1 = idx[dim] < shape[dim];
+         const float* src = from_x1 ? x1 : x2;
+ 
+-        // Compute input index: flip along dim: input_dim_idx = shape[dim] - 1 - (idx[dim] % shape[dim])
++        // Compute input index: flip along dim
+         int64_t src_idx[4];
+         #pragma unroll
+         for (int d = 0; d < ndim; ++d) {
+@@ -71,15 +64,12 @@
+             src_idx[dim] = shape[dim] - 1 - (idx[dim] - shape[dim]);
+         }
+ 
+-        // Compute linear source index using input shape
+-        int64_t src_linear = idx_to_linear(src_idx, shape, ndim);
++        int64_t src_linear = idx_to_linear4(src_idx, shape, ndim);
+         out[linear] = src[src_linear];
+     }
+ }
+ 
+-// Standalone flip kernel: flips along dim
+-// output shape same as input
+-// shape, ndim, dim as above
++// Standalone flip kernel
+ template <int BLOCK_SIZE>
+ __global__ void flip_kernel(
+     float* __restrict__ out,
+@@ -90,24 +80,19 @@
+     int64_t dim
+ ) {
+     for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x; linear < total; linear += gridDim.x * blockDim.x) {
+-        // Decompose linear into multi-index
+         int64_t idx[4];
+         int64_t temp = linear;
+         for (int d = ndim - 1; d >= 0; --d) {
+             idx[d] = temp % shape[d];
+             temp /= shape[d];
+         }
+-        // Flip dimension
+         idx[dim] = shape[dim] - 1 - idx[dim];
+-        // Compute linear source index
+-        int64_t src_linear = idx_to_linear(idx, shape, ndim);
++        int64_t src_linear = idx_to_linear4(idx, shape, ndim);
+         out[linear] = in[src_linear];
+     }
+ }
+ 
+-// Standalone cat kernel: concatenate two tensors along dim
+-// Both inputs same shape; output shape is double along dim
+-// Assumes contiguous inputs and output.
++// Standalone cat kernel
+ template <int BLOCK_SIZE>
+ __global__ void cat_kernel(
+     float* __restrict__ out,
+@@ -120,21 +105,19 @@
+ ) {
+     for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x; linear < total_out; linear += gridDim.x * blockDim.x) {
+         int64_t idx[4];
++        int64_t out_shape[4];
++        #pragma unroll
++        for (int d = 0; d < ndim; ++d) {
++            out_shape[d] = shape[d];
++        }
++        out_shape[dim] = shape[dim] * 2;
+         int64_t temp = linear;
+-        // Build output shape with dim doubled
+-        int64_t out_shape[4];
+-        #pragma unroll
+-        for (int d = 0; d < ndim; ++d) {
+-            out_shape[d] = shape[d];
+-        }
+-        out_shape[dim] = shape[dim] * 2;
+         for (int d = ndim - 1; d >= 0; --d) {
+             idx[d] = temp % out_shape[d];
+             temp /= out_shape[d];
+         }
+         bool from_x1 = idx[dim] < shape[dim];
+         const float* src = from_x1 ? x1 : x2;
+-        // For cat without flip, source index same except dim adjusted
+         int64_t src_idx[4];
+         #pragma unroll
+         for (int d = 0; d < ndim; ++d) {
+@@ -143,38 +126,51 @@
+         if (!from_x1) {
+             src_idx[dim] = idx[dim] - shape[dim];
+         }
+-        int64_t src_linear = idx_to_linear(src_idx, shape, ndim);
++        int64_t src_linear = idx_to_linear4(src_idx, shape, ndim);
+         out[linear] = src[src_linear];
+     }
+ }
+ 
+-// Launchers: extern "C" functions called from binding.cpp
+-// flip_cat_forward: dim, x1, x2, plus shape array (int64_t*), ndim, stream
+-// The binding will allocate output tensor and pass pointers; shape must be provided.
++// Launchers with shape passed as scalar array (by value) to avoid host pointer issue.
++// We'll use a fixed-size array of 4 int64_t values. The binding will copy shape into such an array.
+ extern "C" void flip_cat_launcher(
+     float* out,
+     const float* x1,
+     const float* x2,
+     int64_t total_out,
+-    const int64_t* shape,
++    const int64_t shape[4],  // by value array? In C, array parameter decays to pointer, so we need to pass explicitly as values.
+     int ndim,
+     int64_t dim,
+     cudaStream_t stream
+ ) {
+     constexpr int BLOCK_SIZE = 256;
+     int64_t blocks = (total_out + BLOCK_SIZE - 1) / BLOCK_SIZE;
+-    // Cap grid to reasonable maximum; grid-stride loop handles excess.
+-    const int64_t max_blocks = 65535; // conservative for all GPUs, can be higher but safe
++    const int64_t max_blocks = 65535;
+     if (blocks > max_blocks) blocks = max_blocks;
++    // Need to copy shape to device constant memory or pass as kernel arguments? Since array parameter decays to pointer, we cannot pass by value easily.
++    // Instead, we will create a device copy or use a kernel that takes shape as four scalar arguments.
++    // Let's change kernels to take shape as four separate int64_t values (or three for 3D?) but we have 4D fixed.
++    // Since we know ndim <=4, we can pass shape0, shape1, shape2, shape3 (with unused zeros).
++    // However for simplicity and correctness, we'll allocate device memory inside launcher and copy shape, then pass pointer.
++    // This ensures shape pointer is valid on device.
++    int64_t* d_shape;
++    cudaMalloc(&d_shape, ndim * sizeof(int64_t));
++    cudaMemcpyAsync(d_shape, shape, ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+     flip_cat_kernel<BLOCK_SIZE><<<(unsigned int)blocks, BLOCK_SIZE, 0, stream>>>(
+-        out, x1, x2, total_out, shape, ndim, dim);
++        out, x1, x2, total_out, d_shape, ndim, dim);
++    cudaFree(d_shape); // This is asynchronous free? Safer to not free or use cudaFree after kernel. But free after launch may be okay if stream ordered? Actually cudaFree synchronizes? Better use cudaFree after launch, but it may sync. We'll use cudaFree after kernel, but it might cause sync; acceptable for correctness.
++    // Better: we can allocate d_shape once? But for simplicity, use cudaMalloc/cudaMemcpy/cudaFree each launch.
++    // Note: cudaFree after kernel launch might block until kernel completes, which is fine.
++    // We could also avoid allocation by passing shape as kernel parameters (each as int64_t), but array is easier.
++    // To avoid repeated allocations, we could use constant memory or __constant__ array, but binding cannot set it easily.
++    // We'll keep allocation and free.
+ }
+ 
+ extern "C" void flip_launcher(
+     float* out,
+     const float* in,
+     int64_t total,
+-    const int64_t* shape,
++    const int64_t shape[4],
+     int ndim,
+     int64_t dim,
+     cudaStream_t stream
+@@ -183,8 +179,12 @@
+     int64_t blocks = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+     const int64_t max_blocks = 65535;
+     if (blocks > max_blocks) blocks = max_blocks;
++    int64_t* d_shape;
++    cudaMalloc(&d_shape, ndim * sizeof(int64_t));
++    cudaMemcpyAsync(d_shape, shape, ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+     flip_kernel<BLOCK_SIZE><<<(unsigned int)blocks, BLOCK_SIZE, 0, stream>>>(
+-        out, in, total, shape, ndim, dim);
++        out, in, total, d_shape, ndim, dim);
++    cudaFree(d_shape);
+ }
+ 
+ extern "C" void cat_launcher(
+@@ -192,7 +192,7 @@
+     const float* x1,
+     const float* x2,
+     int64_t total_out,
+-    const int64_t* shape,
++    const int64_t shape[4],
+     int ndim,
+     int64_t dim,
+     cudaStream_t stream
+@@ -201,6 +201,10 @@
+     int64_t blocks = (total_out + BLOCK_SIZE - 1) / BLOCK_SIZE;
+     const int64_t max_blocks = 65535;
+     if (blocks > max_blocks) blocks = max_blocks;
++    int64_t* d_shape;
++    cudaMalloc(&d_shape, ndim * sizeof(int64_t));
++    cudaMemcpyAsync(d_shape, shape, ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+     cat_kernel<BLOCK_SIZE><<<(unsigned int)blocks, BLOCK_SIZE, 0, stream>>>(
+-        out, x1, x2, total_out, shape, ndim, dim);
+-}
++        out, x1, x2, total_out, d_shape, ndim, dim);
++    cudaFree(d_shape);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -3,14 +3,16 @@
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
++#include <vector>
++#include <cstring>
+ 
+-// Declare launchers from custom_ops.cu
++// Declare launchers with shape as fixed-size array of 4 int64_t (passed as pointer to host array)
+ extern "C" void flip_cat_launcher(
+     float* out,
+     const float* x1,
+     const float* x2,
+     int64_t total_out,
+-    const int64_t* shape,
++    const int64_t shape[4],
+     int ndim,
+     int64_t dim,
+     cudaStream_t stream
+@@ -20,7 +22,7 @@
+     float* out,
+     const float* in,
+     int64_t total,
+-    const int64_t* shape,
++    const int64_t shape[4],
+     int ndim,
+     int64_t dim,
+     cudaStream_t stream
+@@ -31,7 +33,7 @@
+     const float* x1,
+     const float* x2,
+     int64_t total_out,
+-    const int64_t* shape,
++    const int64_t shape[4],
+     int ndim,
+     int64_t dim,
+     cudaStream_t stream
+@@ -39,32 +41,37 @@
+ 
+ namespace {
+ 
+-// Check common tensor requirements for all ops
+ void check_tensor(const torch::Tensor& t, const char* name) {
+     TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+     TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
+ }
+ 
+-// Validate dim for 4D tensors used in this task
+ void check_dim(int64_t dim) {
+     TORCH_CHECK(dim >= 0 && dim < 4, "dim must be in [0, 3] for 4D tensors, got ", dim);
+ }
+ 
+-// Copy shape to std::vector<int64_t> for launcher
+-std::vector<int64_t> get_shape_vec(const torch::Tensor& t) {
++// Copy shape into fixed array of 4 int64_t, zero-padded.
++void get_shape_array(const torch::Tensor& t, int64_t shape[4]) {
+     auto sizes = t.sizes();
+-    return std::vector<int64_t>(sizes.begin(), sizes.end());
++    int ndim = static_cast<int>(sizes.size());
++    TORCH_CHECK(ndim <= 4, "only up to 4D tensors supported");
++    for (int i = 0; i < ndim; ++i) {
++        shape[i] = sizes[i];
++    }
++    for (int i = ndim; i < 4; ++i) {
++        shape[i] = 0;
++    }
+ }
+ 
+ } // namespace
+ 
+-// flip_forward: flip tensor along dim
+ torch::Tensor flip_forward(int64_t dim, torch::Tensor x) {
+     check_tensor(x, "x");
+     check_dim(dim);
+     
+-    auto shape = get_shape_vec(x);
++    int64_t shape[4];
++    get_shape_array(x, shape);
+     int64_t total = x.numel();
+     
+     auto out = torch::empty_like(x);
+@@ -74,8 +81,8 @@
+         out.data_ptr<float>(),
+         x.data_ptr<float>(),
+         total,
+-        shape.data(),
+-        static_cast<int>(shape.size()),
++        shape,
++        static_cast<int>(x.dim()),
+         dim,
+         stream
+     );
+@@ -84,7 +91,6 @@
+     return out;
+ }
+ 
+-// cat_forward: concatenate two tensors along dim
+ torch::Tensor cat_forward(int64_t dim, torch::Tensor x1, torch::Tensor x2) {
+     check_tensor(x1, "x1");
+     check_tensor(x2, "x2");
+@@ -92,11 +98,11 @@
+     
+     TORCH_CHECK(x1.sizes() == x2.sizes(), "x1 and x2 must have the same shape");
+     
+-    auto shape = get_shape_vec(x1);
++    int64_t shape[4];
++    get_shape_array(x1, shape);
+     int64_t total_out = x1.numel() * 2;
+     
+-    // output shape: double the dim dimension
+-    std::vector<int64_t> out_shape(shape);
++    std::vector<int64_t> out_shape(x1.sizes().begin(), x1.sizes().end());
+     out_shape[dim] *= 2;
+     
+     auto out = torch::empty(out_shape, x1.options());
+@@ -107,8 +113,8 @@
+         x1.data_ptr<float>(),
+         x2.data_ptr<float>(),
+         total_out,
+-        shape.data(),
+-        static_cast<int>(shape.size()),
++        shape,
++        static_cast<int>(x1.dim()),
+         dim,
+         stream
+     );
+@@ -117,7 +123,6 @@
+     return out;
+ }
+ 
+-// flip_cat_forward: flip both tensors and concatenate
+ torch::Tensor flip_cat_forward(int64_t dim, torch::Tensor x1, torch::Tensor x2) {
+     check_tensor(x1, "x1");
+     check_tensor(x2, "x2");
+@@ -125,11 +130,11 @@
+     
+     TORCH_CHECK(x1.sizes() == x2.sizes(), "x1 and x2 must have the same shape");
+     
+-    auto shape = get_shape_vec(x1);
++    int64_t shape[4];
++    get_shape_array(x1, shape);
+     int64_t total_out = x1.numel() * 2;
+     
+-    // output shape: double the dim dimension
+-    std::vector<int64_t> out_shape(shape);
++    std::vector<int64_t> out_shape(x1.sizes().begin(), x1.sizes().end());
+     out_shape[dim] *= 2;
+     
+     auto out = torch::empty(out_shape, x1.options());
+@@ -140,8 +145,8 @@
+         x1.data_ptr<float>(),
+         x2.data_ptr<float>(),
+         total_out,
+-        shape.data(),
+-        static_cast<int>(shape.size()),
++        shape,
++        static_cast<int>(x1.dim()),
+         dim,
+         stream
+     );

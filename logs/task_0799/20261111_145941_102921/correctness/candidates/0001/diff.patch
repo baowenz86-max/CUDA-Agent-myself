@@ -1,0 +1,253 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,111 @@
++// CUDA kernels for custom operators
++#include <cuda_runtime.h>
++
++// MaxPool2d forward kernel
++// Each thread computes one output element (or loops over multiple via grid-stride).
++// Input and output are float32 tensors with arbitrary strides (but usually contiguous).
++// For simplicity and correctness, we assume contiguous layout for max_pool2d because
++// max_pool2d is usually called on contiguous tensors. The contract says layout supports strides,
++// so we should handle arbitrary strides. We'll implement using explicit stride parameters.
++// However, the launcher signature only includes pointers and sizes, not strides.
++// To support arbitrary strides, we would need to pass strides. But the binding contract only
++// includes input, kernel_size, stride. In practice, max_pool2d input from the model is contiguous
++// because it comes from randn. We'll assume contiguous and document that if non-contiguous input
++// is needed, the binding layer can call .contiguous() first. The contract says layout supports strides,
++// but our launcher takes raw pointer; we can add a note that binding layer must ensure contiguity or
++// pass strides as additional parameters. Since we cannot modify binding contract for this stage,
++// we will assume contiguous input and output, which is sufficient for the given model.
++// If non-contiguous support is required, a future binding can pass strides.
++__global__ void max_pool2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t kernel_size, int64_t stride,
++    int64_t H_out, int64_t W_out)
++{
++    int64_t total = N * C * H_out * W_out;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t grid_size = blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += grid_size) {
++        int64_t ow = i % W_out;
++        int64_t oh = (i / W_out) % H_out;
++        int64_t oc = (i / (W_out * H_out)) % C;
++        int64_t on = i / (W_out * H_out * C);
++
++        int64_t h_start = oh * stride;
++        int64_t w_start = ow * stride;
++
++        float max_val = -3.402823466e+38f;
++        for (int64_t kh = 0; kh < kernel_size; ++kh) {
++            int64_t h = h_start + kh;
++            if (h < 0 || h >= H) continue;
++            for (int64_t kw = 0; kw < kernel_size; ++kw) {
++                int64_t w = w_start + kw;
++                if (w < 0 || w >= W) continue;
++                float val = input[((on * C + oc) * H + h) * W + w];
++                if (val > max_val) max_val = val;
++            }
++        }
++        output[i] = max_val;
++    }
++}
++
++// Stack forward kernel: copies input tensor to output at offset 0
++// Input: single tensor of shape [N, C, H, W]
++// Output: shape [1, N, C, H, W], just copy all elements
++__global__ void stack_single_copy_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t numel)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t grid_size = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += grid_size) {
++        output[i] = input[i];
++    }
++}
++
++// Launcher for max_pool2d_forward
++// Input: float* input, int64_t N, C, H, W, int64_t kernel_size, int64_t stride
++// Output: float* output (preallocated with shape [N, C, H_out, W_out])
++// stream: CUDA stream
++// We assume input and output are contiguous float32 arrays.
++// If non-contiguous input is needed, the binding layer should call .contiguous() and then
++// pass the contiguous data pointer along with the same sizes.
++extern "C" void max_pool2d_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t kernel_size, int64_t stride,
++    cudaStream_t stream)
++{
++    int64_t H_out = (H - kernel_size) / stride + 1;
++    int64_t W_out = (W - kernel_size) / stride + 1;
++
++    int64_t total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535; // grid cap; kernel uses grid-stride loop
++
++    max_pool2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, kernel_size, stride, H_out, W_out);
++}
++
++// Launcher for stack_forward with a single tensor
++// Input: const float* input (single tensor)
++// Output: float* output (preallocated with shape [1, N, C, H, W])
++// numel: number of elements in input (= N*C*H*W)
++// stream: CUDA stream
++extern "C" void stack_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    if (numel <= 0) return;
++    int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    stack_single_copy_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,113 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <vector>
++#include "../binding_registry.h"
++
++extern "C" void max_pool2d_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t kernel_size, int64_t stride,
++    cudaStream_t stream);
++
++extern "C" void stack_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    cudaStream_t stream);
++
++torch::Tensor max_pool2d_forward(torch::Tensor input, int64_t kernel_size, int64_t stride) {
++    TORCH_CHECK(input.is_cuda(), "max_pool2d_forward: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "max_pool2d_forward: input must be float32");
++    TORCH_CHECK(input.dim() == 4, "max_pool2d_forward: input must be 4D [N, C, H, W]");
++    TORCH_CHECK(kernel_size > 0, "max_pool2d_forward: kernel_size must be positive");
++    TORCH_CHECK(stride > 0, "max_pool2d_forward: stride must be positive");
++
++    // Ensure contiguous
++    auto input_contig = input.contiguous();
++
++    int64_t N = input_contig.size(0);
++    int64_t C = input_contig.size(1);
++    int64_t H = input_contig.size(2);
++    int64_t W = input_contig.size(3);
++
++    int64_t H_out = (H - kernel_size) / stride + 1;
++    int64_t W_out = (W - kernel_size) / stride + 1;
++    TORCH_CHECK(H_out > 0 && W_out > 0, "max_pool2d_forward: output size must be positive");
++
++    auto output = torch::empty({N, C, H_out, W_out}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    max_pool2d_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        kernel_size, stride,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "max_pool2d_forward: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++torch::Tensor stack_forward(std::vector<torch::Tensor> tensors) {
++    TORCH_CHECK(!tensors.empty(), "stack_forward: tensors list must not be empty");
++
++    const auto& first = tensors[0];
++    TORCH_CHECK(first.is_cuda(), "stack_forward: all tensors must be CUDA");
++    TORCH_CHECK(first.dtype() == torch::kFloat32, "stack_forward: all tensors must be float32");
++
++    // Ensure all tensors have same shape, dtype, device
++    for (const auto& t : tensors) {
++        TORCH_CHECK(t.is_cuda(), "stack_forward: all tensors must be CUDA");
++        TORCH_CHECK(t.dtype() == torch::kFloat32, "stack_forward: all tensors must be float32");
++        TORCH_CHECK(t.sizes() == first.sizes(), "stack_forward: all tensors must have same shape");
++    }
++
++    int64_t num_tensors = static_cast<int64_t>(tensors.size());
++    std::vector<int64_t> output_shape;
++    output_shape.reserve(1 + first.dim());
++    output_shape.push_back(num_tensors);
++    for (int64_t i = 0; i < first.dim(); ++i) {
++        output_shape.push_back(first.size(i));
++    }
++
++    auto output = torch::empty(output_shape, first.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Each input tensor is copied to the corresponding slice of the output.
++    // We assume each tensor is contiguous (or we make it contiguous).
++    for (int64_t i = 0; i < num_tensors; ++i) {
++        auto t_contig = tensors[i].contiguous();
++        int64_t numel = t_contig.numel();
++        if (numel == 0) continue;
++        float* out_ptr = output.data_ptr<float>() + i * numel;
++        stack_forward_launcher(
++            t_contig.data_ptr<float>(),
++            out_ptr,
++            numel,
++            stream);
++    }
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "stack_forward: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("max_pool2d_forward", &max_pool2d_forward,
++          "MaxPool2d forward",
++          pybind11::arg("input"),
++          pybind11::arg("kernel_size"),
++          pybind11::arg("stride"));
++    m.def("stack_forward", &stack_forward,
++          "Stack tensors along new dimension 0",
++          pybind11::arg("tensors"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_channels, pool_size):
++        super().__init__()
++        self.pool_size = pool_size
++
++    def forward(self, x):
++        y = cuda_extension.max_pool2d_forward(x, self.pool_size, self.pool_size)
++        return cuda_extension.stack_forward([y])
++
++    def debug_forward(self, x):
++        y = cuda_extension.max_pool2d_forward(x, self.pool_size, self.pool_size)
++        stack = [y]
++        yield 'step_001', stack
++        z = cuda_extension.stack_forward(stack)
++        yield 'step_002', z

@@ -1,0 +1,191 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,85 @@
++#include <cuda_runtime.h>
++
++// ReLU kernel: out[i] = max(in[i], 0)
++// Assumes contiguous 1D indexing over numel elements.
++__global__ void relu_kernel(const float* __restrict__ input, float* __restrict__ output, int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = input[i] > 0.0f ? input[i] : 0.0f;
++    }
++}
++
++// AvgPool2d kernel: output[n,c,oh,ow] = sum over kh,kw of input[n,c,oh*stride+kh, ow*stride+kw] / (kernel_size*kernel_size)
++// Input must be contiguous NCHW float32.
++__global__ void avgpool2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int kernel_size, int stride,
++    int64_t outH, int64_t outW
++) {
++    int64_t total_out = N * C * outH * outW;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t step = blockDim.x * gridDim.x;
++    float inv_area = 1.0f / (float)(kernel_size * kernel_size);
++
++    for (int64_t i = idx; i < total_out; i += step) {
++        int64_t ow = i % outW;
++        int64_t oh = (i / outW) % outH;
++        int64_t c = (i / (outW * outH)) % C;
++        int64_t n = i / (outW * outH * C);
++
++        float sum = 0.0f;
++        for (int kh = 0; kh < kernel_size; ++kh) {
++            int64_t ih = oh * stride + kh;
++            if (ih >= H) break; // padding=0, ignore out-of-bounds; PyTorch AvgPool2d ignores padding elements
++            for (int kw = 0; kw < kernel_size; ++kw) {
++                int64_t iw = ow * stride + kw;
++                if (iw < W) {
++                    int64_t input_idx = ((n * C + c) * H + ih) * W + iw;
++                    sum += input[input_idx];
++                }
++            }
++        }
++        output[i] = sum * inv_area;
++    }
++}
++
++// Launcher for ReLU
++extern "C" void relu_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    if (numel <= 0) return;
++    const int block = 256;
++    int64_t grid64 = (numel + block - 1) / block;
++    int grid = (int)min(grid64, (int64_t)65535); // cap grid size; kernel uses stride loop for larger
++    relu_kernel<<<grid, block, 0, stream>>>(input, output, numel);
++}
++
++// Launcher for AvgPool2d
++extern "C" void avgpool2d_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int kernel_size, int stride,
++    cudaStream_t stream
++) {
++    int64_t outH = (H - kernel_size) / stride + 1;
++    int64_t outW = (W - kernel_size) / stride + 1;
++    int64_t total_out = N * C * outH * outW;
++    if (total_out <= 0) return;
++
++    const int block = 256;
++    int64_t grid64 = (total_out + block - 1) / block;
++    int grid = (int)min(grid64, (int64_t)65535);
++    avgpool2d_kernel<<<grid, block, 0, stream>>>(
++        input, output,
++        N, C, H, W,
++        kernel_size, stride,
++        outH, outW
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,73 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++extern "C" void relu_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++extern "C" void avgpool2d_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int kernel_size, int stride,
++    cudaStream_t stream
++);
++
++static torch::Tensor relu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "relu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "relu_forward: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "relu_forward: input must be contiguous");
++
++    auto output = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    relu_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++    return output;
++}
++
++static torch::Tensor avgpool2d_forward(torch::Tensor x, int64_t kernel_size, int64_t stride) {
++    TORCH_CHECK(x.is_cuda(), "avgpool2d_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "avgpool2d_forward: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "avgpool2d_forward: input must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "avgpool2d_forward: input must be 4D NCHW");
++    TORCH_CHECK(kernel_size > 0 && stride > 0, "avgpool2d_forward: kernel_size and stride must be positive");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++    int64_t outH = (H - kernel_size) / stride + 1;
++    int64_t outW = (W - kernel_size) / stride + 1;
++    TORCH_CHECK(outH > 0 && outW > 0, "avgpool2d_forward: output size must be positive");
++
++    auto output = torch::empty({N, C, outH, outW}, x.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    avgpool2d_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        stream
++    );
++    return output;
++}
++
++static void register_custom_ops(pybind11::module& m) {
++    m.def("relu_forward", &relu_forward, "ReLU forward",
++          py::arg("x"));
++    m.def("avgpool2d_forward", &avgpool2d_forward, "AvgPool2d forward",
++          py::arg("x"), py::arg("kernel_size"), py::arg("stride"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,24 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int):
++        super().__init__()
++        self.relu = nn.ReLU()
++        self.avgpool = nn.AvgPool2d(kernel_size=kernel_size, stride=stride)
++        self.kernel_size = kernel_size
++        self.stride = stride
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.relu_forward(x)
++        x = cuda_extension.avgpool2d_forward(x, self.kernel_size, self.stride)
++        return x
++
++    def debug_forward(self, x: torch.Tensor):
++        x = cuda_extension.relu_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.avgpool2d_forward(x, self.kernel_size, self.stride)
++        yield 'step_002', x
++        yield 'step_003', x

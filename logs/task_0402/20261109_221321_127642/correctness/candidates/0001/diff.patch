@@ -1,0 +1,111 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,45 @@
++// CUDA kernel for mean reduction over dim=0 of a 4D tensor [N, C, H, W]
++// Input: float32, output: float32, shape [C, H, W]
++// Contract: torch.mean(x, dim=0)
++
++#include <cuda_runtime.h>
++
++// Kernel: one thread per (c, h, w) output element, loops over N dimension
++__global__ void mean_dim0_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 int N, int C, int H, int W) {
++    // output size = C * H * W
++    int total = C * H * W;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < total; i += stride) {
++        // Decode i into (c, h, w)
++        int w = i % W;
++        int tmp = i / W;
++        int h = tmp % H;
++        int c = tmp / H;
++
++        // Accumulate over N
++        float sum = 0.0f;
++        // index of input[n, c, h, w] = ((n * C + c) * H + h) * W + w
++        // Precompute offset for n=0
++        int base_offset = (c * H + h) * W + w;
++        for (int n = 0; n < N; ++n) {
++            sum += input[n * (C * H * W) + base_offset];
++        }
++        output[i] = sum / static_cast<float>(N);
++    }
++}
++
++// Launcher: no torch dependencies, takes raw pointers and stream
++extern "C" void mean_dim0_launcher(const float* input,
++                                   float* output,
++                                   int N, int C, int H, int W,
++                                   cudaStream_t stream) {
++    int total = C * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    // Grid-stride loop handles large sizes
++    mean_dim0_kernel<<<blocks, threads, 0, stream>>>(input, output, N, C, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,44 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare the CUDA launcher from custom_ops.cu
++extern "C" void mean_dim0_launcher(const float* input,
++                                   float* output,
++                                   int N, int C, int H, int W,
++                                   cudaStream_t stream);
++
++torch::Tensor mean_dim0(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D [N, C, H, W]");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Output shape: [C, H, W]
++    auto output = torch::empty({C, H, W}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    mean_dim0_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        stream
++    );
++
++    return output;
++}
++
++void register_mean_dim0(pybind11::module& m) {
++    m.def("mean_dim0", &mean_dim0, "Compute mean over dim=0 for a 4D tensor",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(mean_dim0, register_mean_dim0);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,13 @@
++import torch
++
++class ModelNew(torch.nn.Module):
++    def __init__(self, dim):
++        super(ModelNew, self).__init__()
++        self.dim = dim
++
++    def forward(self, x):
++        return cuda_extension.mean_dim0(x)
++
++    def debug_forward(self, x):
++        result = cuda_extension.mean_dim0(x)
++        yield 'step_001', result

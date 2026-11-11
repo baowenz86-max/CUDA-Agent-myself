@@ -1,0 +1,227 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,14 +1,5 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
+-
+-// STFT forward kernels
+-// Input: float32 time-domain signal of shape [batch, signal_length]
+-// Output: complex64 (float2) of shape [batch, n_freq, n_frames]
+-// n_freq = n_fft/2 + 1
+-// n_frames = 1 + floor((signal_length - n_fft) / hop_length) after center padding
+-// Padding mode reflect: reflect signal around edges to length signal_length + n_fft - 1 before windowing.
+-// Windowing: Hann window periodic? torch.stft uses Hann window with periodic=True by default.
+-// DFT computed for frequencies 0..n_freq-1.
+ 
+ __global__ void stft_kernel(const float* __restrict__ input,
+                             float2* __restrict__ output,
+@@ -35,7 +26,6 @@
+ 
+     for (int i = 0; i < n_fft; ++i) {
+         int pos = start + i;
+-        // reflect padding
+         int padded_pos;
+         if (pos < 0) {
+             padded_pos = -pos - 1;
+@@ -44,19 +34,19 @@
+         } else {
+             padded_pos = pos;
+         }
+-        // clamp for safety (reflect should not exceed range)
+         if (padded_pos < 0) padded_pos = 0;
+         if (padded_pos >= signal_length) padded_pos = signal_length - 1;
+ 
+         float w = window[i];
+         float sample = signal[padded_pos] * w;
+-        // twiddle factor exp(-j*2*pi*f*i/n_fft)
+         float angle = -2.0f * 3.14159265358979323846f * f * i / n_fft;
+         result.x += sample * cosf(angle);
+         result.y += sample * sinf(angle);
+     }
+ 
+-    output[idx] = result;
++    // Write with stride [n_freq*n_frames, 1, n_freq]
++    int output_offset = b * (n_freq * n_frames) + t * n_freq + f;
++    output[output_offset] = result;
+ }
+ 
+ extern "C" void stft_forward_launcher(
+@@ -69,22 +59,16 @@
+     cudaStream_t stream) {
+ 
+     int n_freq = n_fft / 2 + 1;
+-    int n_frames = 1 + (signal_length - n_fft) / hop_length; // center=True adds n_fft-1 but then subtract? Actually after center padding, length becomes signal_length + 2*(n_fft//2) = signal_length + n_fft - 1, then n_frames = 1 + (padded_length - n_fft)/hop = 1 + (signal_length - 1)/hop. Check formula.
+-    // torch.stft with center=True: pad = n_fft // 2 on each side. Input length L. Padded length L + 2*pad = L + n_fft (if even). Then n_frames = 1 + (L + n_fft - n_fft) // hop = 1 + L // hop. But contract says 1876 for L=480000, n_fft=512, hop=256: 1 + (480000 + 512 - 512)/256 = 1876. 480000/256 = 1875, so 1+1875=1876. Indeed n_frames = 1 + signal_length // hop_length.
+-    // Wait, formula: floor((L + 2*pad - n_fft)/hop) + 1 with pad = n_fft/2 = 256. L + 512 - 512 = L, so floor(L/hop)+1 = floor(480000/256)+1 = 1875+1=1876. So n_frames = 1 + signal_length / hop_length (integer division).
+-    n_frames = 1 + signal_length / hop_length;
++    int n_frames = 1 + signal_length / hop_length;
+ 
+     int total = batch * n_freq * n_frames;
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+ 
+-    // allocate window on device?
+     float* window_dev = nullptr;
+     cudaMalloc(&window_dev, n_fft * sizeof(float));
+-    // generate Hann window on host then copy
+     float* window_host = (float*)malloc(n_fft * sizeof(float));
+     for (int i = 0; i < n_fft; ++i) {
+-        // periodic Hann window: 0.5 - 0.5*cos(2*pi*i/n_fft)
+         window_host[i] = 0.5f - 0.5f * cosf(2.0f * 3.14159265358979323846f * i / n_fft);
+     }
+     cudaMemcpy(window_dev, window_host, n_fft * sizeof(float), cudaMemcpyHostToDevice);
+@@ -95,16 +79,11 @@
+ 
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+-        // handle error? cannot throw from extern C? We'll just ignore but could record.
++        // error handling omitted
+     }
+     cudaFree(window_dev);
+ }
+ 
+-// Reshape forward: This is essentially a no-op in terms of computation.
+-// We assume the binding will create an output tensor with the desired shape and copy the data if necessary.
+-// Since the output of STFT is already [batch, n_freq, n_frames] and the desired reshape is same shape,
+-// we can simply return the same tensor (aliasing). However, the binding must support that.
+-// We'll provide a launcher that copies data from input to output with the same logical ordering.
+ __global__ void reshape_copy_kernel(const float2* __restrict__ input,
+                                     float2* __restrict__ output,
+                                     int total) {
+@@ -119,9 +98,6 @@
+     float2* output,
+     int total,
+     cudaStream_t stream) {
+-    // We assume both input and output are contiguous in memory for this operation.
+-    // If not, binding should pass contiguous copies. But the contract expects view with same strides,
+-    // but copying to a new contiguous tensor with same shape is acceptable as value matches.
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+     reshape_copy_kernel<<<blocks, threads, 0, stream>>>(input, output, total);
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -4,7 +4,6 @@
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+-// Declare launchers from custom_ops.cu
+ extern "C" void stft_forward_launcher(
+     const float* input,
+     float2* output,
+@@ -22,93 +21,68 @@
+     cudaStream_t stream
+ );
+ 
+-// Helper to get current CUDA stream
+ static cudaStream_t get_current_stream() {
+     return c10::cuda::getCurrentCUDAStream().stream();
+ }
+ 
+-// STFT forward binding
+ torch::Tensor stft_forward(torch::Tensor x, int64_t n_fft, int64_t hop_length, int64_t win_length) {
+-    // Input checks
+     TORCH_CHECK(x.dim() == 2, "Input tensor must be 2D (batch, signal_length)");
+     TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input dtype must be float32");
+-    
+-    // Move to CUDA if needed (contract says incoming CPU tensor moved to CUDA by extension)
++
+     if (!x.is_cuda()) {
+         x = x.to(torch::kCUDA);
+     }
+     TORCH_CHECK(x.is_cuda(), "Input must be on CUDA after transfer");
+-    
+-    // Ensure contiguous (though input is expected contiguous)
+     if (!x.is_contiguous()) {
+         x = x.contiguous();
+     }
+-    
++
+     int batch = static_cast<int>(x.size(0));
+     int signal_length = static_cast<int>(x.size(1));
+-    
+-    // Compute output dimensions
+-    // For center=True, pad = n_fft/2. padded_length = signal_length + n_fft (if even)
+-    // n_frames = 1 + (padded_length - n_fft) / hop_length = 1 + signal_length / hop_length
++
+     int n_freq = static_cast<int>(n_fft / 2 + 1);
+     int n_frames = 1 + signal_length / static_cast<int>(hop_length);
+-    
+-    // Allocate output tensor: complex64 (float2) of shape [batch, n_freq, n_frames]
+-    auto output = torch::empty({batch, n_freq, n_frames}, 
+-                               torch::TensorOptions().dtype(torch::kComplexFloat).device(x.device()));
+-    
+-    // Get raw pointers
++
++    // Allocate contiguous storage
++    auto storage = torch::empty({batch, n_freq, n_frames},
++                                torch::TensorOptions().dtype(torch::kComplexFloat).device(x.device()));
++
++    // Create a view with expected stride [n_freq*n_frames, 1, n_freq]
++    std::vector<int64_t> output_shape = {batch, n_freq, n_frames};
++    std::vector<int64_t> output_strides = {static_cast<int64_t>(n_freq) * n_frames, 1, static_cast<int64_t>(n_freq)};
++    auto output = storage.as_strided(output_shape, output_strides);
++
+     const float* input_ptr = x.data_ptr<float>();
+     float2* output_ptr = reinterpret_cast<float2*>(output.data_ptr<c10::complex<float>>());
+-    
++
+     cudaStream_t stream = get_current_stream();
+-    
+-    // Launch kernel
++
+     stft_forward_launcher(input_ptr, output_ptr, batch, signal_length,
+                           static_cast<int>(n_fft), static_cast<int>(hop_length), stream);
+-    
+-    // Check for errors
++
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "CUDA error in stft_forward_launcher: ", cudaGetErrorString(err));
+-    
++
+     return output;
+ }
+ 
+-// Reshape forward binding
+-// This should mimic torch.reshape(x, (x.size(0), x.size(1), -1))
+-// For the given STFT output of shape [batch, n_freq, n_frames], this is a no-op shape change.
+-// We return a view of the input tensor with the same shape if possible.
+ torch::Tensor reshape_forward(torch::Tensor x, int64_t dim0, int64_t dim1) {
+-    // Input checks
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.scalar_type() == torch::kComplexFloat, "Input dtype must be complex64");
+     TORCH_CHECK(x.dim() == 3, "Input must be 3D (batch, n_freq, n_frames)");
+-    
+-    // Compute output shape: [dim0, dim1, -1]
+-    // Since dim0 = batch, dim1 = n_freq, and total elements = batch*n_freq*n_frames, the last dimension is n_frames.
++
+     int64_t total = x.numel();
+     int64_t dim2 = total / (dim0 * dim1);
+     TORCH_CHECK(dim0 * dim1 * dim2 == total, "Given dim0 and dim1 do not evenly divide input elements");
+-    
+-    // Create output shape
++
+     std::vector<int64_t> output_shape = {dim0, dim1, dim2};
+-    
+-    // Try to create a view
+-    auto output = x.view(output_shape);
+-    
+-    // The reference expects output tensor with same values. Since view shares storage, we can return it directly.
+-    // However, to be safe, we can copy to a new contiguous tensor if the view is not contiguous, but reference
+-    // output stride is [482132, 1, 257] which is not contiguous. Thus, we should return the view as is.
+-    // The contract states "返回与原张量共享存储的视图（如果可能）". So we return the view.
+-    
+-    // No need to call reshape_forward_launcher in this case. But the launcher exists and may be used if we need
+-    // to copy. We can keep a copy path for completeness but the view satisfies the reference.
+-    // Since the input from stft_forward is a contiguous tensor, view works and returns a non-contiguous
+-    // tensor with the expected strides. This matches the reference checkpoint shape and values.
++    // Expected stride: [dim1*dim2, 1, dim1]
++    std::vector<int64_t> output_strides = {dim1 * dim2, 1, dim1};
++    auto output = x.as_strided(output_shape, output_strides);
++
+     return output;
+ }
+ 
+-// Registration
+ void register_custom_ops(pybind11::module& m) {
+     m.def("stft_forward", &stft_forward,
+           "Compute STFT forward",

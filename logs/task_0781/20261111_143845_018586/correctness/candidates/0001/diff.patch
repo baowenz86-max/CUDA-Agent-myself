@@ -1,0 +1,250 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,91 @@
++#include <cuda_runtime.h>
++
++// CUDA kernel for constant padding (F.pad with mode='constant', value=0)
++// Input: x of shape [N, C, H, W] contiguous
++template <typename scalar_t>
++__global__ void pad_constant_kernel(
++    scalar_t* __restrict__ out,
++    const scalar_t* __restrict__ in,
++    int N, int C, int H_in, int W_in,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    int H_out, int W_out)
++{
++    int total = N * C * H_out * W_out;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        int w = i % W_out;
++        int h = (i / W_out) % H_out;
++        int c = (i / (W_out * H_out)) % C;
++        int n = i / (W_out * H_out * C);
++
++        int in_h = h - pad_top;
++        int in_w = w - pad_left;
++        if (in_h >= 0 && in_h < H_in && in_w >= 0 && in_w < W_in) {
++            out[i] = in[((n * C + c) * H_in + in_h) * W_in + in_w];
++        } else {
++            out[i] = static_cast<scalar_t>(0);
++        }
++    }
++}
++
++// CUDA kernel for mean along dimension (dim=1) for float32
++// Input: x of shape [N, C, H, W] contiguous
++// Output: y of shape [N, H, W] (when dim=1)
++// Since C is 1 in the current contract, we can copy directly.
++// But we implement general reduction with a single thread per output element.
++template <typename scalar_t>
++__global__ void mean_dim1_kernel(
++    scalar_t* __restrict__ out,
++    const scalar_t* __restrict__ in,
++    int N, int C, int H, int W)
++{
++    int total = N * H * W;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total; i += stride) {
++        int w = i % W;
++        int h = (i / W) % H;
++        int n = i / (H * W);
++
++        scalar_t sum = 0;
++        for (int c = 0; c < C; ++c) {
++            sum += in[((n * C + c) * H + h) * W + w];
++        }
++        out[i] = sum / static_cast<scalar_t>(C);
++    }
++}
++
++// Launcher for pad_forward
++extern "C" void pad_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    cudaStream_t stream)
++{
++    int H_out = H + pad_top + pad_bottom;
++    int W_out = W + pad_left + pad_right;
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    // Cap blocks to avoid grid dimension limits, use grid-stride loop inside
++    if (blocks > 65535) blocks = 65535;
++    pad_constant_kernel<float><<<blocks, threads, 0, stream>>>(
++        output, input, N, C, H, W, pad_left, pad_right, pad_top, pad_bottom, H_out, W_out);
++}
++
++// Launcher for mean_dim_forward (dim=1 only)
++extern "C" void mean_dim_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    cudaStream_t stream)
++{
++    int total = N * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    mean_dim1_kernel<float><<<blocks, threads, 0, stream>>>(
++        output, input, N, C, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,116 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// 声明 custom_ops.cu 中的 launcher
++extern "C" void pad_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int pad_left, int pad_right, int pad_top, int pad_bottom,
++    cudaStream_t stream);
++
++extern "C" void mean_dim_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    cudaStream_t stream);
++
++// PyTorch 包装函数：常数填充
++torch::Tensor pad_forward(
++    torch::Tensor x,
++    int64_t pad_left,
++    int64_t pad_right,
++    int64_t pad_top,
++    int64_t pad_bottom) {
++    // 输入检查
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4D (N,C,H,W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    TORCH_CHECK(pad_left >= 0 && pad_right >= 0 && pad_top >= 0 && pad_bottom >= 0, "Padding must be non-negative");
++
++    int64_t H_out = H + pad_top + pad_bottom;
++    int64_t W_out = W + pad_left + pad_right;
++
++    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    pad_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(pad_left),
++        static_cast<int>(pad_right),
++        static_cast<int>(pad_top),
++        static_cast<int>(pad_bottom),
++        stream);
++
++    // 可选：检查 kernel 启动错误
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "pad_forward_launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// PyTorch 包装函数：沿 dim=1 求均值
++torch::Tensor mean_dim_forward(torch::Tensor x, int64_t dim) {
++    // 输入检查
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4D (N,C,H,W)");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported for mean");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    auto output = torch::empty({N, H, W}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    mean_dim_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "mean_dim_forward_launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// 注册函数
++void register_custom_ops(pybind11::module& m) {
++    m.def("pad_forward", &pad_forward,
++          "Constant padding forward",
++          py::arg("x"),
++          py::arg("pad_left"),
++          py::arg("pad_right"),
++          py::arg("pad_top"),
++          py::arg("pad_bottom"));
++    m.def("mean_dim_forward", &mean_dim_forward,
++          "Mean along dimension forward",
++          py::arg("x"),
++          py::arg("dim"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,34 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, channels, padding_size):
++        super().__init__()
++        self.channels = channels
++        self.padding_size = padding_size
++
++    def forward(self, x):
++        x = cuda_extension.pad_forward(
++            x,
++            self.padding_size[0],
++            self.padding_size[1],
++            self.padding_size[2],
++            self.padding_size[3],
++        )
++        x = cuda_extension.mean_dim_forward(x, self.channels)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.pad_forward(
++            x,
++            self.padding_size[0],
++            self.padding_size[1],
++            self.padding_size[2],
++            self.padding_size[3],
++        )
++        yield "step_001", x
++        x = cuda_extension.mean_dim_forward(x, self.channels)
++        yield "step_002", x
++        yield "step_003", x

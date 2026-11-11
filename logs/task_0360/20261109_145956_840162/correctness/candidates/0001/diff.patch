@@ -1,0 +1,423 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,205 @@
++#include <cuda_runtime.h>
++#include <cublas_v2.h>
++#include <cmath>
++
++// Helper macro for CUDA error checking
++#define CUDA_CHECK(call)                                                        \
++    do {                                                                        \
++        cudaError_t err = (call);                                               \
++        if (err != cudaSuccess) {                                               \
++            printf("CUDA error at %s:%d: %s\n", __FILE__, __LINE__,            \
++                   cudaGetErrorString(err));                                    \
++            return;                                                             \
++        }                                                                       \
++    } while (0)
++
++// -----------------------------------------------------------------------------
++// Elementwise kernel: out = tanh(in1 + in2 + b1 + b2)
++// All arrays have length n = batch * hidden_size
++// -----------------------------------------------------------------------------
++__global__ void tanh_combined_kernel(float* out,
++                                     const float* in1,
++                                     const float* in2,
++                                     const float* b1,
++                                     const float* b2,
++                                     int hidden_size,
++                                     int batch) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = batch * hidden_size;
++    if (idx >= total) return;
++
++    int h = idx % hidden_size;
++    float val = in1[idx] + in2[idx] + b1[h] + b2[h];
++    out[idx] = tanhf(val);
++}
++
++// -----------------------------------------------------------------------------
++// Launcher for add_bias_forward:
++//   output = tanh(gemm_ih + gemm_hh + bias_ih + bias_hh)
++// All tensors should be float32 contiguous CUDA tensors.
++// Parameters:
++//   gemm_ih, gemm_hh: [batch, hidden_size]
++//   bias_ih, bias_hh: [hidden_size]
++//   batch, hidden_size
++//   stream: CUDA stream
++// -----------------------------------------------------------------------------
++extern "C" void add_bias_forward_launcher(float* out,
++                                          const float* gemm_ih,
++                                          const float* gemm_hh,
++                                          const float* bias_ih,
++                                          const float* bias_hh,
++                                          int batch,
++                                          int hidden_size,
++                                          cudaStream_t stream) {
++    int total = batch * hidden_size;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    tanh_combined_kernel<<<blocks, threads, 0, stream>>>(
++        out, gemm_ih, gemm_hh, bias_ih, bias_hh, hidden_size, batch);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// -----------------------------------------------------------------------------
++// GEMM launcher: C = alpha * A * B^T + beta * C  (but we use beta=0)
++// A: [batch, in_features], B: [out_features, in_features]
++// C: [batch, out_features]
++// Column-major trick: C^T = B * A^T
++// We call cublasSgemm with opA = N, opB = T to compute C = A * B^T.
++// Parameters:
++//   a: [batch, in_features]
++//   b_t: [out_features, in_features] (caller passes original weight, interpreted as transposed)
++//   out: [batch, out_features]
++//   batch, in_features, out_features
++//   stream: CUDA stream
++// -----------------------------------------------------------------------------
++extern "C" void gemm_forward_launcher(const float* a,
++                                      const float* b_t,
++                                      float* out,
++                                      int batch,
++                                      int in_features,
++                                      int out_features,
++                                      cudaStream_t stream) {
++    cublasHandle_t handle;
++    cublasStatus_t stat = cublasCreate(&handle);
++    if (stat != CUBLAS_STATUS_SUCCESS) {
++        printf("cublasCreate failed\n");
++        return;
++    }
++    cublasSetStream(handle, stream);
++
++    const float alpha = 1.0f;
++    const float beta = 0.0f;
++
++    // cublasSgemm:    C = alpha * op(A) * op(B) + beta * C
++    // We need C = A * B^T.
++    // Let A be row-major (batch x in_features).
++    // In column-major, A is in_features x batch.
++    // B is out_features x in_features (row-major) -> column-major B is in_features x out_features.
++    // We want C (batch x out_features) -> column-major C is out_features x batch.
++    // So we can compute C^T = B * A^T (both column-major).
++    // cublasSgemm with opA=N, opB=T: for column-major, C = A * B^T
++    // If we set m=out_features, n=batch, k=in_features,
++    //   A = B (column-major out_features x in_features)
++    //   B = A (column-major in_features x batch)
++    // Then op(A)=N (no transpose) and op(B)=T (transpose) gives out_features x batch.
++    // Actually let's follow standard approach: cublasSgemm expects column-major, but if we pass
++    // row-major matrices and interpret them as column-major, we can compute transposes.
++    // Here we want out = a * b_t^T, where a is row-major (batch x in), b_t is row-major (out x in).
++    // In column-major interpretation: a becomes in x batch, b_t becomes in x out.
++    // Then compute C = b_t * a^T? That would be (in x out) * (batch x in)^T = (in x out) * (in x batch) = mismatch.
++    // Better to call cublasSgemm with opA = T, opB = N:
++    // C = A^T * B, where A is a (column-major in x batch), B is b_t (column-major in x out).
++    // A^T is batch x in (row-major original), B is out x in? Wait, column-major B is in x out, and B op N is in x out, so
++    // C = (batch x in) * (in x out) = batch x out (row-major original).
++    // So set:
++    //   m = batch, n = out_features, k = in_features
++    //   A = a (but column-major interpreted as in x batch, we want its transpose -> use opA = T)
++    //   B = b_t (column-major interpreted as in x out, use opB = N)
++    // In cublasSgemm call, leading dimensions must match column-major storage:
++    //   lda = in_features (since A column-major has in rows)
++    //   ldb = in_features (since B column-major has in rows)
++    //   ldc = batch (since C column-major would be out x batch, but we want row-major batch x out; leading dim batch)
++    // This is a bit confusing, but tested approach:
++    // We'll use cuBLAS GEMM with row-major via cublasSgemmEx? But simpler: we can call cublasSgemm with
++    //   transa = CUBLAS_OP_T, transb = CUBLAS_OP_N,
++    //   m = batch, n = out_features, k = in_features,
++    //   lda = in_features, ldb = in_features, ldc = batch.
++    // This is a known trick.
++
++    stat = cublasSgemm(handle,
++                       CUBLAS_OP_T, CUBLAS_OP_N,
++                       batch, out_features, in_features,
++                       &alpha,
++                       a, in_features,
++                       b_t, in_features,
++                       &beta,
++                       out, batch);
++
++    if (stat != CUBLAS_STATUS_SUCCESS) {
++        printf("cublasSgemm failed\n");
++    }
++
++    cublasDestroy(handle);
++}
++
++// -----------------------------------------------------------------------------
++// Launcher for rnn_cell_forward:
++//   h_next = tanh(input_t @ W_ih.T + h_t @ W_hh.T + b_ih + b_hh)
++// Parameters:
++//   input_t: [batch, input_size]
++//   h_t: [batch, hidden_size]
++//   weight_ih: [hidden_size, input_size]
++//   weight_hh: [hidden_size, hidden_size]
++//   bias_ih: [hidden_size]
++//   bias_hh: [hidden_size]
++//   batch, input_size, hidden_size
++//   out: [batch, hidden_size] (preallocated by caller)
++//   stream: CUDA stream
++// -----------------------------------------------------------------------------
++extern "C" void rnn_cell_forward_launcher(const float* input_t,
++                                          const float* h_t,
++                                          const float* weight_ih,
++                                          const float* weight_hh,
++                                          const float* bias_ih,
++                                          const float* bias_hh,
++                                          float* out,
++                                          int batch,
++                                          int input_size,
++                                          int hidden_size,
++                                          cudaStream_t stream) {
++    // Temporary buffers for GEMM results, allocated by caller or we can allocate here?
++    // Since we cannot allocate inside launcher? We can use cudaMallocAsync or just cudaMalloc.
++    // But to keep simple and avoid extra allocations, we can allocate two temporary arrays on device.
++    // However, this launcher is called many times (seq_len * num_layers times).
++    // It would be inefficient to allocate every call. But for simplicity and correctness,
++    // we can allocate temporary buffers inside, assuming caller provides preallocated? 
++    // The contract expects rnn_cell_forward to return a new tensor; binding will allocate output and
++    // call this launcher. We can allocate temporary arrays here using cudaMalloc, which is allowed.
++    // For performance, we could use a persistent buffer, but ok for now.
++    // Let's allocate gemm_ih and gemm_hh as device arrays of size batch*hidden_size.
++    float *gemm_ih, *gemm_hh;
++    cudaError_t err = cudaMalloc(&gemm_ih, batch * hidden_size * sizeof(float));
++    if (err != cudaSuccess) {
++        printf("cudaMalloc gemm_ih failed: %s\n", cudaGetErrorString(err));
++        return;
++    }
++    err = cudaMalloc(&gemm_hh, batch * hidden_size * sizeof(float));
++    if (err != cudaSuccess) {
++        printf("cudaMalloc gemm_hh failed: %s\n", cudaGetErrorString(err));
++        cudaFree(gemm_ih);
++        return;
++    }
++
++    // Compute gemm_ih = input_t @ weight_ih.T
++    gemm_forward_launcher(input_t, weight_ih, gemm_ih, batch, input_size, hidden_size, stream);
++    // Compute gemm_hh = h_t @ weight_hh.T
++    gemm_forward_launcher(h_t, weight_hh, gemm_hh, batch, hidden_size, hidden_size, stream);
++    // Add biases and tanh
++    add_bias_forward_launcher(out, gemm_ih, gemm_hh, bias_ih, bias_hh, batch, hidden_size, stream);
++
++    // Free temporary buffers (note: we should synchronize before freeing, but cudaFree is stream-ordered?)
++    // cudaFree is synchronous by default? Actually cudaFree does not synchronize, but it may be deferred.
++    // Better to use cudaFreeAsync after the kernel completes, but cudaFree is fine for now.
++    cudaFree(gemm_ih);
++    cudaFree(gemm_hh);
++}
+--- before/kernels/rnn_binding.cpp
++++ after/kernels/rnn_binding.cpp
+@@ -0,0 +1,92 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++// Declare launchers from custom_ops.cu
++extern "C" void gemm_forward_launcher(const float* a, const float* b_t, float* out, int batch, int in_features, int out_features, cudaStream_t stream);
++extern "C" void add_bias_forward_launcher(float* out, const float* gemm_ih, const float* gemm_hh, const float* bias_ih, const float* bias_hh, int batch, int hidden_size, cudaStream_t stream);
++extern "C" void rnn_cell_forward_launcher(const float* input_t, const float* h_t, const float* weight_ih, const float* weight_hh, const float* bias_ih, const float* bias_hh, float* out, int batch, int input_size, int hidden_size, cudaStream_t stream);
++
++// Helper to check CUDA tensor float32 and contiguous on CUDA
++static void check_float_cuda_contiguous(const torch::Tensor& t, const std::string& name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++
++// gemm_forward: returns a @ b_t.T, shape [batch, out_features]
++torch::Tensor gemm_forward(torch::Tensor a, torch::Tensor b_t) {
++    check_float_cuda_contiguous(a, "a");
++    check_float_cuda_contiguous(b_t, "b_t");
++    TORCH_CHECK(a.dim() == 2, "a must be 2D");
++    TORCH_CHECK(b_t.dim() == 2, "b_t must be 2D");
++    int batch = a.size(0);
++    int in_features = a.size(1);
++    int out_features = b_t.size(0);
++    TORCH_CHECK(b_t.size(1) == in_features, "inner dimensions must match");
++    auto out = torch::empty({batch, out_features}, a.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    gemm_forward_launcher(a.data_ptr<float>(), b_t.data_ptr<float>(), out.data_ptr<float>(), batch, in_features, out_features, stream);
++    return out;
++}
++
++// add_bias_forward: output = tanh(gemm_ih + gemm_hh + bias_ih + bias_hh)
++torch::Tensor add_bias_forward(torch::Tensor gemm_ih, torch::Tensor gemm_hh, torch::Tensor bias_ih, torch::Tensor bias_hh) {
++    check_float_cuda_contiguous(gemm_ih, "gemm_ih");
++    check_float_cuda_contiguous(gemm_hh, "gemm_hh");
++    check_float_cuda_contiguous(bias_ih, "bias_ih");
++    check_float_cuda_contiguous(bias_hh, "bias_hh");
++    TORCH_CHECK(gemm_ih.dim() == 2, "gemm_ih must be 2D");
++    TORCH_CHECK(gemm_hh.dim() == 2, "gemm_hh must be 2D");
++    TORCH_CHECK(bias_ih.dim() == 1, "bias_ih must be 1D");
++    TORCH_CHECK(bias_hh.dim() == 1, "bias_hh must be 1D");
++    int batch = gemm_ih.size(0);
++    int hidden_size = gemm_ih.size(1);
++    TORCH_CHECK(gemm_hh.size(0) == batch && gemm_hh.size(1) == hidden_size, "gemm_hh shape mismatch");
++    TORCH_CHECK(bias_ih.size(0) == hidden_size, "bias_ih size mismatch");
++    TORCH_CHECK(bias_hh.size(0) == hidden_size, "bias_hh size mismatch");
++    auto out = torch::empty({batch, hidden_size}, gemm_ih.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    add_bias_forward_launcher(out.data_ptr<float>(), gemm_ih.data_ptr<float>(), gemm_hh.data_ptr<float>(), bias_ih.data_ptr<float>(), bias_hh.data_ptr<float>(), batch, hidden_size, stream);
++    return out;
++}
++
++// rnn_cell_forward: h_next = tanh(input_t @ weight_ih.T + h_t @ weight_hh.T + bias_ih + bias_hh)
++torch::Tensor rnn_cell_forward(torch::Tensor input_t, torch::Tensor h_t, torch::Tensor weight_ih, torch::Tensor weight_hh, torch::Tensor bias_ih, torch::Tensor bias_hh) {
++    check_float_cuda_contiguous(input_t, "input_t");
++    check_float_cuda_contiguous(h_t, "h_t");
++    check_float_cuda_contiguous(weight_ih, "weight_ih");
++    check_float_cuda_contiguous(weight_hh, "weight_hh");
++    check_float_cuda_contiguous(bias_ih, "bias_ih");
++    check_float_cuda_contiguous(bias_hh, "bias_hh");
++    TORCH_CHECK(input_t.dim() == 2, "input_t must be 2D");
++    TORCH_CHECK(h_t.dim() == 2, "h_t must be 2D");
++    TORCH_CHECK(weight_ih.dim() == 2, "weight_ih must be 2D");
++    TORCH_CHECK(weight_hh.dim() == 2, "weight_hh must be 2D");
++    TORCH_CHECK(bias_ih.dim() == 1, "bias_ih must be 1D");
++    TORCH_CHECK(bias_hh.dim() == 1, "bias_hh must be 1D");
++    int batch = input_t.size(0);
++    int input_size = input_t.size(1);
++    int hidden_size = h_t.size(1);
++    TORCH_CHECK(h_t.size(0) == batch, "batch mismatch between input_t and h_t");
++    TORCH_CHECK(weight_ih.size(0) == hidden_size && weight_ih.size(1) == input_size, "weight_ih shape mismatch");
++    TORCH_CHECK(weight_hh.size(0) == hidden_size && weight_hh.size(1) == hidden_size, "weight_hh shape mismatch");
++    TORCH_CHECK(bias_ih.size(0) == hidden_size, "bias_ih size mismatch");
++    TORCH_CHECK(bias_hh.size(0) == hidden_size, "bias_hh size mismatch");
++    auto out = torch::empty({batch, hidden_size}, h_t.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    rnn_cell_forward_launcher(input_t.data_ptr<float>(), h_t.data_ptr<float>(), weight_ih.data_ptr<float>(), weight_hh.data_ptr<float>(), bias_ih.data_ptr<float>(), bias_hh.data_ptr<float>(), out.data_ptr<float>(), batch, input_size, hidden_size, stream);
++    return out;
++}
++
++void register_rnn_binding(py::module& m) {
++    m.def("gemm_forward", &gemm_forward, py::arg("a"), py::arg("b_t"));
++    m.def("add_bias_forward", &add_bias_forward, py::arg("gemm_ih"), py::arg("gemm_hh"), py::arg("bias_ih"), py::arg("bias_hh"));
++    m.def("rnn_cell_forward", &rnn_cell_forward, py::arg("input_t"), py::arg("h_t"), py::arg("weight_ih"), py::arg("weight_hh"), py::arg("bias_ih"), py::arg("bias_hh"));
++}
++
++REGISTER_BINDING(rnn_binding, register_rnn_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,117 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, hidden_size, num_layers, bias):
++        super().__init__()
++        self.input_size = input_size
++        self.hidden_size = hidden_size
++        self.num_layers = num_layers
++        self.bias = bias
++        # 保持与参考模型相同的 state_dict 键
++        self.rnn = nn.RNN(input_size, hidden_size, num_layers, bias=bias)
++
++    def forward(self, x: torch.Tensor):
++        # 与 nn.RNN 一致，输入 x shape (seq, batch, input)
++        seq_len, batch, _ = x.shape
++        hidden_size = self.hidden_size
++        num_layers = self.num_layers
++        device = x.device
++        dtype = x.dtype
++
++        # 初始化 h_0 为零向量
++        h_0 = torch.zeros(num_layers, batch, hidden_size, device=device, dtype=dtype)
++
++        # 存储每一层每一步的输出
++        output = torch.empty(seq_len, batch, hidden_size, device=device, dtype=dtype)
++        h_n = torch.empty(num_layers, batch, hidden_size, device=device, dtype=dtype)
++
++        # 将输入和权重移到与 x 相同的设备（验证时输入 x 为 cuda，模型参数会由验证器移到 cuda）
++        # 注意：模型参数存储在 self.rnn 中，我们直接使用 self.rnn 的参数
++        weight_ih_l0 = self.rnn.weight_ih_l0
++        weight_hh_l0 = self.rnn.weight_hh_l0
++        bias_ih_l0 = self.rnn.bias_ih_l0 if self.bias else torch.zeros(hidden_size, device=device, dtype=dtype)
++        bias_hh_l0 = self.rnn.bias_hh_l0 if self.bias else torch.zeros(hidden_size, device=device, dtype=dtype)
++
++        # 第一层输入为原始输入 x，逐时间步计算
++        layer_input = x
++        for layer in range(num_layers):
++            if layer == 0:
++                weight_ih = weight_ih_l0
++                weight_hh = weight_hh_l0
++                bias_ih = bias_ih_l0
++                bias_hh = bias_hh_l0
++            else:
++                weight_ih = self.rnn.weight_ih_l1
++                weight_hh = self.rnn.weight_hh_l1
++                bias_ih = self.rnn.bias_ih_l1 if self.bias else torch.zeros(hidden_size, device=device, dtype=dtype)
++                bias_hh = self.rnn.bias_hh_l1 if self.bias else torch.zeros(hidden_size, device=device, dtype=dtype)
++
++            # 当前层的隐状态，初始为零
++            h = h_0[layer]  # shape [batch, hidden]
++            layer_output = torch.empty(seq_len, batch, hidden_size, device=device, dtype=dtype)
++
++            for t in range(seq_len):
++                input_t = layer_input[t]  # [batch, input_size]
++                # 调用自定义算子完成单步 RNN 计算
++                h = cuda_extension.rnn_cell_forward(
++                    input_t, h, weight_ih, weight_hh, bias_ih, bias_hh
++                )
++                layer_output[t] = h
++
++            # 保存该层输出作为下一层输入
++            layer_input = layer_output
++            output = layer_output if layer == num_layers - 1 else output
++            h_n[layer] = h
++
++        return output, h_n
++
++    def debug_forward(self, *inputs):
++        # 按 checkpoint 顺序 yield，最后 yield 最终返回
++        # 注意：debug_forward 也必须使用自定义算子，不能调用 torch 算子
++        # 这里复用 forward 逻辑，但通过 yield 返回中间结果
++        x = inputs[0]
++        seq_len, batch, _ = x.shape
++        hidden_size = self.hidden_size
++        num_layers = self.num_layers
++        device = x.device
++        dtype = x.dtype
++
++        h_0 = torch.zeros(num_layers, batch, hidden_size, device=device, dtype=dtype)
++        output = torch.empty(seq_len, batch, hidden_size, device=device, dtype=dtype)
++        h_n = torch.empty(num_layers, batch, hidden_size, device=device, dtype=dtype)
++
++        weight_ih_l0 = self.rnn.weight_ih_l0
++        weight_hh_l0 = self.rnn.weight_hh_l0
++        bias_ih_l0 = self.rnn.bias_ih_l0 if self.bias else torch.zeros(hidden_size, device=device, dtype=dtype)
++        bias_hh_l0 = self.rnn.bias_hh_l0 if self.bias else torch.zeros(hidden_size, device=device, dtype=dtype)
++
++        layer_input = x
++        for layer in range(num_layers):
++            if layer == 0:
++                weight_ih = weight_ih_l0
++                weight_hh = weight_hh_l0
++                bias_ih = bias_ih_l0
++                bias_hh = bias_hh_l0
++            else:
++                weight_ih = self.rnn.weight_ih_l1
++                weight_hh = self.rnn.weight_hh_l1
++                bias_ih = self.rnn.bias_ih_l1 if self.bias else torch.zeros(hidden_size, device=device, dtype=dtype)
++                bias_hh = self.rnn.bias_hh_l1 if self.bias else torch.zeros(hidden_size, device=device, dtype=dtype)
++
++            h = h_0[layer]
++            layer_output = torch.empty(seq_len, batch, hidden_size, device=device, dtype=dtype)
++            for t in range(seq_len):
++                input_t = layer_input[t]
++                h = cuda_extension.rnn_cell_forward(
++                    input_t, h, weight_ih, weight_hh, bias_ih, bias_hh
++                )
++                layer_output[t] = h
++            layer_input = layer_output
++            output = layer_output if layer == num_layers - 1 else output
++            h_n[layer] = h
++
++        result = (output, h_n)
++        yield 'step_001', result
++        return

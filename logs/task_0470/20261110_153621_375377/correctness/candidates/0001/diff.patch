@@ -1,0 +1,129 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,41 @@
++#include <cuda_runtime.h>
++
++// 逐元素绝对值 kernel，使用 float4 向量化处理连续内存，提高内存吞吐。
++__global__ void abs_kernel(float* __restrict__ output, const float* __restrict__ input, int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    const int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    const int64_t vec_numel = numel / 4;
++    const int64_t vec_stride = stride;
++
++    // 向量化部分
++    for (int64_t i = idx; i < vec_numel; i += vec_stride) {
++        const float4* in_vec = reinterpret_cast<const float4*>(input) + i;
++        float4 val = *in_vec;
++        val.x = fabsf(val.x);
++        val.y = fabsf(val.y);
++        val.z = fabsf(val.z);
++        val.w = fabsf(val.w);
++        reinterpret_cast<float4*>(output)[i] = val;
++    }
++
++    // 尾部元素处理
++    for (int64_t i = vec_numel * 4 + idx; i < numel; i += stride) {
++        output[i] = fabsf(input[i]);
++    }
++}
++
++// launcher: 外部 C 接口，供 binding.cpp 调用
++extern "C" void custom_abs_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    // 选择 block size 和 grid size
++    const int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) {
++        blocks = 65535; // 限制 grid 维度，kernel 内部 grid-stride 循环处理剩余
++    }
++    abs_kernel<<<blocks, threads, 0, stream>>>(output, input, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,53 @@
++// Binding file for custom_abs operator
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void custom_abs_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream);
++
++// PyTorch wrapper function
++torch::Tensor custom_abs_forward(torch::Tensor x) {
++    // Check CUDA tensor
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be a CUDA tensor");
++    // Check dtype
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input tensor must be float32");
++    // Ensure contiguous (the kernel assumes contiguous layout)
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++
++    // Allocate output tensor with same options
++    auto output = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call the launcher
++    custom_abs_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        x.numel(),
++        stream);
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_custom_abs(pybind11::module& m) {
++    m.def("custom_abs", &custom_abs_forward, "Element-wise absolute value (CUDA)",
++          py::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_abs, register_custom_abs);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import cuda_extension
++
++
++class ModelNew(torch.nn.Module):
++    def __init__(self, device):
++        super(ModelNew, self).__init__()
++        self.device = device
++
++    def forward(self, x):
++        x = x.to(self.device)
++        if x.is_cuda:
++            x = cuda_extension.custom_abs(x)
++        else:
++            x = torch.abs(x)
++        return x
++
++    def debug_forward(self, x):
++        x = x.to(self.device)
++        yield 'step_001', x
++        if x.is_cuda:
++            x = cuda_extension.custom_abs(x)
++        else:
++            x = torch.abs(x)
++        yield 'step_002', x
++        yield 'step_003', x

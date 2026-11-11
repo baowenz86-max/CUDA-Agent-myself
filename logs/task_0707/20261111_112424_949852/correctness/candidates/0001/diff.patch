@@ -1,0 +1,248 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,88 @@
++#include <cuda_runtime.h>
++
++// Embedding forward kernel: output shape [N0, N1, embedding_dim]
++// indices: int64 tensor shape [N0, N1] (may have arbitrary strides)
++// weight: float32 tensor shape [num_embeddings, embedding_dim] contiguous
++// output: float32 contiguous [N0, N1, embedding_dim]
++__global__ void embedding_forward_kernel(
++    const int64_t* __restrict__ indices,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int64_t N0,
++    int64_t N1,
++    int64_t embedding_dim,
++    int64_t num_embeddings) {
++    int64_t total = N0 * N1 * embedding_dim;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (; idx < total; idx += stride) {
++        // decompose flat index into (b, j, k)
++        int64_t k = idx % embedding_dim;
++        int64_t tmp = idx / embedding_dim;
++        int64_t j = tmp % N1;
++        int64_t b = tmp / N1;
++        
++        // indices may be non-contiguous, but we treat it as contiguous in the kernel,
++        // assuming the binding layer ensures contiguity or the strides are handled by caller.
++        // Here, we simply use the flat index for indices tensor as (b * N1 + j).
++        // This is correct if indices is contiguous. If not, binding layer should make it contiguous.
++        int64_t index = indices[b * N1 + j];
++        // PyTorch embedding out-of-bounds behavior: undefined; we just read without bounds check to match.
++        int idx_weight = index * embedding_dim + k;
++        output[idx] = weight[idx_weight];
++    }
++}
++
++// Mean over dim=1 kernel: input shape [N0, N1, N2], output [N0, N2]
++// x: float32 contiguous (or we assume contiguous; binding layer ensures)
++// output: float32 contiguous
++__global__ void mean_dim1_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ output,
++    int64_t N0,
++    int64_t N1,
++    int64_t N2) {
++    int64_t total = N0 * N2;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (; idx < total; idx += stride) {
++        int64_t d = idx % N2;
++        int64_t b = idx / N2;
++        float sum = 0.0f;
++        for (int64_t j = 0; j < N1; ++j) {
++            sum += x[(b * N1 + j) * N2 + d];
++        }
++        output[idx] = sum / (float)N1;
++    }
++}
++
++extern "C" void embedding_forward_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int64_t N0,
++    int64_t N1,
++    int64_t embedding_dim,
++    int64_t num_embeddings,
++    cudaStream_t stream) {
++    int64_t total = N0 * N1 * embedding_dim;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid limit; kernel uses grid-stride loop
++    embedding_forward_kernel<<<blocks, threads, 0, stream>>>(
++        indices, weight, output, N0, N1, embedding_dim, num_embeddings);
++}
++
++extern "C" void mean_dim1_launcher(
++    const float* x,
++    float* output,
++    int64_t N0,
++    int64_t N1,
++    int64_t N2,
++    cudaStream_t stream) {
++    int64_t total = N0 * N2;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    mean_dim1_kernel<<<blocks, threads, 0, stream>>>(x, output, N0, N1, N2);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,105 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void embedding_forward_launcher(
++    const int64_t* indices,
++    const float* weight,
++    float* output,
++    int64_t N0,
++    int64_t N1,
++    int64_t embedding_dim,
++    int64_t num_embeddings,
++    cudaStream_t stream);
++
++extern "C" void mean_dim1_launcher(
++    const float* x,
++    float* output,
++    int64_t N0,
++    int64_t N1,
++    int64_t N2,
++    cudaStream_t stream);
++
++static torch::Tensor embedding_forward(torch::Tensor indices, torch::Tensor weight) {
++    // Check devices
++    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++
++    // Check dtypes
++    TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++
++    // Check dimensions
++    TORCH_CHECK(indices.dim() == 2, "indices must be 2D");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
++
++    // Ensure contiguity: indices may have arbitrary strides; make contiguous
++    auto indices_contig = indices.contiguous();
++    // weight is expected contiguous, but ensure it too
++    auto weight_contig = weight.contiguous();
++
++    int64_t N0 = indices_contig.size(0);
++    int64_t N1 = indices_contig.size(1);
++    int64_t embedding_dim = weight_contig.size(1);
++    int64_t num_embeddings = weight_contig.size(0);
++
++    // Allocate output [N0, N1, embedding_dim]
++    auto output = torch::empty({N0, N1, embedding_dim}, weight_contig.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    embedding_forward_launcher(
++        indices_contig.data_ptr<int64_t>(),
++        weight_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N0,
++        N1,
++        embedding_dim,
++        num_embeddings,
++        stream
++    );
++
++    return output;
++}
++
++static torch::Tensor mean_dim1_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() == 3, "x must be 3D");
++
++    // Ensure contiguous for kernel that uses flat indexing
++    auto x_contig = x.contiguous();
++
++    int64_t N0 = x_contig.size(0);
++    int64_t N1 = x_contig.size(1);
++    int64_t N2 = x_contig.size(2);
++
++    // Allocate output [N0, N2]
++    auto output = torch::empty({N0, N2}, x_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    mean_dim1_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N0,
++        N1,
++        N2,
++        stream
++    );
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("embedding_forward", &embedding_forward, "Embedding forward",
++          py::arg("indices"), py::arg("weight"));
++    m.def("mean_dim1_forward", &mean_dim1_forward, "Mean over dim 1",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,46 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim, padding_idx=None):
++        super().__init__()
++        # Match original state_dict key "embedding.weight" by using a submodule Embedding
++        # Only weights are needed; padding_idx is ignored except for state_dict compatibility.
++        self.embedding = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
++
++    def forward(self, x):
++        # Move indices to CUDA if necessary; custom op expects CUDA int64 tensor.
++        if not x.is_cuda:
++            x = x.cuda()
++        indices = x.to(torch.int64)
++        weight = self.embedding.weight
++        if not weight.is_cuda:
++            weight = weight.cuda()
++
++        # Step 1: embedding lookup
++        embedded = cuda_extension.embedding_forward(indices, weight)
++
++        # Step 2: mean over dim=1
++        result = cuda_extension.mean_dim1_forward(embedded)
++
++        return result
++
++    def debug_forward(self, *inputs):
++        # inputs[0] is x
++        x = inputs[0]
++        if not x.is_cuda:
++            x = x.cuda()
++        indices = x.to(torch.int64)
++        weight = self.embedding.weight
++        if not weight.is_cuda:
++            weight = weight.cuda()
++
++        embedded = cuda_extension.embedding_forward(indices, weight)
++        yield ("step_001", embedded)
++
++        mean_result = cuda_extension.mean_dim1_forward(embedded)
++        yield ("step_002", mean_result)
++
++        yield ("step_003", mean_result)

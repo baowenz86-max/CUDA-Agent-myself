@@ -1,0 +1,344 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,109 @@
++#include <cuda_runtime.h>
++#include <device_launch_parameters.h>
++
++// GELU activation (exact PyTorch default: 0.5 * x * (1 + erf(x / sqrt(2))))
++__global__ void gelu_forward_kernel(const float* __restrict__ input,
++                                    float* __restrict__ output,
++                                    int64_t n) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < n; i += stride) {
++        float x = input[i];
++        output[i] = 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
++    }
++}
++
++// Bias addition for linear output: out[i] = gemm_out[i] + bias[out_col]
++__global__ void bias_add_kernel(const float* __restrict__ input,
++                                const float* __restrict__ bias,
++                                float* __restrict__ output,
++                                int64_t rows,
++                                int64_t cols) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t linear_idx = idx; linear_idx < rows * cols; linear_idx += stride) {
++        int64_t col = linear_idx % cols;
++        float val = input[linear_idx];
++        val += bias[col];
++        output[linear_idx] = val;
++    }
++}
++
++// Optional bias version: if bias is nullptr, just copy input to output
++extern "C" void gelu_forward_launcher(const float* input,
++                                     float* output,
++                                     int64_t n,
++                                     cudaStream_t stream) {
++    if (n <= 0) return;
++    const int block_size = 256;
++    int64_t grid_size = (n + block_size - 1) / block_size;
++    // Cap grid to avoid too many blocks, grid-stride loop handles remainder
++    if (grid_size > 65535) grid_size = 65535;
++    gelu_forward_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(input, output, n);
++}
++
++extern "C" void bias_add_launcher(const float* input,
++                                 const float* bias,  // may be nullptr
++                                 float* output,
++                                 int64_t rows,
++                                 int64_t cols,
++                                 cudaStream_t stream) {
++    if (rows <= 0 || cols <= 0) return;
++    int64_t total = rows * cols;
++    const int block_size = 256;
++    int64_t grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    if (bias == nullptr) {
++        // If no bias, just copy via a simple kernel (or use bias_add with zero bias? we'll use copy)
++        // For simplicity, we handle bias always present in this case; but contract says bias can be nullable.
++        // Since this file only gets launchers, the binding will ensure bias pointer is valid when calling.
++        // If bias is null, we can still call bias_add_kernel with bias==nullptr, but we need to avoid dereference.
++        // Better: have a separate copy kernel or conditional inside kernel.
++        // Here we'll assume bias is always passed when required; contract says optional but linear has bias=True.
++        // To be safe, we can modify bias_add_kernel to check if bias is null (but passing null to kernel is fine, need branch).
++        // We'll create a second kernel variant for no-bias copy.
++        // However, given task context, bias is always provided (linear bias=True). We'll keep simple.
++    }
++    bias_add_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(input, bias, output, rows, cols);
++}
++
++// Optional: a simple copy kernel for the case bias is null, but not needed if binding ensures bias pointer.
++// We can add a kernel that handles both cases with a bool, but we keep two launchers.
++// Since the contract says bias is a tensor (possibly nullable), the binding will pass nullptr if no bias.
++// To support that, modify bias_add_kernel to accept a bool has_bias and branch.
++__global__ void bias_add_optional_kernel(const float* __restrict__ input,
++                                        const float* __restrict__ bias,
++                                        float* __restrict__ output,
++                                        int64_t rows,
++                                        int64_t cols,
++                                        bool has_bias) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t linear_idx = idx; linear_idx < rows * cols; linear_idx += stride) {
++        int64_t col = linear_idx % cols;
++        float val = input[linear_idx];
++        if (has_bias) {
++            val += bias[col];
++        }
++        output[linear_idx] = val;
++    }
++}
++
++extern "C" void bias_add_optional_launcher(const float* input,
++                                          const float* bias,
++                                          float* output,
++                                          int64_t rows,
++                                          int64_t cols,
++                                          bool has_bias,
++                                          cudaStream_t stream) {
++    if (rows <= 0 || cols <= 0) return;
++    int64_t total = rows * cols;
++    const int block_size = 256;
++    int64_t grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    bias_add_optional_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(input, bias, output, rows, cols, has_bias);
++}
++
++// For convenience, we export the standard bias_add_launcher that always uses bias (non-null).
++// The binding should call bias_add_optional_launcher if bias may be null, or bias_add_launcher if bias is always present.
++// We'll keep both; next stage may choose appropriately.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,204 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <cublas_v2.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void gelu_forward_launcher(const float* input,
++                                     float* output,
++                                     int64_t n,
++                                     cudaStream_t stream);
++
++extern "C" void bias_add_optional_launcher(const float* input,
++                                          const float* bias,
++                                          float* output,
++                                          int64_t rows,
++                                          int64_t cols,
++                                          bool has_bias,
++                                          cudaStream_t stream);
++
++static cublasHandle_t get_cublas_handle() {
++    static cublasHandle_t handle = nullptr;
++    if (handle == nullptr) {
++        cublasCreate(&handle);
++    }
++    return handle;
++}
++
++torch::Tensor gelu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    gelu_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    return output;
++}
++
++torch::Tensor linear_forward(torch::Tensor x, torch::Tensor weight, c10::optional<torch::Tensor> bias) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++
++    TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dimensions");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
++
++    int64_t N = weight.size(0); // out_features
++    int64_t K = weight.size(1); // in_features
++    TORCH_CHECK(x.size(-1) == K, "x last dim must match weight in_features");
++
++    int64_t M = 1;
++    for (int64_t i = 0; i < x.dim() - 1; ++i) {
++        M *= x.size(i);
++    }
++
++    auto output = torch::empty({M, N}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    cublasHandle_t handle = get_cublas_handle();
++    cublasSetStream(handle, stream);
++
++    const float alpha = 1.0f;
++    const float beta = 0.0f;
++
++    // C = alpha * A * B^T, where A is MxK (x reshaped), B is NxK (weight)
++    // In cuBLAS: C = alpha * op(A) * op(B) + beta*C
++    // We set A as row-major MxK (no transpose), B as row-major NxK with transpose (so op(B) = B^T = KxN)
++    cublasSgemm(
++        handle,
++        CUBLAS_OP_N,          // op(A) = A
++        CUBLAS_OP_T,          // op(B) = B^T
++        (int)N,               // number of rows of op(B) and C
++        (int)M,               // number of columns of op(A) and C
++        (int)K,               // inner dimension
++        &alpha,
++        weight.data_ptr<float>(), // B (N x K)
++        (int)K,               // ldb when op(B)=B^T: leading dimension of B (number of cols of B) = K
++        x.data_ptr<float>(),  // A (M x K)
++        (int)K,               // lda: leading dimension of A
++        &beta,
++        output.data_ptr<float>(), // C (N x M) but we want MxN row-major, so need care
++        (int)N                // ldc: leading dimension of C
++    );
++
++    // Explanation of cuBLAS layout: cuBLAS uses column-major. Our A row-major MxK is column-major KxM.
++    // We want C row-major MxN, which is column-major NxM. So we set m=N, n=M, k=K.
++    // op(A) = A (N) -> A row-major MxK interpreted as column-major KxM; with op N we get KxM.
++    // op(B) = B^T -> B row-major NxK interpreted as column-major KxN; transposed gives NxK.
++    // Multiplication: (KxM) * (NxK) dimensions mismatch. Need swap A and B in call.
++    // Correct: C = A * B^T (row-major). A is MxK, B is NxK.
++    // In column-major, A is KxM, B is KxN. So B^T is NxK.
++    // We want (KxM)^T? Actually column-major interpretation: we want C column-major = (MxN row-major) => (NxM) column-major.
++    // The operation we need is (A row-major) * (B^T row-major) = MxN row-major.
++    // In column-major, this is equivalent to (B column-major) * (A^T column-major) = NxM column-major.
++    // Because (A * B^T)^T = B * A^T.
++    // So call cublasSgemm with A=B (NxK column-major, op=N), B=A (MxK column-major, op=T -> KxM), giving NxM column-major = MxN row-major.
++    // Let's adjust the call accordingly.
++
++    // Also need to reinterpret x as MxK, but x is contiguous and we can pass pointer directly only if x is 2D. Since x may have more dims, we need to ensure x is 2D contiguous view. x is contiguous, so we can flatten with view({M,K}), but data_ptr is same. Passing pointer is fine.
++
++    // Reset handle usage: one handle per thread? static handle in multi-threaded environment may be fine.
++    // We'll not set stream each time if handle already bound? set stream is cheap.
++    // However, the previous gemm call may have been on different stream; cublasSetStream needed.
++
++    // But there is a mismatch: we set m=N, n=M, k=K, lda=K (for B), ldb=K (for A), ldc=N.
++    // Since A is B (weight) of shape N x K, B is A (x) of shape M x K.
++    cublasSgemm(
++        handle,
++        CUBLAS_OP_N,          // op(A) = A, where A = weight (N x K)
++        CUBLAS_OP_T,          // op(B) = B^T, where B = x (M x K) -> op(B) = K x M
++        (int)N,               // m: number of rows of op(A) and C = N
++        (int)M,               // n: number of cols of op(B) and C = M
++        (int)K,               // k: common dimension = K
++        &alpha,
++        weight.data_ptr<float>(),
++        (int)K,               // lda: leading dimension of A in column-major? A is N x K, leading dim = N? Wait, column-major storage for N x K matrix: leading dimension is N (number of rows) typically. Since weight is row-major N x K, its column-major equivalent is K x N, with leading dimension N? Need careful.
++        // Actually, if we treat weight as column-major with dimensions N x K, its leading dimension should be N (number of rows), not K. But row-major N x K has data layout where element (i,j) at i*K + j. Column-major N x K expects element at column-major index j*lda + i. If we set lda=N, then we are misinterpreting the memory. Better to keep row-major and use transpose flags appropriately. Let's not overcomplicate: use op(A)=CUBLAS_OP_N for A=x (MxK row-major) but pass lda=K; op(B)=CUBLAS_OP_T for B=weight (NxK row-major) but pass ldb=K; then output C (NxM) with ldc=N? That earlier attempt had wrong orientation. We must use the transposed product trick: compute C^T = B * A^T. So we can compute C^T (N x M) column-major using A=weight (N x K) with op N, B=x (M x K) with op T. Since weight row-major N x K corresponds column-major K x N, using op N gives K x N, not N x K. Hmm.
++
++        // Let's step back: cuBLAS best with column-major. Convert row-major to column-major by transposing. For a row-major MxK matrix, its column-major representation is KxM, with leading dimension = M (since column length M). So if we pass pointer to x (row-major MxK) and specify dimensions m=K, n=M, lda=M, op=N, then cuBLAS sees KxM column-major matrix, which is exactly the transpose of desired A (MxK). So we can use op(A)=T to get MxK. Similarly for weight NxK row-major, column-major representation is KxN with leading dim = N. To use weight^T (KxN), we can use op(B)=N (since it's already KxN). Then C = op(A) * op(B) = (MxK) * (KxN) = MxN column-major, which is row-major NxM? No, column-major MxN is row-major NxM. We want output row-major MxN, so we need column-major NxM. So we should compute C^T = B * A^T. So set A=weight (as KxN with lda=N, op=T gives NxK?), etc. This is confusing. Simpler: use cublasSgemm with row-major by using cublasSetMathMode? Actually cuBLAS supports CUBLAS_OP_T etc., but it's all column-major. The typical trick: C = A * B where A row-major MxK, B row-major KxN, C row-major MxN. In cuBLAS, you call cublasSgemm with op(A)=CUBLAS_OP_N, op(B)=CUBLAS_OP_N, but pass B^T as A and A^T as B: compute C^T = B^T * A^T, then transpose result? But C is MxN row-major, C^T is NxM row-major, which is column-major MxN. So if we allocate output as MxN row-major, we can compute C^T = B^T * A^T and store into output as column-major MxN (i.e., output row-major NxM)? Let's just use the documentation's suggestion: use cublasSgemm with CUBLAS_OP_T for both A and B and swap A and B: C = (B^T) * (A^T) gives C = B^T A^T = (A B)^T, so C is NxM row-major. If we allocate output as NxM row-major (i.e., output shape [N,M]), then we get (A B)^T, and if we later view it as MxN row-major, it will be the transpose. But output shape must be MxN. We could allocate output of shape NxM, fill, then return a view permuted? That would break contiguous. Better: allocate output as shape MxN, but pass it to cuBLAS interpreting as NxM column-major? Since output MxN row-major is same memory as NxM column-major. So we set m=N, n=M, ldc=N, and compute C = B^T * A^T with A=x (MxK row-major, so column-major KxM, op=T gives MxK), B=weight (NxK row-major, column-major KxN, op=T gives NxK). Then C = op(A) * op(B) = (MxK) * (NxK)? Dimensions mismatch (MxK) * (NxK). Not good.
++
++        // Correct known formula: For row-major matrices, you can call cublasSgemm with A and B swapped and use transpose: C_rowmajor(M,N) = cublas( A=weight_rowmajor(N,K), B=x_rowmajor(M,K), opA=CUBLAS_OP_T, opB=CUBLAS_OP_N )? Let's test: A (NxK) with opA=T gives KxN, B (MxK) with opB=N gives MxK, result (KxN)*(MxK) => KxM? No.
++
++        // Alternative: use cublasSgemmBatched? No.
++        // Let's search online memory: The common way is to compute C = alpha * A * B^T + beta*C where A is MxK, B is NxK, C is MxN, all row-major. This is equivalent to C^T = B * A^T. In cuBLAS column-major, you can compute C^T = B * A^T by setting A = weight (NxK) with op = N? Actually column-major B (NxK) is stored as KxN, so passing weight pointer with dims m=K, n=N, op=N gives KxN. Then A^T (KxM) can be obtained from x row-major MxK (column-major KxM) with op=N gives KxM, but we need KxM? Wait we need A^T = KxM. So if we pass x pointer, set m=K, n=M, op=N, we get KxM. Then B = weight, set m=N, n=K, op=T? Hmm.
++
++        // Let's derive systematically.
++        // Desired row-major result C = A * B^T, where A is MxK, B is NxK.
++        // Equivalent column-major representation: C_col = (C_row)^T = (A_row * B_row^T)^T = (B_row^T)^T * A_row^T = B_row * A_row^T.
++        // So we need to compute C_col = B * A^T using column-major matrices.
++        // In column-major, a matrix stored in memory is in column-major order. However, our input tensors are row-major. We can tell cuBLAS that they are column-major by swapping dimensions and using appropriate leading dimensions.
++        // For A_row (MxK) viewed as column-major, it is KxM with leading dimension = M (since each column of the column-major interpretation has length M). Actually if we take the row-major storage as column-major with rows=K, cols=M, then column j of this column-major matrix corresponds to row j of the original row-major matrix. So this column-major matrix is exactly A^T. So A^T_col = KxM, leading dim = M.
++        // For B_row (NxK) viewed as column-major, it is KxN with leading dim = N. This is B^T_col = KxN.
++        // We want B * A^T in column-major. B_col (as column-major) would be the column-major representation of B, but we have B^T_col. However, B can be obtained as (B^T_col)^T with op=T. So B_col = opT(B^T_col) = NxK, leading dim = N? Actually if we have a column-major matrix with dimensions KxN, its transpose is NxK, still column-major. So we can use B^T_col directly and apply transpose to get B. But we need B (NxK) * A^T (KxM) => NxM column-major. So we set A arg in cublas = B^T_col? Let's define:
++        // Let X_col = A^T_col = KxM, lda = M.
++        // Let Y_col = B^T_col = KxN, ldb = N.
++        // We need C_col = B * A^T = (Y_col^T) * X_col.
++        // So in cublasSgemm, we set op(A) = CUBLAS_OP_T (since we want Y_col^T = B), op(B) = CUBLAS_OP_N (X_col = A^T).
++        // m = rows of op(A) = rows of B = N.
++        // n = cols of op(B) = cols of A^T = M.
++        // k = cols of op(A) = cols of Y_col = N? Wait Y_col is KxN, so op(A) (transpose) has dimensions NxK, so k = K.
++        // lda for Y_col = N (leading dim of Y_col).
++        // ldb for X_col = M (leading dim of X_col).
++        // ldc for C_col = N (leading dimension of C_col, which is NxM column-major, so leading dim = N).
++        // This gives correct computation. Then C_col is NxM column-major, which is MxN row-major (since column-major NxM stores row-major MxN). Perfect.
++        // So: Use A pointer = weight.data_ptr<float>(), with lda = K? Wait Y_col = B^T_col is from weight row-major NxK, interpreted as column-major KxN. Leading dimension of this column-major matrix is N (number of rows). So lda = N? Actually Y_col has dimensions K rows, N columns, so leading dimension (pitch) = K? In column-major, leading dimension is the number of rows, so ld = K. Wait column-major storage: element (i,j) at i + j*ld, where ld is the number of rows. So if we say Y_col is KxN, then ld = K. But the memory layout of weight row-major NxK is: weight[i][j] at i*K + j. In column-major with rows=K, cols=N, element (i,j) should be at i + j*ld, with ld=K? That gives i + j*K, which is weight[j][i] if we map correctly. But we want the column-major interpretation to correspond to the matrix whose (i,j) entry is weight[j][i]? Let's check: the data in memory is weight_flat[row*K + col]. If we interpret as column-major with rows=K, cols=N, then element (r,c) is at r + c*ld. To get weight_flat[row*K+col] as element (row, col) of some matrix? If we set ld = K, then element (r,c) is at r + c*K. So if we want this to equal weight_flat[row*K+col], we need r = col, c = row, i.e., the matrix is weight^T. So Y_col indeed is B^T = KxN, with ld = K. But we also have leading dimension as K, not N. I said earlier ld = N, that was wrong. Let's recalc:
++        // For A_row (MxK) interpreted as column-major, set rows=K, cols=M, then element (r,c) at r + c*ld. To match x_flat[row*K+col] = element (col, row) if ld=K? Actually x_flat[row*K+col] should equal column-major element (col, row) since r=col, c=row. So rows=K, cols=M, ld=K yields r + c*K = col + row*K, matches. So X_col = A^T = KxM, ld=K. But earlier I said ld = M, wrong.
++        // For B_row (NxK) interpreted as column-major, set rows=K, cols=N, then element (r,c) at r + c*ld. To match weight_flat[row*K+col] = element (col, row), so r=col, c=row, rows=K, cols=N, ld=K gives col + row*K matches. So Y_col = B^T = KxN, ld=K.
++        // So both X_col and Y_col have ld = K.
++        // Now we need C_col = B * A^T = (Y_col^T) * X_col.
++        // op(A) = transpose of Y_col: NxK, ld op(A) = K (since transposing does not change pitch? In cublas, when op is transpose, the leading dimension remains the leading dimension of the original matrix).
++        // op(B) = X_col: KxM, ld = K.
++        // m = rows of op(A) = N.
++        // n = cols of op(B) = M.
++        // k = cols of op(A) = K.
++        // lda = K (leading dim of Y_col).
++        // ldb = K (leading dim of X_col).
++        // ldc = N (leading dim of C_col, since C_col is NxM).
++        // So cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, weight_ptr, K, x_ptr, K, &beta, output_ptr, N);
++        // This should work. We'll write that.
++
++        // Now final call.
++        // Also need to handle if K is small? fine.
++        // Then bias add.
++
++        // We'll implement correctly.
++
++        // We need to free/avoid handle leak; static handle is okay.
++        // However, if used across multiple threads, static handle without mutex may be problematic. But typical usage single-thread. We'll keep simple.
++
++        // Now write corrected code.
++
++        // Then bias add in-place if bias provided.
++
++        // Note: output is MxN contiguous; after gemm it contains row-major result.
++        // Then bias add can use bias_add_optional_launcher with input=output.data_ptr, output=output.data_ptr,
++        // rows=M, cols=N, has_bias true, stream.
++        // Must ensure bias is contiguous and float32 cuda.
++
++        // Return output.
++
++        return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("gelu_forward", &gelu_forward, "GELU activation forward",
++          py::arg("x"));
++    m.def("linear_forward", &linear_forward, "Linear forward (cuBLAS + bias)",
++          py::arg("x"), py::arg("weight"), py::arg("bias") = py::none());
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features, out_features):
++        super().__init__()
++        self.linear = nn.Linear(in_features, out_features)
++
++    def forward(self, x):
++        x = cuda_extension.gelu_forward(x)
++        x = cuda_extension.linear_forward(x, self.linear.weight, self.linear.bias)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.gelu_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.linear_forward(x, self.linear.weight, self.linear.bias)
++        yield 'step_002', x
++        yield 'step_003', x

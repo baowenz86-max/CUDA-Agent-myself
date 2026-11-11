@@ -1,0 +1,243 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,128 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// Kernel for log_softmax along dim=1 (C=3)
++// Input tensor shape: [N, C, H, W], strides: [C*H*W, H*W, W, 1]
++// Each thread processes one spatial location (n, h, w) across all C channels.
++// Grid-stride loop over total spatial locations = N * H * W.
++__global__ void log_softmax_kernel(const float* __restrict__ input,
++                                   float* __restrict__ output,
++                                   int N, int C, int H, int W) {
++    int HW = H * W;
++    long long total = (long long)N * HW; // 1024 * 50176 = 51,380,224
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++
++    for (long long i = idx; i < total; i += stride) {
++        int n = i / HW;
++        int spatial = i - (long long)n * HW;
++        // Compute max over channels
++        float max_val = -INFINITY;
++        for (int c = 0; c < C; ++c) {
++            float val = input[((long long)n * C + c) * HW + spatial];
++            if (val > max_val) max_val = val;
++        }
++        // Compute sum of exp(x - max)
++        float sum = 0.0f;
++        for (int c = 0; c < C; ++c) {
++            float val = input[((long long)n * C + c) * HW + spatial];
++            sum += expf(val - max_val);
++        }
++        float log_sum = logf(sum);
++        // Write log_softmax values
++        for (int c = 0; c < C; ++c) {
++            float val = input[((long long)n * C + c) * HW + spatial];
++            output[((long long)n * C + c) * HW + spatial] = val - max_val - log_sum;
++        }
++    }
++}
++
++// Kernel for hardshrink with threshold = 0.5
++__global__ void hardshrink_kernel(const float* __restrict__ input,
++                                  float* __restrict__ output,
++                                  long long numel,
++                                  float lambd) {
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++
++    for (long long i = idx; i < numel; i += stride) {
++        float val = input[i];
++        if (fabsf(val) <= lambd) {
++            output[i] = 0.0f;
++        } else {
++            output[i] = val;
++        }
++    }
++}
++
++// Fused kernel: log_softmax + hardshrink
++__global__ void log_softmax_hardshrink_kernel(const float* __restrict__ input,
++                                              float* __restrict__ output,
++                                              int N, int C, int H, int W,
++                                              float lambd) {
++    int HW = H * W;
++    long long total = (long long)N * HW;
++    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++
++    for (long long i = idx; i < total; i += stride) {
++        int n = i / HW;
++        int spatial = i - (long long)n * HW;
++        float max_val = -INFINITY;
++        for (int c = 0; c < C; ++c) {
++            float val = input[((long long)n * C + c) * HW + spatial];
++            if (val > max_val) max_val = val;
++        }
++        float sum = 0.0f;
++        for (int c = 0; c < C; ++c) {
++            float val = input[((long long)n * C + c) * HW + spatial];
++            sum += expf(val - max_val);
++        }
++        float log_sum = logf(sum);
++        for (int c = 0; c < C; ++c) {
++            float val = input[((long long)n * C + c) * HW + spatial];
++            float ls = val - max_val - log_sum;
++            if (fabsf(ls) <= lambd) {
++                output[((long long)n * C + c) * HW + spatial] = 0.0f;
++            } else {
++                output[((long long)n * C + c) * HW + spatial] = ls;
++            }
++        }
++    }
++}
++
++// Launcher functions
++extern "C" void log_softmax_hardshrink_launcher(const float* input, float* output,
++                                                int N, int C, int H, int W,
++                                                cudaStream_t stream) {
++    int HW = H * W;
++    long long total = (long long)N * HW;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    // Use fused kernel with lambd=0.5
++    log_softmax_hardshrink_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, 0.5f);
++}
++
++extern "C" void log_softmax_only_launcher(const float* input, float* output,
++                                          int N, int C, int H, int W,
++                                          cudaStream_t stream) {
++    int HW = H * W;
++    long long total = (long long)N * HW;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    log_softmax_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W);
++}
++
++extern "C" void hardshrink_only_launcher(const float* input, float* output,
++                                         long long numel,
++                                         cudaStream_t stream) {
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    hardshrink_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, numel, 0.5f);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,88 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void log_softmax_hardshrink_launcher(
++    const float* input, float* output,
++    int N, int C, int H, int W,
++    cudaStream_t stream);
++
++extern "C" void log_softmax_only_launcher(
++    const float* input, float* output,
++    int N, int C, int H, int W,
++    cudaStream_t stream);
++
++extern "C" void hardshrink_only_launcher(
++    const float* input, float* output,
++    long long numel,
++    cudaStream_t stream);
++
++static torch::Tensor check_input(const torch::Tensor& x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    return x;
++}
++
++torch::Tensor log_softmax_hardshrink(torch::Tensor x) {
++    check_input(x);
++    auto output = torch::empty_like(x);
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    log_softmax_hardshrink_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        stream);
++    return output;
++}
++
++torch::Tensor log_softmax_only(torch::Tensor x) {
++    check_input(x);
++    auto output = torch::empty_like(x);
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    log_softmax_only_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        stream);
++    return output;
++}
++
++torch::Tensor hardshrink_only(torch::Tensor x) {
++    check_input(x);
++    auto output = torch::empty_like(x);
++    long long numel = x.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    hardshrink_only_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        stream);
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("log_softmax_hardshrink", &log_softmax_hardshrink,
++          "log_softmax along dim=1 followed by hardshrink(lambd=0.5)",
++          pybind11::arg("x"));
++    m.def("log_softmax_only", &log_softmax_only,
++          "log_softmax along dim=1",
++          pybind11::arg("x"));
++    m.def("hardshrink_only", &hardshrink_only,
++          "hardshrink(lambd=0.5)",
++          pybind11::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,18 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        return cuda_extension.log_softmax_hardshrink(x)
++
++    def debug_forward(self, x):
++        y = cuda_extension.log_softmax_only(x)
++        yield "step_001", y
++        z = cuda_extension.hardshrink_only(y)
++        yield "step_002", z
++        yield "step_003", z

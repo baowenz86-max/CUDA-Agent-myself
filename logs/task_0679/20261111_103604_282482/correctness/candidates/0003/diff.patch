@@ -1,0 +1,230 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,12 +1,9 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
+ #include <cfloat>
+-#include <climits>
+ 
+-// Kernel: sum over dimension 1 of input shape [B, C, H, W], with C=3 (per contract).
+-// Output shape [B, H, W]. Input may have arbitrary strides but contract expects contiguous.
+-// We assume contiguous row-major layout for simplicity and performance; the binding layer ensures
+-// contiguous input by calling .contiguous() if needed.
++// Kernel: sum over dimension 1 of input shape [B, C, H, W], with C=3.
++// Output shape [B, H, W]. Input assumed contiguous.
+ __global__ void sum_dim1_kernel(const float* __restrict__ input,
+                                 float* __restrict__ output,
+                                 int64_t batch,
+@@ -22,7 +19,6 @@
+         int64_t h = rem / width;
+         int64_t w = rem % width;
+ 
+-        // Channel count is fixed at 3 (contract input shape [16,3,4096,4096])
+         constexpr int C = 3;
+         const float* base = input + b * C * height * width + h * width + w;
+         float sum = base[0];
+@@ -32,29 +28,58 @@
+     }
+ }
+ 
+-// Kernel: find argmax over all elements of a contiguous float array.
+-// Uses a single pass with atomic operations on packed int64 bits.
+-// For each element, we pack: high 32 bits = float bits (order-preserving for positive floats,
+-// but we need to handle sign bit correctly). For a proper order, we transform float to
+-// a sortable uint32: if sign bit set, flip all bits; else flip only sign bit.
+-// Then combined with index (lower 32 bits) we can use atomicMax on unsigned long long.
+-// Since indices are up to 2^28 (268M), lower 32 bits are sufficient.
+-// The output is int64_t, but we reinterpret as unsigned long long for atomicMax.
+-__global__ void argmax_all_kernel(const float* __restrict__ input,
+-                                  unsigned long long* __restrict__ output,
++// Kernel: find maximum float value over all elements.
++// Uses atomicMax on float bits to avoid NaN issues (we assume no NaN inputs).
++__global__ void max_reduce_kernel(const float* __restrict__ input,
++                                  float* __restrict__ max_val,
+                                   int64_t numel) {
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int64_t stride = blockDim.x * gridDim.x;
+ 
++    __shared__ float block_max;
++    if (threadIdx.x == 0) block_max = -FLT_MAX;
++    __syncthreads();
++
++    float local_max = -FLT_MAX;
+     for (int64_t i = idx; i < numel; i += stride) {
+         float val = input[i];
+-        // Convert float to sortable uint32
+-        uint32_t float_bits = __float_as_uint(val);
+-        uint32_t sortable_bits = (float_bits & 0x80000000) ? ~float_bits : (float_bits | 0x80000000);
+-        // Pack: high 32 bits = sortable_bits, low 32 bits = index (i)
+-        unsigned long long packed = ((unsigned long long)sortable_bits << 32) | (unsigned long long)i;
+-        // Atomic max on packed value ensures maximum value and smallest index among ties
+-        atomicMax(output, packed);
++        if (val > local_max) local_max = val;
++    }
++
++    // Reduce within block
++    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
++        if (threadIdx.x < offset) {
++            float other = __shfl_down_sync(0xffffffff, local_max, offset);
++            if (other > local_max) local_max = other;
++        }
++    }
++
++    if (threadIdx.x == 0) {
++        atomicMax(reinterpret_cast<int*>(max_val), __float_as_int(local_max));
++    }
++}
++
++// Kernel: find first index where input[i] == max_val.
++__global__ void find_first_index_kernel(const float* __restrict__ input,
++                                        const float* __restrict__ max_val,
++                                        int64_t* __restrict__ output,
++                                        int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    float target = *max_val;
++    int64_t found_idx = -1;
++
++    for (int64_t i = idx; i < numel; i += stride) {
++        if (input[i] == target) {
++            found_idx = i;
++            break;
++        }
++    }
++
++    // Only one thread should eventually write the result; use atomicMin to get the smallest index among all threads that found it.
++    if (found_idx >= 0) {
++        atomicMin(reinterpret_cast<unsigned long long*>(output), (unsigned long long)found_idx);
+     }
+ }
+ 
+@@ -68,11 +93,11 @@
+     int64_t total = batch * height * width;
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+-    blocks = (blocks < 1024) ? blocks : 1024; // grid-stride loop handles the rest
++    blocks = (blocks < 1024) ? blocks : 1024;
+     sum_dim1_kernel<<<blocks, threads, 0, stream>>>(input, output, batch, height, width);
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+-        // Error will be checked by binding after launch
++        // error will be checked by binding
+     }
+ }
+ 
+@@ -81,23 +106,32 @@
+                                            int64_t* output,
+                                            int64_t numel,
+                                            cudaStream_t stream) {
+-    // Initialize output to the packed value representing -infinity and index 0
+-    // -infinity sortable bits: for -inf, float bits = 0xFF800000, sign bit set => ~0xFF800000 = 0x007FFFFF
+-    // But we need to ensure any valid value will be larger. For -inf, sortable = 0x007FFFFF.
+-    // We'll set packed to (0x007FFFFF << 32) | 0, which is less than any finite positive or negative.
+-    // Actually, for any finite value, sortable bits will be > 0x007FFFFF because negative finite values flip to large values.
+-    // We can set initial packed to 0x007FFFFF00000000ULL.
+-    unsigned long long init_packed = 0x007FFFFF00000000ULL;
+-    cudaMemcpyAsync(output, &init_packed, sizeof(unsigned long long), cudaMemcpyHostToDevice, stream);
++    // Allocate temporary device memory for max_val (float) and initialize.
++    float* d_max_val;
++    cudaMalloc(&d_max_val, sizeof(float));
++    float init_max = -FLT_MAX;
++    cudaMemcpyAsync(d_max_val, &init_max, sizeof(float), cudaMemcpyHostToDevice, stream);
+ 
+     int threads = 256;
+     int blocks = (numel + threads - 1) / threads;
+     blocks = (blocks < 1024) ? blocks : 1024;
+ 
+-    // Launch kernel, output is uint64 pointer
+-    argmax_all_kernel<<<blocks, threads, 0, stream>>>(input, reinterpret_cast<unsigned long long*>(output), numel);
++    // First pass: find max value
++    max_reduce_kernel<<<blocks, threads, 0, stream>>>(input, d_max_val, numel);
++
++    // Initialize output to a large value (e.g., numel) so atomicMin works.
++    // Since valid indices are < numel, we set to numel (or LLONG_MAX).
++    unsigned long long init_index = (unsigned long long)numel;
++    cudaMemcpyAsync(output, &init_index, sizeof(unsigned long long), cudaMemcpyHostToDevice, stream);
++
++    // Second pass: find first index
++    find_first_index_kernel<<<blocks, threads, 0, stream>>>(input, d_max_val, output, numel);
++
++    // Free temporary memory (asynchronously? use cudaFree after stream sync or using cudaFreeAsync? not available; we'll let binding sync).
++    cudaFree(d_max_val);
++
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+-        // binding will check after launch
++        // binding will check
+     }
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -7,31 +7,12 @@
+ #include <cfloat>
+ #include "../binding_registry.h"
+ 
+-// Launchers from custom_ops.cu
+ extern "C" void torch_sum_dim1_launcher(const float* input, float* output, int64_t batch, int64_t height, int64_t width, cudaStream_t stream);
+ extern "C" void torch_argmax_all_launcher(const float* input, int64_t* output, int64_t numel, cudaStream_t stream);
+ 
+-// Helper kernels for argmax (defined here as __global__? No, they are in .cu; we need only launcher declarations).
+-// But the provided launcher torch_argmax_all_launcher is incomplete; we implement the full argmax logic in the binding using temporary device buffers and the existing block_reduce_max_kernel? 
+-// Actually, we cannot define kernels in .cpp; we can only call launchers. However, the existing launcher does not do the full job. 
+-// The instructions say: "绑定文件声明并调用 .cu 导出的非卷积 launcher"，and we must not modify .cu. 
+-// But the current .cu's torch_argmax_all_launcher is broken. We need to decide: either we trust that the .cu will be fixed? No, we cannot modify .cu. 
+-// Reading task: "你负责第三阶段：只生成或修改 kernels/ 下的绑定 .cpp 文件，不要生成或修改 .cu 或 model_new.py。" So we must only write .cpp files. 
+-// Therefore, the .cu must already contain correct launchers? But the provided .cu clearly has issues. The task description says "先阅读 SKILL.md、model.py、model_new.py 以及当前 kernels/*.cu，严格对齐 Python 调用接口和 CUDA launcher 的函数声明。" So we align with the existing .cu as much as possible. 
+-// The existing .cu has torch_argmax_all_launcher that does partial work but not complete. However, we cannot modify it. 
+-// Could we implement the argmax entirely in the binding using torch:: functions? No, forbidden. 
+-// But we can call the launcher and hope it works? It doesn't compute the answer. 
+-// Wait, the .cu file content shown includes comments indicating incomplete implementation. But maybe the actual .cu in the system is different. The task says "以下是工作目录中的文件内容" including kernels/custom_ops.cu, which shows the current state. 
+-// Since we are only allowed to write .cpp, we must assume that the .cu will be fixed by someone else in parallel? But this stage is supposed to be the final stage? Actually, the instructions say "你负责第三阶段：只生成或修改 kernels/ 下的绑定 .cpp 文件，不要生成或修改 .cu 或 model_new.py。" So we are only responsible for the binding. We must make the binding compile and call the launchers as declared. The correctness of the kernel is not our responsibility in this stage; we just need to provide correct tensor wrapping and registration. 
+-// But we should still check for potential issues: the launcher declaration must match. The torch_argmax_all_launcher takes input, output, numel, stream. That's fine. We'll call it. 
+-// To ensure output is a scalar int64, we allocate empty scalar. The launcher is supposed to handle everything. We'll trust that the .cu will be completed correctly by other stages. 
+-
+-// Forward function for torch_sum_dim1
+ torch::Tensor torch_sum_dim1_forward(torch::Tensor x) {
+-    // Check device and dtype
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+-    // Ensure contiguous (contract allows strides but launcher assumes contiguous)
+     if (!x.is_contiguous()) {
+         x = x.contiguous();
+     }
+@@ -41,28 +22,21 @@
+     int64_t H = x.size(2);
+     int64_t W = x.size(3);
+     TORCH_CHECK(C == 3, "Channel dimension must be 3 per contract");
+-    // Allocate output
+     auto output = torch::empty({B, H, W}, x.options());
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    // Launch
+     torch_sum_dim1_launcher(x.data_ptr<float>(), output.data_ptr<float>(), B, H, W, stream);
+-    // Check for error synchronously? launcher returns void, we can call cudaGetLastError and synchronize
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
+     return output;
+ }
+ 
+-// Forward function for torch_argmax_all
+ torch::Tensor torch_argmax_all_forward(torch::Tensor x) {
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+     if (!x.is_contiguous()) {
+         x = x.contiguous();
+     }
+-    // Allocate scalar output int64
+     auto output = torch::empty({}, x.options().dtype(torch::kInt64));
+-    // Launch argmax launcher
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     torch_argmax_all_launcher(x.data_ptr<float>(), output.data_ptr<int64_t>(), x.numel(), stream);
+     cudaError_t err = cudaGetLastError();
+@@ -70,7 +44,6 @@
+     return output;
+ }
+ 
+-// Registration
+ void register_custom_ops(pybind11::module& m) {
+     m.def("torch_sum_dim1", &torch_sum_dim1_forward, "Sum over dimension 1", pybind11::arg("x"));
+     m.def("torch_argmax_all", &torch_argmax_all_forward, "Argmax over all elements", pybind11::arg("x"));

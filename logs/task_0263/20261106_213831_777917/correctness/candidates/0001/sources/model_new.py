@@ -1,0 +1,30 @@
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, kernel_size):
+        super().__init__()
+        # Store kernel_size as tuple for reference, but forward will use custom op.
+        if isinstance(kernel_size, int):
+            self.kernel_size = (kernel_size, kernel_size)
+        else:
+            self.kernel_size = tuple(kernel_size)
+        self.in_channels = in_channels
+        # No buffers or parameters; ensure state_dict is empty.
+
+    def forward(self, x):
+        # Use custom extension operator that computes both avg and max pooling
+        # with the same kernel/stride. kernel_size is passed as ints.
+        x_avg, x_max = torch.ops.cuda_extension.pool2d_avgmax(
+            x, self.kernel_size[0], self.kernel_size[1]
+        )
+        return x_avg, x_max
+
+    def debug_forward(self, x):
+        # Must yield exactly the checkpoints in order.
+        x_avg, x_max = torch.ops.cuda_extension.pool2d_avgmax(
+            x, self.kernel_size[0], self.kernel_size[1]
+        )
+        yield "step_001", x_avg
+        yield "step_002", x_max
+        yield "step_003", (x_avg, x_max)

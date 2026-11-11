@@ -1,0 +1,260 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,123 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// Element-wise sigmoid: y = 1 / (1 + exp(-x))
++// Supports arbitrary strides (non-contiguous input).
++__global__ void custom_sigmoid_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int total_elements,
++    int ndims,
++    const int* __restrict__ in_strides,
++    const int* __restrict__ out_strides,
++    const int* __restrict__ shape)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int linear = idx; linear < total_elements; linear += stride) {
++        // Convert linear index to multi-dimensional indices
++        int remaining = linear;
++        int in_offset = 0;
++        int out_offset = 0;
++        for (int d = 0; d < ndims; ++d) {
++            int dim_size = shape[d];
++            int coord = remaining % dim_size;
++            remaining /= dim_size;
++            in_offset += coord * in_strides[d];
++            out_offset += coord * out_strides[d];
++        }
++        float val = input[in_offset];
++        float sig = 1.0f / (1.0f + expf(-val));
++        output[out_offset] = sig;
++    }
++}
++
++// InstanceNorm2d with affine=False, track_running_stats=False.
++// One thread per (n,c) computes mean and variance over spatial dims (H,W),
++// then normalizes all spatial elements.
++__global__ void custom_instance_norm2d_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int N, int C, int H, int W,
++    const int* __restrict__ in_strides,
++    const int* __restrict__ out_strides,
++    float eps)
++{
++    int nc = blockIdx.x * blockDim.x + threadIdx.x; // index over N*C
++    if (nc >= N * C) return;
++
++    int n = nc / C;
++    int c = nc % C;
++
++    // Compute base offset for this (n,c)
++    int base_in_offset = n * in_strides[0] + c * in_strides[1];
++    int base_out_offset = n * out_strides[0] + c * out_strides[1];
++
++    // Pass 1: compute mean
++    float mean = 0.0f;
++    int spatial_size = H * W;
++    for (int hw = 0; hw < spatial_size; ++hw) {
++        int h = hw / W;
++        int w = hw % W;
++        int in_offset = base_in_offset + h * in_strides[2] + w * in_strides[3];
++        mean += input[in_offset];
++    }
++    mean /= (float)spatial_size;
++
++    // Pass 2: compute variance (biased, as PyTorch InstanceNorm uses biased variance in training? Actually for evaluation with track_running_stats=False, it uses biased variance)
++    float var = 0.0f;
++    for (int hw = 0; hw < spatial_size; ++hw) {
++        int h = hw / W;
++        int w = hw % W;
++        int in_offset = base_in_offset + h * in_strides[2] + w * in_strides[3];
++        float diff = input[in_offset] - mean;
++        var += diff * diff;
++    }
++    var /= (float)spatial_size;
++
++    // Normalize and write output
++    float inv_std = rsqrtf(var + eps);
++    for (int hw = 0; hw < spatial_size; ++hw) {
++        int h = hw / W;
++        int w = hw % W;
++        int in_offset = base_in_offset + h * in_strides[2] + w * in_strides[3];
++        int out_offset = base_out_offset + h * out_strides[2] + w * out_strides[3];
++        float normalized = (input[in_offset] - mean) * inv_std;
++        output[out_offset] = normalized;
++    }
++}
++
++// Launcher for custom_sigmoid
++extern "C" void custom_sigmoid_launcher(
++    float* output,
++    const float* input,
++    int total_elements,
++    int ndims,
++    const int* in_strides,
++    const int* out_strides,
++    const int* shape,
++    cudaStream_t stream)
++{
++    // Use 256 threads per block, grid sized to cover elements but capped for grid-stride
++    int threads = 256;
++    int blocks = min((total_elements + threads - 1) / threads, 65535);
++    custom_sigmoid_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, total_elements, ndims, in_strides, out_strides, shape);
++}
++
++// Launcher for custom_instance_norm2d
++extern "C" void custom_instance_norm2d_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    const int* in_strides,
++    const int* out_strides,
++    float eps,
++    cudaStream_t stream)
++{
++    int total_instances = N * C;
++    int threads = 256;
++    int blocks = (total_instances + threads - 1) / threads;
++    custom_instance_norm2d_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, N, C, H, W, in_strides, out_strides, eps);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,106 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_sigmoid_launcher(
++    float* output,
++    const float* input,
++    int total_elements,
++    int ndims,
++    const int* in_strides,
++    const int* out_strides,
++    const int* shape,
++    cudaStream_t stream);
++
++extern "C" void custom_instance_norm2d_launcher(
++    float* output,
++    const float* input,
++    int N,
++    int C,
++    int H,
++    int W,
++    const int* in_strides,
++    const int* out_strides,
++    float eps,
++    cudaStream_t stream);
++
++static torch::Tensor custom_sigmoid(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
++
++    // Prepare host arrays for strides and shape
++    int64_t in_strides[4];
++    int64_t out_strides[4];
++    int64_t shape[4];
++    for (int i = 0; i < 4; ++i) {
++        in_strides[i] = x.stride(i);
++        out_strides[i] = output.stride(i);
++        shape[i] = x.size(i);
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_sigmoid_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(x.numel()),
++        4,
++        reinterpret_cast<int*>(in_strides),
++        reinterpret_cast<int*>(out_strides),
++        reinterpret_cast<int*>(shape),
++        stream);
++
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return output;
++}
++
++static torch::Tensor custom_instance_norm2d(torch::Tensor x, double eps) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
++
++    int64_t in_strides[4];
++    int64_t out_strides[4];
++    for (int i = 0; i < 4; ++i) {
++        in_strides[i] = x.stride(i);
++        out_strides[i] = output.stride(i);
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_instance_norm2d_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        reinterpret_cast<int*>(in_strides),
++        reinterpret_cast<int*>(out_strides),
++        static_cast<float>(eps),
++        stream);
++
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_sigmoid", &custom_sigmoid, "Element-wise sigmoid");
++    m.def("custom_instance_norm2d", &custom_instance_norm2d, "InstanceNorm2d without affine parameters",
++          py::arg("x"), py::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features, eps):
++        super(ModelNew, self).__init__()
++        self.num_features = num_features
++        self.eps = eps
++
++    def forward(self, x):
++        x = cuda_extension.custom_sigmoid(x)
++        x = cuda_extension.custom_instance_norm2d(x, self.eps)
++        return x
++
++    def debug_forward(self, x):
++        sigmoid_out = cuda_extension.custom_sigmoid(x)
++        yield 'step_001', sigmoid_out
++        norm_out = cuda_extension.custom_instance_norm2d(sigmoid_out, self.eps)
++        yield 'step_002', norm_out
++        yield 'step_003', norm_out

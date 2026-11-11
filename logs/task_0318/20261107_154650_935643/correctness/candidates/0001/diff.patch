@@ -1,0 +1,268 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,92 @@
++#include <cuda_runtime.h>
++
++// BatchNorm2d inference kernel
++// input: [N,C,H,W] float32
++// output: [N,C,H,W] float32
++// weight, bias, running_mean, running_var: [C] float32
++// eps: float
++__global__ void batch_norm2d_inference_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    float eps,
++    int N, int C, int H, int W)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * H * W;
++    if (idx >= total) return;
++
++    int w_idx = idx % W;
++    int h_idx = (idx / W) % H;
++    int c = (idx / (W * H)) % C;
++    // n not needed for batch norm inference
++
++    float mean = running_mean[c];
++    float var = running_var[c];
++    float inv_std = rsqrtf(var + eps);
++
++    float x = input[idx];
++    float y = (x - mean) * inv_std;
++
++    if (weight != nullptr && bias != nullptr) {
++        y = y * weight[c] + bias[c];
++    } else if (weight != nullptr) {
++        y = y * weight[c];
++    } else if (bias != nullptr) {
++        y = y + bias[c];
++    }
++
++    output[idx] = y;
++}
++
++// Hardswish kernel: x * min(max(x+3,0),6) / 6
++__global__ void hardswish_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int total)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total) return;
++
++    float x = input[idx];
++    float y = x * fminf(fmaxf(x + 3.0f, 0.0f), 6.0f) / 6.0f;
++    output[idx] = y;
++}
++
++// Launcher for batch_norm2d_forward (inference mode)
++extern "C" void batch_norm2d_forward_launcher(
++    const float* input,
++    float* output,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    int N, int C, int H, int W,
++    cudaStream_t stream)
++{
++    int total = N * C * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    batch_norm2d_inference_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, weight, bias, running_mean, running_var,
++        eps, N, C, H, W);
++}
++
++// Launcher for hardswish_forward
++extern "C" void hardswish_forward_launcher(
++    const float* input,
++    float* output,
++    int total,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    hardswish_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, total);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,145 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void batch_norm2d_forward_launcher(
++    const float* input,
++    float* output,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    int N, int C, int H, int W,
++    cudaStream_t stream);
++
++extern "C" void hardswish_forward_launcher(
++    const float* input,
++    float* output,
++    int total,
++    cudaStream_t stream);
++
++static torch::Tensor ensure_cuda_float_contiguous(torch::Tensor t, const char* name) {
++    if (!t.defined()) {
++        TORCH_CHECK(false, name, " must be defined");
++    }
++    if (t.dtype() != torch::kFloat32) {
++        TORCH_CHECK(false, name, " must be float32");
++    }
++    if (!t.is_cuda()) {
++        t = t.to(torch::kCUDA);
++    }
++    if (!t.is_contiguous()) {
++        t = t.contiguous();
++    }
++    return t;
++}
++
++torch::Tensor batch_norm2d_forward(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    torch::Tensor running_mean,
++    torch::Tensor running_var,
++    double eps,
++    double momentum,
++    bool training) {
++
++    TORCH_CHECK(input.dim() == 4, "input must be 4D [N,C,H,W]");
++    input = ensure_cuda_float_contiguous(input, "input");
++
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t H = input.size(2);
++    int64_t W = input.size(3);
++    int64_t total = N * C * H * W;
++
++    // We only support inference mode; training=True would need batch statistics
++    // and running stat updates, which this binding intentionally leaves unimplemented.
++    TORCH_CHECK(!training, "batch_norm2d_forward only supports inference mode (training=False)");
++    TORCH_CHECK(running_mean.defined(), "running_mean must be provided in inference mode");
++    TORCH_CHECK(running_var.defined(), "running_var must be provided in inference mode");
++    (void)momentum; // unused in inference mode
++
++    running_mean = ensure_cuda_float_contiguous(running_mean, "running_mean");
++    running_var = ensure_cuda_float_contiguous(running_var, "running_var");
++    TORCH_CHECK(running_mean.numel() == C, "running_mean size must match channels");
++    TORCH_CHECK(running_var.numel() == C, "running_var size must match channels");
++
++    const float* weight_ptr = nullptr;
++    const float* bias_ptr = nullptr;
++    if (weight.defined()) {
++        weight = ensure_cuda_float_contiguous(weight, "weight");
++        TORCH_CHECK(weight.numel() == C, "weight size must match channels");
++        weight_ptr = weight.data_ptr<float>();
++    }
++    if (bias.defined()) {
++        bias = ensure_cuda_float_contiguous(bias, "bias");
++        TORCH_CHECK(bias.numel() == C, "bias size must match channels");
++        bias_ptr = bias.data_ptr<float>();
++    }
++
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    batch_norm2d_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        weight_ptr,
++        bias_ptr,
++        running_mean.data_ptr<float>(),
++        running_var.data_ptr<float>(),
++        static_cast<float>(eps),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "batch_norm2d_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++torch::Tensor hardswish_forward(torch::Tensor input) {
++    TORCH_CHECK(input.dim() == 4, "input must be 4D [N,C,H,W]");
++    input = ensure_cuda_float_contiguous(input, "input");
++    int64_t total = input.numel();
++
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    hardswish_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(total),
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "hardswish_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("batch_norm2d_forward", &batch_norm2d_forward,
++          "BatchNorm2d inference forward",
++          pybind11::arg("input"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"),
++          pybind11::arg("running_mean"),
++          pybind11::arg("running_var"),
++          pybind11::arg("eps"),
++          pybind11::arg("momentum"),
++          pybind11::arg("training"));
++
++    m.def("hardswish_forward", &hardswish_forward,
++          "Hardswish forward",
++          pybind11::arg("input"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
++        super().__init__()
++        self.batchnorm2d = nn.BatchNorm2d(in_channels)
++        self.hardswish = nn.Hardswish()
++
++    def forward(self, x):
++        x = cuda_extension.batch_norm2d_forward(x, self.batchnorm2d.weight, self.batchnorm2d.bias, self.batchnorm2d.running_mean, self.batchnorm2d.running_var, self.batchnorm2d.eps, self.batchnorm2d.momentum, self.training)
++        x = cuda_extension.hardswish_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.batch_norm2d_forward(x, self.batchnorm2d.weight, self.batchnorm2d.bias, self.batchnorm2d.running_mean, self.batchnorm2d.running_var, self.batchnorm2d.eps, self.batchnorm2d.momentum, self.training)
++        yield 'step_001', x
++        x = cuda_extension.hardswish_forward(x)
++        yield 'step_002', x
++        yield 'step_003', x

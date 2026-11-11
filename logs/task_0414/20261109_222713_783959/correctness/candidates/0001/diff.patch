@@ -1,0 +1,245 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,150 @@
++#include <cuda_runtime.h>
++
++// Bicubic interpolation kernel.
++// Implements the same algorithm as PyTorch's F.interpolate with mode='bicubic'
++// and align_corners=False (default when align_corners is None for bicubic).
++// The scale_factor is used to compute output size and input coordinate mapping.
++// For each output pixel (oy, ox) in [0, outH-1] x [0, outW-1], the corresponding
++// input coordinate is (iy, ix) = ((oy + 0.5) / scale - 0.5).
++// Bicubic uses 4x4 neighborhood, clamped at boundaries.
++// The cubic convolution kernel is the same as used by PyTorch:
++//   A = -0.75
++//   w(x) = ( (A+2)x^3 - (A+3)x^2 + 1          if |x| <= 1
++//             A x^3 - 5A x^2 + 8A |x| - 4A     if 1 < |x| < 2
++//             0                                 otherwise )
++// PyTorch's implementation (see aten/src/ATen/native/UpSampleBicubic2d.cpp) uses
++// a cubic convolution with A = -0.75 and computes weights for the four input
++// columns/rows around the fractional coordinate.
++//
++// The kernel processes one output pixel per thread, using grid-stride loop.
++// Input tensor is assumed contiguous float32, shape [N, C, H, W].
++// Output tensor is contiguous float32, shape [N, C, outH, outW].
++
++__device__ __forceinline__ float cubic_weight(float x) {
++    const float A = -0.75f;
++    float absx = fabsf(x);
++    if (absx <= 1.0f) {
++        return ((A + 2.0f) * absx - (A + 3.0f)) * absx * absx + 1.0f;
++    } else if (absx < 2.0f) {
++        return ((A * absx - 5.0f * A) * absx + 8.0f * A) * absx - 4.0f * A;
++    } else {
++        return 0.0f;
++    }
++}
++
++__global__ void interpolate_bicubic_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    double scale_factor)
++{
++    int64_t total = static_cast<int64_t>(N) * C * outH * outW;
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++
++    for (int64_t linear = idx; linear < total; linear += stride) {
++        // Decode linear index to (n, c, oy, ox)
++        int ox = static_cast<int>(linear % outW);
++        int64_t tmp = linear / outW;
++        int oy = static_cast<int>(tmp % outH);
++        tmp /= outH;
++        int c = static_cast<int>(tmp % C);
++        int n = static_cast<int>(tmp / C);
++
++        // Compute fractional input coordinate
++        float ix = (static_cast<float>(ox) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
++        float iy = (static_cast<float>(oy) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
++
++        // Clamp to valid range (note: PyTorch uses -0.5 and H-0.5 boundaries)
++        if (ix < -0.5f) ix = -0.5f;
++        if (iy < -0.5f) iy = -0.5f;
++        if (ix > W - 0.5f) ix = W - 0.5f;
++        if (iy > H - 0.5f) iy = H - 0.5f;
++
++        // Find the 4 nearest integer coordinates for x and y
++        int x0 = static_cast<int>(floorf(ix));
++        int y0 = static_cast<int>(floorf(iy));
++        float fx = ix - x0;
++        float fy = iy - y0;
++
++        // Clamp indices to [-1, W] to allow boundary handling.
++        // We'll then clamp to [0, W-1] for actual access.
++        int x_indices[4];
++        int y_indices[4];
++        x_indices[0] = x0 - 1;
++        x_indices[1] = x0;
++        x_indices[2] = x0 + 1;
++        x_indices[3] = x0 + 2;
++        y_indices[0] = y0 - 1;
++        y_indices[1] = y0;
++        y_indices[2] = y0 + 1;
++        y_indices[3] = y0 + 2;
++
++        // Compute horizontal weights: they depend on fx and the offset (x_indices[i] - ix)
++        // Actually weight for column index x_indices[i] is cubic_weight(x_indices[i] - ix)
++        // But since x_indices[1] = x0 and ix = x0 + fx, offset = -fx.
++        // More generally: offset = (x_indices[i] - ix)
++        float wx[4];
++        #pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            wx[i] = cubic_weight(static_cast<float>(x_indices[i]) - ix);
++        }
++        float wy[4];
++        #pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            wy[j] = cubic_weight(static_cast<float>(y_indices[j]) - iy);
++        }
++
++        // Accumulate weighted sum
++        float sum = 0.0f;
++        const float* input_nc = input + (static_cast<int64_t>(n) * C + c) * H * W;
++        #pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            int y = y_indices[j];
++            // Clamp to [0, H-1]
++            if (y < 0) y = 0;
++            if (y >= H) y = H - 1;
++            const float* row = input_nc + static_cast<int64_t>(y) * W;
++            #pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                int x = x_indices[i];
++                if (x < 0) x = 0;
++                if (x >= W) x = W - 1;
++                sum += wy[j] * wx[i] * row[x];
++            }
++        }
++
++        int64_t out_idx = ((static_cast<int64_t>(n) * C + c) * outH + oy) * outW + ox;
++        output[out_idx] = sum;
++    }
++}
++
++extern "C" void interpolate_bicubic_forward_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    double scale_factor,
++    cudaStream_t stream)
++{
++    int64_t total = static_cast<int64_t>(N) * C * outH * outW;
++    if (total <= 0) return;
++
++    // Choose block size and grid size for grid-stride loop
++    int block_size = 256;
++    int grid_size = static_cast<int>((total + block_size - 1) / block_size);
++    // Cap grid size to a reasonable number (e.g., 65535) but use grid-stride loop to handle large sizes.
++    // We set max grid dimension to 65535 for older GPUs, but modern CUDA supports larger.
++    // To be safe, we cap at 65535 and rely on grid-stride loop.
++    if (grid_size > 65535) grid_size = 65535;
++
++    interpolate_bicubic_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, N, C, H, W, outH, outW, scale_factor);
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In a real binding, this would be checked. We leave a comment.
++        // The binding layer should check cudaGetLastError after calling this launcher.
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,66 @@
++// Binding for custom bicubic interpolation CUDA kernel
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void interpolate_bicubic_forward_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    double scale_factor,
++    cudaStream_t stream);
++
++// PyTorch wrapper function
++static torch::Tensor interpolate_bicubic_forward(
++    torch::Tensor input,
++    double scale_factor) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N,C,H,W)");
++
++    const int N = input.size(0);
++    const int C = input.size(1);
++    const int H = input.size(2);
++    const int W = input.size(3);
++
++    // Compute output dimensions
++    int64_t outH64 = static_cast<int64_t>(std::floor(H * scale_factor + 1e-8));
++    int64_t outW64 = static_cast<int64_t>(std::floor(W * scale_factor + 1e-8));
++    TORCH_CHECK(outH64 > 0 && outW64 > 0, "Output dimensions must be positive");
++    TORCH_CHECK(outH64 <= INT_MAX && outW64 <= INT_MAX, "Output dimensions too large");
++    int outH = static_cast<int>(outH64);
++    int outW = static_cast<int>(outW64);
++
++    auto output = torch::empty({N, C, outH, outW}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    interpolate_bicubic_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        outH, outW,
++        scale_factor,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed with error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++static void register_interpolate_bicubic(pybind11::module& m) {
++    m.def("interpolate_bicubic_forward",
++          &interpolate_bicubic_forward,
++          "Bicubic interpolation forward (CUDA)",
++          pybind11::arg("input"),
++          pybind11::arg("scale_factor"));
++}
++
++REGISTER_BINDING(interpolate_bicubic, register_interpolate_bicubic);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, scale_factor, mode):
++        super().__init__()
++        self.scale_factor = scale_factor
++        self.mode = mode
++
++    def forward(self, x):
++        x = cuda_extension.interpolate_bicubic_forward(x, float(self.scale_factor))
++        return x
++
++    def debug_forward(self, x):
++        y = cuda_extension.interpolate_bicubic_forward(x, float(self.scale_factor))
++        yield 'step_001', y
++        yield 'step_002', y

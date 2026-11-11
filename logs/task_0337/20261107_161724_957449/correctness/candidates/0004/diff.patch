@@ -1,0 +1,179 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -24,17 +24,19 @@
+     int col = spatial % width;
+ 
+     int64_t index = indices[row * width + col];
+-    // Assume indices are valid [0, num_embeddings-1]; add clamp for safety but
+-    // for exact reference behavior no clamping.
++    // Assume indices are valid [0, num_embeddings-1]; no clamping for exact behavior.
+     float val = weight[index * embedding_dim + emb_idx];
+     output[idx] = val;
+ }
+ 
+-// Launcher: takes CPU weight and indices, copies to GPU, launches kernel.
+-// output_ptr must already be allocated on GPU with enough space.
++// Launcher: can accept weight and indices either on CPU or GPU.
++// weight_on_gpu and indices_on_gpu indicate whether the pointers already point to device memory.
++// output_ptr must already be allocated on GPU.
+ extern "C" void embedding_lookup_launcher(
+-    const float* weight_cpu,
+-    const int64_t* indices_cpu,
++    const float* weight_ptr,
++    bool weight_on_gpu,
++    const int64_t* indices_ptr,
++    bool indices_on_gpu,
+     float* output_gpu,
+     int num_embeddings,
+     int height,
+@@ -42,18 +44,24 @@
+     int embedding_dim,
+     cudaStream_t stream)
+ {
+-    // Copy weight and indices to GPU using synchronous cudaMemcpy (or async with stream)
+-    // For simplicity use cudaMemcpyAsync to stream, but ensure stream synchronization later.
+-    float* weight_gpu = nullptr;
+-    int64_t* indices_gpu = nullptr;
++    const float* weight_gpu = nullptr;
++    const int64_t* indices_gpu = nullptr;
+ 
+-    cudaMalloc(&weight_gpu, (size_t)num_embeddings * embedding_dim * sizeof(float));
+-    cudaMalloc(&indices_gpu, (size_t)height * width * sizeof(int64_t));
++    if (weight_on_gpu) {
++        weight_gpu = weight_ptr;
++    } else {
++        cudaMalloc(&weight_gpu, (size_t)num_embeddings * embedding_dim * sizeof(float));
++        cudaMemcpyAsync((void*)weight_gpu, weight_ptr, (size_t)num_embeddings * embedding_dim * sizeof(float),
++                        cudaMemcpyHostToDevice, stream);
++    }
+ 
+-    cudaMemcpyAsync(weight_gpu, weight_cpu, (size_t)num_embeddings * embedding_dim * sizeof(float),
+-                    cudaMemcpyHostToDevice, stream);
+-    cudaMemcpyAsync(indices_gpu, indices_cpu, (size_t)height * width * sizeof(int64_t),
+-                    cudaMemcpyHostToDevice, stream);
++    if (indices_on_gpu) {
++        indices_gpu = indices_ptr;
++    } else {
++        cudaMalloc(&indices_gpu, (size_t)height * width * sizeof(int64_t));
++        cudaMemcpyAsync((void*)indices_gpu, indices_ptr, (size_t)height * width * sizeof(int64_t),
++                        cudaMemcpyHostToDevice, stream);
++    }
+ 
+     int total = height * width * embedding_dim;
+     int threads = 256;
+@@ -62,25 +70,23 @@
+     embedding_lookup_kernel<<<blocks, threads, 0, stream>>>(
+         weight_gpu, indices_gpu, output_gpu, height, width, embedding_dim);
+ 
+-    // Free temporary GPU buffers after kernel completes.
+-    // Use cudaFreeAsync if available, otherwise schedule a callback or just cudaFree after stream sync.
+-    // For simplicity, use cudaFree after cudaStreamSynchronize in caller? But we cannot synchronize here.
+-    // Better: register a callback to free memory, or use cudaFree with stream capture? 
+-    // Here we use cudaFreeAsync (CUDA 11.2+ with stream ordered allocation).
+-    // Since this is a small extension, we can leak for simplicity or use cudaFree after stream sync.
+-    // We'll use cudaFreeAsync to free after kernel completion.
+-    #if CUDART_VERSION >= 11020
+-        cudaFreeAsync((void*)weight_gpu, stream);
+-        cudaFreeAsync((void*)indices_gpu, stream);
+-    #else
+-        // Older CUDA: cannot free async; use cudaFree after stream sync is done externally.
+-        // We'll just leak for now (acceptable for correctness, not performance).
+-        // Alternatively, use cudaStreamAddCallback to free.
+-        cudaStreamAddCallback(stream, [](cudaStream_t, cudaError_t, void* userData){
+-            auto* ptrs = (void**)userData;
+-            cudaFree(ptrs[0]);
+-            cudaFree(ptrs[1]);
+-            delete[] ptrs;
+-        }, new void*[2]{weight_gpu, indices_gpu}, 0);
+-    #endif
++    // Free temporary GPU buffers if they were allocated.
++    if (!weight_on_gpu) {
++        #if CUDART_VERSION >= 11020
++            cudaFreeAsync((void*)weight_gpu, stream);
++        #else
++            cudaStreamAddCallback(stream, [](cudaStream_t, cudaError_t, void* userData){
++                cudaFree(userData);
++            }, (void*)weight_gpu, 0);
++        #endif
++    }
++    if (!indices_on_gpu) {
++        #if CUDART_VERSION >= 11020
++            cudaFreeAsync((void*)indices_gpu, stream);
++        #else
++            cudaStreamAddCallback(stream, [](cudaStream_t, cudaError_t, void* userData){
++                cudaFree(userData);
++            }, (void*)indices_gpu, 0);
++        #endif
++    }
+ }
+--- before/kernels/embedding_lookup_binding.cpp
++++ after/kernels/embedding_lookup_binding.cpp
+@@ -7,8 +7,10 @@
+ 
+ // Declare launcher from custom_ops.cu
+ extern "C" void embedding_lookup_launcher(
+-    const float* weight_cpu,
+-    const int64_t* indices_cpu,
++    const float* weight_ptr,
++    bool weight_on_gpu,
++    const int64_t* indices_ptr,
++    bool indices_on_gpu,
+     float* output_gpu,
+     int num_embeddings,
+     int height,
+@@ -18,13 +20,9 @@
+ 
+ // PyTorch wrapper
+ torch::Tensor embedding_lookup(torch::Tensor weight, torch::Tensor indices) {
+-    // Check inputs
+-    TORCH_CHECK(weight.is_cpu(), "weight must be a CPU tensor");
+-    TORCH_CHECK(indices.is_cpu(), "indices must be a CPU tensor");
++    // Check dtype and shape
+     TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+     TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
+-    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+-    TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
+     TORCH_CHECK(weight.dim() == 2, "weight must be 2D [num_embeddings, embedding_dim]");
+     TORCH_CHECK(indices.dim() == 2, "indices must be 2D [height, width]");
+ 
+@@ -33,16 +31,27 @@
+     int height = indices.size(0);
+     int width = indices.size(1);
+ 
+-    // Allocate output tensor on CUDA
+-    auto output = torch::empty({height, width, embedding_dim}, weight.options().device(torch::kCUDA));
++    // Allocate output tensor on CUDA (always)
++    auto output = torch::empty({height, width, embedding_dim}, 
++                               weight.options().device(torch::kCUDA));
+ 
+     // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
++    // Determine if weight and indices are already on GPU
++    bool weight_on_gpu = weight.is_cuda();
++    bool indices_on_gpu = indices.is_cuda();
++
++    // Ensure tensors are contiguous; if not, make contiguous copies (on their respective device)
++    torch::Tensor weight_contig = weight.is_contiguous() ? weight : weight.contiguous();
++    torch::Tensor indices_contig = indices.is_contiguous() ? indices : indices.contiguous();
++
+     // Call launcher with raw pointers
+     embedding_lookup_launcher(
+-        weight.data_ptr<float>(),
+-        indices.data_ptr<int64_t>(),
++        weight_contig.data_ptr<float>(),
++        weight_on_gpu,
++        indices_contig.data_ptr<int64_t>(),
++        indices_on_gpu,
+         output.data_ptr<float>(),
+         num_embeddings,
+         height,
+@@ -59,7 +68,7 @@
+     m.def(
+         "embedding_lookup",
+         &embedding_lookup,
+-        "Embedding lookup (CPU weight/indices -> CUDA output)",
++        "Embedding lookup (CPU/GPU weight and indices -> CUDA output)",
+         pybind11::arg("weight"),
+         pybind11::arg("indices")
+     );

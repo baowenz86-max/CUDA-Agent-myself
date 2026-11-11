@@ -1,0 +1,300 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,152 @@
++#include <cuda_runtime.h>
++
++// GroupNorm forward kernels.
++// Input layout: [N, C, H, W] with arbitrary strides? We assume contiguous for simplicity
++// because the binding will call .contiguous() if needed. The contract says "supports strides"
++// but we can handle by using input pointer directly assuming contiguous; in the binding we will
++// enforce contiguity. To be safe, the launcher accepts raw pointers and assumes contiguous.
++
++// Reduction kernel: compute mean and variance for each (n, group)
++// Each block handles one (n, group). Block size = 256 up to 1024.
++// We use a grid-stride loop within the block over all elements in the group.
++// Dimensions: input shape [N, C, H, W], group_size = (C / num_groups) * H * W.
++// channel_offset = g * (C / num_groups)
++// The group contains channels [g * channels_per_group, (g+1)*channels_per_group)
++__global__ void group_norm_mean_var_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ mean_out,
++    float* __restrict__ var_out,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t num_groups,
++    int64_t channels_per_group)
++{
++    // blockIdx.x = index = n * num_groups + g
++    int64_t index = blockIdx.x;
++    int64_t n = index / num_groups;
++    int64_t g = index % num_groups;
++    int64_t group_size = channels_per_group * H * W;
++    // Base pointer for this group: input + n*C*H*W + g*channels_per_group*H*W
++    const float* group_base = input + n * C * H * W + g * channels_per_group * H * W;
++
++    // Each thread computes partial sum and sum of squares over its strided elements.
++    float sum = 0.0f;
++    float sumsq = 0.0f;
++    for (int64_t i = threadIdx.x; i < group_size; i += blockDim.x) {
++        float val = group_base[i];
++        sum += val;
++        sumsq += val * val;
++    }
++
++    // Reduction within block using shared memory.
++    __shared__ float s_sum[256];  // blockDim.x max 256? We'll use fixed 256 threads.
++    __shared__ float s_sumsq[256];
++    int tid = threadIdx.x;
++    s_sum[tid] = sum;
++    s_sumsq[tid] = sumsq;
++    __syncthreads();
++
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            s_sum[tid] += s_sum[tid + stride];
++            s_sumsq[tid] += s_sumsq[tid + stride];
++        }
++        __syncthreads();
++    }
++
++    if (tid == 0) {
++        float mean = s_sum[0] / group_size;
++        float var = s_sumsq[0] / group_size - mean * mean;
++        // PyTorch uses biased variance. Ensure non-negative due to float.
++        if (var < 0.0f) var = 0.0f;
++        mean_out[index] = mean;
++        var_out[index] = var;
++    }
++}
++
++// Normalization kernel: output = (input - mean) / sqrt(var + eps) * weight + bias
++__global__ void group_norm_apply_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    const float* __restrict__ mean,
++    const float* __restrict__ var,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t num_groups,
++    int64_t channels_per_group,
++    double eps)
++{
++    int64_t total_elements = N * C * H * W;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total_elements) return;
++
++    // Decode indices
++    int64_t w = idx % W;
++    int64_t tmp = idx / W;
++    int64_t h = tmp % H;
++    tmp = tmp / H;
++    int64_t c = tmp % C;
++    int64_t n = tmp / C;
++
++    int64_t g = c / channels_per_group;
++    int64_t group_index = n * num_groups + g;
++    float m = mean[group_index];
++    float v = var[group_index];
++    float inv_std = rsqrtf(v + (float)eps);
++    float normalized = (input[idx] - m) * inv_std;
++    float w_val = (weight != nullptr) ? weight[c] : 1.0f;
++    float b_val = (bias != nullptr) ? bias[c] : 0.0f;
++    output[idx] = normalized * w_val + b_val;
++}
++
++// Host launcher (extern "C")
++extern "C" void group_norm_forward_launcher(
++    const float* input,
++    float* output,
++    const float* weight,
++    const float* bias,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t num_groups,
++    double eps,
++    cudaStream_t stream)
++{
++    int64_t channels_per_group = C / num_groups;
++    int64_t num_groups_total = N * num_groups;
++
++    // Allocate temporary storage for mean and var
++    float* d_mean = nullptr;
++    float* d_var = nullptr;
++    cudaMalloc(&d_mean, num_groups_total * sizeof(float));
++    cudaMalloc(&d_var, num_groups_total * sizeof(float));
++
++    // Reduction kernel: one block per (n, group), fixed block size 256 (max 1024)
++    int block_size = 256;
++    // Ensure block size not exceed max threads (1024)
++    if (block_size > 1024) block_size = 1024;
++    dim3 grid(num_groups_total);
++    group_norm_mean_var_kernel<<<grid, block_size, 0, stream>>>(
++        input, d_mean, d_var, N, C, H, W, num_groups, channels_per_group);
++
++    // Normalization kernel: grid-stride or exact?
++    int64_t total_elements = N * C * H * W;
++    int apply_block_size = 256;
++    int64_t apply_grid = (total_elements + apply_block_size - 1) / apply_block_size;
++    group_norm_apply_kernel<<<apply_grid, apply_block_size, 0, stream>>>(
++        input, output, d_mean, d_var, weight, bias, N, C, H, W, num_groups, channels_per_group, eps);
++
++    // Free temporary memory asynchronously? We should synchronize before freeing to ensure kernels done.
++    cudaStreamSynchronize(stream);
++    cudaFree(d_mean);
++    cudaFree(d_var);
++}
++
++// Note: The binding layer will call cudaGetLastError() after the launcher returns, as kernels are async.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,93 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++extern "C" void group_norm_forward_launcher(
++    const float* input,
++    float* output,
++    const float* weight,
++    const float* bias,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t num_groups,
++    double eps,
++    cudaStream_t stream);
++
++torch::Tensor group_norm_forward(
++    torch::Tensor input,
++    c10::optional<torch::Tensor> weight,
++    c10::optional<torch::Tensor> bias,
++    int64_t num_groups,
++    double eps) {
++
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D");
++
++    auto input_contig = input.contiguous();
++
++    int64_t N = input_contig.size(0);
++    int64_t C = input_contig.size(1);
++    int64_t H = input_contig.size(2);
++    int64_t W = input_contig.size(3);
++
++    TORCH_CHECK(num_groups > 0, "num_groups must be positive");
++    TORCH_CHECK(C % num_groups == 0, "C must be divisible by num_groups");
++
++    const float* weight_ptr = nullptr;
++    const float* bias_ptr = nullptr;
++
++    if (weight.has_value() && weight->defined()) {
++        TORCH_CHECK(weight->is_cuda(), "weight must be a CUDA tensor");
++        TORCH_CHECK(weight->dtype() == torch::kFloat32, "weight must be float32");
++        TORCH_CHECK(weight->numel() == C, "weight must have C elements");
++        auto weight_contig = weight->contiguous();
++        weight_ptr = weight_contig.data_ptr<float>();
++    }
++
++    if (bias.has_value() && bias->defined()) {
++        TORCH_CHECK(bias->is_cuda(), "bias must be a CUDA tensor");
++        TORCH_CHECK(bias->dtype() == torch::kFloat32, "bias must be float32");
++        TORCH_CHECK(bias->numel() == C, "bias must have C elements");
++        auto bias_contig = bias->contiguous();
++        bias_ptr = bias_contig.data_ptr<float>();
++    }
++
++    auto output = torch::empty_like(input_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    group_norm_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        weight_ptr,
++        bias_ptr,
++        N,
++        C,
++        H,
++        W,
++        num_groups,
++        eps,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_group_norm_forward(pybind11::module& m) {
++    m.def("group_norm_forward", &group_norm_forward,
++          "GroupNorm forward",
++          py::arg("input"),
++          py::arg("weight"),
++          py::arg("bias"),
++          py::arg("num_groups"),
++          py::arg("eps"));
++}
++
++REGISTER_BINDING(group_norm_forward, register_group_norm_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,46 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_channels: int, num_groups: int, eps: float = 1e-5):
++        super().__init__()
++        self.num_channels = num_channels
++        self.num_groups = num_groups
++        self.eps = eps
++        # 使用 nn.GroupNorm 的参数，保持 state_dict 键一致
++        self.group_norm = nn.GroupNorm(num_groups, num_channels, eps)
++
++    def forward(self, x: torch.Tensor):
++        # 使用自定义 CUDA 算子完成 GroupNorm 计算
++        x = cuda_extension.group_norm_forward(
++            x, self.group_norm.weight, self.group_norm.bias,
++            self.num_groups, self.eps
++        )
++
++        # 保留 dummy tensor 比较逻辑
++        a = torch.tensor([1, 2, 3])
++        b = torch.tensor([1, 2, 3])
++        equal = torch.equal(a, b)
++
++        return x, equal
++
++    def debug_forward(self, x: torch.Tensor):
++        # 与 forward 相同计算，但额外按检查点 yield
++        x = cuda_extension.group_norm_forward(
++            x, self.group_norm.weight, self.group_norm.bias,
++            self.num_groups, self.eps
++        )
++        yield 'step_001', x
++
++        a = torch.tensor([1, 2, 3])
++        yield 'step_002', a
++
++        b = torch.tensor([1, 2, 3])
++        yield 'step_003', b
++
++        equal = torch.equal(a, b)
++        yield 'step_004', equal
++
++        yield 'step_005', (x, equal)

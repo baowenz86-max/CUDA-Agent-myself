@@ -1,0 +1,465 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,210 @@
++#include <cuda_runtime.h>
++#include <cublas_v2.h>
++#include <cstdint>
++
++// -----------------------------------------------------------------------------
++// custom_hardtanh
++// -----------------------------------------------------------------------------
++__global__ void hardtanh_kernel(const float* __restrict__ input,
++                                float* __restrict__ output,
++                                int64_t numel,
++                                float min_val,
++                                float max_val) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (; idx < numel; idx += stride) {
++        float v = input[idx];
++        v = fminf(fmaxf(v, min_val), max_val);
++        output[idx] = v;
++    }
++}
++
++extern "C" void custom_hardtanh_launcher(const float* input,
++                                          float* output,
++                                          int64_t numel,
++                                          float min_val,
++                                          float max_val,
++                                          cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 2147483647LL) {
++        grid_size = 2147483647LL;
++    }
++    hardtanh_kernel<<<static_cast<unsigned int>(grid_size), block_size, 0, stream>>>(
++        input, output, numel, min_val, max_val);
++}
++
++// -----------------------------------------------------------------------------
++// custom_max_pool2d
++// -----------------------------------------------------------------------------
++__global__ void max_pool2d_kernel(const float* __restrict__ input,
++                                  float* __restrict__ output,
++                                  int batch_size,
++                                  int channels,
++                                  int input_height,
++                                  int input_width,
++                                  int output_height,
++                                  int output_width,
++                                  int kernel_h,
++                                  int kernel_w,
++                                  int stride_h,
++                                  int stride_w,
++                                  int padding_h,
++                                  int padding_w,
++                                  int dilation_h,
++                                  int dilation_w) {
++    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_outputs = batch_size * channels * output_height * output_width;
++    if (out_idx >= total_outputs) return;
++
++    // 分解输出索引为 (n, c, oh, ow)
++    int ow = out_idx % output_width;
++    int tmp = out_idx / output_width;
++    int oh = tmp % output_height;
++    tmp /= output_height;
++    int c = tmp % channels;
++    int n = tmp / channels;
++
++    // 计算输入窗口起始位置
++    int h_start = oh * stride_h - padding_h;
++    int w_start = ow * stride_w - padding_w;
++
++    float max_val = -FLT_MAX;
++    for (int kh = 0; kh < kernel_h; ++kh) {
++        int ih = h_start + kh * dilation_h;
++        if (ih < 0 || ih >= input_height) continue;
++        for (int kw = 0; kw < kernel_w; ++kw) {
++            int iw = w_start + kw * dilation_w;
++            if (iw < 0 || iw >= input_width) continue;
++            // 输入张量形状 [N, C, H, W]，连续存储
++            int64_t input_idx = ((static_cast<int64_t>(n) * channels + c) * input_height + ih) * input_width + iw;
++            float v = input[input_idx];
++            max_val = fmaxf(max_val, v);
++        }
++    }
++    output[out_idx] = max_val;
++}
++
++extern "C" void custom_max_pool2d_launcher(const float* input,
++                                           float* output,
++                                           int batch_size,
++                                           int channels,
++                                           int input_height,
++                                           int input_width,
++                                           int output_height,
++                                           int output_width,
++                                           int kernel_h,
++                                           int kernel_w,
++                                           int stride_h,
++                                           int stride_w,
++                                           int padding_h,
++                                           int padding_w,
++                                           int dilation_h,
++                                           int dilation_w,
++                                           cudaStream_t stream) {
++    int total_outputs = batch_size * channels * output_height * output_width;
++    const int block_size = 256;
++    int grid_size = (total_outputs + block_size - 1) / block_size;
++    max_pool2d_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, batch_size, channels, input_height, input_width,
++        output_height, output_width, kernel_h, kernel_w, stride_h, stride_w,
++        padding_h, padding_w, dilation_h, dilation_w);
++}
++
++// -----------------------------------------------------------------------------
++// custom_flatten
++// -----------------------------------------------------------------------------
++// 输入 [N, C, H, W] 且连续，输出 [N, C*H*W] 连续。
++// 由于模型中新版 max_pool 输出为连续，输入通常连续，但为安全仍使用线性拷贝。
++__global__ void flatten_copy_kernel(const float* __restrict__ input,
++                                    float* __restrict__ output,
++                                    int64_t numel) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (; idx < numel; idx += stride) {
++        output[idx] = input[idx];
++    }
++}
++
++extern "C" void custom_flatten_launcher(const float* input,
++                                        float* output,
++                                        int64_t numel,
++                                        cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 2147483647LL) {
++        grid_size = 2147483647LL;
++    }
++    flatten_copy_kernel<<<static_cast<unsigned int>(grid_size), block_size, 0, stream>>>(
++        input, output, numel);
++}
++
++// -----------------------------------------------------------------------------
++// custom_linear (cuBLAS GEMM)
++// -----------------------------------------------------------------------------
++extern "C" void custom_linear_launcher(const float* input,   // [N, in_features]
++                                       const float* weight,  // [out_features, in_features]
++                                       const float* bias,    // [out_features] 或 nullptr
++                                       float* output,        // [N, out_features]
++                                       int N,
++                                       int in_features,
++                                       int out_features,
++                                       cudaStream_t stream) {
++    cublasHandle_t handle;
++    cublasCreate(&handle);
++    cublasSetStream(handle, stream);
++
++    const float alpha = 1.0f;
++    const float beta = 0.0f;
++
++    // 计算 output = 1.0 * input @ weight^T + 0.0 * output
++    // cuBLAS 使用列主序，根据我们的行主序存储，等价于 C = A * B^T
++    // 其中 A 是 input (N x in_features)，B 是 weight (out_features x in_features)
++    // 因此 C = A * B^T 使用 cublasSgemm 时：
++    // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
++    //             out_features, N, in_features,  // m=out_features, n=N, k=in_features
++    //             &alpha, weight, in_features,   // A = weight^T
++    //                     input, in_features,    // B = input^T
++    //             &beta, output, out_features);  // C = output^T
++    // 但这样 row-major 的解释有些绕，常用方法是：
++    // 直接调用 cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
++    //                     N, out_features, in_features,
++    //                     &alpha, input, in_features,
++    //                     weight, in_features,
++    //                     &beta, output, out_features);
++    // 注意 cuBLAS 期望列主序，但当我们把行主序矩阵当作列主序的转置时，
++    // 上述调用正确。
++    cublasStatus_t status = cublasSgemm(handle,
++                                        CUBLAS_OP_N, CUBLAS_OP_T,
++                                        N, out_features, in_features,
++                                        &alpha,
++                                        input, in_features,
++                                        weight, in_features,
++                                        &beta,
++                                        output, N);
++
++    if (status != CUBLAS_STATUS_SUCCESS) {
++        // 简单的错误处理：不抛出，依赖后续 error check
++    }
++
++    if (bias != nullptr) {
++        // 添加 bias
++        int block_size = 256;
++        int grid_size = (N * out_features + block_size - 1) / block_size;
++        // 为了简单，直接调用一个 kernel 添加 bias
++        add_bias_kernel<<<grid_size, block_size, 0, stream>>>(output, bias, N, out_features);
++    }
++
++    cublasDestroy(handle);
++}
++
++__global__ void add_bias_kernel(float* __restrict__ output,
++                                const float* __restrict__ bias,
++                                int N,
++                                int out_features) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * out_features;
++    if (idx >= total) return;
++    int col = idx % out_features;
++    output[idx] += bias[col];
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,193 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Declare CUDA launchers from custom_ops.cu
++extern "C" {
++void custom_hardtanh_launcher(const float* input, float* output, int64_t numel,
++                              float min_val, float max_val, cudaStream_t stream);
++
++void custom_max_pool2d_launcher(const float* input, float* output,
++                                int batch_size, int channels,
++                                int input_height, int input_width,
++                                int output_height, int output_width,
++                                int kernel_h, int kernel_w,
++                                int stride_h, int stride_w,
++                                int padding_h, int padding_w,
++                                int dilation_h, int dilation_w,
++                                cudaStream_t stream);
++
++void custom_flatten_launcher(const float* input, float* output, int64_t numel,
++                             cudaStream_t stream);
++
++void custom_linear_launcher(const float* input, const float* weight,
++                            const float* bias, float* output,
++                            int N, int in_features, int out_features,
++                            cudaStream_t stream);
++}
++
++// -----------------------------------------------------------------------------
++// custom_hardtanh wrapper
++// -----------------------------------------------------------------------------
++torch::Tensor custom_hardtanh(torch::Tensor x, double min_val, double max_val) {
++    TORCH_CHECK(x.is_cuda(), "custom_hardtanh: input must be CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_hardtanh: input must be float32");
++    // Ensure contiguous to match launcher expectation
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++    auto output = torch::empty_like(x);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_hardtanh_launcher(x.data_ptr<float>(), output.data_ptr<float>(),
++                             x.numel(), static_cast<float>(min_val),
++                             static_cast<float>(max_val), stream);
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_hardtanh kernel failed: ", cudaGetErrorString(err));
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// custom_max_pool2d wrapper
++// -----------------------------------------------------------------------------
++torch::Tensor custom_max_pool2d(torch::Tensor x, int64_t kernel_size,
++                               int64_t stride, int64_t padding,
++                               int64_t dilation, bool ceil_mode) {
++    TORCH_CHECK(x.is_cuda(), "custom_max_pool2d: input must be CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_max_pool2d: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "custom_max_pool2d: input must be 4D (N,C,H,W)");
++    TORCH_CHECK(kernel_size > 0 && stride > 0 && padding >= 0 && dilation > 0,
++                "custom_max_pool2d: invalid pooling parameters");
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    // Compute output spatial dimensions (floor formula, matching PyTorch for ceil_mode=False)
++    int64_t out_h, out_w;
++    if (ceil_mode) {
++        out_h = (H + 2 * padding - dilation * (kernel_size - 1) - 1 + stride - 1) / stride + 1;
++        out_w = (W + 2 * padding - dilation * (kernel_size - 1) - 1 + stride - 1) / stride + 1;
++    } else {
++        out_h = (H + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
++        out_w = (W + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
++    }
++    TORCH_CHECK(out_h > 0 && out_w > 0, "custom_max_pool2d: output size too small");
++
++    auto output = torch::empty({N, C, out_h, out_w}, x.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_max_pool2d_launcher(x.data_ptr<float>(), output.data_ptr<float>(),
++                               static_cast<int>(N), static_cast<int>(C),
++                               static_cast<int>(H), static_cast<int>(W),
++                               static_cast<int>(out_h), static_cast<int>(out_w),
++                               static_cast<int>(kernel_size), static_cast<int>(kernel_size),
++                               static_cast<int>(stride), static_cast<int>(stride),
++                               static_cast<int>(padding), static_cast<int>(padding),
++                               static_cast<int>(dilation), static_cast<int>(dilation),
++                               stream);
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_max_pool2d kernel failed: ", cudaGetErrorString(err));
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// custom_flatten wrapper
++// -----------------------------------------------------------------------------
++torch::Tensor custom_flatten(torch::Tensor x, int64_t start_dim) {
++    TORCH_CHECK(x.is_cuda(), "custom_flatten: input must be CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_flatten: input must be float32");
++    TORCH_CHECK(start_dim >= 0 && start_dim < x.dim(), "custom_flatten: invalid start_dim");
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++
++    // Compute output shape: [dims before start_dim, -1]
++    std::vector<int64_t> out_shape;
++    for (int64_t i = 0; i < start_dim; ++i) {
++        out_shape.push_back(x.size(i));
++    }
++    int64_t flattened_size = 1;
++    for (int64_t i = start_dim; i < x.dim(); ++i) {
++        flattened_size *= x.size(i);
++    }
++    out_shape.push_back(flattened_size);
++
++    auto output = torch::empty(out_shape, x.options());
++    // The launcher copies exactly input.numel() elements; because input is contiguous,
++    // the flattened layout matches output's contiguous layout.
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_flatten_launcher(x.data_ptr<float>(), output.data_ptr<float>(),
++                            x.numel(), stream);
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_flatten kernel failed: ", cudaGetErrorString(err));
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// custom_linear wrapper
++// -----------------------------------------------------------------------------
++torch::Tensor custom_linear(torch::Tensor x, torch::Tensor weight,
++                            torch::Tensor bias) {
++    TORCH_CHECK(x.is_cuda() && weight.is_cuda(), "custom_linear: inputs must be CUDA tensors");
++    TORCH_CHECK(x.dtype() == torch::kFloat32 && weight.dtype() == torch::kFloat32,
++                "custom_linear: inputs must be float32");
++    TORCH_CHECK(x.dim() == 2, "custom_linear: x must be 2D");
++    TORCH_CHECK(weight.dim() == 2, "custom_linear: weight must be 2D");
++    if (bias.defined()) {
++        TORCH_CHECK(bias.is_cuda() && bias.dtype() == torch::kFloat32,
++                    "custom_linear: bias must be CUDA float32 if provided");
++        TORCH_CHECK(bias.dim() == 1 && bias.size(0) == weight.size(0),
++                    "custom_linear: bias dimension mismatch");
++    }
++
++    if (!x.is_contiguous()) x = x.contiguous();
++    if (!weight.is_contiguous()) weight = weight.contiguous();
++    if (bias.defined() && !bias.is_contiguous()) bias = bias.contiguous();
++
++    int64_t N = x.size(0);
++    int64_t in_features = x.size(1);
++    int64_t out_features = weight.size(0);
++    TORCH_CHECK(in_features == weight.size(1), "custom_linear: in_features mismatch");
++
++    auto output = torch::empty({N, out_features}, x.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    const float* bias_ptr = bias.defined() ? bias.data_ptr<float>() : nullptr;
++
++    custom_linear_launcher(x.data_ptr<float>(), weight.data_ptr<float>(),
++                           bias_ptr, output.data_ptr<float>(),
++                           static_cast<int>(N),
++                           static_cast<int>(in_features),
++                           static_cast<int>(out_features),
++                           stream);
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_linear kernel failed: ", cudaGetErrorString(err));
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// Registration
++// -----------------------------------------------------------------------------
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_hardtanh", &custom_hardtanh,
++          "Custom hardtanh",
++          pybind11::arg("x"), pybind11::arg("min_val"), pybind11::arg("max_val"));
++    m.def("custom_max_pool2d", &custom_max_pool2d,
++          "Custom max_pool2d",
++          pybind11::arg("x"), pybind11::arg("kernel_size"),
++          pybind11::arg("stride"), pybind11::arg("padding"),
++          pybind11::arg("dilation"), pybind11::arg("ceil_mode"));
++    m.def("custom_flatten", &custom_flatten,
++          "Custom flatten",
++          pybind11::arg("x"), pybind11::arg("start_dim"));
++    m.def("custom_linear", &custom_linear,
++          "Custom linear",
++          pybind11::arg("x"), pybind11::arg("weight"), pybind11::arg("bias"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,53 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features, out_features, max_pool_kernel_size):
++        super().__init__()
++        self.hardtanh = nn.Hardtanh()
++        self.max_pool = nn.MaxPool2d(kernel_size=max_pool_kernel_size)
++        self.linear = nn.Linear(in_features, out_features)
++
++    def forward(self, x):
++        x = cuda_extension.custom_hardtanh(x, -1.0, 1.0)
++        kernel_h, kernel_w = self.max_pool.kernel_size
++        stride_h, stride_w = self.max_pool.stride
++        padding_h, padding_w = self.max_pool.padding
++        dilation_h, dilation_w = self.max_pool.dilation
++        ceil_mode = self.max_pool.ceil_mode
++        x = cuda_extension.custom_max_pool2d(
++            x,
++            kernel_h,
++            stride_h,
++            padding_h,
++            dilation_h,
++            ceil_mode,
++        )
++        x = cuda_extension.custom_flatten(x, 1)
++        x = cuda_extension.custom_linear(x, self.linear.weight, self.linear.bias)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_hardtanh(x, -1.0, 1.0)
++        yield "step_001", x
++        kernel_h, kernel_w = self.max_pool.kernel_size
++        stride_h, stride_w = self.max_pool.stride
++        padding_h, padding_w = self.max_pool.padding
++        dilation_h, dilation_w = self.max_pool.dilation
++        ceil_mode = self.max_pool.ceil_mode
++        x = cuda_extension.custom_max_pool2d(
++            x,
++            kernel_h,
++            stride_h,
++            padding_h,
++            dilation_h,
++            ceil_mode,
++        )
++        yield "step_002", x
++        x = cuda_extension.custom_flatten(x, 1)
++        yield "step_003", x
++        x = cuda_extension.custom_linear(x, self.linear.weight, self.linear.bias)
++        yield "step_004", x
++        yield "step_005", x

@@ -1,0 +1,239 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,98 @@
++#include <cuda_runtime.h>
++
++// ceil_forward: element-wise ceil for float32
++__global__ void ceil_kernel(const float* __restrict__ input,
++                            float* __restrict__ output,
++                            int64_t numel) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = ceilf(input[i]);
++    }
++}
++
++// reflection_pad2d: output shape [N,C,H+pad_top+pad_bottom, W+pad_left+pad_right]
++// input shape [N,C,H,W], contiguous
++__global__ void reflection_pad2d_kernel(const float* __restrict__ input,
++                                        float* __restrict__ output,
++                                        int N, int C, int H, int W,
++                                        int pad_left, int pad_right, int pad_top, int pad_bottom) {
++    int64_t out_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t out_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    int out_h = H + pad_top + pad_bottom;
++    int out_w = W + pad_left + pad_right;
++    int64_t out_numel = static_cast<int64_t>(N) * C * out_h * out_w;
++
++    for (int64_t i = out_idx; i < out_numel; i += out_stride) {
++        int ow = i % out_w;
++        int64_t tmp = i / out_w;
++        int oh = tmp % out_h;
++        tmp /= out_h;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        int iw = ow - pad_left;
++        int ih = oh - pad_top;
++
++        // Reflect index in width dimension
++        if (iw < 0) {
++            iw = -iw;
++        }
++        if (iw >= W) {
++            iw = 2 * W - iw - 2;
++        }
++        // Reflect index in height dimension
++        if (ih < 0) {
++            ih = -ih;
++        }
++        if (ih >= H) {
++            ih = 2 * H - ih - 2;
++        }
++        // Clamp for safety (should be inside bounds for valid padding)
++        iw = max(0, min(iw, W - 1));
++        ih = max(0, min(ih, H - 1));
++
++        int64_t input_idx = ((static_cast<int64_t>(n) * C + c) * H + ih) * W + iw;
++        output[i] = input[input_idx];
++    }
++}
++
++// Launcher for ceil
++extern "C" void ceil_forward_launcher(const float* input,
++                                     float* output,
++                                     int64_t numel,
++                                     cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t blocks = (numel + block_size - 1) / block_size;
++    if (blocks > 0) {
++        // Cap grid size to 2^31-1; kernel uses grid-stride loop
++        int grid = static_cast<int>(min<int64_t>(blocks, 2147483647LL));
++        ceil_kernel<<<grid, block_size, 0, stream>>>(input, output, numel);
++    }
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Error will be surfaced by binding layer via cudaGetLastError; do nothing here
++    }
++}
++
++// Launcher for reflection_pad2d
++extern "C" void reflection_pad2d_forward_launcher(const float* input,
++                                                   float* output,
++                                                   int N, int C, int H, int W,
++                                                   int pad_left, int pad_right, int pad_top, int pad_bottom,
++                                                   cudaStream_t stream) {
++    int out_h = H + pad_top + pad_bottom;
++    int out_w = W + pad_left + pad_right;
++    int64_t out_numel = static_cast<int64_t>(N) * C * out_h * out_w;
++    const int block_size = 256;
++    int64_t blocks = (out_numel + block_size - 1) / block_size;
++    if (blocks > 0) {
++        int grid = static_cast<int>(min<int64_t>(blocks, 2147483647LL));
++        reflection_pad2d_kernel<<<grid, block_size, 0, stream>>>(
++            input, output, N, C, H, W, pad_left, pad_right, pad_top, pad_bottom);
++    }
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Error will be surfaced by binding layer via cudaGetLastError; do nothing here
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,96 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void ceil_forward_launcher(const float* input,
++                                     float* output,
++                                     int64_t numel,
++                                     cudaStream_t stream);
++
++extern "C" void reflection_pad2d_forward_launcher(const float* input,
++                                                   float* output,
++                                                   int N, int C, int H, int W,
++                                                   int pad_left, int pad_right, int pad_top, int pad_bottom,
++                                                   cudaStream_t stream);
++
++// Wrapper for ceil_forward
++torch::Tensor ceil_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "ceil_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "ceil_forward: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "ceil_forward: input must be contiguous");
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    ceil_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "ceil_forward: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for reflection_pad2d_forward
++torch::Tensor reflection_pad2d_forward(torch::Tensor x,
++                                       int64_t pad_left,
++                                       int64_t pad_right,
++                                       int64_t pad_top,
++                                       int64_t pad_bottom) {
++    TORCH_CHECK(x.is_cuda(), "reflection_pad2d_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "reflection_pad2d_forward: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "reflection_pad2d_forward: input must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "reflection_pad2d_forward: input must be 4D (N,C,H,W)");
++    TORCH_CHECK(pad_left >= 0 && pad_right >= 0 && pad_top >= 0 && pad_bottom >= 0,
++                "reflection_pad2d_forward: padding sizes must be non-negative");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    int out_h = H + pad_top + pad_bottom;
++    int out_w = W + pad_left + pad_right;
++
++    auto output = torch::empty({N, C, out_h, out_w}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    reflection_pad2d_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        static_cast<int>(pad_left),
++        static_cast<int>(pad_right),
++        static_cast<int>(pad_top),
++        static_cast<int>(pad_bottom),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "reflection_pad2d_forward: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Register both functions
++void register_custom_ops(pybind11::module& m) {
++    m.def("ceil_forward", &ceil_forward,
++          "Element-wise ceil for float32 CUDA tensors",
++          py::arg("x"));
++    m.def("reflection_pad2d_forward", &reflection_pad2d_forward,
++          "Reflection padding for 2D spatial dimensions",
++          py::arg("x"),
++          py::arg("pad_left") = 3,
++          py::arg("pad_right") = 3,
++          py::arg("pad_top") = 3,
++          py::arg("pad_bottom") = 3);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,36 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, padding_size):
++        super().__init__()
++        self.padding_size = padding_size
++        # padding_size is a tuple of four ints (left, right, top, bottom)
++        self.pad_left, self.pad_right, self.pad_top, self.pad_bottom = padding_size
++
++    def forward(self, x):
++        x = cuda_extension.ceil_forward(x)
++        x = cuda_extension.reflection_pad2d_forward(
++            x,
++            pad_left=self.pad_left,
++            pad_right=self.pad_right,
++            pad_top=self.pad_top,
++            pad_bottom=self.pad_bottom,
++        )
++        return x
++
++    def debug_forward(self, x):
++        # Yield the same checkpoints as the reference, using identical custom ops.
++        x = cuda_extension.ceil_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.reflection_pad2d_forward(
++            x,
++            pad_left=self.pad_left,
++            pad_right=self.pad_right,
++            pad_top=self.pad_top,
++            pad_bottom=self.pad_bottom,
++        )
++        yield 'step_002', x
++        yield 'step_003', x

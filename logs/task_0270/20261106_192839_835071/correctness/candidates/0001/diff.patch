@@ -1,0 +1,259 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,108 @@
++#include <cuda_runtime.h>
++
++// Compute x * (pi / 180) for each element
++__global__ void deg2rad_kernel(float* output, const float* input, int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    const float scale = 0.017453292519943295f; // pi / 180
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = input[i] * scale;
++    }
++}
++
++// Reflection padding for last two dimensions (H, W)
++// output: [N, C, H_out, W_out], input: [N, C, H_in, W_in]
++// pad_l, pad_r, pad_t, pad_b are non-negative
++__global__ void reflection_pad2d_kernel(
++    float* output,
++    const float* input,
++    int64_t N,
++    int64_t C,
++    int64_t H_in,
++    int64_t W_in,
++    int64_t H_out,
++    int64_t W_out,
++    int pad_t,
++    int pad_l,
++    int64_t in_stride_n,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w
++) {
++    int64_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t out_stride = blockDim.x * gridDim.x;
++    int64_t total_elements = N * C * H_out * W_out;
++
++    // Reflection helper: maps coordinate to [0, size-1] with reflection
++    auto reflect = [](int64_t coord, int64_t size) -> int64_t {
++        if (size == 1) return 0;
++        coord = coord % (2 * size - 2);
++        if (coord < 0) coord += 2 * size - 2;
++        if (coord < size) return coord;
++        return 2 * size - 2 - coord;
++    };
++
++    for (int64_t idx = out_idx; idx < total_elements; idx += out_stride) {
++        int64_t w_out = idx % W_out;
++        int64_t tmp = idx / W_out;
++        int64_t h_out = tmp % H_out;
++        tmp /= H_out;
++        int64_t c = tmp % C;
++        int64_t n = tmp / C;
++
++        // Compute input coordinates
++        int64_t h_in = h_out - pad_t;
++        int64_t w_in = w_out - pad_l;
++
++        // Reflect if outside
++        h_in = reflect(h_in, H_in);
++        w_in = reflect(w_in, W_in);
++
++        int64_t in_idx = n * in_stride_n + c * in_stride_c + h_in * in_stride_h + w_in * in_stride_w;
++        output[idx] = input[in_idx];
++    }
++}
++
++// Launcher for custom_deg2rad
++extern "C" void custom_deg2rad_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    if (numel == 0) return;
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    // Use grid-stride loop for large data
++    if (grid_size > 65535) grid_size = 65535;
++    deg2rad_kernel<<<grid_size, block_size, 0, stream>>>(output, input, numel);
++}
++
++// Launcher for custom_reflection_pad2d
++extern "C" void custom_reflection_pad2d_launcher(
++    float* output,
++    const float* input,
++    int64_t N,
++    int64_t C,
++    int64_t H_in,
++    int64_t W_in,
++    int64_t H_out,
++    int64_t W_out,
++    int pad_t,
++    int pad_l,
++    int64_t in_stride_n,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    cudaStream_t stream
++) {
++    int64_t total_elements = N * C * H_out * W_out;
++    if (total_elements == 0) return;
++    const int block_size = 256;
++    int64_t grid_size = (total_elements + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    reflection_pad2d_kernel<<<grid_size, block_size, 0, stream>>>(
++        output, input, N, C, H_in, W_in, H_out, W_out, pad_t, pad_l,
++        in_stride_n, in_stride_c, in_stride_h, in_stride_w
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,114 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_deg2rad_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++extern "C" void custom_reflection_pad2d_launcher(
++    float* output,
++    const float* input,
++    int64_t N,
++    int64_t C,
++    int64_t H_in,
++    int64_t W_in,
++    int64_t H_out,
++    int64_t W_out,
++    int pad_t,
++    int pad_l,
++    int64_t in_stride_n,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    cudaStream_t stream
++);
++
++// Forward wrapper for custom_deg2rad
++torch::Tensor custom_deg2rad_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "custom_deg2rad: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_deg2rad: input must be float32");
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_deg2rad_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    return output;
++}
++
++// Forward wrapper for custom_reflection_pad2d
++torch::Tensor custom_reflection_pad2d_forward(
++    torch::Tensor x,
++    int64_t pad_l,
++    int64_t pad_r,
++    int64_t pad_t,
++    int64_t pad_b
++) {
++    TORCH_CHECK(x.is_cuda(), "custom_reflection_pad2d: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_reflection_pad2d: input must be float32");
++    TORCH_CHECK(x.dim() == 3, "custom_reflection_pad2d: input must be 3D (N, H, W)");
++    TORCH_CHECK(pad_l >= 0 && pad_r >= 0 && pad_t >= 0 && pad_b >= 0,
++                "custom_reflection_pad2d: padding must be non-negative");
++
++    int64_t N = x.size(0);
++    int64_t H_in = x.size(1);
++    int64_t W_in = x.size(2);
++    int64_t H_out = H_in + pad_t + pad_b;
++    int64_t W_out = W_in + pad_l + pad_r;
++
++    auto output = torch::empty({N, H_out, W_out}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_reflection_pad2d_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        N,
++        1,          // C dimension not present, set to 1
++        H_in,
++        W_in,
++        H_out,
++        W_out,
++        static_cast<int>(pad_t),
++        static_cast<int>(pad_l),
++        x.stride(0),
++        x.stride(1),
++        x.stride(2),
++        1,          // in_stride_w is 1 for the last dimension of 3D input
++        // Actually need to pass in_stride_c, in_stride_h, in_stride_w properly
++        // Since input is 3D, C=1, stride_c is not used; we pass x.stride(1) as in_stride_h,
++        // and x.stride(2) as in_stride_w; in_stride_n = x.stride(0); in_stride_c = 0 (unused)
++        0,
++        stream
++    );
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_deg2rad", &custom_deg2rad_forward,
++          "Convert angles from degrees to radians",
++          py::arg("x"));
++    m.def("custom_reflection_pad2d", &custom_reflection_pad2d_forward,
++          "Reflection pad 2D",
++          py::arg("x"),
++          py::arg("pad_l"),
++          py::arg("pad_r"),
++          py::arg("pad_t"),
++          py::arg("pad_b"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,28 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, pad_width, pad_mode):
++        super().__init__()
++        self.pad_width = pad_width
++        self.pad_mode = pad_mode
++
++    def forward(self, x):
++        x = cuda_extension.custom_deg2rad(x)
++        pad_l, pad_r, pad_t, pad_b = self.pad_width
++        x = cuda_extension.custom_reflection_pad2d(
++            x, pad_l, pad_r, pad_t, pad_b
++        )
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_deg2rad(x)
++        yield 'step_001', x
++        pad_l, pad_r, pad_t, pad_b = self.pad_width
++        x = cuda_extension.custom_reflection_pad2d(
++            x, pad_l, pad_r, pad_t, pad_b
++        )
++        yield 'step_002', x
++        yield 'step_003', x

@@ -1,0 +1,269 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,120 @@
++#include <cuda_runtime.h>
++
++// -----------------------------------------------------------------------------
++// CUDA kernels for model_new.py
++//
++// This file contains all CUDA kernels and host launchers.
++// No torch/ATen/c10/pybind dependencies.
++//
++// Operators implemented:
++//   1. linear_forward: y = input @ weight^T + bias
++//   2. minimum_forward: elementwise minimum with broadcasting along last dim
++// -----------------------------------------------------------------------------
++
++// Kernel: one thread per output element (row, col) computes dot product of
++// input[row, :] and weight[col, :] plus bias[col].
++__global__ void linear_forward_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int batch_size,
++    int in_features,
++    int out_features)
++{
++    // Grid-stride loop over all (row, col) pairs
++    int total = batch_size * out_features;
++    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
++         idx < total;
++         idx += blockDim.x * gridDim.x)
++    {
++        int row = idx / out_features;
++        int col = idx % out_features;
++
++        const float* input_row = input + (size_t)row * in_features;
++        const float* weight_col = weight + (size_t)col * in_features;
++
++        float sum = 0.0f;
++        for (int k = 0; k < in_features; ++k) {
++            sum += input_row[k] * weight_col[k];
++        }
++        sum += bias[col];
++
++        output[(size_t)row * out_features + col] = sum;
++    }
++}
++
++// Kernel: elementwise minimum, broadcasting other (length out_features)
++// along the last dimension.
++__global__ void minimum_forward_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ other,
++    float* __restrict__ output,
++    int64_t numel,
++    int64_t out_features)
++{
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < numel; i += stride) {
++        int64_t col = i % out_features;
++        float a = input[i];
++        float b = other[col];
++        output[i] = (a < b) ? a : b;  // matches torch.minimum (NaN handling not required)
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Host launchers (extern "C" so they can be called from binding.cpp)
++// -----------------------------------------------------------------------------
++
++extern "C" void linear_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int64_t batch_size,
++    int64_t in_features,
++    int64_t out_features,
++    cudaStream_t stream)
++{
++    dim3 block(256);
++    // Cap grid size and rely on grid-stride loop
++    int max_grid = 65535;  // conservative for all architectures
++    int64_t total = batch_size * out_features;
++    int grid = (int)std::min((int64_t)max_grid, (total + block.x - 1) / block.x);
++    if (grid < 1) grid = 1;
++
++    linear_forward_kernel<<<grid, block, 0, stream>>>(
++        input, weight, bias, output,
++        (int)batch_size, (int)in_features, (int)out_features);
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Cannot throw here; binding layer may check via cudaDeviceSynchronize
++        // We do nothing; user must handle as appropriate.
++    }
++}
++
++extern "C" void minimum_forward_launcher(
++    const float* input,
++    const float* other,
++    float* output,
++    int64_t numel,
++    int64_t out_features,
++    cudaStream_t stream)
++{
++    dim3 block(256);
++    int64_t total = numel;
++    int max_grid = 65535;
++    int grid = (int)std::min((int64_t)max_grid, (total + block.x - 1) / block.x);
++    if (grid < 1) grid = 1;
++
++    minimum_forward_kernel<<<grid, block, 0, stream>>>(
++        input, other, output, numel, out_features);
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // silent failure; binding layer can check with cudaDeviceSynchronize
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,118 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <ATen/cuda/CUDAContext.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void linear_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int64_t batch_size,
++    int64_t in_features,
++    int64_t out_features,
++    cudaStream_t stream);
++
++extern "C" void minimum_forward_launcher(
++    const float* input,
++    const float* other,
++    float* output,
++    int64_t numel,
++    int64_t out_features,
++    cudaStream_t stream);
++
++namespace {
++
++// Helper to validate CUDA float32 contiguous tensor
++torch::Tensor check_cuda_float32_contiguous(const torch::Tensor& t, const char* name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++    return t;
++}
++
++} // anonymous namespace
++
++// linear_forward: y = input @ weight^T + bias
++torch::Tensor linear_forward(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    int64_t in_features,
++    int64_t out_features) {
++    check_cuda_float32_contiguous(input, "input");
++    check_cuda_float32_contiguous(weight, "weight");
++    check_cuda_float32_contiguous(bias, "bias");
++
++    TORCH_CHECK(input.dim() == 2, "input must be 2D [batch_size, in_features]");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [out_features, in_features]");
++    TORCH_CHECK(bias.dim() == 1, "bias must be 1D [out_features]");
++
++    int64_t batch_size = input.size(0);
++    TORCH_CHECK(input.size(1) == in_features, "input.size(1) must equal in_features");
++    TORCH_CHECK(weight.size(0) == out_features, "weight.size(0) must equal out_features");
++    TORCH_CHECK(weight.size(1) == in_features, "weight.size(1) must equal in_features");
++    TORCH_CHECK(bias.size(0) == out_features, "bias.size(0) must equal out_features");
++
++    auto output = torch::empty({batch_size, out_features}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    linear_forward_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch_size,
++        in_features,
++        out_features,
++        stream);
++
++    // Surface launch errors immediately
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "linear_forward launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// minimum_forward: elementwise minimum with broadcasting along last dim
++torch::Tensor minimum_forward(torch::Tensor input, torch::Tensor other) {
++    check_cuda_float32_contiguous(input, "input");
++    check_cuda_float32_contiguous(other, "other");
++
++    TORCH_CHECK(input.dim() >= 1, "input must have at least one dimension");
++    TORCH_CHECK(other.dim() == 1, "other must be 1D");
++    TORCH_CHECK(input.size(-1) == other.size(0), "input.size(-1) must equal other.size(0)");
++
++    auto output = torch::empty_like(input);
++    int64_t numel = input.numel();
++    int64_t out_features = other.size(0);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    minimum_forward_launcher(
++        input.data_ptr<float>(),
++        other.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        out_features,
++        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "minimum_forward launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("linear_forward", &linear_forward,
++          "Linear forward: y = input @ weight^T + bias",
++          py::arg("input"), py::arg("weight"), py::arg("bias"),
++          py::arg("in_features"), py::arg("out_features"));
++    m.def("minimum_forward", &minimum_forward,
++          "Elementwise minimum with broadcasting along last dim",
++          py::arg("input"), py::arg("other"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features, out_features, bias_shape):
++        super().__init__()
++        self.linear = nn.Linear(in_features, out_features)
++        self.bias = nn.Parameter(torch.randn(bias_shape))
++
++    def forward(self, x):
++        x = cuda_extension.linear_forward(x, self.linear.weight, self.linear.bias, self.linear.in_features, self.linear.out_features)
++        x = cuda_extension.minimum_forward(x, self.bias)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.linear_forward(x, self.linear.weight, self.linear.bias, self.linear.in_features, self.linear.out_features)
++        yield 'step_001', x
++        x = cuda_extension.minimum_forward(x, self.bias)
++        yield 'step_002', x
++        yield 'step_003', x

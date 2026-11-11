@@ -1,0 +1,114 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -4,7 +4,6 @@
+ // No PyTorch/Tensor dependencies.
+ 
+ #include <cuda_runtime.h>
+-#include <cublas_v2.h>
+ 
+ // -----------------------------------------------------------------------------
+ // adaptive_avg_pool2d
+@@ -94,33 +93,43 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// bias_add kernel (for linear_forward after GEMM)
++// linear_forward (custom CUDA kernel, no cuBLAS)
+ // -----------------------------------------------------------------------------
++// Computes output = input @ weight^T + bias
++// input: [batch, in_features] (row-major)
++// weight: [out_features, in_features] (row-major)
++// bias: [out_features] (may be null)
++// output: [batch, out_features] (row-major)
++// Each thread computes one output element.
++
+ template <typename scalar_t>
+-__global__ void bias_add_kernel(
++__global__ void linear_kernel(
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ weight,
++    const scalar_t* __restrict__ bias,
+     scalar_t* __restrict__ output,
+-    const scalar_t* __restrict__ bias,
+     int batch,
+-    int out_features,
+-    int total_elements) {
++    int in_features,
++    int out_features) {
+ 
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= total_elements) return;
++    int total = batch * out_features;
++    if (idx >= total) return;
+ 
+-    int col = idx % out_features;
+-    output[idx] += bias[col];
++    int b = idx / out_features;
++    int o = idx % out_features;
++
++    scalar_t sum = 0;
++    for (int k = 0; k < in_features; ++k) {
++        sum += input[b * in_features + k] * weight[o * in_features + k];
++    }
++    if (bias != nullptr) {
++        sum += bias[o];
++    }
++    output[idx] = sum;
+ }
+ 
+-// -----------------------------------------------------------------------------
+-// linear_forward
+-// -----------------------------------------------------------------------------
+-// Computes output = input @ weight^T + bias using cuBLAS GEMM.
+-// input: [batch, in_features]
+-// weight: [out_features, in_features]
+-// bias: [out_features] (may be null)
+-// output: [batch, out_features]
+-// Uses CUBLAS_OP_T for weight to perform X * W^T.
+-
++// Launcher for float32
+ extern "C" void linear_launcher(
+     const float* input,
+     const float* weight,
+@@ -131,35 +140,11 @@
+     int out_features,
+     cudaStream_t stream) {
+ 
+-    cublasHandle_t handle;
+-    cublasCreate(&handle);
+-    cublasSetStream(handle, stream);
++    int total_elements = batch * out_features;
++    int block_size = 256;
++    int grid_size = (total_elements + block_size - 1) / block_size;
+ 
+-    const float alpha = 1.0f;
+-    const float beta = 0.0f;
+-
+-    // Perform GEMM: C = alpha * A * B + beta * C
+-    // A is input [batch, in_features], B is weight^T [in_features, out_features]
+-    // So we set: op(A)=CUBLAS_OP_N, op(B)=CUBLAS_OP_T
+-    // lda = in_features, ldb = in_features, ldc = out_features
+-    cublasSgemm(
+-        handle,
+-        CUBLAS_OP_N, CUBLAS_OP_T,
+-        batch, out_features, in_features,
+-        &alpha,
+-        input, in_features,
+-        weight, in_features,
+-        &beta,
+-        output, out_features);
+-
+-    // Add bias if present
+-    if (bias != nullptr) {
+-        int total_elements = batch * out_features;
+-        int block_size = 256;
+-        int grid_size = (total_elements + block_size - 1) / block_size;
+-        bias_add_kernel<float><<<grid_size, block_size, 0, stream>>>(
+-            output, bias, batch, out_features, total_elements);
+-    }
+-
+-    cublasDestroy(handle);
++    linear_kernel<float><<<grid_size, block_size, 0, stream>>>(
++        input, weight, bias, output,
++        batch, in_features, out_features);
+ }

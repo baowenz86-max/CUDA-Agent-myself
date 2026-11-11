@@ -1,0 +1,197 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -25,9 +25,6 @@
+     int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+     if (out_x >= outW || out_y >= outH) return;
+ 
+-    // Compute source coordinates using PyTorch's area_pixel_compute_source_index
+-    // with align_corners=false and cubic=false: src = scale * (dst + 0.5) - 0.5
+-    // where scale = input_size / output_size
+     float h1r = rheight * (out_y + 0.5f) - 0.5f;
+     h1r = h1r < 0 ? 0 : h1r;
+     int h1 = (int)h1r;
+@@ -83,53 +80,69 @@
+ // Input: tensor of shape [d0, d1, ..., dn-1], arbitrary strides.
+ // Output: same shape, contiguous.
+ // dim: dimension to normalize over (0 <= dim < n).
+-// We use a stable algorithm: subtract max along dim, then exp, then divide by sum.
+-// The kernel is launched with one thread per element in the "outer" part
+-// (product of dimensions before and after dim), and each thread loops over
+-// the softmax dimension to compute max, then sum, then writes normalized values.
++// We use one thread per output element. Each thread computes its multi-dimensional
++// indices, then loops over the softmax dimension to compute max, then sum, then writes.
++// This avoids any complex stride aggregation and is correct for arbitrary strides.
+ 
+ __global__ void softmax_dim_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+-    int outer_size,   // product of dimensions before dim
+-    int dim_size,     // size of the softmax dimension
+-    int inner_size,   // product of dimensions after dim
+-    int64_t stride_outer, // stride of the dimension before dim (for indexing)
+-    int64_t stride_dim,   // stride of the softmax dimension
+-    int64_t stride_inner) // stride of the next dimension after dim (usually 1)
++    int64_t total_numel,
++    int64_t dim_size,
++    int64_t dim_stride,  // input stride for softmax dimension
++    int64_t inner_size,  // product of dimensions after dim
++    const int64_t* __restrict__ shape,   // shape array on device
++    const int64_t* __restrict__ stride,  // input strides array on device
++    int64_t ndim,
++    int64_t dim)
+ {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = outer_size * inner_size;
+-    if (idx >= total) return;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total_numel) return;
+ 
+-    int outer = idx / inner_size;
+-    int inner = idx - outer * inner_size;
++    // Decompose idx into multi-dimensional indices.
++    int64_t remaining = idx;
++    int64_t indices[8]; // assume ndim <= 8 for this task
++    for (int64_t d = 0; d < ndim; ++d) {
++        int64_t s = shape[d];
++        indices[d] = remaining % s;
++        remaining /= s;
++    }
+ 
+-    const float* data = input + outer * stride_outer + inner * stride_inner;
+-    float* out_data = output + outer * dim_size * inner_size + inner;
++    // Compute base offset for the element, excluding the softmax dimension.
++    int64_t base_offset = 0;
++    for (int64_t d = 0; d < ndim; ++d) {
++        if (d != dim) {
++            base_offset += indices[d] * stride[d];
++        }
++    }
+ 
+-    // max over dim
++    // Output index is simply idx (since output is contiguous and same shape).
++    float* out_ptr = output + idx;
++
++    // Compute max over softmax dimension.
+     float max_val = -FLT_MAX;
+-    for (int d = 0; d < dim_size; ++d) {
+-        float v = data[d * stride_dim];
++    for (int64_t j = 0; j < dim_size; ++j) {
++        float v = input[base_offset + j * dim_stride];
+         if (v > max_val) max_val = v;
+     }
+ 
+-    // sum of exp
++    // Compute sum of exp.
+     float sum = 0.0f;
+-    for (int d = 0; d < dim_size; ++d) {
+-        sum += __expf(data[d * stride_dim] - max_val);
++    for (int64_t j = 0; j < dim_size; ++j) {
++        sum += __expf(input[base_offset + j * dim_stride] - max_val);
+     }
+ 
+-    // normalize
+-    float inv_sum = 1.0f / sum;
+-    for (int d = 0; d < dim_size; ++d) {
+-        out_data[d * inner_size] = __expf(data[d * stride_dim] - max_val) * inv_sum;
+-    }
++    // Normalize and write the softmax dimension slice for this output element.
++    // But note: one thread per output element, so we only write one value.
++    // However, the output element at idx has a specific value for its softmax index.
++    // We need to know the index along the softmax dimension for this thread.
++    // Instead of one thread per element, we can have one thread per (outer,inner) pair
++    // and then loop over softmax dimension. Since we already have the indices,
++    // we can compute the value for this specific element.
++    int64_t softmax_index = indices[dim];
++    out_ptr[0] = __expf(input[base_offset + softmax_index * dim_stride] - max_val) * (1.0f / sum);
+ }
+ 
+-// Helper to compute strides from shape (contiguous input assumed for output)
+-// For arbitrary input strides, we pass the actual strides and the dim index.
+ extern "C" void custom_softmax_dim_launcher(
+     const float* input,
+     float* output,
+@@ -140,39 +153,29 @@
+     int64_t total_numel,
+     cudaStream_t stream)
+ {
+-    // Handle negative dim
+     if (dim < 0) dim += ndim;
+-    if (dim < 0 || dim >= ndim) return; // should not happen, binding validates
++    if (dim < 0 || dim >= ndim || total_numel == 0) return;
+ 
+     int64_t dim_size = shape[dim];
+-    if (dim_size == 0) return;
++    int64_t dim_stride = stride[dim];
+ 
+-    int64_t outer_size = 1;
+-    for (int64_t i = 0; i < dim; ++i) outer_size *= shape[i];
+-    int64_t inner_size = 1;
+-    for (int64_t i = dim + 1; i < ndim; ++i) inner_size *= shape[i];
++    // Copy shape and stride to device memory for kernel access.
++    int64_t* d_shape;
++    int64_t* d_stride;
++    cudaMalloc(&d_shape, ndim * sizeof(int64_t));
++    cudaMalloc(&d_stride, ndim * sizeof(int64_t));
++    cudaMemcpyAsync(d_shape, shape, ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
++    cudaMemcpyAsync(d_stride, stride, ndim * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+ 
+-    int64_t stride_outer = (dim > 0) ? stride[dim - 1] : 0;
+-    int64_t stride_dim = stride[dim];
+-    int64_t stride_inner = (dim + 1 < ndim) ? stride[dim + 1] : 1;
+-
+-    // For contiguous output we need to compute positions differently.
+-    // Here we assume output is contiguous with shape given by shape,
+-    // so we need to map output indices accordingly.
+-    // Our kernel writes to out_data[d * inner_size], which assumes
+-    // contiguous layout for the dimensions after dim; but we need to
+-    // account for outer stride as well. However, outer loop iterates over
+-    // outer_size * inner_size combinations, and out_data is set to
+-    // output + outer * dim_size * inner_size + inner, which is correct
+-    // for contiguous output (outer dimensions have stride = dim_size*inner_size,
+-    // then inner has stride 1). This works regardless of input strides.
+-
+-    int total = (int)(outer_size * inner_size);
+     int block = 256;
+-    int grid = (total + block - 1) / block;
++    int grid = (int)((total_numel + block - 1) / block);
+ 
+     softmax_dim_kernel<<<grid, block, 0, stream>>>(
+-        input, output,
+-        (int)outer_size, (int)dim_size, (int)inner_size,
+-        stride_outer, stride_dim, stride_inner);
++        input, output, total_numel, dim_size, dim_stride,
++        0, // unused inner_size placeholder
++        d_shape, d_stride, ndim, dim);
++
++    // Free device memory after kernel completion (assuming stream ordered).
++    cudaFree(d_shape);
++    cudaFree(d_stride);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -42,7 +42,6 @@
+ 
+     TORCH_CHECK(outH > 0 && outW > 0, "custom_upsample_bilinear: scale_factor too small");
+ 
+-    // Allocate contiguous output
+     auto output = torch::empty({N, C, outH, outW}, x.options());
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+@@ -69,17 +68,11 @@
+     int64_t ndim = x.dim();
+     TORCH_CHECK(ndim > 0, "custom_softmax_dim: input must have at least one dimension");
+ 
+-    // Normalize negative dim
+     if (dim < 0) dim += ndim;
+     TORCH_CHECK(dim >= 0 && dim < ndim, "custom_softmax_dim: dim out of range");
+ 
+-    // Allocate contiguous output with same shape
+     auto output = torch::empty_like(x);
+ 
+-    // Prepare shape and stride arrays on host (launcher copies them to device?)
+-    // The launcher signature expects pointers to host or device memory.
+-    // In this binding we pass host pointers; the current launcher only reads them
+-    // on host before kernel launch, so host memory is fine.
+     std::vector<int64_t> shape_vec(ndim);
+     std::vector<int64_t> stride_vec(ndim);
+     for (int64_t i = 0; i < ndim; ++i) {

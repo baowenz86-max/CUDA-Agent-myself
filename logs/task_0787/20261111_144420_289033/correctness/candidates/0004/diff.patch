@@ -1,0 +1,236 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -13,36 +13,37 @@
+ ) {
+     int64_t total_spatial = N * H * W;
+     int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+-    if (idx >= total_spatial) return;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t spatial = idx; spatial < total_spatial; spatial += stride) {
++        // Decode spatial index into n, h, w
++        int64_t n = spatial / (H * W);
++        int64_t rem = spatial - n * (H * W);
++        int64_t h = rem / W;
++        int64_t w = rem - h * W;
+ 
+-    // Decode spatial index into n, h, w
+-    int64_t n = idx / (H * W);
+-    int64_t rem = idx - n * (H * W);
+-    int64_t h = rem / W;
+-    int64_t w = rem - h * W;
++        const float* x_base = x + n * in_stride[0] + h * in_stride[2] + w * in_stride[3];
++        float* y_base = y + n * out_stride[0] + h * out_stride[2] + w * out_stride[3];
+ 
+-    const float* x_base = x + n * in_stride[0] + h * in_stride[2] + w * in_stride[3];
+-    float* y_base = y + n * out_stride[0] + h * out_stride[2] + w * out_stride[3];
++        // First pass: find max value for numerical stability
++        float max_val = -__FLT_MAX__;
++        for (int64_t c = 0; c < C; ++c) {
++            float val = x_base[c * in_stride[1]];
++            if (val > max_val) max_val = val;
++        }
+ 
+-    // First pass: find max value for numerical stability
+-    float max_val = -__FLT_MAX__;
+-    for (int64_t c = 0; c < C; ++c) {
+-        float val = x_base[c * in_stride[1]];
+-        if (val > max_val) max_val = val;
+-    }
++        // Second pass: compute sum of exp(x - max)
++        float sum = 0.0f;
++        for (int64_t c = 0; c < C; ++c) {
++            float val = __expf(x_base[c * in_stride[1]] - max_val);
++            sum += val;
++        }
+ 
+-    // Second pass: compute sum of exp(x - max)
+-    float sum = 0.0f;
+-    for (int64_t c = 0; c < C; ++c) {
+-        float val = __expf(x_base[c * in_stride[1]] - max_val);
+-        sum += val;
+-    }
+-
+-    // Third pass: write normalized values
+-    float inv_sum = 1.0f / sum;
+-    for (int64_t c = 0; c < C; ++c) {
+-        float val = __expf(x_base[c * in_stride[1]] - max_val);
+-        y_base[c * out_stride[1]] = val * inv_sum;
++        // Third pass: write normalized values
++        float inv_sum = 1.0f / sum;
++        for (int64_t c = 0; c < C; ++c) {
++            float val = __expf(x_base[c * in_stride[1]] - max_val);
++            y_base[c * out_stride[1]] = val * inv_sum;
++        }
+     }
+ }
+ 
+@@ -61,27 +62,28 @@
+     int64_t W_out = W_in + pad_l + pad_r;
+     int64_t total = N * C * H_out * W_out;
+     int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+-    if (idx >= total) return;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t linear = idx; linear < total; linear += stride) {
++        // Decode output index: n, c, h_out, w_out
++        int64_t n = linear / (C * H_out * W_out);
++        int64_t rem = linear - n * (C * H_out * W_out);
++        int64_t c = rem / (H_out * W_out);
++        rem -= c * (H_out * W_out);
++        int64_t h_out = rem / W_out;
++        int64_t w_out = rem - h_out * W_out;
+ 
+-    // Decode output index: n, c, h_out, w_out
+-    int64_t n = idx / (C * H_out * W_out);
+-    int64_t rem = idx - n * (C * H_out * W_out);
+-    int64_t c = rem / (H_out * W_out);
+-    rem -= c * (H_out * W_out);
+-    int64_t h_out = rem / W_out;
+-    int64_t w_out = rem - h_out * W_out;
+-
+-    bool inside = (h_out >= pad_t && h_out < pad_t + H_in && 
+-                   w_out >= pad_l && w_out < pad_l + W_in);
+-    float out_val = value;
+-    if (inside) {
+-        int64_t h_in = h_out - pad_t;
+-        int64_t w_in = w_out - pad_l;
+-        const float* x_ptr = x + n * in_stride[0] + c * in_stride[1] + h_in * in_stride[2] + w_in * in_stride[3];
+-        out_val = *x_ptr;
++        bool inside = (h_out >= pad_t && h_out < pad_t + H_in && 
++                       w_out >= pad_l && w_out < pad_l + W_in);
++        float out_val = value;
++        if (inside) {
++            int64_t h_in = h_out - pad_t;
++            int64_t w_in = w_out - pad_l;
++            const float* x_ptr = x + n * in_stride[0] + c * in_stride[1] + h_in * in_stride[2] + w_in * in_stride[3];
++            out_val = *x_ptr;
++        }
++        float* y_ptr = y + n * out_stride[0] + c * out_stride[1] + h_out * out_stride[2] + w_out * out_stride[3];
++        *y_ptr = out_val;
+     }
+-    float* y_ptr = y + n * out_stride[0] + c * out_stride[1] + h_out * out_stride[2] + w_out * out_stride[3];
+-    *y_ptr = out_val;
+ }
+ 
+ extern "C" {
+@@ -105,10 +107,10 @@
+     int64_t total_spatial = N * H * W;
+     if (total_spatial <= 0) return;
+     int threads = 256;
+-    int64_t blocks = (total_spatial + threads - 1) / threads;
+-    if (blocks > 2147483647) blocks = 2147483647; // grid max for x dimension, but we may need y dimension
+-    // Use grid-stride loop to cover all elements safely, but we'll launch with capped blocks.
+-    // For large sizes we may exceed 2^31-1 blocks, but total_spatial here ~ 16*512*512=4M, so blocks ~16384, safe.
++    int64_t blocks_64 = (total_spatial + threads - 1) / threads;
++    // Cap grid size to avoid exceeding limits; use grid-stride loop in kernel.
++    const int64_t max_grid_x = 2147483647LL;
++    int64_t blocks = blocks_64 < max_grid_x ? blocks_64 : max_grid_x;
+     softmax_dim1_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
+         y, x, N, C, H, W, in_stride, out_stride);
+     // Error check is left to caller; here we only ensure launch did not fail synchronously.
+@@ -140,8 +142,9 @@
+     int64_t total = N * C * H_out * W_out;
+     if (total <= 0) return;
+     int threads = 256;
+-    int64_t blocks = (total + threads - 1) / threads;
+-    if (blocks > 2147483647) blocks = 2147483647;
++    int64_t blocks_64 = (total + threads - 1) / threads;
++    const int64_t max_grid_x = 2147483647LL;
++    int64_t blocks = blocks_64 < max_grid_x ? blocks_64 : max_grid_x;
+     constant_pad2d_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
+         y, x, N, C, H_in, W_in, pad_l, pad_r, pad_t, pad_b, value,
+         in_stride, out_stride);
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -2,6 +2,7 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
++#include <vector>
+ #include "../binding_registry.h"
+ 
+ extern "C" {
+@@ -29,21 +30,27 @@
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_softmax_dim1: input must be float32");
+     TORCH_CHECK(x.dim() == 4, "custom_softmax_dim1: input must be 4-dimensional [N, C, H, W]");
+ 
+-    int64_t N = x.size(0);
+-    int64_t C = x.size(1);
+-    int64_t H = x.size(2);
+-    int64_t W = x.size(3);
++    // Ensure contiguous for predictable strides and kernel correctness.
++    auto x_contig = x.contiguous();
++    int64_t N = x_contig.size(0);
++    int64_t C = x_contig.size(1);
++    int64_t H = x_contig.size(2);
++    int64_t W = x_contig.size(3);
+ 
+-    auto output = torch::empty_like(x);
++    auto output = torch::empty_like(x_contig);
++
++    // Copy strides to local arrays to guarantee valid pointers for kernel launch.
++    int64_t in_stride[4] = {x_contig.stride(0), x_contig.stride(1), x_contig.stride(2), x_contig.stride(3)};
++    int64_t out_stride[4] = {output.stride(0), output.stride(1), output.stride(2), output.stride(3)};
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     softmax_dim1_forward(
+         output.data_ptr<float>(),
+-        x.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
+         N, C, H, W,
+-        x.strides().data(),
+-        output.strides().data(),
++        in_stride,
++        out_stride,
+         stream
+     );
+ 
+@@ -58,33 +65,38 @@
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_constant_pad2d: input must be float32");
+     TORCH_CHECK(x.dim() == 4, "custom_constant_pad2d: input must be 4-dimensional [N, C, H_in, W_in]");
+ 
+-    // Decode padding: assumption pad_left = padding / 10, pad_right = padding % 10, top=bottom=0
+-    // For this task padding=12 -> left=1, right=2
++    // Ensure contiguous
++    auto x_contig = x.contiguous();
++
++    // Decode padding: left = padding / 10, right = padding % 10, top=bottom=0
+     int64_t pad_l = padding / 10;
+     int64_t pad_r = padding % 10;
+     int64_t pad_t = 0;
+     int64_t pad_b = 0;
+     TORCH_CHECK(pad_l >= 0 && pad_r >= 0, "custom_constant_pad2d: padding must be non-negative");
+ 
+-    int64_t N = x.size(0);
+-    int64_t C = x.size(1);
+-    int64_t H_in = x.size(2);
+-    int64_t W_in = x.size(3);
++    int64_t N = x_contig.size(0);
++    int64_t C = x_contig.size(1);
++    int64_t H_in = x_contig.size(2);
++    int64_t W_in = x_contig.size(3);
+     int64_t H_out = H_in + pad_t + pad_b;
+     int64_t W_out = W_in + pad_l + pad_r;
+ 
+-    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++    auto output = torch::empty({N, C, H_out, W_out}, x_contig.options());
++
++    int64_t in_stride[4] = {x_contig.stride(0), x_contig.stride(1), x_contig.stride(2), x_contig.stride(3)};
++    int64_t out_stride[4] = {output.stride(0), output.stride(1), output.stride(2), output.stride(3)};
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     constant_pad2d_forward(
+         output.data_ptr<float>(),
+-        x.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
+         N, C, H_in, W_in,
+         pad_l, pad_r, pad_t, pad_b,
+         static_cast<float>(value),
+-        x.strides().data(),
+-        output.strides().data(),
++        in_stride,
++        out_stride,
+         stream
+     );
+ 

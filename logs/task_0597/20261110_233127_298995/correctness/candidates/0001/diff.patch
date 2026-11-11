@@ -1,0 +1,159 @@
+--- before/kernels/channel_shuffle_binding.cpp
++++ after/kernels/channel_shuffle_binding.cpp
+@@ -0,0 +1,68 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare the launcher from custom_ops.cu
++extern "C" void channel_shuffle_launcher(
++    float* output,
++    const float* input,
++    int N,
++    int C,
++    int H,
++    int W,
++    int groups,
++    cudaStream_t stream);
++
++// PyTorch wrapper for channel shuffle forward
++torch::Tensor channel_shuffle_forward(torch::Tensor x, int64_t groups) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++    TORCH_CHECK(groups > 0, "groups must be positive");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    TORCH_CHECK(C % groups == 0, "C must be divisible by groups");
++
++    // Allocate output tensor of same shape
++    auto output = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call the launcher
++    channel_shuffle_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(groups),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "Kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_channel_shuffle(pybind11::module& m) {
++    m.def("channel_shuffle_forward", &channel_shuffle_forward,
++          "Channel shuffle forward",
++          py::arg("x"),
++          py::arg("groups"));
++}
++
++// Auto-register
++REGISTER_BINDING(channel_shuffle, register_channel_shuffle);
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,65 @@
++#include <cuda_runtime.h>
++
++// Channel shuffle kernel: output[n,c,h,w] = input[n, perm(c), h, w]
++// where perm(c) = (c % groups) * (C / groups) + (c / groups)
++// Input and output are contiguous NCHW tensors.
++__global__ void channel_shuffle_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int total_elements,
++    int C,
++    int HW,
++    int groups)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    int channels_per_group = C / groups;
++
++    for (int i = idx; i < total_elements; i += stride) {
++        // Decompose flattened index into n, c, hw
++        int hw = i % HW;
++        int c = (i / HW) % C;
++        int n = i / (HW * C);
++
++        // Source channel index
++        int src_c = (c % groups) * channels_per_group + (c / groups);
++
++        // Source flattened index
++        int src_idx = ((n * C + src_c) * HW) + hw;
++
++        output[i] = input[src_idx];
++    }
++}
++
++extern "C" void channel_shuffle_launcher(
++    float* output,
++    const float* input,
++    int N,
++    int C,
++    int H,
++    int W,
++    int groups,
++    cudaStream_t stream)
++{
++    if (N <= 0 || C <= 0 || H <= 0 || W <= 0 || groups <= 0) {
++        return;
++    }
++
++    int HW = H * W;
++    long long total_elements_ll = 1LL * N * C * HW;
++    if (total_elements_ll <= 0) {
++        return;
++    }
++
++    // Use int for indexing; total elements for contract is 268435456 < INT_MAX, but we guard generally.
++    // If total elements may exceed INT_MAX, we would need 64-bit indexing; but for this task it's within int.
++    int total_elements = static_cast<int>(total_elements_ll);
++
++    int block_size = 256;
++    // Calculate grid size capped at 65535 (max grid x dimension for simplicity); use grid-stride loop.
++    int grid_size = (total_elements + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++
++    channel_shuffle_kernel<<<grid_size, block_size, 0, stream>>>(
++        output, input, total_elements, C, HW, groups);
++}
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,17 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, groups: int):
++        super().__init__()
++        self.groups = groups
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.channel_shuffle_forward(x, self.groups)
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        out = cuda_extension.channel_shuffle_forward(x, self.groups)
++        yield 'step_001', out

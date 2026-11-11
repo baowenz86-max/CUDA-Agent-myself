@@ -1,0 +1,207 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,87 @@
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// Kernel: compute max over channel dimension (dim=1)
++// input: [B, C, H, W], output values: [B, H, W] float, indices: [B, H, W] int64
++// Each thread handles one (b, h, w) position and loops over C.
++__global__ void max_dim1_kernel(
++    float* __restrict__ values,
++    int64_t* __restrict__ indices,
++    const float* __restrict__ input,
++    int B, int C, int H, int W) {
++    int total = B * H * W;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total) return;
++
++    int w = idx % W;
++    int h = (idx / W) % H;
++    int b = idx / (W * H);
++
++    const float* base = input + ((long long)b * C * H + (long long)h) * W + w;
++    float max_val = -3.402823466e+38F; // -FLT_MAX
++    int64_t max_idx = 0;
++
++    for (int c = 0; c < C; ++c) {
++        float val = base[(long long)c * H * W];
++        if (val > max_val) {
++            max_val = val;
++            max_idx = c;
++        }
++    }
++
++    values[idx] = max_val;
++    indices[idx] = max_idx;
++}
++
++// Kernel: stack input twice along new dim=1
++// output shape: [B, 2, C, H, W], each block copies a contiguous chunk.
++// We use a 1D grid over total output elements.
++__global__ void stack_dim1_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int B, int C, int H, int W) {
++    long long total = (long long)B * 2LL * C * H * W;
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total) return;
++
++    int w = idx % W;
++    long long tmp = idx / W;
++    int h = tmp % H;
++    tmp /= H;
++    int c = tmp % C;
++    tmp /= C;
++    int s = tmp % 2; // which copy (0 or 1)
++    int b = tmp / 2;
++
++    // input index: same b, c, h, w
++    long long input_idx = ((long long)b * C * H + (long long)c * H + h) * W + w;
++    output[idx] = input[input_idx];
++}
++
++// Host launchers (extern "C")
++extern "C" void custom_max_dim1_launcher(
++    float* values,
++    int64_t* indices,
++    const float* input,
++    int B, int C, int H, int W,
++    cudaStream_t stream) {
++    int total = B * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    max_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        values, indices, input, B, C, H, W);
++}
++
++extern "C" void custom_stack_dim1_launcher(
++    float* output,
++    const float* input,
++    int B, int C, int H, int W,
++    cudaStream_t stream) {
++    long long total = (long long)B * 2LL * C * H * W;
++    int threads = 256;
++    long long blocks_ll = (total + threads - 1) / threads;
++    // Grid dimension limited to 2^31-1, but our total may be ~536M, blocks ~2.1M, fine.
++    int blocks = (int)blocks_ll;
++    stack_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, B, C, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,90 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++extern "C" void custom_max_dim1_launcher(
++    float* values,
++    int64_t* indices,
++    const float* input,
++    int B, int C, int H, int W,
++    cudaStream_t stream);
++
++extern "C" void custom_stack_dim1_launcher(
++    float* output,
++    const float* input,
++    int B, int C, int H, int W,
++    cudaStream_t stream);
++
++static pybind11::object make_max_return_type(pybind11::object values, pybind11::object indices) {
++    pybind11::module torch = pybind11::module::import("torch");
++    pybind11::object return_types = torch.attr("return_types");
++    pybind11::object max_type = return_types.attr("max");
++    return max_type(values, indices);
++}
++
++torch::Tensor custom_max_dim1(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D [B,C,H,W]");
++
++    auto x_contig = x.contiguous();
++    int B = x_contig.size(0);
++    int C = x_contig.size(1);
++    int H = x_contig.size(2);
++    int W = x_contig.size(3);
++
++    auto values = torch::empty({B, H, W}, x_contig.options());
++    auto indices = torch::empty({B, H, W}, x_contig.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_max_dim1_launcher(
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        x_contig.data_ptr<float>(),
++        B, C, H, W,
++        stream);
++
++    // Construct torch.return_types.max
++    pybind11::object values_obj = pybind11::reinterpret_borrow<pybind11::object>(
++        pybind11::detail::type_caster<torch::Tensor>::cast(values, pybind11::return_value_policy::automatic, pybind11::handle())
++    );
++    pybind11::object indices_obj = pybind11::reinterpret_borrow<pybind11::object>(
++        pybind11::detail::type_caster<torch::Tensor>::cast(indices, pybind11::return_value_policy::automatic, pybind11::handle())
++    );
++    pybind11::object result = make_max_return_type(values_obj, indices_obj);
++    return result.cast<torch::Tensor>();
++}
++
++torch::Tensor custom_stack_dim1(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D [B,C,H,W]");
++
++    auto x_contig = x.contiguous();
++    int B = x_contig.size(0);
++    int C = x_contig.size(1);
++    int H = x_contig.size(2);
++    int W = x_contig.size(3);
++
++    auto output = torch::empty({B, 2, C, H, W}, x_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_stack_dim1_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        B, C, H, W,
++        stream);
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_max_dim1", &custom_max_dim1, "Computes torch.max(x, dim=1)",
++          py::arg("x"));
++    m.def("custom_stack_dim1", &custom_stack_dim1, "Computes torch.stack((x,x), dim=1)",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        x_max_result = cuda_extension.custom_max_dim1(x)
++        x_max, _ = x_max_result
++        x_stacked = cuda_extension.custom_stack_dim1(x)
++        return x_max, x_stacked
++
++    def debug_forward(self, x):
++        x_max_result = cuda_extension.custom_max_dim1(x)
++        yield 'step_001', x_max_result
++        x_stacked = cuda_extension.custom_stack_dim1(x)
++        yield 'step_002', x_stacked
++        yield 'step_003', (x_max_result.values, x_stacked)

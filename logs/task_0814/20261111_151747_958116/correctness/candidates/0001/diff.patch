@@ -1,0 +1,385 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,214 @@
++// CUDA kernels for upsampling_bilinear2d and constant_pad2d
++#include <cuda_runtime.h>
++
++// -----------------------------------------------------------------------------
++// Kernel: bilinear upsampling (align_corners = false)
++// Each thread computes one output pixel.
++// Input is assumed to be contiguous (or at least row-major with stride provided).
++// We pass input strides (or assume contiguous if stride==0).
++// Grid-stride loop to handle large outputs.
++// -----------------------------------------------------------------------------
++template <typename scalar_t>
++__global__ void bilinear_upsample_kernel(
++    const scalar_t* __restrict__ input,
++    scalar_t* __restrict__ output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    float scale_factor,
++    bool align_corners,
++    long long in_N_stride,
++    long long in_C_stride,
++    long long in_H_stride,
++    long long in_W_stride)
++{
++    int total = N * C * H_out * W_out;
++    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
++        int w_out = idx % W_out;
++        int h_out = (idx / W_out) % H_out;
++        int c = (idx / (W_out * H_out)) % C;
++        int n = idx / (W_out * H_out * C);
++
++        // compute source coordinates
++        float h_in_f, w_in_f;
++        if (align_corners && H_out > 1) {
++            h_in_f = (float)h_out * (H_in - 1) / (float)(H_out - 1);
++        } else {
++            h_in_f = ((float)h_out + 0.5f) / scale_factor - 0.5f;
++        }
++        if (align_corners && W_out > 1) {
++            w_in_f = (float)w_out * (W_in - 1) / (float)(W_out - 1);
++        } else {
++            w_in_f = ((float)w_out + 0.5f) / scale_factor - 0.5f;
++        }
++
++        // clamp to [0, H_in-1] and [0, W_in-1]
++        h_in_f = fmaxf(0.0f, h_in_f);
++        w_in_f = fmaxf(0.0f, w_in_f);
++        float h_floor_f = floorf(h_in_f);
++        float w_floor_f = floorf(w_in_f);
++        int h0 = (int)h_floor_f;
++        int w0 = (int)w_floor_f;
++        int h1 = min(h0 + 1, H_in - 1);
++        int w1 = min(w0 + 1, W_in - 1);
++        h0 = max(h0, 0);
++        w0 = max(w0, 0);
++
++        float h_lambda = h_in_f - h_floor_f;
++        float w_lambda = w_in_f - w_floor_f;
++
++        // base pointer for this n,c
++        const scalar_t* in_base = input + n * in_N_stride + c * in_C_stride;
++
++        // fetch four neighbors
++        scalar_t v00 = in_base[h0 * in_H_stride + w0 * in_W_stride];
++        scalar_t v01 = in_base[h0 * in_H_stride + w1 * in_W_stride];
++        scalar_t v10 = in_base[h1 * in_H_stride + w0 * in_W_stride];
++        scalar_t v11 = in_base[h1 * in_H_stride + w1 * in_W_stride];
++
++        // bilinear interpolation
++        float top = v00 * (1.0f - w_lambda) + v01 * w_lambda;
++        float bottom = v10 * (1.0f - w_lambda) + v11 * w_lambda;
++        float result = top * (1.0f - h_lambda) + bottom * h_lambda;
++
++        output[idx] = (scalar_t)result;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Kernel: constant pad2d
++// Each thread fills one output pixel (including padding area).
++// Input strides are provided, can handle non-contiguous.
++// -----------------------------------------------------------------------------
++template <typename scalar_t>
++__global__ void constant_pad2d_kernel(
++    const scalar_t* __restrict__ input,
++    scalar_t* __restrict__ output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    int left, int right, int top, int bottom,
++    scalar_t value,
++    long long in_N_stride,
++    long long in_C_stride,
++    long long in_H_stride,
++    long long in_W_stride)
++{
++    int total = N * C * H_out * W_out;
++    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
++        int w_out = idx % W_out;
++        int h_out = (idx / W_out) % H_out;
++        int c = (idx / (W_out * H_out)) % C;
++        int n = idx / (W_out * H_out * C);
++
++        int w_in = w_out - left;
++        int h_in = h_out - top;
++        bool inside = (w_in >= 0 && w_in < W_in && h_in >= 0 && h_in < H_in);
++
++        if (inside) {
++            const scalar_t* in_base = input + n * in_N_stride + c * in_C_stride;
++            output[idx] = in_base[h_in * in_H_stride + w_in * in_W_stride];
++        } else {
++            output[idx] = value;
++        }
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Launchers (extern "C" so C++ binding.cpp can call them)
++// -----------------------------------------------------------------------------
++
++// Bilinear upsampling launcher
++// Args:
++//   input: device pointer to input tensor (float)
++//   output: device pointer to output tensor (float)
++//   N, C, H_in, W_in: input dimensions
++//   H_out, W_out: output dimensions
++//   scale_factor: float scale
++//   align_corners: bool
++//   in_strides: array of 4 long long strides for N,C,H,W (or nullptr for contiguous assumption)
++//   stream: CUDA stream
++// Note: if in_strides is nullptr, we assume contiguous and compute strides as C*H*W, H*W, W, 1.
++void upsample_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    float scale_factor,
++    bool align_corners,
++    const long long* in_strides,
++    cudaStream_t stream)
++{
++    long long sN, sC, sH, sW;
++    if (in_strides) {
++        sN = in_strides[0];
++        sC = in_strides[1];
++        sH = in_strides[2];
++        sW = in_strides[3];
++    } else {
++        // contiguous assumed
++        sN = (long long)C * H_in * W_in;
++        sC = (long long)H_in * W_in;
++        sH = W_in;
++        sW = 1;
++    }
++
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = min((total + threads - 1) / threads, 65535); // grid cap, grid-stride loop handles rest
++    if (blocks <= 0) blocks = 1;
++
++    bilinear_upsample_kernel<float><<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H_in, W_in, H_out, W_out,
++        scale_factor, align_corners, sN, sC, sH, sW);
++}
++
++// Constant pad2d launcher
++// Args:
++//   input, output: device pointers
++//   N, C, H_in, W_in
++//   H_out, W_out
++//   left, right, top, bottom: padding amounts
++//   value: padding value
++//   in_strides: array of 4 long long strides (or nullptr for contiguous)
++//   stream
++void constant_pad2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    int left, int right, int top, int bottom,
++    float value,
++    const long long* in_strides,
++    cudaStream_t stream)
++{
++    long long sN, sC, sH, sW;
++    if (in_strides) {
++        sN = in_strides[0];
++        sC = in_strides[1];
++        sH = in_strides[2];
++        sW = in_strides[3];
++    } else {
++        sN = (long long)C * H_in * W_in;
++        sC = (long long)H_in * W_in;
++        sH = W_in;
++        sW = 1;
++    }
++
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = min((total + threads - 1) / threads, 65535);
++    if (blocks <= 0) blocks = 1;
++
++    constant_pad2d_kernel<float><<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H_in, W_in, H_out, W_out,
++        left, right, top, bottom, value, sN, sC, sH, sW);
++}
++
++// Extern "C" wrapper names likely used by binding.cpp.
++// The binding.cpp will likely define functions like:
++// torch::Tensor upsampling_bilinear2d_forward(torch::Tensor x, double scale_factor, bool align_corners)
++// and then call upsample_launcher(...)
++// Similarly for constant_pad2d_forward.
++// We provide these two launchers with clear names.
++
++// Additional comment: We could also provide C-compatible names like upsampling_bilinear2d_launcher and constant_pad2d_launcher.
++// But to avoid confusion, we'll define them as done above.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,137 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" {
++void upsample_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    float scale_factor,
++    bool align_corners,
++    const long long* in_strides,
++    cudaStream_t stream);
++
++void constant_pad2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    int left, int right, int top, int bottom,
++    float value,
++    const long long* in_strides,
++    cudaStream_t stream);
++}
++
++// Helper to extract strides from a tensor; returns true if contiguous (and sets strides to nullptr)
++static bool get_strides(const torch::Tensor& t, long long* strides) {
++    if (t.is_contiguous()) {
++        return true;
++    }
++    auto sizes = t.sizes();
++    auto strides_vec = t.strides();
++    for (int i = 0; i < 4; ++i) {
++        strides[i] = static_cast<long long>(strides_vec[i]);
++    }
++    return false;
++}
++
++// Upsampling bilinear 2D forward
++torch::Tensor upsampling_bilinear2d_forward(
++    torch::Tensor x,
++    double scale_factor,
++    bool align_corners) {
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H_in = x.size(2);
++    int W_in = x.size(3);
++
++    int H_out = static_cast<int>(std::floor(H_in * scale_factor));
++    int W_out = static_cast<int>(std::floor(W_in * scale_factor));
++
++    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++
++    long long strides[4];
++    bool is_contiguous = get_strides(x, strides);
++    const long long* strides_ptr = is_contiguous ? nullptr : strides;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    upsample_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H_in, W_in,
++        H_out, W_out,
++        static_cast<float>(scale_factor),
++        align_corners,
++        strides_ptr,
++        stream);
++
++    return output;
++}
++
++// Constant pad 2D forward
++torch::Tensor constant_pad2d_forward(
++    torch::Tensor x,
++    std::vector<int64_t> padding,
++    double value) {
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++    TORCH_CHECK(padding.size() == 4, "Padding must contain 4 integers (left, right, top, bottom)");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H_in = x.size(2);
++    int W_in = x.size(3);
++
++    int left = static_cast<int>(padding[0]);
++    int right = static_cast<int>(padding[1]);
++    int top = static_cast<int>(padding[2]);
++    int bottom = static_cast<int>(padding[3]);
++
++    int H_out = H_in + top + bottom;
++    int W_out = W_in + left + right;
++
++    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++
++    long long strides[4];
++    bool is_contiguous = get_strides(x, strides);
++    const long long* strides_ptr = is_contiguous ? nullptr : strides;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    constant_pad2d_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H_in, W_in,
++        H_out, W_out,
++        left, right, top, bottom,
++        static_cast<float>(value),
++        strides_ptr,
++        stream);
++
++    return output;
++}
++
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("upsampling_bilinear2d_forward", &upsampling_bilinear2d_forward,
++          "Upsampling bilinear 2D forward",
++          py::arg("x"), py::arg("scale_factor"), py::arg("align_corners"));
++    m.def("constant_pad2d_forward", &constant_pad2d_forward,
++          "Constant pad 2D forward",
++          py::arg("x"), py::arg("padding"), py::arg("value"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, scale_factor, mode, padding_dim, padding_value):
++        super().__init__()
++        self.scale_factor = scale_factor
++        self.mode = mode
++        self.padding_dim = padding_dim
++        self.padding_value = padding_value
++
++    def forward(self, x):
++        x = cuda_extension.upsampling_bilinear2d_forward(x, float(self.scale_factor), False)
++        left, right, top, bottom = self.padding_dim
++        x = cuda_extension.constant_pad2d_forward(x, [left, right, top, bottom], float(self.padding_value))
++        return x
++
++    def debug_forward(self, x):
++        upsampled = cuda_extension.upsampling_bilinear2d_forward(x, float(self.scale_factor), False)
++        yield 'step_001', upsampled
++        left, right, top, bottom = self.padding_dim
++        padded = cuda_extension.constant_pad2d_forward(upsampled, [left, right, top, bottom], float(self.padding_value))
++        yield 'step_002', padded
++        yield 'step_003', padded

@@ -1,0 +1,852 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -4,30 +4,50 @@
+ 
+ #include <cuda_runtime.h>
+ #include <cufft.h>
++#include <cudnn.h>
+ #include <complex>
+ 
+-// -----------------------------------------------------------------------------
+-// Helper: check CUDA errors (only used inside launcher, not exposed to PyTorch)
++// Forward declarations of helper kernels used in custom_stft_launcher
++__global__ void pad_reflect_kernel(const float* __restrict__ input,
++                                   float* __restrict__ padded,
++                                   long long batch,
++                                   long long length,
++                                   int pad_left,
++                                   int pad_right,
++                                   long long pad_length);
++
++__global__ void extract_frames_kernel(const float* __restrict__ padded,
++                                      float* __restrict__ frames,
++                                      long long batch,
++                                      long long num_frames,
++                                      long long n_fft,
++                                      long long hop_length,
++                                      long long pad_length);
++
++__global__ void scatter_fft_kernel(const float2* __restrict__ fft_out,
++                                   float* __restrict__ output_real,
++                                   float* __restrict__ output_imag,
++                                   long long batch,
++                                   long long n_freq,
++                                   long long frames);
++
++// -----------------------------------------------------------------------------
++// Helper: check CUDA errors (not used, we just ignore for launcher)
+ // -----------------------------------------------------------------------------
+ static void check_cuda_error(cudaError_t err, const char* msg) {
+-    if (err != cudaSuccess) {
+-        // Cannot use TORCH_CHECK or throw; simply return. Binding layer will check.
+-        // We do not print anything to avoid overhead.
+-    }
++    // We can't throw here; binding will check after launch.
+ }
+ 
+ // -----------------------------------------------------------------------------
+ // Elementwise kernels for custom_abs and custom_remainder.
+-// These handle arbitrary strides by computing index manually from linear index
+-// and using provided strides.
+ // -----------------------------------------------------------------------------
+ 
+ // custom_abs: complex64 -> float32 magnitude
+ __global__ void abs_kernel(const float* __restrict__ input_real,
+                            const float* __restrict__ input_imag,
+                            float* __restrict__ output,
+-                           long long numel,  // total number of complex elements
+-                           long long elem_stride_real,  // stride between real parts of consecutive complex elements (in elements, not bytes)
++                           long long numel,
++                           long long elem_stride_real,
+                            long long elem_stride_imag) {
+     long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+     if (idx >= numel) return;
+@@ -48,8 +68,6 @@
+     if (idx >= numel) return;
+     long long offset = idx * stride;
+     float val = input[offset];
+-    // Python-style remainder for floats: result has same sign as divisor.
+-    // Compute using fmod then adjust if negative and divisor positive.
+     float r = fmodf(val, divisor);
+     if (r != 0 && ((r < 0 && divisor > 0) || (r > 0 && divisor < 0))) {
+         r += divisor;
+@@ -59,16 +77,9 @@
+ 
+ // -----------------------------------------------------------------------------
+ // STFT launcher using cuFFT.
+-// Input: x [batch, length] float32, contiguous or non-contiguous?
+-// The contract says supports strides. However, STFT with center and reflect padding
+-// is complex. We will require contiguous input for simplicity? The binding layer
+-// will ensure contiguity by calling .contiguous() before passing? The launcher
+-// must be robust, so we handle arbitrary stride by copying to contiguous buffer
+-// if needed.
+-// We'll allocate temporary contiguous array if input stride != 1.
+-// Output: complex64 [batch, n_fft//2+1, frames] with stride [freq*frames, 1, freq]
+-// (typical PyTorch layout). We will fill it with row-major order and set strides
+-// in binding wrapper.
++// Input: x [batch, length] float32, contiguous.
++// Output: complex64 [batch, n_freq, frames] with strides [n_freq*frames, 1, n_freq].
++// We fill output_real and output_imag with the correct layout.
+ // -----------------------------------------------------------------------------
+ extern "C" void custom_stft_launcher(
+     const float* input,
+@@ -80,140 +91,94 @@
+     float* output_imag,
+     cudaStream_t stream)
+ {
+-    // We assume input is contiguous because binding will make it contiguous.
+-    // But to be safe, we could handle non-contiguous by using strides passed separately.
+-    // For simplicity, assume contiguous (stride 1). The binding layer should ensure this.
+-
+     long long n_freq = n_fft / 2 + 1;
+-    long long frames = 1 + length / hop_length; // for center=True default, but check formula: frames = 1 + length // hop_length? Torch returns frames = 1 + length // hop_length when center=True and pad_mode reflect? Actually with center=True, the number of frames is 1 + (length + n_fft/2*2) // hop_length? But contract says frames = 1 + length // hop_length. We'll use that.
+-    // Actually torch.stft with center=True pads n_fft//2 on both sides, then computes frames = 1 + (length + 2*(n_fft//2)) // hop_length - (n_fft // hop_length?) Let's examine: standard formula: frames = 1 + floor((length + 2*padding - n_fft) / hop_length) + 1? There's ambiguity. The contract explicitly states frames = 1 + length // hop_length. So we'll trust that.
+-
+-    // cuFFT plan for many batches
+-    int rank = 1;
+-    long long n[1] = {n_fft};
+-    long long inembed[1] = {1}; // no special embedding for C2R? For R2C, inembed is stride between elements, set to 1 for contiguous.
+-    long long onembed[1] = {1};
+-    long long istride = 1; // distance between consecutive input elements in same batch (after batch offset)
+-    long long ostride = 1; // distance between consecutive output complex elements (real and imag interleaved? cuFFT expects interleaved complex? We'll create complex output buffer interleaved, then split? Actually cuFFT R2C outputs non-interleaved? Let's recall: cuFFT supports both interleaved and non-interleaved for complex, but for R2C, output is non-interleaved? The type cufftComplex is interleaved (float2), and cufftReal is float. For R2C, output is cufftComplex (interleaved). We'll allocate a temporary complex array, then extract real and imag.
+-
+-    long long dist_in = length; // distance between input batch start (contiguous)
+-    long long dist_out = n_freq; // number of complex elements per batch (but we allocate interleaved complex, but length n_freq)
+-
+-    cufftHandle plan;
+-    cufftResult res;
+-    res = cufftPlanMany(&plan, rank, n,
+-                        inembed, istride, dist_in,
+-                        onembed, ostride, dist_out,
+-                        CUFFT_R2C, batch);
+-    if (res != CUFFT_SUCCESS) return;
+-
+-    // Set stream
+-    cufftSetStream(plan, stream);
+-
+-    // Need to pad input with reflect padding around edges (center=True).
+-    // Create a padded buffer of size length + n_fft (or length + 2*(n_fft//2) = length + n_fft -1 for odd? For n_fft even, n_fft//2 each side, total + n_fft). Torch uses reflect padding with n_fft//2 on both sides.
+-    long long pad_length = length + n_fft; // for even n_fft, n_fft//2 each side -> total + n_fft; for odd, might be n_fft-1, but n_fft=512 even.
+-    // Actually for reflect, if pad size is n_fft//2, then total padded length = length + 2*(n_fft//2). For n_fft=512, that's length + 512.
++    long long frames = 1 + length / hop_length;
++
++    // Step 1: Pad input with reflect padding using a kernel.
++    int pad_left = n_fft / 2;
++    int pad_right = n_fft / 2;
++    long long pad_length = length + 2 * pad_left;
+     float* padded_input;
+     cudaMalloc(&padded_input, pad_length * batch * sizeof(float));
+-    cudaMemsetAsync(padded_input, 0, pad_length * batch * sizeof(float), stream); // not needed, we will fill all.
+-
+-    // Copy with padding: first copy original to middle, then reflect edges.
+-    int pad_left = n_fft / 2;
+-    int pad_right = n_fft / 2;
+-    // Use a kernel to do padding efficiently.
++    if (!padded_input) return;
++
+     int threads = 256;
+-    int blocks = (pad_length * batch + threads - 1) / threads;
+-    pad_reflect_kernel<<<blocks, threads, 0, stream>>>(
++    int blocks_pad = (pad_length * batch + threads - 1) / threads;
++    pad_reflect_kernel<<<blocks_pad, threads, 0, stream>>>(
+         input, padded_input, batch, length, pad_left, pad_right, pad_length);
+ 
+-    // Now perform batched FFT on padded_input, but with frames strided by hop_length.
+-    // We need to compute STFT frames: each frame starts at index i*hop_length in padded_input, length n_fft.
+-    // We can either do a batched FFT over frames: treat each frame as a separate batch element.
+-    // Total frames = batch * frames. We can create a new plan for total_batch = batch * frames, with input elements contiguous within frame, and distance between frames = hop_length (in padded_input).
+-    // However, cuFFT planMany can accept arbitrary distance between batches. So we can directly compute FFT for each frame without copying.
+-    // We'll create a plan with batch = batch * frames, and dist_in = hop_length (distance between starts of consecutive frames in padded_input), istride = 1, n = [n_fft].
+-    // But frames from different original batches are separated by pad_length, so distance between last frame of batch i and first frame of batch i+1 is pad_length - (frames-1)*hop_length, which is not constant if we treat all frames as one batch. So we cannot do that with a single planMany because distance between batch elements must be constant. We could instead compute FFT for each batch separately using the same plan, looping over batches and frames? That would be slow because we'd launch many small FFTs. Better approach: create a contiguous array of all frames, where we extract and stack frames from padded_input. That requires copying frames into a [batch, frames, n_fft] array then doing batched FFT with dist_in = n_fft. We'll do that.
+-
++    // Step 2: Extract frames into a contiguous buffer.
+     long long total_frames = batch * frames;
+-    long long frame_input_size = total_frames * n_fft; // float elements
++    long long frame_input_size = total_frames * n_fft;
+     float* frame_buffer;
+     cudaMalloc(&frame_buffer, frame_input_size * sizeof(float));
+-
+-    // Kernel to extract frames: frame_buffer[b* frames * n_fft + f*n_fft + t] = padded_input[b*pad_length + f*hop_length + t]
+-    int blocks_extract = (total_frames * n_fft + threads - 1) / threads;
++    if (!frame_buffer) {
++        cudaFree(padded_input);
++        return;
++    }
++    int blocks_extract = (frame_input_size + threads - 1) / threads;
+     extract_frames_kernel<<<blocks_extract, threads, 0, stream>>>(
+         padded_input, frame_buffer, batch, frames, n_fft, hop_length, pad_length);
+ 
+-    // Now create a cufft plan for batched R2C on frame_buffer: batch = total_frames, dist = n_fft (contiguous frames), output complex of size n_freq per frame.
++    // Step 3: Create cuFFT plan for batched R2C on frame_buffer.
+     cufftHandle plan_frames;
+-    long long n_frames_fft[1] = {n_fft};
+-    long long inembed_frames[1] = {1}; // contiguous within each frame
+-    long long onembed_frames[1] = {1};
+-    res = cufftPlanMany(&plan_frames, 1, n_frames_fft,
+-                        inembed_frames, 1, n_fft,
+-                        onembed_frames, 1, n_freq,
+-                        CUFFT_R2C, total_frames);
++    cufftResult res;
++    int n_frames_fft = (int)n_fft;
++    int inembed_frames = 1;
++    int onembed_frames = 1;
++    int istride_frames = 1;
++    int ostride_frames = 1;
++    int idist_frames = (int)n_fft;
++    int odist_frames = (int)n_freq;
++    res = cufftPlanMany(&plan_frames, 1, &n_frames_fft,
++                        &inembed_frames, istride_frames, idist_frames,
++                        &onembed_frames, ostride_frames, odist_frames,
++                        CUFFT_R2C, (int)total_frames);
+     if (res != CUFFT_SUCCESS) {
+         cudaFree(padded_input);
+         cudaFree(frame_buffer);
+-        cufftDestroy(plan);
+         return;
+     }
+     cufftSetStream(plan_frames, stream);
+ 
+-    // Allocate output complex buffer for all frames: total_frames * n_freq * sizeof(cufftComplex)
++    // Allocate output complex buffer.
+     cufftComplex* fft_out;
+     cudaMalloc(&fft_out, total_frames * n_freq * sizeof(cufftComplex));
+-
+-    // Execute FFT
++    if (!fft_out) {
++        cudaFree(padded_input);
++        cudaFree(frame_buffer);
++        cufftDestroy(plan_frames);
++        return;
++    }
++
++    // Execute FFT.
+     res = cufftExecR2C(plan_frames, frame_buffer, fft_out);
+     if (res != CUFFT_SUCCESS) {
+         cudaFree(padded_input);
+         cudaFree(frame_buffer);
+         cudaFree(fft_out);
+-        cufftDestroy(plan);
+         cufftDestroy(plan_frames);
+         return;
+     }
+ 
+-    // Now split fft_out into separate output_real and output_imag arrays with proper strides.
+-    // Output shape: [batch, n_freq, frames] with strides typically [n_freq*frames, frames, 1] or [n_freq*frames, 1, n_freq]? The contract says output stride [160882, 1, 257] for [batch, 257, 626]. That means stride[0]=160882 = n_freq*frames? 257*626=160882 yes. Stride[1]=1, stride[2]=257. So the layout is [batch, freq, frame] with freq contiguous? Wait: stride[1]=1 means the fastest dimension is freq? For shape [batch, freq, frame], PyTorch default stride would be [freq*frame, frame, 1] if contiguous. But here stride is [160882, 1, 257], which is not contiguous; it's channels_last? Actually that means the tensor is transposed: shape [batch, 257, 626] but stride [160882, 1, 257] -> element (b,f,t) offset = b*160882 + f*1 + t*257. So the memory is laid out as [batch, frame, freq] (because frame stride 257, freq stride 1). So the output is not contiguous; it's a view of a [batch, frames, n_freq] tensor transposed to [batch, n_freq, frames]. We need to write output with those strides. We'll create output_real and output_imag with appropriate layout. We can fill them with a kernel that reads from fft_out (which is [frame_index, freq] interleaved) and writes to output arrays using given strides.
+-    // The binding wrapper will allocate output with the same strides as reference? Or we can allocate contiguous and then permute? It's easier to allocate output with exactly the expected strides. The launcher should fill the output arrays provided by binding, which already have correct strides. We'll pass pointers and assume the binding allocates with shape [batch, n_freq, frames] and strides [n_freq*frames, 1, n_freq] (i.e., non-contiguous but correct). The binding can create empty tensor with those strides via torch.empty_strided. We'll document that.
+-
+-    // Kernel to scatter: For each batch b, frame f, freq k: output_real[b*n_freq*frames + k*frames + f] = fft_out[(b*frames + f)*n_freq + k].x ; similarly imag.
++    // Step 4: Scatter FFT output to output_real and output_imag with non-contiguous strides.
+     long long total_out_elements = batch * n_freq * frames;
+     int blocks_scatter = (total_out_elements + threads - 1) / threads;
+     scatter_fft_kernel<<<blocks_scatter, threads, 0, stream>>>(
+-        (const float2*)fft_out, output_real, output_imag,
++        reinterpret_cast<const float2*>(fft_out), output_real, output_imag,
+         batch, n_freq, frames);
+ 
+-    // Cleanup
++    // Cleanup.
+     cudaFree(padded_input);
+     cudaFree(frame_buffer);
+     cudaFree(fft_out);
+-    cufftDestroy(plan);
+     cufftDestroy(plan_frames);
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// Custom abs launcher: input is complex64 tensor with shape [batch, freq, frames],
+-// possibly non-contiguous. We receive pointers to real and imaginary parts?
+-// In PyTorch, complex64 tensor is stored as pairs of floats (real, imag) interleaved,
+-// but the memory layout depends on strides. The binding wrapper will pass two pointers:
+-// one to the real part and one to the imaginary part, or we can treat it as float2*?
+-// Since we cannot use torch in .cu, we will define custom_abs_launcher that takes:
+-//   const float* input_real, const float* input_imag, float* output, 
+-//   long long numel, long long stride_real_elem, long long stride_imag_elem, 
+-//   long long output_stride, cudaStream_t stream.
+-// The binding will extract data_ptr for real and imag, and compute strides.
+-// But easier: bindings can make the input contiguous with .contiguous() before calling,
+-// then real/imag interleaved. However contract says supports strides, so we must handle
+-// non-contiguous. We'll pass strides explicitly.
+-// For simplicity, we'll implement a generic elementwise operation with strides.
+-// We'll define a kernel that takes real and imag pointers and their strides (in elements)
+-// and output pointer and its stride. We'll compute linear index and map to offset.
+-// The binding layer will provide these strides.
++// Custom abs launcher: input is complex64 tensor, made contiguous by binding.
++// Here we assume input_real and input_imag pointers from contiguous complex buffer
++// with stride_real_elem = 2, stride_imag_elem = 2.
+ // -----------------------------------------------------------------------------
+ extern "C" void custom_abs_launcher(
+     const float* input_real,
+@@ -222,7 +187,7 @@
+     long long numel,
+     long long stride_real_elem,
+     long long stride_imag_elem,
+-    long long output_stride_elem,
++    long long output_stride_elem, // ignored, output assumed contiguous
+     cudaStream_t stream)
+ {
+     int threads = 256;
+@@ -230,13 +195,10 @@
+     abs_kernel<<<blocks, threads, 0, stream>>>(
+         input_real, input_imag, output, numel,
+         stride_real_elem, stride_imag_elem);
+-    // Note: output_stride_elem not used because we assume output contiguous? Actually output may also have stride, but we can require output contiguous; binding can allocate contiguous.
+-    // In abs_kernel we write output[idx] with implicit stride 1. So output must be contiguous. We'll require binding to make output contiguous.
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Custom remainder launcher: input float32, output float32, both may have strides.
+-// We'll handle input stride and output stride (output contiguous typically).
++}
++
++// -----------------------------------------------------------------------------
++// Custom remainder launcher: input float32, made contiguous by binding.
+ // -----------------------------------------------------------------------------
+ extern "C" void custom_remainder_launcher(
+     const float* input,
+@@ -244,21 +206,135 @@
+     float divisor,
+     long long numel,
+     long long input_stride_elem,
+-    long long output_stride_elem,
++    long long output_stride_elem, // ignored, output assumed contiguous
+     cudaStream_t stream)
+ {
+     int threads = 256;
+     long long blocks = (numel + threads - 1) / threads;
+     remainder_kernel<<<blocks, threads, 0, stream>>>(
+         input, output, divisor, numel, input_stride_elem);
+-    // We ignore output_stride_elem, assuming output contiguous.
+-}
+-
+-// -----------------------------------------------------------------------------
+-// Helper kernels used by STFT
+-// -----------------------------------------------------------------------------
+-
+-// Pad input with reflect padding
++}
++
++// -----------------------------------------------------------------------------
++// cuDNN convolution launcher for conv1d.
++// This avoids including cudnn.h in binding .cpp. The binding will call this launcher.
++// -----------------------------------------------------------------------------
++extern "C" void custom_conv1d_launcher(
++    const float* x,            // input [batch, in_channels, length_in]
++    const float* weight,       // weight [out_channels, in_channels, kernel_size]
++    const float* bias,         // bias [out_channels] or nullptr
++    long long batch,
++    long long in_channels,
++    long long length_in,
++    long long out_channels,
++    long long kernel_size,
++    long long stride,
++    long long padding,
++    float* output,             // output [batch, out_channels, length_out]
++    cudaStream_t stream)
++{
++    // cuDNN handles and descriptors.
++    cudnnHandle_t cudnn;
++    if (cudnnCreate(&cudnn) != CUDNN_STATUS_SUCCESS) return;
++    cudnnSetStream(cudnn, stream);
++
++    long long length_out = (length_in + 2 * padding - kernel_size) / stride + 1;
++
++    cudnnTensorDescriptor_t x_desc, y_desc, b_desc;
++    cudnnFilterDescriptor_t w_desc;
++    cudnnConvolutionDescriptor_t conv_desc;
++    cudnnCreateTensorDescriptor(&x_desc);
++    cudnnCreateTensorDescriptor(&y_desc);
++    cudnnCreateTensorDescriptor(&b_desc);
++    cudnnCreateFilterDescriptor(&w_desc);
++    cudnnCreateConvolutionDescriptor(&conv_desc);
++
++    // Treat 1D conv as 2D conv with height=1.
++    int dimA[4] = {static_cast<int>(batch), static_cast<int>(in_channels), 1, static_cast<int>(length_in)};
++    int strideA[4] = {static_cast<int>(in_channels * length_in), static_cast<int>(length_in), static_cast<int>(length_in), 1};
++    cudnnSetTensorNdDescriptor(x_desc, CUDNN_DATA_FLOAT, 4, dimA, strideA);
++
++    int dimY[4] = {static_cast<int>(batch), static_cast<int>(out_channels), 1, static_cast<int>(length_out)};
++    int strideY[4] = {static_cast<int>(out_channels * length_out), static_cast<int>(length_out), static_cast<int>(length_out), 1};
++    cudnnSetTensorNdDescriptor(y_desc, CUDNN_DATA_FLOAT, 4, dimY, strideY);
++
++    int dimW[4] = {static_cast<int>(out_channels), static_cast<int>(in_channels), 1, static_cast<int>(kernel_size)};
++    cudnnSetFilterNdDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 4, dimW);
++
++    int padA[2] = {0, static_cast<int>(padding)};
++    int strideAconv[2] = {1, static_cast<int>(stride)};
++    int dilA[2] = {1, 1};
++    cudnnSetConvolutionNdDescriptor(conv_desc, 2, padA, strideAconv, dilA, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
++
++    int dimB[4] = {1, static_cast<int>(out_channels), 1, 1};
++    int strideB[4] = {static_cast<int>(out_channels), 1, 1, 1};
++    cudnnSetTensorNdDescriptor(b_desc, CUDNN_DATA_FLOAT, 4, dimB, strideB);
++
++    // Choose algorithm.
++    cudnnConvolutionFwdAlgo_t algo;
++    cudnnGetConvolutionForwardAlgorithm_v7(cudnn, x_desc, w_desc, conv_desc, y_desc, 1, 0, &algo);
++
++    size_t ws_size = 0;
++    cudnnGetConvolutionForwardWorkspaceSize(cudnn, x_desc, w_desc, conv_desc, y_desc, algo, &ws_size);
++    void* ws_ptr = nullptr;
++    if (ws_size > 0) {
++        if (cudaMalloc(&ws_ptr, ws_size) != cudaSuccess) {
++            cudnnDestroyTensorDescriptor(x_desc);
++            cudnnDestroyTensorDescriptor(y_desc);
++            cudnnDestroyTensorDescriptor(b_desc);
++            cudnnDestroyFilterDescriptor(w_desc);
++            cudnnDestroyConvolutionDescriptor(conv_desc);
++            cudnnDestroy(cudnn);
++            return;
++        }
++    }
++
++    float alpha = 1.0f, beta = 0.0f;
++    if (bias != nullptr) {
++        // convolution with bias addition: set beta=1.0 and use cudnnAddTensor after convolution with beta=0.
++        beta = 0.0f;
++        if (cudnnConvolutionForward(cudnn, &alpha, x_desc, x, w_desc, weight, conv_desc, algo, ws_ptr, ws_size, &beta, y_desc, output) != CUDNN_STATUS_SUCCESS) {
++            // cleanup and return
++            cudaFree(ws_ptr);
++            cudnnDestroyTensorDescriptor(x_desc);
++            cudnnDestroyTensorDescriptor(y_desc);
++            cudnnDestroyTensorDescriptor(b_desc);
++            cudnnDestroyFilterDescriptor(w_desc);
++            cudnnDestroyConvolutionDescriptor(conv_desc);
++            cudnnDestroy(cudnn);
++            return;
++        }
++        // Add bias: alpha_bias=1, beta_bias=1
++        float alpha_bias = 1.0f, beta_bias = 1.0f;
++        cudnnAddTensor(cudnn, &alpha_bias, b_desc, bias, &beta_bias, y_desc, output);
++    } else {
++        beta = 0.0f;
++        if (cudnnConvolutionForward(cudnn, &alpha, x_desc, x, w_desc, weight, conv_desc, algo, ws_ptr, ws_size, &beta, y_desc, output) != CUDNN_STATUS_SUCCESS) {
++            // cleanup and return
++            cudaFree(ws_ptr);
++            cudnnDestroyTensorDescriptor(x_desc);
++            cudnnDestroyTensorDescriptor(y_desc);
++            cudnnDestroyTensorDescriptor(b_desc);
++            cudnnDestroyFilterDescriptor(w_desc);
++            cudnnDestroyConvolutionDescriptor(conv_desc);
++            cudnnDestroy(cudnn);
++            return;
++        }
++    }
++
++    // Cleanup.
++    if (ws_size > 0) cudaFree(ws_ptr);
++    cudnnDestroyTensorDescriptor(x_desc);
++    cudnnDestroyTensorDescriptor(y_desc);
++    cudnnDestroyTensorDescriptor(b_desc);
++    cudnnDestroyFilterDescriptor(w_desc);
++    cudnnDestroyConvolutionDescriptor(conv_desc);
++    cudnnDestroy(cudnn);
++}
++
++// -----------------------------------------------------------------------------
++// Helper kernel definitions (placed after launchers, but forward declared above)
++// -----------------------------------------------------------------------------
+ __global__ void pad_reflect_kernel(const float* __restrict__ input,
+                                    float* __restrict__ padded,
+                                    long long batch,
+@@ -274,20 +350,16 @@
+     long long pos = idx % pad_length;
+     long long src_idx;
+     if (pos < pad_left) {
+-        // reflect: pad_left - pos ? Actually reflect padding: for index 0..pad_left-1, map to pad_left - pos? 
+-        // Example: length=4, pad_left=2, padded[0]=x[2], padded[1]=x[1], padded[2]=x[0], ...? That's symmetric, not reflect? PyTorch reflect uses reflection without repeating edge: for sequence [a,b,c,d], pad_left=2 gives [c,b,a,b,c,d]? Actually torch reflect: [c,b,a,b,c,d]? For pad=2, result is [c, b, a, b, c, d]? Let's check: reflect padding mode: Reflects without repeating boundary. So for [1,2,3,4] and pad (2,0), output [3,2,1,2,3,4]. So mapping: padded[0]=x[2], padded[1]=x[1], padded[2]=x[0], padded[3]=x[1], padded[4]=x[2], ... So formula: if pos < pad_left, src = pad_left - pos (allowing index up to pad_left); else if pos >= pad_left + length, reflect at right: src = 2*length - 2 - (pos - pad_left) +? Actually: pad_right = pad_right, total padded length = pad_left + length + pad_right. For right side, first extra element at pos=pad_left+length maps to x[length-2], then x[length-3], etc. So src = 2*length - 2 - (pos - pad_left - length)? Let's derive: pos = pad_left + length + k for k=0..pad_right-1. Desired src = length - 2 - k. So src = 2*length - 2 - (pos - pad_left - length) = 2*length - 2 - pos + pad_left + length? That becomes 3*length - 2 - pos + pad_left? Not sure. We'll handle carefully.
+-        src_idx = pad_left - pos - 1; // Because reflect without boundary? Let's test: pad_left=2, pos=0 -> src=1? But we want padded[0]=x[2]? That would be src=2, so formula src = pad_left - pos? pos=0 -> src=2, pos=1 -> src=1. That works: src = pad_left - pos. Then pos=2 (original start) src=0. So for pos < pad_left, src = pad_left - pos.
++        src_idx = pad_left - pos;
+     } else if (pos >= pad_left + length) {
+-        long long k = pos - (pad_left + length); // 0,1,...
+-        long long src = length - 2 - k; // this may become negative if k large; need clamp? For valid pad_right <= length-1? In our case pad_right = n_fft/2 =256, length=160000, fine.
+-        src_idx = src;
++        long long k = pos - (pad_left + length);
++        src_idx = length - 2 - k;
+     } else {
+         src_idx = pos - pad_left;
+     }
+     padded[idx] = input[b * length + src_idx];
+ }
+ 
+-// Extract frames from padded input
+ __global__ void extract_frames_kernel(const float* __restrict__ padded,
+                                       float* __restrict__ frames,
+                                       long long batch,
+@@ -299,16 +371,14 @@
+     long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+     long long total = batch * num_frames * n_fft;
+     if (idx >= total) return;
+-    // Compute b, f, t
+     long long t = idx % n_fft;
+     long long tmp = idx / n_fft;
+     long long f = tmp % num_frames;
+     long long b = tmp / num_frames;
+-    long long src_pos = f * hop_length + t; // position in padded_input
++    long long src_pos = f * hop_length + t;
+     frames[idx] = padded[b * pad_length + src_pos];
+ }
+ 
+-// Scatter FFT output into output arrays with strides
+ __global__ void scatter_fft_kernel(const float2* __restrict__ fft_out,
+                                    float* __restrict__ output_real,
+                                    float* __restrict__ output_imag,
+@@ -319,20 +389,13 @@
+     long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+     long long total = batch * n_freq * frames;
+     if (idx >= total) return;
+-    // Decode idx into b, freq, frame
+     long long frame = idx % frames;
+     long long tmp = idx / frames;
+     long long freq = tmp % n_freq;
+     long long b = tmp / n_freq;
+-    // fft_out index is (b*frames + frame)*n_freq + freq
+     long long fft_idx = (b * frames + frame) * n_freq + freq;
+     float2 val = fft_out[fft_idx];
+-    // output offset: b * (n_freq * frames) + freq * frames + frame
+-    // Because output strides: [n_freq*frames, 1, frames]? Wait earlier we said stride[1]=1, stride[2]=257 (which is n_freq). That would correspond to offset = b*n_freq*frames + freq*1 + frame*n_freq? That's not what we wrote. Let's re-evaluate: shape [batch, freq, frames], stride [n_freq*frames, 1, n_freq]. So offset = b*(n_freq*frames) + freq*1 + frame*n_freq. Yes, that's what we should write.
+     long long out_idx = b * n_freq * frames + freq + frame * n_freq;
+     output_real[out_idx] = val.x;
+     output_imag[out_idx] = val.y;
+-}
+-
+-// Note: The launcher signatures must be declared extern "C" for linkage.
+-// We have defined them above. Also we need to include cufft.h, but linking will require cufft library; this is handled by compile script.
++}--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -5,8 +5,6 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cuda_runtime.h>
+-#include <cudnn.h>
+-#include <ATen/cuda/CUDAContext.h>
+ #include "../binding_registry.h"
+ 
+ // Declarations of launchers from custom_ops.cu
+@@ -39,33 +37,39 @@
+     long long output_stride_elem,
+     cudaStream_t stream);
+ 
++extern "C" void custom_conv1d_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    long long batch,
++    long long in_channels,
++    long long length_in,
++    long long out_channels,
++    long long kernel_size,
++    long long stride,
++    long long padding,
++    float* output,
++    cudaStream_t stream);
++
+ // Helper: check CUDA error
+ static inline void check_cuda_error(cudaError_t err, const char* msg) {
+     TORCH_CHECK(err == cudaSuccess, msg, ": ", cudaGetErrorString(err));
+ }
+ 
+-// Helper: check cuDNN error
+-static inline void check_cudnn_error(cudnnStatus_t status, const char* msg) {
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, msg, ": ", cudnnGetErrorString(status));
+-}
+-
+ // custom_stft wrapper
+ // Input x: float32 CUDA tensor [batch, length]
+-// Output: complex64 CUDA tensor [batch, n_freq, frames] with non-contiguous strides
+-// matching reference: [n_freq*frames, 1, n_freq]
++// Output: complex64 CUDA tensor [batch, n_freq, frames] with strides [n_freq*frames, 1, n_freq]
+ torch::Tensor custom_stft(torch::Tensor x, int64_t n_fft, int64_t hop_length) {
+     TORCH_CHECK(x.is_cuda(), "custom_stft: input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_stft: input must be float32");
+     TORCH_CHECK(x.dim() == 2, "custom_stft: input must be 2D");
+ 
+-    // Ensure input is contiguous for launcher
+     auto x_contig = x.contiguous();
+     long long batch = x_contig.size(0);
+     long long length = x_contig.size(1);
+     long long n_freq = n_fft / 2 + 1;
+     long long frames = 1 + length / hop_length;
+ 
+-    // Allocate output with the exact strides from reference: [n_freq*frames, 1, n_freq]
+     auto output = torch::empty_strided(
+         {batch, n_freq, frames},
+         {n_freq * frames, 1, n_freq},
+@@ -73,11 +77,10 @@
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Get pointers to real and imag parts of output complex tensor
++    // Get pointers to real and imag parts of output complex tensor (interleaved)
+     float* output_real = reinterpret_cast<float*>(output.data_ptr<c10::complex<float>>());
+-    float* output_imag = output_real + 1; // interleaved layout; second float is imaginary
+-
+-    // call launcher
++    float* output_imag = output_real + 1;
++
+     custom_stft_launcher(
+         x_contig.data_ptr<float>(),
+         batch,
+@@ -88,9 +91,7 @@
+         output_imag,
+         stream);
+ 
+-    // check for kernel errors
+-    cudaError_t err = cudaGetLastError();
+-    check_cuda_error(err, "custom_stft kernel launch failed");
++    check_cuda_error(cudaGetLastError(), "custom_stft kernel launch failed");
+ 
+     return output;
+ }
+@@ -103,52 +104,25 @@
+     TORCH_CHECK(x.dtype() == torch::kComplexFloat, "custom_abs: input must be complex64");
+     TORCH_CHECK(x.dim() == 3, "custom_abs: input must be 3D");
+ 
+-    // Get shape
+-    long long batch = x.size(0);
+-    long long freq = x.size(1);
+-    long long frames = x.size(2);
+-    long long numel = x.numel();
+-
+-    // Compute strides in elements for real and imaginary pointers.
+-    // For complex64 tensor, data_ptr<c10::complex<float>> points to interleaved real/imag pairs.
+-    // The real part pointer is cast from complex data pointer, and the imag pointer is one float offset.
+-    // We need element strides for real and imag assuming they are consecutive floats.
+-    // Let's derive: If tensor stride for complex dimension d is s_d (in elements of complex), then
+-    // real part offset increment for that dimension is 2*s_d (floats), imag similarly.
+-    auto strides = x.strides(); // in complex elements
+-    long long stride0 = strides[0];
+-    long long stride1 = strides[1];
+-    long long stride2 = strides[2];
+-
+-    // For real and imag, we treat them as separate float arrays with strides doubled.
+-    long long stride_real_elem_0 = stride0 * 2;
+-    long long stride_real_elem_1 = stride1 * 2;
+-    long long stride_real_elem_2 = stride2 * 2;
+-    // For imag, offset by one float
+-    long long stride_imag_elem_0 = stride0 * 2;
+-    long long stride_imag_elem_1 = stride1 * 2;
+-    long long stride_imag_elem_2 = stride2 * 2;
+-
+-    // Since our launcher only supports a single stride for real and imag (elem_stride_real, elem_stride_imag),
+-    // we need to adapt. The current launcher assumes that the linear index maps to offset = idx * stride_real_elem.
+-    // That only works if the tensor is contiguous with stride_real=1. For non-contiguous we need a different approach.
+-    // To simplify, we can make the input contiguous, then real/imag are interleaved with stride 1 for both.
+-    auto x_contig = x.contiguous();
++    // Make contiguous to simplify strides
++    auto x_contig = x.contiguous();
++    long long batch = x_contig.size(0);
++    long long freq = x_contig.size(1);
++    long long frames = x_contig.size(2);
++    long long numel = x_contig.numel();
++
+     float* input_real = reinterpret_cast<float*>(x_contig.data_ptr<c10::complex<float>>());
+     float* input_imag = input_real + 1;
+ 
+-    // Output is contiguous float32 with same shape
+     auto output = torch::empty({batch, freq, frames}, torch::dtype(torch::kFloat32).device(x.device()));
+     float* out_ptr = output.data_ptr<float>();
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // For contiguous complex, real stride = 2 (since each complex element is 2 floats), imag stride = 2 as well, starting at offset 1.
+-    // But our launcher expects elem_stride_real and elem_stride_imag as the distance in elements between consecutive real parts.
+-    // For contiguous complex with interleaved layout, real parts are 2 floats apart, so stride_real_elem = 2.
++    // For contiguous complex, real parts are 2 floats apart, imag parts are 2 floats apart
+     long long stride_real_elem = 2;
+     long long stride_imag_elem = 2;
+-    long long output_stride_elem = 1; // output contiguous
++    long long output_stride_elem = 1;
+ 
+     custom_abs_launcher(
+         input_real,
+@@ -160,8 +134,7 @@
+         output_stride_elem,
+         stream);
+ 
+-    cudaError_t err = cudaGetLastError();
+-    check_cuda_error(err, "custom_abs kernel launch failed");
++    check_cuda_error(cudaGetLastError(), "custom_abs kernel launch failed");
+ 
+     return output;
+ }
+@@ -190,13 +163,12 @@
+         1, // output contiguous stride
+         stream);
+ 
+-    cudaError_t err = cudaGetLastError();
+-    check_cuda_error(err, "custom_remainder kernel launch failed");
+-
+-    return output;
+-}
+-
+-// custom_conv1d wrapper using cuDNN
++    check_cuda_error(cudaGetLastError(), "custom_remainder kernel launch failed");
++
++    return output;
++}
++
++// custom_conv1d wrapper using cuDNN launcher
+ // Input x: float32 CUDA tensor [batch, in_channels, length_in] (may be non-contiguous)
+ // weight: float32 CUDA tensor [out_channels, in_channels, kernel_size]
+ // bias: float32 CUDA tensor [out_channels] (may be None)
+@@ -217,134 +189,36 @@
+     long long kernel_size = weight.size(2);
+     long long length_out = (length_in + 2 * padding - kernel_size) / stride + 1;
+ 
+-    // Ensure contiguous
+     auto x_contig = x.contiguous();
+     auto w_contig = weight.contiguous();
+     // Bias may be None; handle later
+ 
+-    // Create cuDNN handle
+-    cudnnHandle_t cudnn;
+-    cudnnStatus_t status = cudnnCreate(&cudnn);
+-    check_cudnn_error(status, "cudnnCreate failed");
+-
+-    // Set stream
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    status = cudnnSetStream(cudnn, stream);
+-    check_cudnn_error(status, "cudnnSetStream failed");
+-
+-    // Create tensor descriptors
+-    cudnnTensorDescriptor_t x_desc;
+-    cudnnTensorDescriptor_t y_desc;
+-    cudnnTensorDescriptor_t b_desc;
+-    cudnnFilterDescriptor_t w_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    cudnnCreateTensorDescriptor(&x_desc);
+-    cudnnCreateTensorDescriptor(&y_desc);
+-    cudnnCreateTensorDescriptor(&b_desc);
+-    cudnnCreateFilterDescriptor(&w_desc);
+-    cudnnCreateConvolutionDescriptor(&conv_desc);
+-
+-    // For cuDNN, treat 1D conv as 2D conv with height=1.
+-    int dimA[4] = {static_cast<int>(batch), static_cast<int>(in_channels), 1, static_cast<int>(length_in)};
+-    int strideA[4] = {static_cast<int>(in_channels * length_in), static_cast<int>(length_in), static_cast<int>(length_in), 1};
+-    cudnnSetTensorNdDescriptor(x_desc, CUDNN_DATA_FLOAT, 4, dimA, strideA);
+-
+-    int dimY[4] = {static_cast<int>(batch), static_cast<int>(out_channels), 1, static_cast<int>(length_out)};
+-    int strideY[4] = {static_cast<int>(out_channels * length_out), static_cast<int>(length_out), static_cast<int>(length_out), 1};
+-    cudnnSetTensorNdDescriptor(y_desc, CUDNN_DATA_FLOAT, 4, dimY, strideY);
+-
+-    // Filter descriptor: filter layout [out_channels, in_channels, 1, kernel_size]
+-    int dimW[4] = {static_cast<int>(out_channels), static_cast<int>(in_channels), 1, static_cast<int>(kernel_size)};
+-    cudnnSetFilterNdDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 4, dimW);
+-
+-    // Convolution descriptor
+-    int padA[2] = {0, static_cast<int>(padding)};
+-    int strideAconv[2] = {1, static_cast<int>(stride)};
+-    int dilA[2] = {1, 1};
+-    cudnnSetConvolutionNdDescriptor(conv_desc, 2, padA, strideAconv, dilA, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
+-
+-    // Bias descriptor
+-    int dimB[4] = {1, static_cast<int>(out_channels), 1, 1};
+-    int strideB[4] = {static_cast<int>(out_channels), 1, 1, 1};
+-    cudnnSetTensorNdDescriptor(b_desc, CUDNN_DATA_FLOAT, 4, dimB, strideB);
+-
+-    // Allocate output
+     auto output = torch::empty({batch, out_channels, length_out}, torch::dtype(torch::kFloat32).device(x.device()));
+-    float* y_ptr = output.data_ptr<float>();
+-
+-    // Convolution forward algorithm
+-    cudnnConvolutionFwdAlgo_t algo;
+-    cudnnGetConvolutionForwardAlgorithm_v7(cudnn, x_desc, w_desc, conv_desc, y_desc, 1, 0, &algo);
+-
+-    // Workspace size
+-    size_t ws_size = 0;
+-    cudnnGetConvolutionForwardWorkspaceSize(cudnn, x_desc, w_desc, conv_desc, y_desc, algo, &ws_size);
+-    void* ws_ptr = nullptr;
+-    if (ws_size > 0) {
+-        cudaMalloc(&ws_ptr, ws_size);
+-        if (cudaGetLastError() != cudaSuccess) {
+-            // handle error
+-        }
+-    }
+-
+-    float alpha = 1.0f, beta = 0.0f;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    const float* bias_ptr = nullptr;
+     if (bias.defined() && bias.numel() > 0) {
+         TORCH_CHECK(bias.is_cuda() && bias.dtype() == torch::kFloat32, "bias must be CUDA float32");
+         auto b_contig = bias.contiguous();
+-        beta = 1.0f; // add bias after convolution
+-        status = cudnnConvolutionForward(
+-            cudnn,
+-            &alpha,
+-            x_desc, x_contig.data_ptr<float>(),
+-            w_desc, w_contig.data_ptr<float>(),
+-            conv_desc, algo, ws_ptr, ws_size,
+-            &beta,
+-            y_desc, y_ptr);
+-        check_cudnn_error(status, "cudnnConvolutionForward failed with bias");
+-        // Add bias: cuDNN adds bias if beta=1 and b_desc set, but we need to call cudnnAddTensor or set bias mode.
+-        // Simpler: call cudnnAddTensor after convolution.
+-        // Actually above with beta=1 and no bias descriptor set, it would add 1*y, not bias. Need to use bias descriptor.
+-        // Let's use cudnnConvolutionBiasActivationForward or separate cudnnAddTensor.
+-        // We'll do separate: first conv with beta=0, then add bias.
+-        // So reset beta=0, then add bias.
+-        // Redo:
+-        status = cudnnConvolutionForward(
+-            cudnn,
+-            &alpha,
+-            x_desc, x_contig.data_ptr<float>(),
+-            w_desc, w_contig.data_ptr<float>(),
+-            conv_desc, algo, ws_ptr, ws_size,
+-            &beta0 /* 0 */,
+-            y_desc, y_ptr);
+-        check_cudnn_error(status, "cudnnConvolutionForward failed");
+-        // Add bias
+-        float alpha_bias = 1.0f, beta_bias = 1.0f;
+-        status = cudnnAddTensor(cudnn, &alpha_bias, b_desc, b_contig.data_ptr<float>(), &beta_bias, y_desc, y_ptr);
+-        check_cudnn_error(status, "cudnnAddTensor failed");
+-    } else {
+-        beta = 0.0f;
+-        status = cudnnConvolutionForward(
+-            cudnn,
+-            &alpha,
+-            x_desc, x_contig.data_ptr<float>(),
+-            w_desc, w_contig.data_ptr<float>(),
+-            conv_desc, algo, ws_ptr, ws_size,
+-            &beta,
+-            y_desc, y_ptr);
+-        check_cudnn_error(status, "cudnnConvolutionForward failed");
++        bias_ptr = b_contig.data_ptr<float>();
+     }
+ 
+-    // Free workspace
+-    if (ws_size > 0) cudaFree(ws_ptr);
+-
+-    // Destroy descriptors and handle
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyTensorDescriptor(b_desc);
+-    cudnnDestroyFilterDescriptor(w_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn);
++    custom_conv1d_launcher(
++        x_contig.data_ptr<float>(),
++        w_contig.data_ptr<float>(),
++        bias_ptr,
++        batch,
++        in_channels,
++        length_in,
++        out_channels,
++        kernel_size,
++        stride,
++        padding,
++        output.data_ptr<float>(),
++        stream);
++
++    check_cuda_error(cudaGetLastError(), "custom_conv1d kernel launch failed");
+ 
+     return output;
+ }
+@@ -360,4 +234,4 @@
+           py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("stride"), py::arg("padding"));
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);
++REGISTER_BINDING(custom_ops, register_custom_ops);

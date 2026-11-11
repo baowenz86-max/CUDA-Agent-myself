@@ -1,0 +1,242 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,100 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++#include <cfloat>
++
++// Kernel for max over dim=1, keepdim=True
++// Input: x [B, C, H, W] with strides (sx_b, sx_c, sx_h, sx_w)
++// Output: values [B, 1, H, W], indices [B, 1, H, W] (int64_t)
++// Each thread block handles one (b, h, w) position, reduces over C.
++__global__ void max_dim1_kernel(const float* __restrict__ x,
++                                float* __restrict__ values,
++                                int64_t* __restrict__ indices,
++                                int B, int C, int H, int W,
++                                long long sx_b, long long sx_c,
++                                long long sx_h, long long sx_w,
++                                long long so_b, long long so_c,
++                                long long so_h, long long so_w)
++{
++    int b = blockIdx.x;
++    int h = blockIdx.y;
++    int w = blockIdx.z;
++    if (b >= B || h >= H || w >= W) return;
++
++    const float* base = x + (long long)b * sx_b + (long long)h * sx_h + (long long)w * sx_w;
++    float max_val = -FLT_MAX;
++    int max_idx = 0;
++
++    for (int c = 0; c < C; ++c) {
++        float val = base[c * sx_c];
++        if (val > max_val) {
++            max_val = val;
++            max_idx = c;
++        }
++    }
++
++    long long out_idx = (long long)b * so_b + (long long)h * so_h + (long long)w * so_w;
++    values[out_idx] = max_val;
++    indices[out_idx] = (int64_t)max_idx;
++}
++
++// Kernel for max over dim=2, keepdim=False
++// Input: x [B, 1, H, W] with strides (sx_b, sx_c, sx_h, sx_w)
++// Output: values [B, 1, W], indices [B, 1, W] (int64_t)
++__global__ void max_dim2_kernel(const float* __restrict__ x,
++                                float* __restrict__ values,
++                                int64_t* __restrict__ indices,
++                                int B, int C, int H, int W,
++                                long long sx_b, long long sx_c,
++                                long long sx_h, long long sx_w,
++                                long long so_b, long long so_c,
++                                long long so_w)
++{
++    int b = blockIdx.x;
++    int c = blockIdx.y; // should be 0, but we use C=1
++    int w = blockIdx.z;
++    if (b >= B || c >= C || w >= W) return;
++
++    const float* base = x + (long long)b * sx_b + (long long)c * sx_c + (long long)w * sx_w;
++    float max_val = -FLT_MAX;
++    int max_idx = 0;
++
++    for (int h = 0; h < H; ++h) {
++        float val = base[h * sx_h];
++        if (val > max_val) {
++            max_val = val;
++            max_idx = h;
++        }
++    }
++
++    long long out_idx = (long long)b * so_b + (long long)c * so_c + (long long)w * so_w;
++    values[out_idx] = max_val;
++    indices[out_idx] = (int64_t)max_idx;
++}
++
++extern "C" void max_dim1_keepdim_launcher(
++    const float* x, float* values, int64_t* indices,
++    int B, int C, int H, int W,
++    long long sx_b, long long sx_c, long long sx_h, long long sx_w,
++    long long so_b, long long so_c, long long so_h, long long so_w,
++    cudaStream_t stream)
++{
++    dim3 grid(B, H, W);
++    max_dim1_kernel<<<grid, 1, 0, stream>>>(
++        x, values, indices, B, C, H, W,
++        sx_b, sx_c, sx_h, sx_w,
++        so_b, so_c, so_h, so_w);
++}
++
++extern "C" void max_dim2_no_keepdim_launcher(
++    const float* x, float* values, int64_t* indices,
++    int B, int C, int H, int W,
++    long long sx_b, long long sx_c, long long sx_h, long long sx_w,
++    long long so_b, long long so_c, long long so_w,
++    cudaStream_t stream)
++{
++    dim3 grid(B, C, W);
++    max_dim2_kernel<<<grid, 1, 0, stream>>>(
++        x, values, indices, B, C, H, W,
++        sx_b, sx_c, sx_h, sx_w,
++        so_b, so_c, so_w);
++}--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,114 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void max_dim1_keepdim_launcher(
++    const float* x, float* values, int64_t* indices,
++    int B, int C, int H, int W,
++    long long sx_b, long long sx_c, long long sx_h, long long sx_w,
++    long long so_b, long long so_c, long long so_h, long long so_w,
++    cudaStream_t stream);
++
++extern "C" void max_dim2_no_keepdim_launcher(
++    const float* x, float* values, int64_t* indices,
++    int B, int C, int H, int W,
++    long long sx_b, long long sx_c, long long sx_h, long long sx_w,
++    long long so_b, long long so_c, long long so_w,
++    cudaStream_t stream);
++
++// Helper to check CUDA errors after kernel launch
++static void check_cuda_error(cudaError_t err, const char* op_name) {
++    TORCH_CHECK(err == cudaSuccess, op_name, " CUDA error: ", cudaGetErrorString(err));
++}
++
++// Wrapper for max over dim=1 with keepdim=True
++// Input: [B, C, H, W] float32 (supports strides)
++// Output: torch.return_types.max with values [B,1,H,W] float32 and indices [B,1,H,W] int64
++torch::return_types::max max_dim1_keepdim(torch::Tensor x) {
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "max_dim1_keepdim: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "max_dim1_keepdim: input dtype must be float32");
++    TORCH_CHECK(x.dim() == 4, "max_dim1_keepdim: input must be 4D [B, C, H, W]");
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++    TORCH_CHECK(B > 0 && C > 0 && H > 0 && W > 0, "max_dim1_keepdim: dimensions must be positive");
++
++    // Output tensors: values [B,1,H,W] float32, indices [B,1,H,W] int64
++    auto values = torch::empty({B, 1, H, W}, x.options());
++    auto indices = torch::empty({B, 1, H, W}, x.options().dtype(torch::kInt64));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Launch kernel
++    max_dim1_keepdim_launcher(
++        x.data_ptr<float>(),
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        B, C, H, W,
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        values.stride(0), values.stride(1), values.stride(2), values.stride(3),
++        stream
++    );
++    check_cuda_error(cudaGetLastError(), "max_dim1_keepdim");
++
++    // Construct torch.return_types.max
++    torch::return_types::max result;
++    result.values = values;
++    result.indices = indices;
++    return result;
++}
++
++// Wrapper for max over dim=2 with keepdim=False
++// Input: [B, 1, H, W] float32 (supports strides)
++// Output: torch.return_types.max with values [B,1,W] float32 and indices [B,1,W] int64
++torch::return_types::max max_dim2_no_keepdim(torch::Tensor x) {
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "max_dim2_no_keepdim: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "max_dim2_no_keepdim: input dtype must be float32");
++    TORCH_CHECK(x.dim() == 4, "max_dim2_no_keepdim: input must be 4D [B, 1, H, W]");
++    TORCH_CHECK(x.size(1) == 1, "max_dim2_no_keepdim: dimension 1 must be 1");
++    int B = x.size(0);
++    int C = 1; // always 1
++    int H = x.size(2);
++    int W = x.size(3);
++    TORCH_CHECK(B > 0 && H > 0 && W > 0, "max_dim2_no_keepdim: dimensions must be positive");
++
++    // Output tensors: values [B,1,W] float32, indices [B,1,W] int64
++    auto values = torch::empty({B, 1, W}, x.options());
++    auto indices = torch::empty({B, 1, W}, x.options().dtype(torch::kInt64));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Launch kernel
++    max_dim2_no_keepdim_launcher(
++        x.data_ptr<float>(),
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        B, C, H, W,
++        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
++        values.stride(0), values.stride(1), values.stride(2),
++        stream
++    );
++    check_cuda_error(cudaGetLastError(), "max_dim2_no_keepdim");
++
++    // Construct torch.return_types.max
++    torch::return_types::max result;
++    result.values = values;
++    result.indices = indices;
++    return result;
++}
++
++// Register bindings
++void register_custom_ops_binding(pybind11::module& m) {
++    m.def("max_dim1_keepdim", &max_dim1_keepdim, "Max over dim=1 with keepdim=True", py::arg("x"));
++    m.def("max_dim2_no_keepdim", &max_dim2_no_keepdim, "Max over dim=2 with keepdim=False", py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops_binding, register_custom_ops_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        max_val_1, _ = cuda_extension.max_dim1_keepdim(x)
++        max_val_2, _ = cuda_extension.max_dim2_no_keepdim(max_val_1)
++        return max_val_2
++
++    def debug_forward(self, x):
++        max_val_1, indices_1 = cuda_extension.max_dim1_keepdim(x)
++        yield "step_001", (max_val_1, indices_1)
++        max_val_2, indices_2 = cuda_extension.max_dim2_no_keepdim(max_val_1)
++        yield "step_002", (max_val_2, indices_2)
++        yield "step_003", max_val_2

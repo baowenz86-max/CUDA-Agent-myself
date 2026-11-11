@@ -1,0 +1,101 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,5 +1,6 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
++#include <cstring>
+ 
+ // L1 loss mean reduction kernel, supports broadcasting of target to input shape.
+ // Each thread processes multiple elements via grid-stride loop.
+@@ -30,7 +31,7 @@
+         for (int64_t d = ndim - 1; d >= 0; --d) {
+             int64_t coord = rem % input_shape[d];
+             rem /= input_shape[d];
+-            int64_t tcoord = (coord < target_shape[d]) ? coord : 0; // broadcasting: if target dim is 1, coord 0; if target dim equals input dim, coord itself
++            int64_t tcoord = (coord < target_shape[d]) ? coord : 0;
+             input_offset += coord * input_strides[d];
+             target_offset += tcoord * target_strides[d];
+         }
+@@ -59,22 +60,8 @@
+ 
+ // Launcher function, callable from binding.cpp.
+ // All tensors must be CUDA float32.
+-// input_shape, input_strides, target_shape, target_strides are device arrays? We pass shapes as int64_t arrays on host,
+-// but kernel needs to read them. We will copy shape and stride arrays to device constant memory? Simpler: we can pass them by value
+-// if ndim is small and constant. For this task, ndim up to maybe 4. We can create a small struct in device code.
+-// Instead, we can copy the shape and stride arrays to device via cudaMemcpyToSymbol or pass as kernel arguments in constant memory.
+-// However, kernel launch may not accept many arguments efficiently, but for small ndim it's okay.
+-// We'll use a device struct holding shape and strides.
+-// But for simplicity and to avoid dynamic allocation, we can pass pointers to device memory allocated by launcher.
+-// The launcher will allocate small device arrays for shapes and strides, copy them, launch kernel, then free.
+-// Or we can use kernel arguments of type int64_t arrays passed by value? Not possible for variable length.
+-// We'll allocate device buffers for shape and strides in launcher.
+-// Another approach: since this op likely used with same shape, we can specialize for ndim=4. But contract says supports broadcasting.
+-// We'll implement general ndim (up to 8) with device arrays.
+-
+-// To keep launcher simple and efficient, we can precompute broadcasted strides on host and pass them as arguments,
+-// but kernel needs to access them per element. We'll allocate device memory and copy.
+-
++// input_shape, input_strides, target_shape, target_strides are host arrays.
++// We allocate device arrays for shape/stride and copy them asynchronously.
+ extern "C" void l1_loss_forward_launcher(
+     const float* input,
+     const float* target,
+@@ -87,10 +74,12 @@
+     const int64_t* target_strides,
+     cudaStream_t stream)
+ {
++    // Input must be non-empty; binding checks this.
+     if (input_numel == 0) {
+-        // Empty tensor: L1Loss mean over zero elements? PyTorch returns NaN? Actually mean of empty tensor is NaN.
+-        // We'll set output to NaN.
+-        float nan_val = __int_as_float(0x7fc00000);
++        // Set output to NaN in a host-safe way.
++        uint32_t nan_bits = 0x7fc00000u;
++        float nan_val;
++        std::memcpy(&nan_val, &nan_bits, sizeof(nan_val));
+         cudaMemcpyAsync(output, &nan_val, sizeof(float), cudaMemcpyHostToDevice, stream);
+         return;
+     }
+@@ -136,30 +125,7 @@
+     float h_sum;
+     cudaMemcpyAsync(&h_sum, d_sum, sizeof(float), cudaMemcpyDeviceToHost, stream);
+ 
+-    // Need to synchronize to ensure copy completes before division on host? We can do division on host after synchronizing.
+-    // But launcher should not synchronize? It can use cudaStreamSynchronize to ensure correctness, but that may hurt performance.
+-    // Better: do division in a small kernel or use a device-side operation.
+-    // To avoid host sync, we can write a small kernel that scales d_sum and writes to output.
+-    // Simpler: allocate another device scalar, compute mean in a second kernel.
+-    // We'll create a small kernel to compute mean from sum.
+-    // Alternatively, use atomicAdd for sum and then a single thread in a separate kernel.
+-    // But we already have d_sum. We'll scale on device.
+-    
+-    // Scale kernel: output = d_sum / numel
+-    // Launch a 1-thread kernel.
+-    // But we can do that in the same kernel if we use a different approach.
+-    // For simplicity, we'll do host-side division after synchronizing; but launcher should avoid syncs.
+-    // Since we need to return output pointer, we can do division on host after a stream sync inside launcher, but that blocks.
+-    // The binding will call launcher and then return, expecting result ready. Usually synchronous operations are okay.
+-    // To minimize sync overhead, we can use a device kernel for scale and avoid host sync.
+-    
+-    // We'll do a kernel to scale.
+-    // Free temporary arrays after kernel? Need to ensure kernel completed before freeing. Use cudaFree after launching scale kernel, but must wait for completion.
+-    // The launcher can call cudaStreamSynchronize for simplicity; later optimize if needed.
+-    // But task requires at least 5% faster than torch.compile; maybe sync hurts. We'll avoid sync by not freeing? Actually we must free.
+-    // We can use cudaFree after cudaStreamSynchronize, but that synchronizes. We'll do it.
+-    // For now, use host sync to keep code simple.
+-
++    // Synchronize to ensure copy completes before division on host.
+     cudaStreamSynchronize(stream);
+ 
+     float mean = h_sum / (float)input_numel;
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -28,7 +28,6 @@
+     TORCH_CHECK(input.numel() > 0, "input must not be empty");
+ 
+     // Handle broadcasting: make target same shape as input via expand
+-    // Note: expand returns a view with possibly non-contiguous strides; we'll make it contiguous below.
+     auto target_expanded = target.expand(input.sizes());
+ 
+     // Ensure contiguous tensors for direct pointer access

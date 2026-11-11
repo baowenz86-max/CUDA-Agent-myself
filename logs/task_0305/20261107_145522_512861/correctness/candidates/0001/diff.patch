@@ -1,0 +1,194 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,70 @@
++#include <cuda_runtime.h>
++#include <cmath>
++
++// CUDA kernel for LPPool1d with norm_type=2 (Euclidean norm)
++// input: 3D tensor [batch, channels, length]
++// output: 3D tensor [batch, channels, output_length]
++// kernel_size, stride are integers
++template <typename scalar_t>
++__global__ void lp_pool1d_kernel(
++    const scalar_t* __restrict__ input,
++    scalar_t* __restrict__ output,
++    int batch,
++    int channels,
++    int length,
++    int output_length,
++    int kernel_size,
++    int stride) {
++
++    // Each thread computes one output element
++    int output_idx = blockIdx.y * blockDim.y + threadIdx.y;
++    int bc_idx = blockIdx.x * blockDim.x + threadIdx.x; // combined batch*channels index
++
++    if (bc_idx >= batch * channels || output_idx >= output_length) {
++        return;
++    }
++
++    int b = bc_idx / channels;
++    int c = bc_idx % channels;
++
++    int input_start = output_idx * stride;
++    scalar_t sum_sq = 0.0f;
++
++    for (int k = 0; k < kernel_size; ++k) {
++        int input_pos = input_start + k;
++        if (input_pos < length) {
++            scalar_t val = input[(b * channels + c) * length + input_pos];
++            sum_sq += val * val;
++        }
++    }
++
++    output[bc_idx * output_length + output_idx] = sqrtf(sum_sq);
++}
++
++// Launcher for lp_pool1d
++extern "C" void lp_pool1d_launcher(
++    const float* input,
++    float* output,
++    int batch,
++    int channels,
++    int length,
++    int output_length,
++    int kernel_size,
++    int stride,
++    cudaStream_t stream) {
++
++    // Grid dimensions: x for batch*channels, y for output_length
++    dim3 threads_per_block(32, 8); // 256 threads per block
++    dim3 num_blocks((batch * channels + threads_per_block.x - 1) / threads_per_block.x,
++                    (output_length + threads_per_block.y - 1) / threads_per_block.y);
++
++    lp_pool1d_kernel<float><<<num_blocks, threads_per_block, 0, stream>>>(
++        input, output, batch, channels, length, output_length, kernel_size, stride);
++
++    // Check for launch errors
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Note: In a real binding layer, this would be reported via PyTorch error mechanisms.
++        // Here we just ignore; the binding layer will check via torch.cuda.synchronize() later.
++    }
++}
+--- before/kernels/lp_pool1d_binding.cpp
++++ after/kernels/lp_pool1d_binding.cpp
+@@ -0,0 +1,80 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include "../binding_registry.h"
++
++// Launcher declaration from custom_ops.cu
++extern "C" void lp_pool1d_launcher(
++    const float* input,
++    float* output,
++    int batch,
++    int channels,
++    int length,
++    int output_length,
++    int kernel_size,
++    int stride,
++    cudaStream_t stream);
++
++// PyTorch wrapper
++static torch::Tensor lp_pool1d(
++    torch::Tensor x,
++    int64_t norm_type,
++    int64_t kernel_size,
++    int64_t stride) {
++
++    // Parameter validation
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be on CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 3, "Input tensor must be 3D [batch, channels, length]");
++    TORCH_CHECK(norm_type == 2, "Only norm_type=2 is supported");
++    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++
++    int batch = x.size(0);
++    int channels = x.size(1);
++    int length = x.size(2);
++
++    // Output length calculation (matching PyTorch LPPool1d with no padding, ceil_mode=False)
++    int output_length = (length - kernel_size) / stride + 1;
++    TORCH_CHECK(output_length > 0, "Output length must be positive");
++
++    // Make input contiguous if needed (we'll pass a contiguous view to launcher)
++    auto x_contig = x.contiguous();
++
++    // Allocate output tensor
++    auto output = torch::empty({batch, channels, output_length}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    lp_pool1d_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch,
++        channels,
++        length,
++        output_length,
++        static_cast<int>(kernel_size),
++        static_cast<int>(stride),
++        stream);
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Register binding
++static void register_lp_pool1d(pybind11::module& m) {
++    m.def("lp_pool1d", &lp_pool1d,
++          "LPPool1d forward (norm_type=2, Euclidean norm)",
++          pybind11::arg("x"),
++          pybind11::arg("norm_type"),
++          pybind11::arg("kernel_size"),
++          pybind11::arg("stride"));
++}
++
++REGISTER_BINDING(lp_pool1d, register_lp_pool1d);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,35 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, norm_type, kernel_size, stride):
++        super().__init__()
++        self.norm_type = norm_type
++        self.kernel_size = kernel_size
++        self.stride = stride
++
++    def forward(self, x):
++        return cuda_extension.lp_pool1d(x, self.norm_type, self.kernel_size, self.stride)
++
++    def debug_forward(self, x):
++        y = cuda_extension.lp_pool1d(x, self.norm_type, self.kernel_size, self.stride)
++        yield "step_001", y
++
++
++batch_size = 128
++channels = 32
++length = 16384
++norm_type = 2
++kernel_size = 3
++stride = 2
++
++
++def get_inputs():
++    x = torch.randn(batch_size, channels, length)
++    return [x]
++
++
++def get_init_inputs():
++    return [norm_type, kernel_size, stride]

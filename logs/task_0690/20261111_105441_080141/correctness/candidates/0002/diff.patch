@@ -1,0 +1,151 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -2,29 +2,35 @@
+ #include <cmath>
+ 
+ // Kernel for concatenating two tensors along channel dimension (dim=1)
+-// Both inputs are contiguous float32 tensors of shape [N, C, H, W]
+-// Output is [N, 2*C, H, W] contiguous
+-// We perform a straightforward elementwise copy since inputs are contiguous and
+-// we copy the first tensor to the first half of the output, second to the second half.
++// Inputs: contiguous float32 tensors of shape [N, C, H, W]
++// Output: contiguous float32 tensor of shape [N, 2*C, H, W]
++// Mapping: output[n, c_out, h, w] = (c_out < C) ? input1[n, c_out, h, w] : input2[n, c_out-C, h, w]
+ __global__ void cat_forward_kernel(
+     float* __restrict__ output,
+     const float* __restrict__ input1,
+     const float* __restrict__ input2,
+-    int total_output_elements,
+-    int first_half_elements,
+-    int second_half_elements)
++    int N, int C, int H, int W)
+ {
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_elements = N * 2 * C * H * W;
+     int stride = blockDim.x * gridDim.x;
+ 
+-    // First half: copy from input1
+-    for (int i = idx; i < first_half_elements; i += stride) {
+-        output[i] = input1[i];
+-    }
++    for (int i = idx; i < total_elements; i += stride) {
++        int w = i % W;
++        int tmp = i / W;
++        int h = tmp % H;
++        tmp = tmp / H;
++        int c_out = tmp % (2 * C);
++        int n = tmp / (2 * C);
+ 
+-    // Second half: copy from input2 with offset
+-    for (int i = idx; i < second_half_elements; i += stride) {
+-        output[first_half_elements + i] = input2[i];
++        if (c_out < C) {
++            int in_idx = ((n * C + c_out) * H + h) * W + w;
++            output[i] = input1[in_idx];
++        } else {
++            int c = c_out - C;
++            int in_idx = ((n * C + c) * H + h) * W + w;
++            output[i] = input2[in_idx];
++        }
+     }
+ }
+ 
+@@ -42,40 +48,30 @@
+ }
+ 
+ // Host launcher for cat_forward
+-// Both inputs are contiguous CUDA float32 tensors of shape [N, C, H, W]
+-// Output is contiguous CUDA float32 tensor of shape [N, 2*C, H, W]
+-// Uses current CUDA stream passed from binding.
+ extern "C" void cat_forward_launcher(
+     float* output,
+     const float* input1,
+     const float* input2,
+-    int total_output_elements,
+-    int first_half_elements,
+-    int second_half_elements,
++    int N, int C, int H, int W,
+     cudaStream_t stream)
+ {
+-    if (total_output_elements <= 0) return;
++    int total_elements = N * 2 * C * H * W;
++    if (total_elements <= 0) return;
+ 
+     const int threads = 256;
+-    // Use enough blocks with grid-stride loop; cap grid to reasonable size
+-    int blocks = (total_output_elements + threads - 1) / threads;
++    int blocks = (total_elements + threads - 1) / threads;
+     if (blocks > 65535) blocks = 65535;
+ 
+     cat_forward_kernel<<<blocks, threads, 0, stream>>>(
+-        output, input1, input2,
+-        total_output_elements, first_half_elements, second_half_elements);
++        output, input1, input2, N, C, H, W);
+ 
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+-        // Since this is a .cu file without torch, we cannot throw exceptions.
+-        // We ignore the error here; binding layer may check synchronization.
+-        // In practice, we rely on correct launch parameters.
++        // Ignore; binding layer may check synchronization.
+     }
+ }
+ 
+ // Host launcher for cos_forward
+-// Input is contiguous CUDA float32 tensor of shape [N, C, H, W]
+-// Output is contiguous CUDA float32 tensor of same shape
+ extern "C" void cos_forward_launcher(
+     float* output,
+     const float* input,
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -9,9 +9,7 @@
+     float* output,
+     const float* input1,
+     const float* input2,
+-    int total_output_elements,
+-    int first_half_elements,
+-    int second_half_elements,
++    int N, int C, int H, int W,
+     cudaStream_t stream);
+ 
+ extern "C" void cos_forward_launcher(
+@@ -21,7 +19,6 @@
+     cudaStream_t stream);
+ 
+ torch::Tensor cat_forward(torch::Tensor tensor1, torch::Tensor tensor2) {
+-    // 输入检查
+     TORCH_CHECK(tensor1.is_cuda(), "tensor1 must be a CUDA tensor");
+     TORCH_CHECK(tensor2.is_cuda(), "tensor2 must be a CUDA tensor");
+     TORCH_CHECK(tensor1.dtype() == torch::kFloat32, "tensor1 must be float32");
+@@ -42,26 +39,22 @@
+ 
+     auto output = torch::empty({N, output_C, H, W}, tensor1.options());
+ 
+-    int64_t first_half_elements = static_cast<int64_t>(N) * C * H * W;
+-    int64_t second_half_elements = first_half_elements;
+-    int64_t total_output_elements = 2 * first_half_elements;
+-
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     cat_forward_launcher(
+         output.data_ptr<float>(),
+         tensor1.data_ptr<float>(),
+         tensor2.data_ptr<float>(),
+-        static_cast<int>(total_output_elements),
+-        static_cast<int>(first_half_elements),
+-        static_cast<int>(second_half_elements),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
+         stream);
+ 
+     return output;
+ }
+ 
+ torch::Tensor cos_forward(torch::Tensor input) {
+-    // 输入检查
+     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");

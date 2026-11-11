@@ -1,0 +1,120 @@
+#include <cuda_runtime.h>
+#include <cfloat>
+
+// Kernel: compute max along a reduced dimension, keepdim=True
+// Input x is assumed 4D float32 tensor with arbitrary strides.
+// output has same shape as x but dim replaced with 1.
+// Each thread block computes one output element (b, c, ..., w).
+// Block-wide grid-stride loop over the reduction dimension.
+template <typename scalar_t>
+__global__ void reduce_max_4d_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    int64_t dim_size,          // size of the reduction dimension
+    int64_t inner_size,        // product of sizes after dim (contiguous in index space)
+    int64_t outer_size,        // product of sizes before dim
+    int64_t input_stride_dim,  // stride of reduction dimension (in elements)
+    int64_t input_stride_outer,// stride of outer dimension (ignored if outer simple? use generic)
+    int64_t input_stride_inner,// stride of inner dimension
+    int64_t output_size        // total number of output elements (outer_size * inner_size)
+) {
+    int64_t out_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total_threads = static_cast<int64_t>(gridDim.x) * blockDim.x;
+
+    // Grid-stride loop over output elements
+    for (int64_t i = out_idx; i < output_size; i += total_threads) {
+        // Decode i into outer index o and inner index r
+        int64_t o = i / inner_size;
+        int64_t r = i % inner_size;
+
+        // Base input offset for this outer and inner position, reduction dim index 0
+        int64_t base = o * input_stride_outer + r * input_stride_inner;
+
+        // Initialize reduction
+        scalar_t max_val = -FLT_MAX;
+        // Iterate over reduction dimension
+        for (int64_t d = 0; d < dim_size; ++d) {
+            scalar_t val = input[base + d * input_stride_dim];
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+        output[i] = max_val;
+    }
+}
+
+// Kernel: compute product along a reduced dimension, keepdim=True
+// Similar structure to max.
+template <typename scalar_t>
+__global__ void reduce_prod_4d_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    int64_t dim_size,
+    int64_t inner_size,
+    int64_t outer_size,
+    int64_t input_stride_dim,
+    int64_t input_stride_outer,
+    int64_t input_stride_inner,
+    int64_t output_size
+) {
+    int64_t out_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total_threads = static_cast<int64_t>(gridDim.x) * blockDim.x;
+
+    for (int64_t i = out_idx; i < output_size; i += total_threads) {
+        int64_t o = i / inner_size;
+        int64_t r = i % inner_size;
+        int64_t base = o * input_stride_outer + r * input_stride_inner;
+        scalar_t prod_val = static_cast<scalar_t>(1.0);
+        for (int64_t d = 0; d < dim_size; ++d) {
+            prod_val *= input[base + d * input_stride_dim];
+        }
+        output[i] = prod_val;
+    }
+}
+
+// Launcher for max reduction.
+// x_dims: array of 4 dimensions; x_strides: array of 4 strides.
+// dim: reduction dimension, 0<=dim<4.
+extern "C" void reduce_max_4d_launcher(
+    const float* input,
+    float* output,
+    int64_t dim,
+    const int64_t* x_dims,
+    const int64_t* x_strides,
+    cudaStream_t stream
+) {
+    // Output dimension size 1 at dim, others same
+    int64_t outer_size = 1;
+    for (int d = 0; d < dim; ++d) outer_size *= x_dims[d];
+    int64_t dim_size = x_dims[dim];
+    int64_t inner_size = 1;
+    for (int d = dim + 1; d < 4; ++d) inner_size *= x_dims[d];
+    int64_t output_size = outer_size * inner_size;
+
+    int64_t input_stride_outer, input_stride_dim, input_stride_inner;
+    // Compute product of strides corresponding to outer part? Actually need stride for outer index (product of outer dims contribution).
+    // Since outer index o is a flattened index over dims [0, dim), the offset contribution is sum over those dims o_d * stride_d.
+    // Similarly inner index r is flattened over dims (dim+1, 4), contribution sum r_d * stride_d.
+    // Here we cannot simply use single stride because outer and inner may not be contiguous in memory in a simple way if the tensor has arbitrary strides.
+    // Our kernel currently assumes linear combination with a single stride for outer and inner, which fails for arbitrary strides.
+    // To handle arbitrary strides, we must pass all strides and reconstruct offsets per dimension inside kernel.
+    // We need a more general kernel: each output element corresponds to a set of indices; we loop over reduction dim and compute input offset using all 4 strides.
+    // Let's implement a simpler approach: launch one block per output element, and compute for each output element the linear index using precomputed multi-index via blockIdx and threadIdx, then compute offset using sum over non-reduction dims.*stride + d*stride_dim.
+    // For simplicity, we can have each block compute one output element, and number of blocks = output_size (capped with grid-stride). Then inside each block threadIdx.x=0 (maybe multiple threads) but we can let a single thread do reduction, or use block-stride loop. We'll use one thread per block for simplicity; output_size may be large but grid-stride loop will handle.
+    // Use block size 128 and grid size min(output_size, 65535).
+
+    int threads = 128;
+    int blocks = (output_size + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+
+    // Need kernel with full stride array.
+    // We'll create a new kernel that receives pointer to strides x_strides.
+    // Modify reduce_max_4d_kernel signature to receive strides pointer instead of precomputed combined strides.
+    // For performance, we can precompute combined strides for outer and inner only if they are contiguous; but to be robust, use full strides.
+    // We'll define a kernel that takes x_dims and x_strides pointers.
+    // However, kernel already defined above expects combined strides. We can either rewrite kernel or add another kernel. Let's rewrite both kernels to accept full strides.
+    // We'll keep template kernel but with additional pointer to strides; and launcher passes x_strides.
+    // For brevity, we'll implement a new kernel named reduce_max_4d_kernel_v2 and call that.
+    // Actually we can just include the full-strides logic in this file by defining new kernels.
+    // In final code, we'll have two kernels: one for max, one for prod, each takes x_strides pointer and computes offset generically.
+}

@@ -1,0 +1,129 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,49 @@
++#include <cuda_runtime.h>
++
++// GLU forward kernel: output = a * sigmoid(b)
++// input shape: [B, 2*N, F], output shape: [B, N, F]
++// a = input[:, :N, :], b = input[:, N:, :]
++__global__ void glu_forward_kernel(const float* __restrict__ input,
++                                   float* __restrict__ output,
++                                   int B, int N, int F) {
++    int total = B * N * F;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++
++    for (int i = idx; i < total; i += stride) {
++        // decompose i into (b, n, f) where n in [0, N), f in [0, F)
++        int f = i % F;
++        int tmp = i / F;
++        int n = tmp % N;
++        int b = tmp / N;
++
++        // offset in input for a and b
++        int a_idx = ((long long)b * (2 * N) + n) * F + f;
++        int b_idx = ((long long)b * (2 * N) + (n + N)) * F + f;
++
++        float a = input[a_idx];
++        float bb = input[b_idx];
++        // fast sigmoid: 1 / (1 + exp(-x))
++        float sig = 1.0f / (1.0f + expf(-bb));
++        output[i] = a * sig;
++    }
++}
++
++// C-interface launcher (no PyTorch dependencies)
++extern "C" void glu_forward_launcher(const float* input,
++                                     float* output,
++                                     int B, int N, int F,
++                                     cudaStream_t stream) {
++    int total = B * N * F;
++    if (total == 0) return;
++
++    const int block_size = 256;
++    // use enough blocks to cover the work, but cap to avoid excessive launch overhead
++    int grid_size = (total + block_size - 1) / block_size;
++    // limit grid to avoid too many blocks, grid-stride loop will handle rest
++    if (grid_size > 65535) grid_size = 65535;
++    if (grid_size < 1) grid_size = 1;
++
++    glu_forward_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, B, N, F);
++}
+--- before/kernels/glu_binding.cpp
++++ after/kernels/glu_binding.cpp
+@@ -0,0 +1,52 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declaration from custom_ops.cu
++extern "C" void glu_forward_launcher(const float* input,
++                                     float* output,
++                                     int B, int N, int F,
++                                     cudaStream_t stream);
++
++torch::Tensor glu_forward(torch::Tensor x) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 3, "Input must be 3D (batch, 2*n, features)");
++
++    int B = x.size(0);
++    int twoN = x.size(1);
++    TORCH_CHECK(twoN % 2 == 0, "Input dimension 1 must be even (2*n)");
++    int N = twoN / 2;
++    int F = x.size(2);
++
++    // Allocate output [B, N, F]
++    auto output = torch::empty({B, N, F}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call CUDA launcher
++    glu_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        B, N, F,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_glu(pybind11::module& m) {
++    m.def("glu_forward", &glu_forward, "GLU forward along dimension 1",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(glu, register_glu);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,19 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_dim, hidden_dim):
++        super().__init__()
++        # No learnable parameters, matching reference state_dict (empty)
++        # input_dim and hidden_dim accepted to match signature
++
++    def forward(self, x):
++        x = cuda_extension.glu_forward(x)
++        return x
++
++    def debug_forward(self, x):
++        y = cuda_extension.glu_forward(x)
++        yield ('step_001', y)
++        yield ('step_002', y)

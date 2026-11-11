@@ -1,0 +1,198 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,71 @@
++// kernels/custom_ops.cu
++// CUDA implementation of unfold (im2col) matching torch.nn.functional.unfold with stride=1, padding=0.
++// Only float32 input/output. Input may be non-contiguous; launcher receives strides.
++
++#include <cuda_runtime.h>
++
++// Kernel: copy elements from input to output according to unfold layout.
++// output shape: [N, C*K, L] where K = kernel_h * kernel_w, L = out_h * out_w.
++// Global index idx in output maps to (n, c*K + k, l).
++// For each thread, we use grid-stride loop to cover all elements.
++__global__ void unfold_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int kernel_h, int kernel_w,
++    int dilation_h, int dilation_w,
++    int out_h, int out_w,
++    int inp_sN, int inp_sC, int inp_sH, int inp_sW)
++{
++    int K = kernel_h * kernel_w;
++    int L = out_h * out_w;
++    int total = N * C * K * L;
++    int stride = blockDim.x * gridDim.x;
++    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
++        int n = idx / (C * K * L);
++        int rem = idx % (C * K * L);
++        int c = rem / (K * L);
++        int rem2 = rem % (K * L);
++        int k = rem2 / L;
++        int l = rem2 % L;
++        int kh = k / kernel_w;
++        int kw = k % kernel_w;
++        int oh = l / out_w;
++        int ow = l % out_w;
++        int ih = oh + kh * dilation_h;
++        int iw = ow + kw * dilation_w;
++        // Input offset: n*inp_sN + c*inp_sC + ih*inp_sH + iw*inp_sW
++        int in_idx = n * inp_sN + c * inp_sC + ih * inp_sH + iw * inp_sW;
++        output[idx] = input[in_idx];
++    }
++}
++
++// Host launcher: no PyTorch dependencies. Takes preallocated contiguous output.
++// Strides for input are passed separately to support non-contiguous tensors.
++extern "C" void unfold_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int kernel_h, int kernel_w,
++    int dilation_h, int dilation_w,
++    int inp_sN, int inp_sC, int inp_sH, int inp_sW,
++    cudaStream_t stream)
++{
++    int out_h = H - dilation_h * (kernel_h - 1);
++    int out_w = W - dilation_w * (kernel_w - 1);
++    int total = N * C * kernel_h * kernel_w * out_h * out_w;
++    if (total <= 0) return;
++
++    const int block = 256;
++    // Choose grid size to cover all elements, but cap to avoid excessive blocks.
++    // Grid-stride loop handles overflow.
++    int grid = (total + block - 1) / block;
++    if (grid > 65535) grid = 65535;
++    unfold_kernel<<<grid, block, 0, stream>>>(
++        input, output,
++        N, C, H, W,
++        kernel_h, kernel_w,
++        dilation_h, dilation_w,
++        out_h, out_w,
++        inp_sN, inp_sC, inp_sH, inp_sW);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,91 @@
++// kernels/custom_ops_binding.cpp
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void unfold_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int kernel_h, int kernel_w,
++    int dilation_h, int dilation_w,
++    int inp_sN, int inp_sC, int inp_sH, int inp_sW,
++    cudaStream_t stream);
++
++// PyTorch wrapper for unfold (im2col)
++torch::Tensor unfold(
++    torch::Tensor x,
++    int64_t kernel_h,
++    int64_t kernel_w,
++    int64_t dilation_h,
++    int64_t dilation_w) {
++    // Validate input tensor
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    // Ensure input is contiguous; if not, we'll handle strides, but for simplicity
++    // we'll require contiguity? No, launcher supports strides.
++    // We'll pass strides as is.
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    // Compute output dimensions
++    int64_t out_h = H - dilation_h * (kernel_h - 1);
++    int64_t out_w = W - dilation_w * (kernel_w - 1);
++    TORCH_CHECK(out_h > 0 && out_w > 0, "Kernel size too large for input");
++
++    int64_t K = kernel_h * kernel_w;
++    int64_t L = out_h * out_w;
++
++    // Allocate output tensor: contiguous [N, C*K, L]
++    auto output = torch::empty({N, C * K, L}, x.options());
++
++    // Get input strides
++    auto strides = x.strides();
++    int64_t inp_sN = strides[0];
++    int64_t inp_sC = strides[1];
++    int64_t inp_sH = strides[2];
++    int64_t inp_sW = strides[3];
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher with int64_t converted to int (should be safe for practical sizes)
++    unfold_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(kernel_h),
++        static_cast<int>(kernel_w),
++        static_cast<int>(dilation_h),
++        static_cast<int>(dilation_w),
++        static_cast<int>(inp_sN),
++        static_cast<int>(inp_sC),
++        static_cast<int>(inp_sH),
++        static_cast<int>(inp_sW),
++        stream);
++
++    return output;
++}
++
++// Registration
++void register_unfold(pybind11::module& m) {
++    m.def("unfold", &unfold,
++          "Unfold (im2col) with stride=1, padding=0",
++          pybind11::arg("x"),
++          pybind11::arg("kernel_h"),
++          pybind11::arg("kernel_w"),
++          pybind11::arg("dilation_h"),
++          pybind11::arg("dilation_w"));
++}
++
++REGISTER_BINDING(unfold, register_unfold);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,27 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, batch_size, in_channels, out_channels, kernel_size, dilation, height, width):
++        super().__init__()
++        # Store configuration for forward, but do not use torch.nn.Unfold
++        self.kernel_size = kernel_size
++        self.dilation = dilation
++        # No parameters, state_dict stays empty
++
++    def forward(self, x):
++        # Call custom CUDA extension unfold, reproducing nn.Unfold with stride=1, padding=0
++        # kernel_size and dilation are tuples, pass as ints
++        x = torch.ops.cuda_extension.unfold(x, self.kernel_size[0], self.kernel_size[1],
++                                            self.dilation[0], self.dilation[1])
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        # Step 001: unfold
++        x = torch.ops.cuda_extension.unfold(x, self.kernel_size[0], self.kernel_size[1],
++                                            self.dilation[0], self.dilation[1])
++        yield 'step_001', x
++        # Step 002: return x
++        yield 'step_002', x

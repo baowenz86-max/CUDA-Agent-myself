@@ -1,0 +1,158 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,61 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// CUDA kernel for cumulative minimum along dimension 0 (columns) of a 2D tensor.
++// Input: x with strides sx0 (row stride) and sx1 (column stride).
++// Output: out with contiguous row-major layout (strides: sy0 = D, sy1 = 1), allocated via empty_like.
++// Each thread processes one column sequentially over all rows.
++// Launched with enough threads to cover D columns.
++__global__ void cummin_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int N,          // number of rows
++    int D,          // number of columns
++    long long sx0,  // input stride for row (in elements)
++    long long sx1,  // input stride for column (in elements)
++    long long sy0,  // output row stride (should be D)
++    long long sy1   // output column stride (should be 1)
++) {
++    int col = blockIdx.x * blockDim.x + threadIdx.x;
++    if (col >= D) return;
++
++    // Compute base offset for this column (row 0)
++    const float* in_ptr = x + col * sx1;
++    float* out_ptr = out + col * sy1;
++
++    float running_min = *in_ptr;
++    *out_ptr = running_min;
++
++    for (int i = 1; i < N; ++i) {
++        float val = *(in_ptr + i * sx0);
++        running_min = (val < running_min) ? val : running_min;
++        *(out_ptr + i * sy0) = running_min;
++    }
++}
++
++// Host launcher with C linkage, no PyTorch dependencies.
++// Parameters:
++//   x: pointer to input float data (CUDA)
++//   out: pointer to output float data (CUDA)
++//   N: number of rows
++//   D: number of columns
++//   sx0, sx1: input strides in elements (as int64_t)
++//   sy0, sy1: output strides in elements (as int64_t)
++//   stream: CUDA stream
++extern "C" void cummin_forward_launcher(
++    const float* x,
++    float* out,
++    int N,
++    int D,
++    int64_t sx0,
++    int64_t sx1,
++    int64_t sy0,
++    int64_t sy1,
++    cudaStream_t stream)
++{
++    // Use a 1D grid of threads covering D columns.
++    int threads = 256;
++    int blocks = (D + threads - 1) / threads;
++    cummin_kernel<<<blocks, threads, 0, stream>>>(
++        x, out, N, D, (long long)sx0, (long long)sx1, (long long)sy0, (long long)sy1);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,74 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void cummin_forward_launcher(
++    const float* x,
++    float* out,
++    int N,
++    int D,
++    int64_t sx0,
++    int64_t sx1,
++    int64_t sy0,
++    int64_t sy1,
++    cudaStream_t stream);
++
++// PyTorch wrapper for cumulative minimum along dimension 0
++torch::Tensor cummin_forward(torch::Tensor x) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() >= 2, "Input must have at least 2 dimensions (N, D, ...)");
++
++    // For this specific task, input is [N, D] with N=10000, D=128. We support 2D only.
++    TORCH_CHECK(x.dim() == 2, "cummin_forward currently supports only 2D input [N, D]");
++
++    const int64_t N = x.size(0);
++    const int64_t D = x.size(1);
++    TORCH_CHECK(N > 0 && D > 0, "Input dimensions must be positive");
++
++    // Input strides in elements
++    const int64_t sx0 = x.stride(0);
++    const int64_t sx1 = x.stride(1);
++
++    // Allocate output using empty_like: same shape, stride, dtype, device as input
++    auto out = torch::empty_like(x);
++
++    // Output strides in elements (should match input, but we pass them explicitly)
++    const int64_t sy0 = out.stride(0);
++    const int64_t sy1 = out.stride(1);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    cummin_forward_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(D),
++        sx0,
++        sx1,
++        sy0,
++        sy1,
++        stream);
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Registration function
++void register_cummin(pybind11::module& m) {
++    m.def("cummin_forward", &cummin_forward,
++          "Cumulative minimum along dimension 0 (values only)",
++          pybind11::arg("x"));
++}
++
++REGISTER_BINDING(cummin, register_cummin);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,14 @@
++import torch
++import cuda_extension
++
++
++class ModelNew(torch.nn.Module):
++    def __init__(self):
++        super(ModelNew, self).__init__()
++
++    def forward(self, x):
++        return cuda_extension.cummin_forward(x)
++
++    def debug_forward(self, x):
++        out = cuda_extension.cummin_forward(x)
++        yield 'step_001', out

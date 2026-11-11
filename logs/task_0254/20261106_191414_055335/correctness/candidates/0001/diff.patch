@@ -1,0 +1,180 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,77 @@
++#include <cuda_runtime.h>
++
++// Element-wise hardtanh (clamp) for float32 tensors with arbitrary strides.
++// The launcher computes element offset using the tensor's shape and strides
++// by flattening the multi-dimensional index into a linear index and then
++// deriving the source/destination offset via position-based multiplication.
++// A grid-stride loop ensures all elements are processed even if the total
++// number of elements exceeds the maximum grid dimension.
++__global__ void hardtanh_kernel(const float* __restrict__ input,
++                                float* __restrict__ output,
++                                int64_t numel,
++                                int64_t num_dims,
++                                const int64_t* __restrict__ shape,
++                                const int64_t* __restrict__ input_strides,
++                                const int64_t* __restrict__ output_strides,
++                                float min_val,
++                                float max_val) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < numel; i += stride) {
++        // Compute multi-dimensional index from linear index i
++        int64_t remaining = i;
++        int64_t input_offset = 0;
++        int64_t output_offset = 0;
++        for (int64_t d = 0; d < num_dims; ++d) {
++            int64_t dim_size = shape[d];
++            int64_t coord = remaining % dim_size;
++            remaining /= dim_size;
++            input_offset += coord * input_strides[d];
++            output_offset += coord * output_strides[d];
++        }
++
++        float val = input[input_offset];
++        val = fminf(fmaxf(val, min_val), max_val);
++        output[output_offset] = val;
++    }
++}
++
++// C-interface launcher for hardtanh on CUDA float32 tensors.
++// Input and output must be non-null CUDA pointers; dimensions and strides are
++// provided by the binding layer from the tensor metadata.
++extern "C" void hardtanh_forward_launcher(const float* input,
++                                          float* output,
++                                          int64_t numel,
++                                          int64_t num_dims,
++                                          const int64_t* shape,
++                                          const int64_t* input_strides,
++                                          const int64_t* output_strides,
++                                          float min_val,
++                                          float max_val,
++                                          cudaStream_t stream) {
++    if (numel == 0 || input == nullptr || output == nullptr) {
++        return;
++    }
++
++    // Choose block size and grid size with grid-stride loop
++    const int threads = 256;
++    int64_t blocks_64 = (numel + threads - 1) / threads;
++    // Cap grid to avoid exceeding max grid dimension; remainder handled by loop
++    const int64_t max_blocks = 1048576; // typical max grid x dimension
++    int blocks = (int)(blocks_64 < max_blocks ? blocks_64 : max_blocks);
++
++    hardtanh_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, numel, num_dims,
++        shape, input_strides, output_strides,
++        min_val, max_val);
++
++    // Check for launch errors (but do not synchronize)
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In a real binding, you would throw an exception; here we just
++        // return, but the binding should check after launch if necessary.
++        // Since .cu cannot throw, we leave it to binding to call cudaGetLastError.
++        // We still call it to clear the error status.
++    }
++}
+--- before/kernels/hardtanh_binding.cpp
++++ after/kernels/hardtanh_binding.cpp
+@@ -0,0 +1,71 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of the CUDA launcher from custom_ops.cu
++extern "C" void hardtanh_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    int64_t num_dims,
++    const int64_t* shape,
++    const int64_t* input_strides,
++    const int64_t* output_strides,
++    float min_val,
++    float max_val,
++    cudaStream_t stream);
++
++// Wrapper function for the Python-visible operator
++torch::Tensor hardtanh_forward(torch::Tensor x, double min_val, double max_val) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.numel() > 0, "Input tensor must not be empty");
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Allocate output with same shape (empty_like preserves strides but we'll handle arbitrary strides)
++    auto output = torch::empty_like(x);
++
++    // Extract metadata as int64_t vectors to ensure stable pointers
++    auto shape_vec = x.sizes().vec();
++    auto input_strides_vec = x.strides().vec();
++    auto output_strides_vec = output.strides().vec();
++    int64_t numel = x.numel();
++    int64_t num_dims = x.dim();
++
++    // Call launcher
++    hardtanh_forward_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        num_dims,
++        shape_vec.data(),
++        input_strides_vec.data(),
++        output_strides_vec.data(),
++        static_cast<float>(min_val),
++        static_cast<float>(max_val),
++        stream
++    );
++
++    // Check for launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_hardtanh(pybind11::module& m) {
++    m.def("hardtanh_forward", &hardtanh_forward,
++          "Hardtanh forward (element-wise clamp)",
++          py::arg("x"),
++          py::arg("min_val") = -1.0,
++          py::arg("max_val") = 1.0);
++}
++
++// Auto-register
++REGISTER_BINDING(hardtanh, register_hardtanh);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,23 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, min_val, max_val):
++        super().__init__()
++        self.input_size = input_size
++        self.min_val = float(min_val)
++        self.max_val = float(max_val)
++
++    def forward(self, x):
++        if not x.is_cuda:
++            x = x.cuda()
++        return cuda_extension.hardtanh_forward(x, min_val=self.min_val, max_val=self.max_val)
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        if not x.is_cuda:
++            x = x.cuda()
++        output = cuda_extension.hardtanh_forward(x, min_val=self.min_val, max_val=self.max_val)
++        yield 'step_001', output

@@ -1,0 +1,175 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,12 +1,12 @@
+ #include <cuda_runtime.h>
+ #include <math.h>
+ 
+-// ---------------- Upsample bilinear 2x (NCHW, float32) ----------------
++// ---------------- Upsample bilinear 2x (NCHW, float32, contiguous) ----------------
+ // 参考 PyTorch align_corners=False 的坐标映射：
+ //   src_x = (dst_x + 0.5) / scale - 0.5 = (dst_x + 0.5) * 0.5 - 0.5
+ //   src_y 同理
+ //   对源坐标先 floor 再线性插值，边界 clamp 到 [0, W-1] / [0, H-1]
+-// 输入支持任意 stride，输出为连续 NCHW。
++// 输入输出均为连续 NCHW，步长由形状决定。
+ // 线程映射：每个线程负责一个输出像素 (w, h)，block 维度为 (32, 8)，grid 维度覆盖整个输出平面。
+ 
+ template <typename T>
+@@ -14,13 +14,21 @@
+     const T* __restrict__ input,
+     T* __restrict__ output,
+     int N, int C, int H, int W,
+-    int outH, int outW,
+-    const long long* __restrict__ in_strides, // 数组 [strideN, strideC, strideH, strideW]
+-    const long long* __restrict__ out_strides // 数组 [strideN, strideC, strideH, strideW]
++    int outH, int outW
+ ) {
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int idy = blockIdx.y * blockDim.y + threadIdx.y;
++    int plane = blockIdx.z;
++
++    if (plane >= N * C) return;
+     if (idx >= outW || idy >= outH) return;
++
++    int n = plane / C;
++    int c = plane - n * C;
++
++    // 连续 NCHW 下，输入基地址偏移
++    const T* in_plane = input + (size_t)n * C * H * W + (size_t)c * H * W;
++    T* out_plane = output + (size_t)n * C * outH * outW + (size_t)c * outH * outW;
+ 
+     int dst_x = idx;
+     int dst_y = idy;
+@@ -49,32 +57,21 @@
+     float wx0 = 1.0f - wx1;
+     float wy0 = 1.0f - wy1;
+ 
+-    // 对 N 和 C 维度进行循环（通常一个 block 覆盖整个输出图像的块，但 N*C 较大时 grid.z 使用）
+-    // 为了简单和高效，我们让 blockIdx.z 遍历 N*C 平面，每个平面内 blockIdx.x/y 覆盖 outW/outH
+-    int plane = blockIdx.z;
+-    if (plane >= N * C) return;
+-    int n = plane / C;
+-    int c = plane - n * C;
+-
+-    const T* in_plane = input + n * in_strides[0] + c * in_strides[1];
+-    T* out_plane = output + n * out_strides[0] + c * out_strides[1];
+-
+-    // 读取四个源像素
+-    T v00 = in_plane[y0 * in_strides[2] + x0 * in_strides[3]];
+-    T v01 = in_plane[y0 * in_strides[2] + x1 * in_strides[3]];
+-    T v10 = in_plane[y1 * in_strides[2] + x0 * in_strides[3]];
+-    T v11 = in_plane[y1 * in_strides[2] + x1 * in_strides[3]];
++    // 读取四个源像素（连续内存）
++    T v00 = in_plane[y0 * W + x0];
++    T v01 = in_plane[y0 * W + x1];
++    T v10 = in_plane[y1 * W + x0];
++    T v11 = in_plane[y1 * W + x1];
+ 
+     float result = wx0 * (wy0 * (float)v00 + wy1 * (float)v10) +
+                    wx1 * (wy0 * (float)v01 + wy1 * (float)v11);
+ 
+-    // 输出位置：连续输出使用 out_strides，通常 strideW=1，strideH=outW，strideC=outH*outW，strideN=outC*outH*outW
+-    out_plane[dst_y * out_strides[2] + dst_x * out_strides[3]] = (T)result;
++    out_plane[dst_y * outW + dst_x] = (T)result;
+ }
+ 
+ // ---------------- Ceil kernel ----------------
+-// 逐元素 ceil，支持任意 stride，输出连续。
+-// 为了高效，我们使用一维 grid-stride 循环，每个线程处理多个元素。
++// 逐元素 ceil，输入输出均为连续内存。
++// 使用一维 grid-stride 循环，每个线程处理多个元素。
+ template <typename T>
+ __global__ void ceil_kernel(
+     const T* __restrict__ input,
+@@ -95,8 +92,6 @@
+     float* output,
+     int N, int C, int H, int W,
+     int outH, int outW,
+-    const long long* in_strides,
+-    const long long* out_strides,
+     cudaStream_t stream
+ ) {
+     dim3 block(32, 8);
+@@ -104,10 +99,8 @@
+               (outH + block.y - 1) / block.y,
+               N * C);
+ 
+-    // 注意：如果 N*C 很大（此处 512*3=1536），grid.z 在支持范围内（最大 65535），但为了保险可以限制并循环
+-    // 但直接这样没问题，因为 1536 < 65535。
+     upsample_bilinear2x_kernel<float><<<grid, block, 0, stream>>>(
+-        input, output, N, C, H, W, outH, outW, in_strides, out_strides);
++        input, output, N, C, H, W, outH, outW);
+ }
+ 
+ extern "C" void ceil_launcher(
+@@ -117,12 +110,7 @@
+     cudaStream_t stream
+ ) {
+     const int block_size = 256;
+-    // 计算足够覆盖的 grid 大小，同时避免太多 block（使用 grid-stride 循环处理）
+     long long total_blocks = (numel + block_size - 1) / block_size;
+-    // 限制 grid 维度，使用 grid-stride 循环
+-    int grid_size = (int)min(total_blocks, (long long)65535 * 32768); // 最大 grid 维度，但保守
+-    // 为了避免 grid 过大，使用最大 65535*若干？实际上可以直接用 total_blocks 但是若超过 2^31-1 会溢出，但 numel 最大 100M 不至于
+-    // 为了符合 grid dim 限制 (x 最大 2^31-1)，100M/256≈390625，远小于限制，可以直接使用 int
+     int grid = (int)total_blocks;
+     ceil_kernel<float><<<grid, block_size, 0, stream>>>(input, output, numel);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -10,8 +10,6 @@
+     float* output,
+     int N, int C, int H, int W,
+     int outH, int outW,
+-    const long long* in_strides,
+-    const long long* out_strides,
+     cudaStream_t stream
+ );
+ 
+@@ -29,6 +27,9 @@
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
+ 
++    // 确保输入连续
++    input = input.contiguous();
++
+     int N = input.size(0);
+     int C = input.size(1);
+     int H = input.size(2);
+@@ -39,25 +40,15 @@
+     // 创建连续输出张量
+     auto output = torch::empty({N, C, outH, outW}, input.options());
+ 
+-    // 准备 stride 数组（输入使用实际 stride，输出使用连续 stride）
+-    long long in_strides[4];
+-    long long out_strides[4];
+-    for (int i = 0; i < 4; ++i) {
+-        in_strides[i] = input.stride(i);
+-        out_strides[i] = output.stride(i);
+-    }
+-
+     // 获取当前 CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // 调用 launcher
++    // 调用 launcher（不再传递 stride 指针）
+     upsample_bilinear2x_launcher(
+         input.data_ptr<float>(),
+         output.data_ptr<float>(),
+         N, C, H, W,
+         outH, outW,
+-        in_strides,
+-        out_strides,
+         stream
+     );
+ 
+@@ -72,6 +63,9 @@
+     // 输入检查
+     TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++
++    // 确保输入连续
++    input = input.contiguous();
+ 
+     // 创建连续输出张量，保留 shape
+     auto output = torch::empty_like(input);

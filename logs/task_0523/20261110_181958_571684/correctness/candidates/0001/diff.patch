@@ -1,0 +1,154 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,51 @@
++#include <cuda_runtime.h>
++
++// Kernel to flip a tensor along a single dimension.
++// Supports arbitrary number of dimensions via sizes and strides.
++// Only float32 used in this task.
++__global__ void flip_single_dim_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t dim,
++    const int64_t* __restrict__ sizes,
++    const int64_t* __restrict__ strides,
++    int64_t ndim,
++    int64_t total_elements)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    for (int64_t linear = idx; linear < total_elements; linear += stride) {
++        int64_t remaining = linear;
++        int64_t src_index = 0;
++        for (int64_t d = 0; d < ndim; ++d) {
++            int64_t coord = remaining / sizes[d];
++            remaining = remaining % sizes[d];
++            if (d == dim) {
++                coord = sizes[d] - 1 - coord;
++            }
++            src_index += coord * strides[d];
++        }
++        output[linear] = input[src_index];
++    }
++}
++
++// Launcher for flip_forward. Assumes input and output are contiguous tensors
++// of same shape, dtype float32, on CUDA. dim is the dimension to flip.
++extern "C" void flip_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t dim,
++    const int64_t* sizes,
++    const int64_t* strides,
++    int64_t ndim,
++    int64_t total_elements,
++    cudaStream_t stream)
++{
++    const int block_size = 256;
++    int64_t blocks = (total_elements + block_size - 1) / block_size;
++    // Cap grid size to avoid exceeding maximum (2^31-1 in x dimension for compute capability >= 3.0)
++    if (blocks > 2147483647) blocks = 2147483647;
++    flip_single_dim_kernel<<<(unsigned int)blocks, block_size, 0, stream>>>(
++        output, input, dim, sizes, strides, ndim, total_elements);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,67 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void flip_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t dim,
++    const int64_t* sizes,
++    const int64_t* strides,
++    int64_t ndim,
++    int64_t total_elements,
++    cudaStream_t stream);
++
++torch::Tensor flip_forward(torch::Tensor x, int64_t dim) {
++    // Validate input tensor
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be on CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() > dim && dim >= -x.dim(), "dim out of range");
++
++    // Convert negative dim to positive
++    if (dim < 0) {
++        dim += x.dim();
++    }
++
++    // Allocate output tensor with same shape and options
++    auto output = torch::empty(x.sizes(), x.options());
++
++    // Collect sizes and strides as int64_t vectors
++    int64_t ndim = x.dim();
++    std::vector<int64_t> sizes(ndim);
++    std::vector<int64_t> strides(ndim);
++    for (int64_t i = 0; i < ndim; ++i) {
++        sizes[i] = x.size(i);
++        strides[i] = x.stride(i);
++    }
++
++    int64_t total_elements = x.numel();
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    flip_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        dim,
++        sizes.data(),
++        strides.data(),
++        ndim,
++        total_elements,
++        stream);
++
++    return output;
++}
++
++void register_flip_forward(pybind11::module& m) {
++    m.def("flip_forward", &flip_forward,
++          "Flip tensor along a single dimension",
++          py::arg("x"), py::arg("dim"));
++}
++
++REGISTER_BINDING(flip_forward, register_flip_forward);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,28 @@
++import torch
++import cuda_extension
++
++
++class ModelNew(torch.nn.Module):
++    def __init__(self, flip_dims):
++        super().__init__()
++        # Store flip_dims as in original; assume it is a tuple or list.
++        # For this task, flip_dims is provided as (2,) in init_inputs.
++        # We will extract the single dimension for the custom op.
++        if isinstance(flip_dims, (tuple, list)):
++            # For simplicity, assume length 1 as per task contract.
++            # If multiple dims are present, we would need a different design.
++            self.dim = int(flip_dims[0])
++        else:
++            self.dim = int(flip_dims)
++        # Keep original attribute for potential state_dict compatibility, though no params exist.
++        self.flip_dims = flip_dims
++
++    def forward(self, x):
++        # Call custom CUDA extension to perform flip along self.dim.
++        return cuda_extension.flip_forward(x, self.dim)
++
++    def debug_forward(self, *inputs):
++        """Yields (checkpoint_id, value) for each checkpoint in order."""
++        x = inputs[0]
++        result = cuda_extension.flip_forward(x, self.dim)
++        yield 'step_001', result

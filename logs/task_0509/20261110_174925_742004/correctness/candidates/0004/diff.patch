@@ -1,0 +1,80 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -102,27 +102,51 @@
+ 
+     // Perform GEMM: C = A^T * B, where A is weight [out_features x in_features], B is input [in_features x batch]
+     // Actually torch linear: input [batch, in] @ weight.T [in, out] -> [batch, out]
+-    // For cuBLAS, we need dimensions: m = batch, n = out_features, k = in_features
+-    // C (m x n) = A (m x k) * B (k x n)
+-    // A = input (batch x in), B = weight.T? But weight.T is [in, out], which is B (k x n). So we need B = weight.T (not stored).
+-    // Alternative: use cublasSgemm with transa=CUBLAS_OP_T, transb=CUBLAS_OP_N: C = A^T * B where A is weight (out x in), B is input (in x batch)
+-    // Then C would be out x batch, not batch x out. We need batch x out, so we can compute C^T = A * B^T where A is input (batch x in), B is weight (out x in).
+-    // Use cublasSgemm with transa=CUBLAS_OP_N, transb=CUBLAS_OP_T on A=input, B=weight: C = A * B^T = input @ weight.T, dimensions: m=batch, n=out_features, k=in_features.
++    // For cuBLAS column-major format: C (m x n) = A (m x k) * B (k x n)
++    // We want C_row_major [batch, out] = input_row_major [batch, in] * weight_row_major^T [out, in]^T
++    // In column-major view: C_col_major has shape (out, batch), leading dimension = out_features.
++    // A (input) row-major [batch, in] is column-major matrix of shape (in, batch), leading dimension = in_features.
++    // B (weight) row-major [out, in] is column-major matrix of shape (in, out), leading dimension = in_features.
++    // We need C_col_major = A_col_major^T * B_col_major^T? Instead of transposing, we use cublasSgemm with:
++    //   A = input (column-major view shape in x batch, lda=in_features)
++    //   B = weight (column-major view shape in x out, ldb=in_features)
++    //   Transpose A: A^T = input^T (column-major view of original input? Actually A^T is shape batch x in).
++    // Let's compute directly: output_row_major [batch, out] = input_row_major [batch, in] * weight_row_major^T [in, out]
++    // In column-major, if we view input_row_major as a column-major matrix with dimensions in x batch, call it A (in x batch).
++    // View weight_row_major as column-major matrix with dimensions in x out, call it B (in x out).
++    // Then output_row_major [batch, out] corresponds to column-major matrix C with dimensions out x batch.
++    // C = B^T * A (out x in) * (in x batch) = out x batch.
++    // So we use cublasSgemm with transa=CUBLAS_OP_T, transb=CUBLAS_OP_N:
++    //   A = weight (column-major in x out), but we want A as out x in? Actually cublasSgemm computes C = op(A) * op(B).
++    // Let A = weight (in x out) as column-major, but we want A^T (out x in). So transa=OP_T.
++    // Let B = input (in x batch) as column-major, transb=OP_N.
++    // Then C = weight^T * input (out x batch) as column-major, which corresponds to output_row_major [batch, out].
++    // Dimensions: m = out_features, n = batch_size, k = in_features.
++    // For A (weight) lda = in_features (since column-major matrix of shape in x out has leading dimension in_features).
++    // For B (input) ldb = in_features (shape in x batch).
++    // For C (column-major out x batch) ldc = out_features.
++    // This yields C column-major shape out x batch, stored in our row-major output tensor of shape batch x out.
++    // Correction: The above computes C_col = weight^T * input, shape out x batch. In memory, if we have row-major output [batch, out],
++    // the column-major C with shape out x batch and leading dimension out_features is exactly the same memory layout.
++    // So we set m=out_features, n=batch_size, k=in_features, transa=CUBLAS_OP_T, transb=CUBLAS_OP_N,
++    // A=weight, lda=in_features; B=input, ldb=in_features; C=output, ldc=out_features.
++    // This is correct and avoids the previous erroneous use of m=batch_size, n=out_features.
+     cublasSgemm(handle,
+-                CUBLAS_OP_N, CUBLAS_OP_T,
+-                (int)batch_size, (int)out_features, (int)in_features,
++                CUBLAS_OP_T, CUBLAS_OP_N,
++                (int)out_features, (int)batch_size, (int)in_features,
+                 &alpha,
+-                input, (int)in_features,   // A: batch x in (leading dimension = in_features)
+-                weight, (int)in_features,   // B: out x in (leading dimension = in_features), but with trans, effectively in x out
++                weight, (int)in_features,
++                input, (int)in_features,
+                 &beta,
+-                output, (int)batch_size);
++                output, (int)out_features);
+ 
+     cublasDestroy(handle);
+ 
+     if (bias != nullptr) {
+         // Launch bias add kernel
+         int block = 256;
+-        int grid = (int)((batch_size * out_features + block - 1) / block);
++        int64_t total = batch_size * out_features;
++        int grid = (int)((total + block - 1) / block);
+         bias_add_kernel<<<grid, block, 0, stream>>>(output, bias, batch_size, out_features);
+     }
+ }
+@@ -138,13 +162,10 @@
+                                          int64_t input_stride,
+                                          int64_t output_stride,
+                                          cudaStream_t stream) {
+-    // For typical contiguous tensors, stride is 1. But we support arbitrary.
+     int block = 256;
+-    // Grid size limited to avoid launching too many blocks; use grid-stride loop safely
+     int max_blocks = 65535;
+     int64_t needed_blocks = (total_elements + block - 1) / block;
+     int grid = (int)min(needed_blocks, (int64_t)max_blocks);
+-    // For small tensors, needed_blocks may be smaller
+     if (grid < 1) grid = 1;
+     sigmoid_kernel<<<grid, block, 0, stream>>>(input, output, total_elements, input_stride, output_stride);
+ }

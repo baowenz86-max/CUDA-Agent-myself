@@ -1,0 +1,93 @@
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include "../binding_registry.h"
+
+// 声明 .cu 导出的 launcher
+extern "C" void cat_forward_launcher(
+    float* output,
+    const float* input1,
+    const float* input2,
+    int total_output_elements,
+    int first_half_elements,
+    int second_half_elements,
+    cudaStream_t stream);
+
+extern "C" void cos_forward_launcher(
+    float* output,
+    const float* input,
+    int total_elements,
+    cudaStream_t stream);
+
+torch::Tensor cat_forward(torch::Tensor tensor1, torch::Tensor tensor2) {
+    // 输入检查
+    TORCH_CHECK(tensor1.is_cuda(), "tensor1 must be a CUDA tensor");
+    TORCH_CHECK(tensor2.is_cuda(), "tensor2 must be a CUDA tensor");
+    TORCH_CHECK(tensor1.dtype() == torch::kFloat32, "tensor1 must be float32");
+    TORCH_CHECK(tensor2.dtype() == torch::kFloat32, "tensor2 must be float32");
+    TORCH_CHECK(tensor1.is_contiguous(), "tensor1 must be contiguous");
+    TORCH_CHECK(tensor2.is_contiguous(), "tensor2 must be contiguous");
+    TORCH_CHECK(tensor1.dim() == 4 && tensor1.size(0) == tensor2.size(0) &&
+                tensor1.size(1) == tensor2.size(1) &&
+                tensor1.size(2) == tensor2.size(2) &&
+                tensor1.size(3) == tensor2.size(3),
+                "tensor1 and tensor2 must have identical [N, C, H, W] shapes");
+
+    int64_t N = tensor1.size(0);
+    int64_t C = tensor1.size(1);
+    int64_t H = tensor1.size(2);
+    int64_t W = tensor1.size(3);
+    int64_t output_C = 2 * C;
+
+    auto output = torch::empty({N, output_C, H, W}, tensor1.options());
+
+    int64_t first_half_elements = static_cast<int64_t>(N) * C * H * W;
+    int64_t second_half_elements = first_half_elements;
+    int64_t total_output_elements = 2 * first_half_elements;
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    cat_forward_launcher(
+        output.data_ptr<float>(),
+        tensor1.data_ptr<float>(),
+        tensor2.data_ptr<float>(),
+        static_cast<int>(total_output_elements),
+        static_cast<int>(first_half_elements),
+        static_cast<int>(second_half_elements),
+        stream);
+
+    return output;
+}
+
+torch::Tensor cos_forward(torch::Tensor input) {
+    // 输入检查
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+
+    auto output = torch::empty_like(input);
+
+    int64_t total_elements = input.numel();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    cos_forward_launcher(
+        output.data_ptr<float>(),
+        input.data_ptr<float>(),
+        static_cast<int>(total_elements),
+        stream);
+
+    return output;
+}
+
+void register_custom_ops(pybind11::module& m) {
+    m.def("cat_forward", &cat_forward,
+          "Concatenate two CUDA float32 tensors along channel dim",
+          pybind11::arg("tensor1"),
+          pybind11::arg("tensor2"));
+    m.def("cos_forward", &cos_forward,
+          "Elementwise cosine of a CUDA float32 tensor",
+          pybind11::arg("input"));
+}
+
+REGISTER_BINDING(custom_ops, register_custom_ops);

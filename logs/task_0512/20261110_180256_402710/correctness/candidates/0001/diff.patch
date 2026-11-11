@@ -1,0 +1,278 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,126 @@
++#include <cuda_runtime.h>
++
++// AvgPool1d forward kernel
++// input: (batch, channels, length) float32, arbitrary strides
++// output: (batch, channels, out_length) with same batch, channels as input
++// kernel_size, stride, padding are integers
++__global__ void avgpool1d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int batch_size,
++    int channels,
++    int input_length,
++    int output_length,
++    long long input_batch_stride,   // stride between batch elements
++    long long input_channel_stride, // stride between channel elements
++    long long input_pixel_stride,   // stride between adjacent length elements (usually 1)
++    long long output_batch_stride,
++    long long output_channel_stride,
++    long long output_pixel_stride,
++    int kernel_size,
++    int stride,
++    int padding,
++    int total_output_elements
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int grid_stride = blockDim.x * gridDim.x;
++
++    for (int out_idx = idx; out_idx < total_output_elements; out_idx += grid_stride) {
++        // Decompose out_idx into batch, channel, out_pos
++        int out_pos = out_idx % output_length;
++        int tmp = out_idx / output_length;
++        int ch = tmp % channels;
++        int b = tmp / channels;
++
++        // Compute input start index for pooling window
++        int in_start = out_pos * stride - padding;
++        float sum = 0.0f;
++        // We hardcode count = kernel_size because count_include_pad=True
++        // but we still need to guard against out-of-bounds when reading input.
++        for (int k = 0; k < kernel_size; ++k) {
++            int in_idx = in_start + k;
++            if (in_idx >= 0 && in_idx < input_length) {
++                // Compute input memory offset using strides
++                const float* input_ptr = input 
++                    + b * input_batch_stride 
++                    + ch * input_channel_stride 
++                    + in_idx * input_pixel_stride;
++                sum += *input_ptr;
++            }
++            // else padding zero contributes nothing
++        }
++        float avg = sum / float(kernel_size);
++
++        // Compute output memory offset
++        float* output_ptr = output 
++            + b * output_batch_stride 
++            + ch * output_channel_stride 
++            + out_pos * output_pixel_stride;
++        *output_ptr = avg;
++    }
++}
++
++// Launcher for the avgpool1d kernel.
++// This function is called from the binding layer after tensor extraction.
++extern "C" void avgpool1d_forward_launcher(
++    const float* input,
++    float* output,
++    int batch_size,
++    int channels,
++    int input_length,
++    int output_length,
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_pixel_stride,
++    long long output_batch_stride,
++    long long output_channel_stride,
++    long long output_pixel_stride,
++    int kernel_size,
++    int stride,
++    int padding,
++    cudaStream_t stream
++) {
++    // Determine total number of output elements
++    long long total_elements_ll = (long long)batch_size * channels * output_length;
++    if (total_elements_ll == 0) {
++        return;
++    }
++    int total_output_elements = (int)total_elements_ll; // safe for sizes up to 2^31-1, larger handled via grid-stride loop? We can use long long in kernel if needed.
++    // To support >2^31 elements, kernel would need long long indexing. For now, int is sufficient for typical sizes (< 2^31).
++
++    // Launch configuration: 256 threads per block, enough blocks to cover, grid-stride loop handles large grids.
++    int threads = 256;
++    int blocks = (total_output_elements + threads - 1) / threads;
++    if (blocks > 65535) {
++        // Limit grid dim to 65535 in x, use a smaller block count and rely on grid-stride loop.
++        blocks = 65535;
++    }
++    avgpool1d_kernel<<<blocks, threads, 0, stream>>>(
++        input,
++        output,
++        batch_size,
++        channels,
++        input_length,
++        output_length,
++        input_batch_stride,
++        input_channel_stride,
++        input_pixel_stride,
++        output_batch_stride,
++        output_channel_stride,
++        output_pixel_stride,
++        kernel_size,
++        stride,
++        padding,
++        total_output_elements
++    );
++
++    // Check for launch errors
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In a real binding, we should throw a c10::Error, but we cannot include torch here.
++        // The binding layer will check cudaGetLastError after calling this launcher.
++        // We just ignore here; binding.cpp should call cudaDeviceSynchronize or check.
++        // For safety, we could call cudaDeviceSynchronize, but that's expensive.
++        // The contract implies the binding will do error checking.
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,114 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare the launcher from custom_ops.cu
++extern "C" void avgpool1d_forward_launcher(
++    const float* input,
++    float* output,
++    int batch_size,
++    int channels,
++    int input_length,
++    int output_length,
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_pixel_stride,
++    long long output_batch_stride,
++    long long output_channel_stride,
++    long long output_pixel_stride,
++    int kernel_size,
++    int stride,
++    int padding,
++    cudaStream_t stream
++);
++
++// PyTorch binding function
++static torch::Tensor avgpool1d_forward(
++    torch::Tensor input,
++    int64_t kernel_size,
++    int64_t stride,
++    int64_t padding
++) {
++    // Validate input
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 3, "Input must have 3 dimensions (batch, channels, length)");
++
++    // Validate kernel parameters
++    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
++    TORCH_CHECK(stride > 0, "stride must be positive");
++    TORCH_CHECK(padding >= 0, "padding must be non-negative");
++
++    // Cast to int for CUDA launcher, check range
++    TORCH_CHECK(kernel_size <= INT32_MAX, "kernel_size too large");
++    TORCH_CHECK(stride <= INT32_MAX, "stride too large");
++    TORCH_CHECK(padding <= INT32_MAX, "padding too large");
++    int kernel_size_i = static_cast<int>(kernel_size);
++    int stride_i = static_cast<int>(stride);
++    int padding_i = static_cast<int>(padding);
++
++    // Extract dimensions
++    int batch_size = static_cast<int>(input.size(0));
++    int channels = static_cast<int>(input.size(1));
++    int input_length = static_cast<int>(input.size(2));
++
++    // Compute output length: floor((input_length + 2*padding - kernel_size) / stride) + 1
++    int output_length = (input_length + 2 * padding_i - kernel_size_i) / stride_i + 1;
++    TORCH_CHECK(output_length > 0, "Output length must be positive");
++
++    // Allocate output tensor with same shape but last dim = output_length
++    // Use torch::empty_like(input) then view/slice? Better: allocate new tensor with required shape.
++    // We need output shape [batch, channels, output_length], same device and dtype.
++    auto output = torch::empty({batch_size, channels, output_length}, input.options());
++
++    // Get strides. Input might be non-contiguous; we pass actual strides to launcher.
++    long long input_batch_stride = input.stride(0);
++    long long input_channel_stride = input.stride(1);
++    long long input_pixel_stride = input.stride(2);
++    long long output_batch_stride = output.stride(0);
++    long long output_channel_stride = output.stride(1);
++    long long output_pixel_stride = output.stride(2);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    avgpool1d_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch_size,
++        channels,
++        input_length,
++        output_length,
++        input_batch_stride,
++        input_channel_stride,
++        input_pixel_stride,
++        output_batch_stride,
++        output_channel_stride,
++        output_pixel_stride,
++        kernel_size_i,
++        stride_i,
++        padding_i,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++static void register_avgpool1d(pybind11::module& m) {
++    m.def("avgpool1d_forward", &avgpool1d_forward,
++          "Average pooling 1D forward",
++          pybind11::arg("input"),
++          pybind11::arg("kernel_size"),
++          pybind11::arg("stride"),
++          pybind11::arg("padding"));
++}
++
++REGISTER_BINDING(avgpool1d, register_avgpool1d);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,29 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
++        super().__init__()
++        # The reference model stores nn.AvgPool1d in self.pool. To preserve
++        # state_dict keys and initialization semantics, we emulate its presence
++        # with a dummy module-like attribute that has no parameters.
++        # Since state_dict is empty, no parameters are registered.
++        self.pool = nn.AvgPool1d(kernel_size, stride=stride, padding=padding)
++        # Store configuration for forward use
++        self.kernel_size = kernel_size
++        self.stride = stride
++        self.padding = padding
++
++    def forward(self, x):
++        # Use custom extension operator implementing the same 1D average pooling
++        y = cuda_extension.avgpool1d_forward(x, self.kernel_size, self.stride, self.padding)
++        return y
++
++    def debug_forward(self, *inputs):
++        # inputs should be a single tensor x
++        x = inputs[0]
++        y = cuda_extension.avgpool1d_forward(x, self.kernel_size, self.stride, self.padding)
++        yield 'step_001', y
++        yield 'step_002', y

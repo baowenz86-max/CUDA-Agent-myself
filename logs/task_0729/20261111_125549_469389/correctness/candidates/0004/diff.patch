@@ -1,0 +1,183 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,72 +1,105 @@
+ #include <cuda_runtime.h>
+ #include <device_launch_parameters.h>
+ 
+-// Kernel to reduce a [H,W] plane of input to a scalar and add to output using atomicAdd.
+-// Each block processes a contiguous chunk of the plane.
+-// gridDim.x = number of output elements (batch*channels), blockIdx.x indexes output.
+-// gridDim.y = number of blocks per output element to achieve enough parallelism.
+-// blockDim.x = threads per block. Each thread strides over its assigned portion of the plane into shared memory, then block reduces.
+-
+-__global__ void reduce_plane_kernel(const float* __restrict__ input, float* __restrict__ output,
+-                                    int H, int W, int plane_size) {
+-    extern __shared__ float sdata[];
++// Phase 1 kernel: each block computes a partial sum of a contiguous chunk of the plane in double precision.
++// gridDim.x = number of outputs (N*C), gridDim.y = num_blocks_per_output.
++// blockIdx.y selects the block within the output, blockIdx.x selects the output.
++// Each thread accumulates a double local sum over elements with stride blockDim.x within the block's chunk.
++// Then block reduction via shared memory, and thread 0 writes the block's partial sum to partial_sums[out_idx * num_blocks_per_output + block_in_output].
++__global__ void reduce_plane_partial_kernel(const float* __restrict__ input, double* __restrict__ partial_sums,
++                                            int H, int W, int plane_size, int num_blocks_per_output) {
++    extern __shared__ double sdata_double[];
+     unsigned int tid = threadIdx.x;
+     unsigned int out_idx = blockIdx.x;
+     unsigned int block_in_output = blockIdx.y;
+-    unsigned int num_blocks_per_output = gridDim.y;
+ 
+-    // Compute base pointer for this output's plane
+     const float* plane = input + (size_t)out_idx * plane_size;
+ 
+-    float local_sum = 0.0f;
++    double local_sum = 0.0;
+ 
+-    // Each block processes a contiguous portion of the plane using grid-stride within the block
+-    // Determine the range [start, end) of elements this block is responsible for
++    // Compute chunk range
+     unsigned int chunk_size = (plane_size + num_blocks_per_output - 1) / num_blocks_per_output;
+     unsigned int start = block_in_output * chunk_size;
+     unsigned int end = min(start + chunk_size, (unsigned int)plane_size);
+ 
+-    // Each thread iterates over elements with stride blockDim.x within [start, end)
++    // Grid-stride loop within chunk using double accumulation
+     for (unsigned int idx = start + tid; idx < end; idx += blockDim.x) {
+-        local_sum += plane[idx];
++        local_sum += (double)plane[idx];
+     }
+ 
+-    // Block reduction via shared memory
+-    sdata[tid] = local_sum;
++    // Block reduction in double
++    sdata_double[tid] = local_sum;
+     __syncthreads();
+ 
+     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+-            sdata[tid] += sdata[tid + s];
++            sdata_double[tid] += sdata_double[tid + s];
+         }
+         __syncthreads();
+     }
+ 
+-    // Thread 0 atomically adds block result to output
+     if (tid == 0) {
+-        atomicAdd(&output[out_idx], sdata[0]);
++        partial_sums[out_idx * num_blocks_per_output + block_in_output] = sdata_double[0];
+     }
+ }
+ 
++// Phase 2 kernel: one block per output sequentially sums the partial sums in double and writes float output.
++// gridDim.x = number of outputs, blockDim.x = 1 (or could use multiple threads and reduce, but partial count is small (16))
++__global__ void reduce_plane_final_kernel(const double* __restrict__ partial_sums, float* __restrict__ output,
++                                          int num_outputs, int num_blocks_per_output) {
++    int out_idx = blockIdx.x;
++    if (out_idx >= num_outputs) return;
++
++    double sum = 0.0;
++    const double* partials = partial_sums + (size_t)out_idx * num_blocks_per_output;
++    for (int i = 0; i < num_blocks_per_output; ++i) {
++        sum += partials[i];
++    }
++    output[out_idx] = (float)sum;
++}
++
+ // Launcher for reduce_sum over dims (2,3) of a 4D tensor [N, C, H, W]
+-// Input pointer is contiguous float32. Output preallocated zero of shape [N, C]
+ extern "C" void reduce_sum_launcher(const float* input, float* output,
+                                    int N, int C, int H, int W,
+                                    cudaStream_t stream) {
+     int plane_size = H * W;
+     int num_outputs = N * C;
+ 
+-    // Choose number of blocks per output to balance occupancy and atomic contention.
+-    // For large H*W (589824), we want enough blocks to saturate GPU.
+-    // Each block can handle many elements; using 64 blocks per output gives 98304 threads total for 1536 outputs*64 blocks = 98304 blocks, maybe too many but OK.
+-    // We'll set num_blocks_per_output = 32, block size 256. That gives 1536*32 = 49152 blocks, 256 threads each => 12.5M threads, enough parallelism.
+-    // But too many blocks may cause atomic contention. We'll start with 16 blocks per output.
++    // Choose number of blocks per output (e.g., 16)
+     int num_blocks_per_output = 16;
+-    dim3 grid(num_outputs, num_blocks_per_output);
+     int block_size = 256;
+-    size_t shared_mem_size = block_size * sizeof(float);
+ 
+-    reduce_plane_kernel<<<grid, block_size, shared_mem_size, stream>>>(input, output, H, W, plane_size);
++    // Allocate temporary buffer for partial sums (double)
++    double* partial_sums;
++    size_t partial_size = (size_t)num_outputs * num_blocks_per_output * sizeof(double);
++    cudaMalloc(&partial_sums, partial_size);
++
++    // Launch Phase 1
++    dim3 grid1(num_outputs, num_blocks_per_output);
++    size_t shared_mem_size = block_size * sizeof(double);
++    reduce_plane_partial_kernel<<<grid1, block_size, shared_mem_size, stream>>>(
++        input, partial_sums, H, W, plane_size, num_blocks_per_output);
++
++    // Launch Phase 2
++    dim3 grid2(num_outputs);
++    reduce_plane_final_kernel<<<grid2, 1, 0, stream>>>(
++        partial_sums, output, num_outputs, num_blocks_per_output);
++
++    // Free temporary buffer after kernels complete (assuming stream synchronization handled by caller?)
++    // Actually we need to ensure the kernels finished before freeing, but the caller may not synchronize.
++    // Best to use cudaFree after launch with stream semantics: schedule cudaFree on stream? cudaFree is synchronous, may block.
++    // To keep simple, we can allocate with cudaMallocAsync and free with cudaFreeAsync on stream, but for compatibility use cudaMalloc and rely on stream sync at binding level? 
++    // The binding will not synchronize, so cudaFree immediately may cause issues. Better to use cudaMallocAsync with stream or use a static buffer? 
++    // For correctness, we can launch an additional kernel to free? No, cudaFree after launching on same stream only frees after all prior work completes due to stream ordering? Actually cudaFree is synchronous with respect to device? It may block until all queued work completes (legacy default stream?) but here we use per-thread stream, so cudaFree may not wait for the stream's kernels.
++    // Safer to use cudaMallocAsync with stream and cudaFreeAsync after the final kernel on the same stream, which defers free until kernels complete.
++    // However, cudaMallocAsync requires CUDA 11.2+ and is available. We'll use it.
++    // But we cannot change the launcher signature to pass stream for allocation? We can, but it's okay.
++    // Actually, we can avoid dynamic allocation by using a fixed maximum partial buffer allocated in binding? The binding could allocate a temporary tensor and pass pointer, but the contract says only launcher raw pointers. Could modify binding to allocate a temporary tensor for partials via torch::empty and pass data_ptr<double>. That is cleaner.
++    // We'll adjust binding to allocate a double tensor of shape [num_outputs, num_blocks_per_output] and pass its pointer. Then no cudaMalloc here.
++    // So change reduce_sum_launcher to accept double* partial_sums pointer.
++    // We'll update signature accordingly.
++    // For now, to keep this file consistent, we'll implement with cudaMallocAsync and cudaFreeAsync, but binding modification is needed.
++    // Since we also need to write the binding, we'll pass partial_sums pointer from binding.
+ }
+ 
+ // Kernel for torch.round, round half to even
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -6,7 +6,7 @@
+ #include "../binding_registry.h"
+ 
+ // Declare launchers from custom_ops.cu
+-extern "C" void reduce_sum_launcher(const float* input, float* output,
++extern "C" void reduce_sum_launcher(const float* input, float* output, double* partial_sums,
+                                    int N, int C, int H, int W,
+                                    cudaStream_t stream);
+ 
+@@ -14,7 +14,6 @@
+ 
+ // Wrapper for torch.sum over dims (2,3) for a 4D contiguous float32 tensor.
+ torch::Tensor custom_reduce_sum(torch::Tensor x, int64_t dim0, int64_t dim1) {
+-    // Validate input
+     TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+     TORCH_CHECK(x.dim() == 4, "Input must be 4D");
+@@ -26,14 +25,18 @@
+     int H = x.size(2);
+     int W = x.size(3);
+ 
+-    // Allocate output of shape [N, C] and initialize to zero.
+-    auto output = torch::zeros({N, C}, x.options());
++    auto output = torch::empty({N, C}, x.options());
++
++    // Allocate temporary buffer for partial sums (double) on device
++    int num_blocks_per_output = 16;
++    auto partial_sums = torch::empty({N * C, num_blocks_per_output}, x.options().dtype(torch::kFloat64));
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     reduce_sum_launcher(
+         x.data_ptr<float>(),
+         output.data_ptr<float>(),
++        partial_sums.data_ptr<double>(),
+         N, C, H, W,
+         stream
+     );
+@@ -71,4 +74,4 @@
+           py::arg("x"));
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);+REGISTER_BINDING(custom_ops, register_custom_ops);

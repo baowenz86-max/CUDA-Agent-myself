@@ -1,0 +1,309 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,137 @@
++#include <cuda_runtime.h>
++
++// LeakyReLU kernel: output = input > 0 ? input : negative_slope * input
++__global__ void leaky_relu_kernel(float* output, const float* input, long long numel, float negative_slope) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (long long i = idx; i < numel; i += stride) {
++        float val = input[i];
++        output[i] = val > 0.0f ? val : negative_slope * val;
++    }
++}
++
++// InstanceNorm kernel for 2D spatial normalization
++// Each block processes one (N,C) pair: computes mean and variance over H*W, then normalizes.
++// Input layout: input pointer with strides: n_stride, c_stride, h_stride, w_stride
++// Output layout: same as input (output pointer passed in, assumed same layout as input)
++// weight and bias are optional, length C
++__global__ void instance_norm_kernel(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int N, int C, int H, int W,
++    long long n_stride, long long c_stride, long long h_stride, long long w_stride,
++    float eps)
++{
++    int nc = blockIdx.x; // 0..N*C-1
++    int n = nc / C;
++    int c = nc % C;
++    long long n_offset = (long long)n * n_stride;
++    long long c_offset = (long long)c * c_stride;
++    const float* in_base = input + n_offset + c_offset;
++    float* out_base = output + n_offset + c_offset;
++
++    int HW = H * W;
++    float sum = 0.0f;
++    float sumsq = 0.0f;
++
++    // Compute mean and variance using thread reduction
++    extern __shared__ float sdata[];
++    // sdata[0..blockDim.x-1] for sum, sdata[blockDim.x..2*blockDim.x-1] for sumsq
++    float* s_sum = sdata;
++    float* s_sumsq = sdata + blockDim.x;
++
++    int tid = threadIdx.x;
++    float local_sum = 0.0f;
++    float local_sumsq = 0.0f;
++    for (int idx = tid; idx < HW; idx += blockDim.x) {
++        int h = idx / W;
++        int w = idx % W;
++        float val = in_base[h * h_stride + w * w_stride];
++        local_sum += val;
++        local_sumsq += val * val;
++    }
++
++    s_sum[tid] = local_sum;
++    s_sumsq[tid] = local_sumsq;
++    __syncthreads();
++
++    // Reduce within block
++    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            s_sum[tid] += s_sum[tid + s];
++            s_sumsq[tid] += s_sumsq[tid + s];
++        }
++        __syncthreads();
++    }
++
++    float total_sum = s_sum[0];
++    float total_sumsq = s_sumsq[0];
++    float mean = total_sum / HW;
++    float var = total_sumsq / HW - mean * mean; // biased variance
++    float inv_std = rsqrtf(var + eps);
++
++    float gamma = (weight != nullptr) ? weight[c] : 1.0f;
++    float beta = (bias != nullptr) ? bias[c] : 0.0f;
++
++    // Normalize and write output
++    for (int idx = tid; idx < HW; idx += blockDim.x) {
++        int h = idx / W;
++        int w = idx % W;
++        float val = in_base[h * h_stride + w * w_stride];
++        float normalized = (val - mean) * inv_std;
++        out_base[h * h_stride + w * w_stride] = normalized * gamma + beta;
++    }
++}
++
++// Launcher for leaky_relu_forward
++extern "C" void leaky_relu_forward_launcher(
++    float* output,
++    const float* input,
++    long long numel,
++    float negative_slope,
++    cudaStream_t stream)
++{
++    const int block_size = 256;
++    long long grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 2147483647LL) grid_size = 2147483647LL;
++    leaky_relu_kernel<<<(int)grid_size, block_size, 0, stream>>>(output, input, numel, negative_slope);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Error handled in binding via throw? We can't throw here without torch. Just ignore? 
++        // We'll rely on binding to check after. But launcher should not cause undefined behavior.
++    }
++}
++
++// Launcher for instance_norm_forward
++extern "C" void instance_norm_forward_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int N, int C, int H, int W,
++    long long n_stride, long long c_stride, long long h_stride, long long w_stride,
++    float eps,
++    cudaStream_t stream)
++{
++    int nc_total = N * C;
++    // Choose block size (threads per (N,C) block)
++    int block_size = 256;
++    if (H * W < 256) block_size = 128;
++    if (H * W < 128) block_size = 64;
++    if (H * W < 64) block_size = 32;
++
++    int shared_mem_size = 2 * block_size * sizeof(float); // for sum and sumsq arrays
++    // Ensure block_size <= max threads (1024)
++    if (block_size > 1024) block_size = 1024;
++
++    instance_norm_kernel<<<nc_total, block_size, shared_mem_size, stream>>>(
++        output, input, weight, bias, N, C, H, W,
++        n_stride, c_stride, h_stride, w_stride, eps);
++    
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Same as above
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,132 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void leaky_relu_forward_launcher(
++    float* output,
++    const float* input,
++    long long numel,
++    float negative_slope,
++    cudaStream_t stream
++);
++
++extern "C" void instance_norm_forward_launcher(
++    float* output,
++    const float* input,
++    const float* weight,
++    const float* bias,
++    int N, int C, int H, int W,
++    long long n_stride, long long c_stride, long long h_stride, long long w_stride,
++    float eps,
++    cudaStream_t stream
++);
++
++// LeakyReLU wrapper
++static torch::Tensor leaky_relu_forward(torch::Tensor input, double negative_slope = 0.01) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.numel() > 0, "Input must have at least one element");
++
++    // Preserve original stride/size for output
++    auto original_sizes = input.sizes();
++    auto original_strides = input.strides();
++
++    // Ensure contiguous for simple elementwise launcher
++    auto input_contig = input.contiguous();
++    auto output = torch::empty_like(input_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    leaky_relu_forward_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        input_contig.numel(),
++        static_cast<float>(negative_slope),
++        stream
++    );
++
++    // Check for kernel errors
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "leaky_relu_forward kernel launch failed");
++
++    // Restore original stride by as_strided if needed
++    if (!input.is_contiguous()) {
++        return output.as_strided(original_sizes, original_strides);
++    }
++    return output;
++}
++
++// InstanceNorm wrapper
++static torch::Tensor instance_norm_forward(
++    torch::Tensor input,
++    c10::optional<torch::Tensor> weight,
++    c10::optional<torch::Tensor> bias,
++    double eps
++) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "InstanceNorm2d expects 4D input (N,C,H,W)");
++
++    int N = input.size(0);
++    int C = input.size(1);
++    int H = input.size(2);
++    int W = input.size(3);
++
++    // Weight and bias checks
++    const float* weight_ptr = nullptr;
++    const float* bias_ptr = nullptr;
++    if (weight.has_value() && weight.value().defined()) {
++        TORCH_CHECK(weight.value().is_cuda(), "weight must be a CUDA tensor");
++        TORCH_CHECK(weight.value().dtype() == torch::kFloat32, "weight must be float32");
++        TORCH_CHECK(weight.value().numel() == C, "weight shape must match C");
++        weight_ptr = weight.value().contiguous().data_ptr<float>();
++    }
++    if (bias.has_value() && bias.value().defined()) {
++        TORCH_CHECK(bias.value().is_cuda(), "bias must be a CUDA tensor");
++        TORCH_CHECK(bias.value().dtype() == torch::kFloat32, "bias must be float32");
++        TORCH_CHECK(bias.value().numel() == C, "bias shape must match C");
++        bias_ptr = bias.value().contiguous().data_ptr<float>();
++    }
++
++    // Ensure input is contiguous? launcher supports strides but we can also pass original
++    // If input is non-contiguous, the launcher can still handle strides, so no need to contiguous.
++    // However we must ensure the output has same shape and stride.
++    auto output = torch::empty_like(input);
++
++    // Strides (in elements)
++    long long n_stride = input.stride(0);
++    long long c_stride = input.stride(1);
++    long long h_stride = input.stride(2);
++    long long w_stride = input.stride(3);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    instance_norm_forward_launcher(
++        output.data_ptr<float>(),
++        input.data_ptr<float>(),
++        weight_ptr,
++        bias_ptr,
++        N, C, H, W,
++        n_stride, c_stride, h_stride, w_stride,
++        static_cast<float>(eps),
++        stream
++    );
++
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "instance_norm_forward kernel launch failed");
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("leaky_relu_forward", &leaky_relu_forward,
++          "Leaky ReLU forward",
++          py::arg("input"),
++          py::arg("negative_slope") = 0.01);
++    m.def("instance_norm_forward", &instance_norm_forward,
++          "InstanceNorm2d forward",
++          py::arg("input"),
++          py::arg("weight"),
++          py::arg("bias"),
++          py::arg("eps"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,31 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features: int, eps: float = 1e-5, affine: bool = True):
++        super().__init__()
++        self.instance_norm = nn.InstanceNorm2d(in_features, eps=eps, affine=affine)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.leaky_relu_forward(x, negative_slope=0.01)
++        x = cuda_extension.instance_norm_forward(
++            x,
++            self.instance_norm.weight,
++            self.instance_norm.bias,
++            self.instance_norm.eps,
++        )
++        return x
++
++    def debug_forward(self, x: torch.Tensor):
++        y = cuda_extension.leaky_relu_forward(x, negative_slope=0.01)
++        yield 'step_001', y
++        z = cuda_extension.instance_norm_forward(
++            y,
++            self.instance_norm.weight,
++            self.instance_norm.bias,
++            self.instance_norm.eps,
++        )
++        yield 'step_002', z
++        yield 'step_003', z

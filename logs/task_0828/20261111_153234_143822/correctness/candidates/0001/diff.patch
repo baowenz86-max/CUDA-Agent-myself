@@ -1,0 +1,304 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,177 @@
++#include <cuda_runtime.h>
++#include <cufft.h>
++#include <math_constants.h>
++#include <cstdint>
++#include <cstdio>
++
++// Hann window generation on host, transferred to device
++static void generate_hann_window(float* h_window, int n_fft) {
++    for (int i = 0; i < n_fft; ++i) {
++        h_window[i] = 0.5f * (1.0f - cosf(2.0f * CUDART_PI_F * i / (n_fft - 1)));
++    }
++}
++
++// CUDA kernel to apply reflect padding and Hann window, and pack into complex input for cuFFT.
++// input: (batch, L) float, L = input_last_dim
++template <int N_FFT>
++__global__ void prepare_frames_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ padded_frames, // layout: (total_frames, N_FFT)
++    const float* __restrict__ hann_window,
++    int batch,
++    int L,
++    int hop_length,
++    int num_frames
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_frames = batch * num_frames;
++    if (idx >= total_frames * N_FFT) return;
++
++    int frame_idx = idx / N_FFT;
++    int t = idx % N_FFT;
++    int b = frame_idx / num_frames;
++    int f = frame_idx % num_frames;
++
++    // Determine center position: start sample for this frame in centered coordinates
++    int start = f * hop_length - N_FFT / 2;
++    // The frame covers samples [start, start + N_FFT - 1] in input coordinates after reflect padding
++    int src_idx = start + t;
++    float val;
++    if (src_idx >= 0 && src_idx < L) {
++        val = input[b * L + src_idx];
++    } else {
++        // Reflect padding
++        int m = (src_idx < 0) ? -src_idx : (2 * L - 2 - src_idx);
++        while (m < 0 || m >= L) {
++            m = (m < 0) ? -m : (2 * L - 2 - m);
++        }
++        val = input[b * L + m];
++    }
++    padded_frames[frame_idx * N_FFT + t] = val * hann_window[t];
++}
++
++// Launcher for complex STFT using cuFFT.
++// Input: input pointer (float32, shape batch x L)
++// Output: output pointer (complex64, shape batch x (N_FFT/2+1) x num_frames)
++// We assume input is contiguous (the binding will ensure), and output allocated by binding.
++// n_fft must be power of 2 for cuFFT? cuFFT supports any size but power-of-2 is optimal; here n_fft=4096 is power of 2.
++extern "C" void custom_stft_launcher(
++    const float* input,
++    float2* output,
++    int batch,
++    int L,
++    int n_fft,
++    int hop_length,
++    int win_length,
++    cudaStream_t stream
++) {
++    // Validate win_length == n_fft? PyTorch allows win_length <= n_fft, but default when window=None is win_length=n_fft. Our contract sets win_length=n_fft, so we assert.
++    if (win_length != n_fft) {
++        // If win_length smaller, we would need to pad window with zeros; not needed here.
++        // Print error and return; binding should have validated.
++        printf("custom_stft_launcher: win_length must equal n_fft\n");
++        return;
++    }
++
++    int num_frames = 1 + (L - n_fft) / hop_length; // center=True, so this formula holds
++
++    // Generate Hann window on host
++    float* h_hann = (float*)malloc(n_fft * sizeof(float));
++    generate_hann_window(h_hann, n_fft);
++
++    // Device buffers
++    float* d_hann;
++    cudaMalloc(&d_hann, n_fft * sizeof(float));
++    cudaMemcpyAsync(d_hann, h_hann, n_fft * sizeof(float), cudaMemcpyHostToDevice, stream);
++    free(h_hann);
++
++    int total_frames = batch * num_frames;
++
++    // Prepare padded frames (real) as float arrays; we'll use them as real part for cuFFT
++    float* d_padded_frames;
++    cudaMalloc(&d_padded_frames, total_frames * n_fft * sizeof(float));
++
++    // Launch kernel to fill padded frames with windowed reflect-padded input
++    int threads = 256;
++    int blocks = (total_frames * n_fft + threads - 1) / threads;
++    prepare_frames_kernel<4096><<<blocks, threads, 0, stream>>>(
++        input, d_padded_frames, d_hann, batch, L, hop_length, num_frames);
++
++    // Create cuFFT plan for batched 1D R2C? We have real input, so use R2C to produce complex with N_FFT/2+1 bins directly.
++    // However, we already prepared real data (windowed frames). Use cufftExecR2C with batch = total_frames.
++    // But we need output complex64 (float2). We'll allocate a complex buffer for the full spectrum? R2C output will have n_fft/2+1 complex elements per frame.
++    cufftHandle plan;
++    if (cufftPlan1d(&plan, n_fft, CUFFT_R2C, total_frames) != CUFFT_SUCCESS) {
++        printf("cufftPlan1d failed\n");
++        cudaFree(d_padded_frames);
++        cudaFree(d_hann);
++        return;
++    }
++    cufftSetStream(plan, stream);
++
++    // Output from cuFFT R2C: complex array of shape (total_frames, n_fft/2+1)
++    cufftComplex* d_fft_out;
++    cudaMalloc(&d_fft_out, total_frames * (n_fft/2 + 1) * sizeof(cufftComplex));
++
++    if (cufftExecR2C(plan, d_padded_frames, d_fft_out) != CUFFT_SUCCESS) {
++        printf("cufftExecR2C failed\n");
++        cufftDestroy(plan);
++        cudaFree(d_padded_frames);
++        cudaFree(d_hann);
++        cudaFree(d_fft_out);
++        return;
++    }
++
++    // Copy from d_fft_out to output tensor in the correct layout: output shape (batch, n_fft/2+1, num_frames)
++    // d_fft_out is (total_frames, n_fft/2+1) with frame index = b * num_frames + f.
++    // We need to transpose to (batch, n_fft/2+1, num_frames). We can do this with a kernel.
++    int output_size = batch * (n_fft/2 + 1) * num_frames;
++    int copy_threads = 256;
++    int copy_blocks = (output_size + copy_threads - 1) / copy_threads;
++    // Actually output is float2*; we can treat output as float2 array of length batch * (n_fft/2+1) * num_frames
++    // And d_fft_out is float2 array of length total_frames * (n_fft/2+1)
++    // We'll write a copy kernel that maps linear index to (b, freq, f)
++    // Kernel:
++    auto copy_kernel = [] __device__ (float2* out, const cufftComplex* in, int batch, int n_freq, int num_frames) {
++        int idx = blockIdx.x * blockDim.x + threadIdx.x;
++        int total = batch * n_freq * num_frames;
++        if (idx >= total) return;
++        int f = idx % num_frames;
++        int tmp = idx / num_frames;
++        int freq = tmp % n_freq;
++        int b = tmp / n_freq;
++        int src_frame = b * num_frames + f;
++        out[idx] = make_float2(in[src_frame * n_freq + freq].x, in[src_frame * n_freq + freq].y);
++    };
++    // We can't define lambda in global scope; define __global__ function instead.
++
++    // Instead, we'll define a separate __global__ function for copying.
++
++    // Cleanup
++    cufftDestroy(plan);
++    cudaFree(d_padded_frames);
++    cudaFree(d_hann);
++    cudaFree(d_fft_out);
++}
++
++// Copy kernel to reorder cuFFT output to PyTorch STFT layout
++__global__ void copy_fft_output_kernel(
++    float2* __restrict__ output,
++    const float2* __restrict__ fft_out,
++    int batch,
++    int n_freq,
++    int num_frames
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = batch * n_freq * num_frames;
++    if (idx >= total) return;
++    int f = idx % num_frames;
++    int tmp = idx / num_frames;
++    int freq = tmp % n_freq;
++    int b = tmp / n_freq;
++    int src_frame = b * num_frames + f;
++    output[idx] = fft_out[src_frame * n_freq + freq];
++}
++
++// Wrapper that launches the copy kernel after cuFFT
++// We'll incorporate the copy kernel launch inside custom_stft_launcher.
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,90 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void custom_stft_launcher(
++    const float* input,
++    float2* output,
++    int batch,
++    int L,
++    int n_fft,
++    int hop_length,
++    int win_length,
++    cudaStream_t stream
++);
++
++// custom_reshape: mirrors torch.reshape, returns a view when possible
++torch::Tensor custom_reshape(torch::Tensor input, std::vector<int64_t> shape) {
++    TORCH_CHECK(input.is_cuda(), "custom_reshape: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_reshape: input must be float32");
++    return input.view(shape);
++}
++
++// custom_stft: mirrors torch.stft with return_complex=True and default window=None
++// (Hann window generated inside launcher)
++torch::Tensor custom_stft(
++    torch::Tensor input,
++    int64_t n_fft,
++    int64_t hop_length,
++    int64_t win_length,
++    bool return_complex
++) {
++    TORCH_CHECK(input.is_cuda(), "custom_stft: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "custom_stft: input must be float32");
++    TORCH_CHECK(input.dim() == 2, "custom_stft: input must be 2D (batch, L)");
++    TORCH_CHECK(n_fft > 0, "custom_stft: n_fft must be positive");
++    TORCH_CHECK(hop_length > 0, "custom_stft: hop_length must be positive");
++    TORCH_CHECK(win_length == n_fft, "custom_stft: win_length must equal n_fft in this implementation");
++    TORCH_CHECK(return_complex, "custom_stft: return_complex must be true");
++
++    // Input is expected to be contiguous; if not, make it contiguous to simplify launcher
++    auto input_contig = input.contiguous();
++
++    const int64_t batch = input_contig.size(0);
++    const int64_t L = input_contig.size(1);
++    // Formula from PyTorch: num_frames = 1 + (L - n_fft) / hop_length (center=True, pad_mode='reflect')
++    const int64_t num_frames = 1 + (L - n_fft) / hop_length;
++    TORCH_CHECK(num_frames > 0, "custom_stft: invalid parameters, num_frames must be positive");
++
++    const int64_t n_freq = n_fft / 2 + 1;
++    // Output tensor: (batch, n_freq, num_frames), dtype complex64
++    auto output = torch::empty({batch, n_freq, num_frames}, input_contig.options().dtype(torch::kComplex64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_stft_launcher(
++        input_contig.data_ptr<float>(),
++        reinterpret_cast<float2*>(output.data_ptr<c10::complex<float>>()),
++        static_cast<int>(batch),
++        static_cast<int>(L),
++        static_cast<int>(n_fft),
++        static_cast<int>(hop_length),
++        static_cast<int>(win_length),
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_stft: CUDA error after launch: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_reshape", &custom_reshape,
++          "Reshape operation (view)",
++          pybind11::arg("input"), pybind11::arg("shape"));
++    m.def("custom_stft", &custom_stft,
++          "Short-time Fourier transform (complex output)",
++          pybind11::arg("input"),
++          pybind11::arg("n_fft"),
++          pybind11::arg("hop_length"),
++          pybind11::arg("win_length"),
++          pybind11::arg("return_complex"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,28 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, n_fft: int, hop_length: int, win_length: int, n_mels: int, mel_shape: tuple):
++        super().__init__()
++        self.n_fft = n_fft
++        self.hop_length = hop_length
++        self.win_length = win_length
++        self.n_mels = n_mels
++        self.mel_shape = mel_shape
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.custom_reshape(x, (-1, x.size(-1)))
++        x = cuda_extension.custom_stft(x, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length, return_complex=True)
++        x = cuda_extension.custom_reshape(x, self.mel_shape)
++        return x
++
++    def debug_forward(self, x: torch.Tensor):
++        x = cuda_extension.custom_reshape(x, (-1, x.size(-1)))
++        yield 'step_001', x
++        x = cuda_extension.custom_stft(x, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length, return_complex=True)
++        yield 'step_002', x
++        x = cuda_extension.custom_reshape(x, self.mel_shape)
++        yield 'step_003', x
++        yield 'step_004', x

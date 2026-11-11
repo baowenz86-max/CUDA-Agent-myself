@@ -1,0 +1,179 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,82 @@
++#include <cuda_runtime.h>
++
++extern "C" {
++
++// PixelShuffle kernel: rearrange input tensor (B, C*r^2, H, W) to output (B, C, H*r, W*r)
++// y[b, c, h*r + i, w*r + j] = x[b, c*r^2 + i*r + j, h, w]
++__global__ void pixel_shuffle_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int batch,
++    int channels,        // C = output channels
++    int height,          // H
++    int width,           // W
++    int upscale_factor,  // r
++    long long input_batch_stride,
++    long long input_channel_stride,
++    long long input_height_stride,
++    long long input_width_stride)
++{
++    long long total_output = (long long)batch * channels * height * upscale_factor * width * upscale_factor;
++    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++
++    for (; idx < total_output; idx += stride) {
++        // Decode output linear index into (b, c, oh, ow)
++        int ow = idx % (width * upscale_factor);
++        long long tmp = idx / (width * upscale_factor);
++        int oh = tmp % (height * upscale_factor);
++        tmp /= (height * upscale_factor);
++        int c = tmp % channels;
++        int b = tmp / channels;
++
++        int h = oh / upscale_factor;
++        int w = ow / upscale_factor;
++        int i = oh % upscale_factor;
++        int j = ow % upscale_factor;
++
++        int input_channel = c * upscale_factor * upscale_factor + i * upscale_factor + j;
++
++        long long input_offset = (long long)b * input_batch_stride
++                               + (long long)input_channel * input_channel_stride
++                               + (long long)h * input_height_stride
++                               + (long long)w * input_width_stride;
++
++        output[idx] = input[input_offset];
++    }
++}
++
++void pixel_shuffle_forward_launcher(
++    float* output,
++    const float* input,
++    int batch,
++    int channels,
++    int height,
++    int width,
++    int upscale_factor,
++    const long long* input_strides, // array of 4 strides in elements, not bytes
++    cudaStream_t stream)
++{
++    long long total_output = (long long)batch * channels * height * upscale_factor * width * upscale_factor;
++    if (total_output <= 0) return;
++
++    int threads = 256;
++    int blocks = (int)((total_output + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid cap, kernel uses grid-stride loop
++
++    pixel_shuffle_kernel<<<blocks, threads, 0, stream>>>(
++        output,
++        input,
++        batch,
++        channels,
++        height,
++        width,
++        upscale_factor,
++        input_strides[0],
++        input_strides[1],
++        input_strides[2],
++        input_strides[3]
++    );
++}
++
++} // extern "C"
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,71 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void pixel_shuffle_forward_launcher(
++    float* output,
++    const float* input,
++    int batch,
++    int channels,
++    int height,
++    int width,
++    int upscale_factor,
++    const long long* input_strides,
++    cudaStream_t stream);
++
++torch::Tensor pixel_shuffle_forward(torch::Tensor x, int64_t upscale_factor) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (B, C*r^2, H, W)");
++    TORCH_CHECK(upscale_factor > 0, "upscale_factor must be positive");
++
++    int64_t r = upscale_factor;
++    int64_t B = x.size(0);
++    int64_t C_in = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    TORCH_CHECK(C_in % (r * r) == 0, "Input channel dimension must be divisible by r^2");
++
++    int64_t C = C_in / (r * r);
++    int64_t H_out = H * r;
++    int64_t W_out = W * r;
++
++    auto output = torch::empty({B, C, H_out, W_out}, x.options());
++
++    // Extract input strides in elements (not bytes) as long long array
++    long long input_strides[4];
++    for (int i = 0; i < 4; ++i) {
++        input_strides[i] = static_cast<long long>(x.stride(i));
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    pixel_shuffle_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(B),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(r),
++        input_strides,
++        stream
++    );
++
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "Kernel launch failed");
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("pixel_shuffle_forward", &pixel_shuffle_forward,
++          "PixelShuffle forward",
++          pybind11::arg("x"),
++          pybind11::arg("upscale_factor"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,17 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, upscale_factor):
++        super().__init__()
++        self.upscale_factor = upscale_factor
++
++    def forward(self, x):
++        return cuda_extension.pixel_shuffle_forward(x, self.upscale_factor)
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        out = cuda_extension.pixel_shuffle_forward(x, self.upscale_factor)
++        yield 'step_001', out

@@ -1,0 +1,176 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,10 +1,6 @@
+ #include <cuda_runtime.h>
+ #include <cstdint>
+ 
+-// Custom max over dimension 1 with keepdim=True
+-// Input: x shape [N, C, H, W], stored in any strides (we only accept contiguous for now, but use strides for generality)
+-// Output: values [N, 1, H, W] float32, indices [N, 1, H, W] int64
+-// Reduction over C with tie-breaking to first occurrence.
+ __global__ void max_dim1_kernel(const float* __restrict__ x,
+                                 float* __restrict__ values,
+                                 int64_t* __restrict__ indices,
+@@ -29,28 +25,27 @@
+             max_idx = c;
+         }
+     }
++    // Output tensors are contiguous with shape [N,1,H,W]; stride is [H*W, H*W, W, 1]
++    // So flat output index is n*(H*W) + h*W + w
+     int out_idx = n * (H * W) + h * W + w;
+     values[out_idx] = max_val;
+     indices[out_idx] = max_idx;
+ }
+ 
+-// Custom layer normalization over last dimension (C)
+-// Input x shape [N, 1, H, W] interpreted as [N, H, W, C]
+-// weight and bias shape [C]. Output same shape.
+-// We assume contiguous layout for x: N*H*W*C elements, where C = W dimension? Actually we know from contract:
+-// Input to layer_norm is max output shape [512,1,1024,64], so N=512, H=1024, W=64, and normalized_shape is [64] = W.
+-// We treat last dim size as C_norm = W = 64. For general, we accept C_norm as W.
+ __global__ void layer_norm_kernel(const float* __restrict__ x,
+                                   const float* __restrict__ weight,
+                                   const float* __restrict__ bias,
+                                   float* __restrict__ y,
+                                   int N, int H, int W, int C_norm,
+                                   double eps) {
+-    int total = N * H * W; // number of normalization groups
++    // Correct number of normalization groups: N * 1 * H = N * H
++    int total = N * H;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx >= total) return;
+ 
+-    const float* x_group = x + idx * C_norm; // contiguous assumption
++    // x is contiguous [N,1,H,W], so group idx corresponds to n=idx/H, h=idx%H,
++    // offset = (n * (1*H*W) + 0*(H*W) + h*W) = (n * H + h) * W = idx * W
++    const float* x_group = x + idx * W;
+     float sum = 0.0f;
+     for (int i = 0; i < C_norm; ++i) {
+         sum += x_group[i];
+@@ -64,13 +59,12 @@
+     float var = sq_sum / C_norm;
+     float inv_std = rsqrtf(var + (float)eps);
+ 
+-    float* y_group = y + idx * C_norm;
++    float* y_group = y + idx * W;
+     for (int i = 0; i < C_norm; ++i) {
+         y_group[i] = (x_group[i] - mean) * inv_std * weight[i] + bias[i];
+     }
+ }
+ 
+-// Launcher for custom_max_dim1_keepdim
+ extern "C" void custom_max_dim1_keepdim_launcher(const float* x,
+                                                 float* values,
+                                                 int64_t* indices,
+@@ -84,7 +78,6 @@
+                                                     stride_n, stride_c, stride_h, stride_w);
+ }
+ 
+-// Launcher for custom_layer_norm
+ extern "C" void custom_layer_norm_launcher(const float* x,
+                                           const float* weight,
+                                           const float* bias,
+@@ -92,7 +85,7 @@
+                                           int N, int H, int W, int C_norm,
+                                           double eps,
+                                           cudaStream_t stream) {
+-    int total = N * H * W;
++    int total = N * H;
+     int threads = 256;
+     int blocks = (total + threads - 1) / threads;
+     layer_norm_kernel<<<blocks, threads, 0, stream>>>(x, weight, bias, y, N, H, W, C_norm, eps);
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -5,7 +5,6 @@
+ #include <c10/cuda/CUDAStream.h>
+ #include "../binding_registry.h"
+ 
+-// Declare launchers from custom_ops.cu
+ extern "C" void custom_max_dim1_keepdim_launcher(const float* x,
+                                                 float* values,
+                                                 int64_t* indices,
+@@ -21,9 +20,7 @@
+                                           double eps,
+                                           cudaStream_t stream);
+ 
+-// Wrapper for custom_max_dim1_keepdim
+ std::tuple<torch::Tensor, torch::Tensor> custom_max_dim1_keepdim(torch::Tensor x) {
+-    // Input validation
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(x.dim() == 4, "x must be 4D (N,C,H,W)");
+@@ -34,14 +31,11 @@
+     int H = x.size(2);
+     int W = x.size(3);
+ 
+-    // Output tensors
+     auto values = torch::empty({N, 1, H, W}, x.options());
+     auto indices = torch::empty({N, 1, H, W}, x.options().dtype(torch::kInt64));
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Launcher uses strides (even if x is non-contiguous)
+     custom_max_dim1_keepdim_launcher(
+         x.data_ptr<float>(),
+         values.data_ptr<float>(),
+@@ -54,12 +48,10 @@
+     return {values, indices};
+ }
+ 
+-// Wrapper for custom_layer_norm
+ torch::Tensor custom_layer_norm(torch::Tensor x,
+                                 torch::Tensor weight,
+                                 torch::Tensor bias,
+                                 double eps) {
+-    // Input validation
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(weight.is_cuda() && weight.dtype() == torch::kFloat32, "weight must be CUDA float32");
+@@ -72,18 +64,17 @@
+     int N = x.size(0);
+     int H = x.size(2);
+     int W = x.size(3);
+-    int C_norm = W;  // last dim = normalized size
++    int C_norm = W;
+ 
+-    // Output tensor (same shape as x)
+     auto output = torch::empty_like(x);
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Launcher assumes x is contiguous (as contracted for layer_norm)
+-    TORCH_CHECK(x.is_contiguous(), "x must be contiguous for layer_norm");
++    // Ensure x is contiguous for kernel simplicity (it should be contiguous from max output)
++    auto x_contig = x.contiguous();
++
+     custom_layer_norm_launcher(
+-        x.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
+         weight.data_ptr<float>(),
+         bias.data_ptr<float>(),
+         output.data_ptr<float>(),
+@@ -95,7 +86,6 @@
+     return output;
+ }
+ 
+-// Registration function
+ void register_custom_ops(pybind11::module& m) {
+     m.def("custom_max_dim1_keepdim", &custom_max_dim1_keepdim,
+           "Custom max over dimension 1 with keepdim=True",
+@@ -105,5 +95,4 @@
+           py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("eps") = 1e-05);
+ }
+ 
+-// Auto-register
+ REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -1,5 +1,6 @@
+ import torch
+ import torch.nn as nn
++import cuda_extension
+ 
+ 
+ class ModelNew(nn.Module):

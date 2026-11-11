@@ -1,0 +1,298 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,150 @@
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// Softmax along dim=1 (channels) for each spatial location (n, h, w)
++// x: input tensor (N, C, H, W) with arbitrary strides;
++// y: output tensor same shape; out_strides can be same as in_strides or chosen by binding.
++__global__ void softmax_dim1_kernel(
++    float* __restrict__ y,
++    const float* __restrict__ x,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    const int64_t* __restrict__ in_stride,  // 4 strides: N, C, H, W
++    const int64_t* __restrict__ out_stride
++) {
++    int64_t total_spatial = N * H * W;
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    if (idx >= total_spatial) return;
++
++    // Decode spatial index into n, h, w
++    int64_t n = idx / (H * W);
++    int64_t rem = idx - n * (H * W);
++    int64_t h = rem / W;
++    int64_t w = rem - h * W;
++
++    const float* x_base = x + n * in_stride[0] + h * in_stride[2] + w * in_stride[3];
++    float* y_base = y + n * out_stride[0] + h * out_stride[2] + w * out_stride[3];
++
++    // First pass: find max value for numerical stability
++    float max_val = -__FLT_MAX__;
++    for (int64_t c = 0; c < C; ++c) {
++        float val = x_base[c * in_stride[1]];
++        if (val > max_val) max_val = val;
++    }
++
++    // Second pass: compute sum of exp(x - max)
++    float sum = 0.0f;
++    for (int64_t c = 0; c < C; ++c) {
++        float val = __expf(x_base[c * in_stride[1]] - max_val);
++        sum += val;
++    }
++
++    // Third pass: write normalized values
++    float inv_sum = 1.0f / sum;
++    for (int64_t c = 0; c < C; ++c) {
++        float val = __expf(x_base[c * in_stride[1]] - max_val);
++        y_base[c * out_stride[1]] = val * inv_sum;
++    }
++}
++
++// Constant pad 2D: pad left, right, top, bottom with constant value
++// x: input (N,C,H,W) with in_stride; y: output (N,C,H+top+bottom, W+left+right) with out_stride
++__global__ void constant_pad2d_kernel(
++    float* __restrict__ y,
++    const float* __restrict__ x,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t pad_l, int64_t pad_r, int64_t pad_t, int64_t pad_b,
++    float value,
++    const int64_t* __restrict__ in_stride,
++    const int64_t* __restrict__ out_stride
++) {
++    int64_t H_out = H_in + pad_t + pad_b;
++    int64_t W_out = W_in + pad_l + pad_r;
++    int64_t total = N * C * H_out * W_out;
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    if (idx >= total) return;
++
++    // Decode output index: n, c, h_out, w_out
++    int64_t n = idx / (C * H_out * W_out);
++    int64_t rem = idx - n * (C * H_out * W_out);
++    int64_t c = rem / (H_out * W_out);
++    rem -= c * (H_out * W_out);
++    int64_t h_out = rem / W_out;
++    int64_t w_out = rem - h_out * W_out;
++
++    bool inside = (h_out >= pad_t && h_out < pad_t + H_in && 
++                   w_out >= pad_l && w_out < pad_l + W_in);
++    float out_val = value;
++    if (inside) {
++        int64_t h_in = h_out - pad_t;
++        int64_t w_in = w_out - pad_l;
++        const float* x_ptr = x + n * in_stride[0] + c * in_stride[1] + h_in * in_stride[2] + w_in * in_stride[3];
++        out_val = *x_ptr;
++    }
++    float* y_ptr = y + n * out_stride[0] + c * out_stride[1] + h_out * out_stride[2] + w_out * out_stride[3];
++    *y_ptr = out_val;
++}
++
++extern "C" {
++
++// Launcher for softmax dim=1
++// Parameters:
++//   y: output tensor pointer (float*)
++//   x: input tensor pointer (const float*)
++//   N, C, H, W: tensor dimensions
++//   in_stride: int64_t array of 4 strides for x
++//   out_stride: int64_t array of 4 strides for y
++//   stream: CUDA stream
++void softmax_dim1_forward(
++    float* y,
++    const float* x,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    const int64_t* in_stride,
++    const int64_t* out_stride,
++    cudaStream_t stream)
++{
++    int64_t total_spatial = N * H * W;
++    if (total_spatial <= 0) return;
++    int threads = 256;
++    int64_t blocks = (total_spatial + threads - 1) / threads;
++    if (blocks > 2147483647) blocks = 2147483647; // grid max for x dimension, but we may need y dimension
++    // Use grid-stride loop to cover all elements safely, but we'll launch with capped blocks.
++    // For large sizes we may exceed 2^31-1 blocks, but total_spatial here ~ 16*512*512=4M, so blocks ~16384, safe.
++    softmax_dim1_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
++        y, x, N, C, H, W, in_stride, out_stride);
++    // Error check is left to caller; here we only ensure launch did not fail synchronously.
++    // cudaGetLastError();
++}
++
++// Launcher for constant pad2d
++// Parameters:
++//   y: output tensor pointer (float*)
++//   x: input tensor pointer (const float*)
++//   N, C, H_in, W_in: input dims
++//   pad_l, pad_r, pad_t, pad_b: padding amounts
++//   value: fill value
++//   in_stride: int64_t array of 4 strides for x
++//   out_stride: int64_t array of 4 strides for y
++//   stream: CUDA stream
++void constant_pad2d_forward(
++    float* y,
++    const float* x,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t pad_l, int64_t pad_r, int64_t pad_t, int64_t pad_b,
++    float value,
++    const int64_t* in_stride,
++    const int64_t* out_stride,
++    cudaStream_t stream)
++{
++    int64_t H_out = H_in + pad_t + pad_b;
++    int64_t W_out = W_in + pad_l + pad_r;
++    int64_t total = N * C * H_out * W_out;
++    if (total <= 0) return;
++    int threads = 256;
++    int64_t blocks = (total + threads - 1) / threads;
++    if (blocks > 2147483647) blocks = 2147483647;
++    constant_pad2d_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
++        y, x, N, C, H_in, W_in, pad_l, pad_r, pad_t, pad_b, value,
++        in_stride, out_stride);
++}
++
++} // extern "C"
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,96 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++extern "C" {
++void softmax_dim1_forward(
++    float* y,
++    const float* x,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    const int64_t* in_stride,
++    const int64_t* out_stride,
++    cudaStream_t stream);
++
++void constant_pad2d_forward(
++    float* y,
++    const float* x,
++    int64_t N, int64_t C, int64_t H_in, int64_t W_in,
++    int64_t pad_l, int64_t pad_r, int64_t pad_t, int64_t pad_b,
++    float value,
++    const int64_t* in_stride,
++    const int64_t* out_stride,
++    cudaStream_t stream);
++}
++
++static torch::Tensor custom_softmax_dim1(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "custom_softmax_dim1: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_softmax_dim1: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "custom_softmax_dim1: input must be 4-dimensional [N, C, H, W]");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    softmax_dim1_forward(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        N, C, H, W,
++        x.strides().data(),
++        output.strides().data(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_softmax_dim1: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++static torch::Tensor custom_constant_pad2d(torch::Tensor x, int64_t pad_l, int64_t pad_r, int64_t pad_t, int64_t pad_b, double value) {
++    TORCH_CHECK(x.is_cuda(), "custom_constant_pad2d: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "custom_constant_pad2d: input must be float32");
++    TORCH_CHECK(x.dim() == 4, "custom_constant_pad2d: input must be 4-dimensional [N, C, H_in, W_in]");
++    TORCH_CHECK(pad_l >= 0 && pad_r >= 0 && pad_t >= 0 && pad_b >= 0, "custom_constant_pad2d: padding must be non-negative");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H_in = x.size(2);
++    int64_t W_in = x.size(3);
++    int64_t H_out = H_in + pad_t + pad_b;
++    int64_t W_out = W_in + pad_l + pad_r;
++
++    auto output = torch::empty({N, C, H_out, W_out}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    constant_pad2d_forward(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        N, C, H_in, W_in,
++        pad_l, pad_r, pad_t, pad_b,
++        static_cast<float>(value),
++        x.strides().data(),
++        output.strides().data(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_constant_pad2d: CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_softmax_dim1", &custom_softmax_dim1, "Softmax along dim=1 for [N,C,H,W] tensor", py::arg("x"));
++    m.def("custom_constant_pad2d", &custom_constant_pad2d, "Constant pad 2D with explicit padding amounts",
++          py::arg("x"), py::arg("pad_l"), py::arg("pad_r"), py::arg("pad_t"), py::arg("pad_b"), py::arg("value"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,43 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, padding_size, padding_value):
++        super().__init__()
++        # 参考模型没有可学习参数，state_dict 为空
++        # 保留 padding_size 和 padding_value 以便 forward 使用
++        self.padding_size = padding_size
++        self.padding_value = padding_value
++
++    def forward(self, x):
++        # 第一步：沿通道维 softmax
++        x = torch.ops.cuda_extension.custom_softmax_dim1(x)
++        # 第二步：常数填充 2D
++        # padding_size 参考模型 nn.ConstantPad2d 接受 (pad_left, pad_right, pad_top, pad_bottom) 或 (pad_w, pad_h)
++        # 任务中 padding_size=(1,2)，根据输出 shape [16,64,512,515] 推断实际为左右各1、上下无填充？
++        # 但任务契约明确输出 [16,64,512,515]，宽度增加3？需要仔细确定。
++        # 标准 ConstantPad2d((1,2)) 表示左右各1，上下各2，输出 [16,64,516,514]。
++        # 而契约输出 [16,64,512,515]，宽 515 = 512+3，高不变，说明实际 padding 是 (1,2) 被解释为左侧1、右侧2，上下0？
++        # 但 ConstantPad2d 的输入若为 (1,2) 作为 2-tuple 表示 (left, right)，4-tuple 才是 (left, right, top, bottom)。
++        # 这里 padding_size 是 (1,2)，2-tuple，所以 pad_left=1, pad_right=2, pad_top=0, pad_bottom=0，输出 [16,64,512,515]。
++        # 但参考模型 __init__ 传入 padding_size=(1,2) 且 ConstantPad2d 接受 2-tuple 或 4-tuple，2-tuple 时表示左右，因此输出宽度 512+1+2=515，高度不变，与契约一致。
++        # 因此 padding 参数应展开为 (1,2,0,0)
++        pad_left, pad_right = self.padding_size
++        pad_top, pad_bottom = 0, 0
++        # 调用自定义填充算子，参数顺序：x, padding_left, padding_right, padding_top, padding_bottom, value
++        x = torch.ops.cuda_extension.custom_constant_pad2d(x, pad_left, pad_right, pad_top, pad_bottom, self.padding_value)
++        return x
++
++    def debug_forward(self, *inputs):
++        # 按照参考检查点顺序 yield (id, value)
++        x = inputs[0]
++        # step_001: softmax
++        x = torch.ops.cuda_extension.custom_softmax_dim1(x)
++        yield "step_001", x
++        # step_002: pad
++        pad_left, pad_right = self.padding_size
++        x = torch.ops.cuda_extension.custom_constant_pad2d(x, pad_left, pad_right, 0, 0, self.padding_value)
++        yield "step_002", x
++        # step_003: final return
++        yield "step_003", x

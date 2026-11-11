@@ -1,0 +1,105 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,28 @@
++#include <cuda_runtime.h>
++
++// Hardswish activation: y = x * relu6(x + 3) / 6
++__global__ void hardswish_kernel(float* __restrict__ output, const float* __restrict__ input, int64_t numel) {
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float x = input[i];
++        float relu6 = fminf(fmaxf(x + 3.0f, 0.0f), 6.0f);
++        output[i] = x * relu6 / 6.0f;
++    }
++}
++
++// Launcher for elementwise hardswish on float32 tensors.
++// Handles non-contiguous tensors via linear indexing (caller must allocate output with same layout).
++extern "C" void hardswish_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    const int block_size = 256;
++    int64_t blocks = (numel + block_size - 1) / block_size;
++    // Cap grid to avoid exceeding limits; grid-stride loop covers the rest.
++    const int64_t max_grid = 65535;
++    if (blocks > max_grid) blocks = max_grid;
++    hardswish_kernel<<<static_cast<unsigned int>(blocks), block_size, 0, stream>>>(output, input, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,49 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declared in custom_ops.cu
++extern "C" void hardswish_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++// PyTorch wrapper for hardswish forward
++torch::Tensor hardswish_forward(torch::Tensor x) {
++    // Validate tensor
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    // x can be non-contiguous; launcher uses linear indexing over numel.
++    // Output must be allocated with same shape and device.
++    auto output = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Launch kernel
++    hardswish_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    return output;
++}
++
++// Register function
++void register_hardswish_forward(pybind11::module& m) {
++    m.def("hardswish_forward", &hardswish_forward,
++          "Apply Hardswish activation elementwise.\n\n"
++          "Args:\n"
++          "    x (torch.Tensor): Input tensor of shape [16, 512, 64000], dtype torch.float32 on CUDA.\n\n"
++          "Returns:\n"
++          "    torch.Tensor: Output tensor with same shape and dtype.",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(hardswish_forward, register_hardswish_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,19 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features):
++        super().__init__()
++        # No parameters or submodules needed; hardswish is stateless.
++        # Preserve signature: in_features is unused but matches reference.
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return cuda_extension.hardswish_forward(x)
++
++    def debug_forward(self, *inputs):
++        # Single input tensor x
++        x = inputs[0]
++        y = cuda_extension.hardswish_forward(x)
++        yield 'step_001', y

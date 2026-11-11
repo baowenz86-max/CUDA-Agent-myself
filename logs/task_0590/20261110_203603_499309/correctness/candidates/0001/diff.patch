@@ -1,0 +1,223 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,85 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel for cat_dim1: concatenates two 4D tensors along dim=1 (channel dimension)
++// Inputs: a (N, C1, H, W), b (N, C2, H, W), output (N, C1+C2, H, W)
++// Output strides are assumed contiguous: n*Cout*H*W + c*H*W + h*W + w
++// Input strides may be arbitrary; compute using provided strides.
++__global__ void cat_dim1_kernel(
++    const float* __restrict__ a, const float* __restrict__ b,
++    float* __restrict__ out,
++    int N, int C1, int C2, int H, int W,
++    long long a_stride_n, long long a_stride_c, long long a_stride_h, long long a_stride_w,
++    long long b_stride_n, long long b_stride_c, long long b_stride_h, long long b_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    int Cout = C1 + C2;
++    int plane = H * W;
++    long long total = (long long)N * Cout * plane;
++
++    for (long long linear = idx; linear < total; linear += stride) {
++        int w = linear % W;
++        long long tmp = linear / W;
++        int h = tmp % H;
++        tmp /= H;
++        int c = tmp % Cout;
++        int n = tmp / Cout;
++
++        const float* src;
++        long long src_offset;
++        if (c < C1) {
++            src = a;
++            src_offset = n * a_stride_n + c * a_stride_c + h * a_stride_h + w * a_stride_w;
++        } else {
++            int c2 = c - C1;
++            src = b;
++            src_offset = n * b_stride_n + c2 * b_stride_c + h * b_stride_h + w * b_stride_w;
++        }
++
++        long long out_offset = n * out_stride_n + c * out_stride_c + h * out_stride_h + w * out_stride_w;
++        out[out_offset] = src[src_offset];
++    }
++}
++
++// Kernel for clone_tensor: copies data from input to output assuming contiguous layout.
++__global__ void clone_kernel(const float* __restrict__ src, float* __restrict__ dst, long long numel)
++{
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = blockDim.x * (long long)gridDim.x;
++    for (long long i = idx; i < numel; i += stride) {
++        dst[i] = src[i];
++    }
++}
++
++// Launcher for cat_dim1. Expects pointers to device memory.
++extern "C" void cat_dim1_launcher(
++    const float* a, const float* b, float* out,
++    int N, int C1, int C2, int H, int W,
++    long long a_stride_n, long long a_stride_c, long long a_stride_h, long long a_stride_w,
++    long long b_stride_n, long long b_stride_c, long long b_stride_h, long long b_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
++    cudaStream_t stream)
++{
++    int Cout = C1 + C2;
++    long long total = (long long)N * Cout * H * W;
++    int threads = 256;
++    int blocks = (int)std::min((total + threads - 1) / threads, (long long)INT_MAX);
++    if (blocks == 0) blocks = 1;
++    cat_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        a, b, out, N, C1, C2, H, W,
++        a_stride_n, a_stride_c, a_stride_h, a_stride_w,
++        b_stride_n, b_stride_c, b_stride_h, b_stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w);
++}
++
++// Launcher for clone_tensor. Expects device pointers.
++extern "C" void clone_tensor_launcher(const float* src, float* dst, long long numel, cudaStream_t stream)
++{
++    int threads = 256;
++    long long blocks_ll = (numel + threads - 1) / threads;
++    int blocks = (int)std::min(blocks_ll, (long long)INT_MAX);
++    if (blocks == 0) blocks = 1;
++    clone_kernel<<<blocks, threads, 0, stream>>>(src, dst, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,107 @@
++// Binding for cat_dim1 and clone_tensor CUDA kernels
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void cat_dim1_launcher(
++    const float* a, const float* b, float* out,
++    int N, int C1, int C2, int H, int W,
++    long long a_stride_n, long long a_stride_c, long long a_stride_h, long long a_stride_w,
++    long long b_stride_n, long long b_stride_c, long long b_stride_h, long long b_stride_w,
++    long long out_stride_n, long long out_stride_c, long long out_stride_h, long long out_stride_w,
++    cudaStream_t stream);
++
++extern "C" void clone_tensor_launcher(const float* src, float* dst, long long numel, cudaStream_t stream);
++
++// Implementation of cat_dim1 operator
++torch::Tensor cat_dim1(torch::Tensor a, torch::Tensor b) {
++    // Input validation
++    TORCH_CHECK(a.is_cuda(), "cat_dim1 input a must be a CUDA tensor");
++    TORCH_CHECK(b.is_cuda(), "cat_dim1 input b must be a CUDA tensor");
++    TORCH_CHECK(a.dtype() == torch::kFloat32, "cat_dim1 input a must be float32");
++    TORCH_CHECK(b.dtype() == torch::kFloat32, "cat_dim1 input b must be float32");
++    TORCH_CHECK(a.dim() == 4 && b.dim() == 4, "cat_dim1 expects 4D tensors");
++    TORCH_CHECK(a.size(0) == b.size(0), "batch dimension mismatch");
++    TORCH_CHECK(a.size(2) == b.size(2) && a.size(3) == b.size(3), "spatial dimensions mismatch");
++
++    int N = a.size(0);
++    int C1 = a.size(1);
++    int C2 = b.size(1);
++    int H = a.size(2);
++    int W = a.size(3);
++
++    // Allocate output contiguous
++    torch::Tensor out = torch::empty({N, C1 + C2, H, W}, a.options());
++
++    // Compute strides (assuming contiguous output)
++    long long out_stride_w = 1;
++    long long out_stride_h = W;
++    long long out_stride_c = (long long)H * W;
++    long long out_stride_n = (long long)(C1 + C2) * H * W;
++
++    // Get input strides from tensors (may be non-contiguous)
++    long long a_stride_n = a.stride(0);
++    long long a_stride_c = a.stride(1);
++    long long a_stride_h = a.stride(2);
++    long long a_stride_w = a.stride(3);
++    long long b_stride_n = b.stride(0);
++    long long b_stride_c = b.stride(1);
++    long long b_stride_h = b.stride(2);
++    long long b_stride_w = b.stride(3);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Launch kernel
++    cat_dim1_launcher(
++        a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(),
++        N, C1, C2, H, W,
++        a_stride_n, a_stride_c, a_stride_h, a_stride_w,
++        b_stride_n, b_stride_c, b_stride_h, b_stride_w,
++        out_stride_n, out_stride_c, out_stride_h, out_stride_w,
++        stream
++    );
++
++    // Check for CUDA errors after launch (optional but good practice)
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "cat_dim1 CUDA error: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Implementation of clone_tensor operator
++torch::Tensor clone_tensor(torch::Tensor x) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "clone_tensor input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "clone_tensor input must be float32");
++
++    // Allocate output like input (contiguous)
++    torch::Tensor out = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Launch kernel
++    clone_tensor_launcher(
++        x.data_ptr<float>(), out.data_ptr<float>(), x.numel(), stream
++    );
++
++    // Check for CUDA errors after launch
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "clone_tensor CUDA error: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Registration function
++void register_custom_ops_binding(pybind11::module& m) {
++    m.def("cat_dim1", &cat_dim1, "Concatenate two tensors along dimension 1 (channel)",
++          py::arg("a"), py::arg("b"));
++    m.def("clone_tensor", &clone_tensor, "Clone a tensor (copy)",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops_binding, register_custom_ops_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_shape1, input_shape2):
++        super().__init__()
++        self.input_shape1 = input_shape1
++        self.input_shape2 = input_shape2
++
++    def forward(self, x1, x2):
++        x1 = cuda_extension.cat_dim1(x1, x2)
++        x1 = cuda_extension.clone_tensor(x1)
++        return x1
++
++    def debug_forward(self, x1, x2):
++        yield 'step_001', cuda_extension.cat_dim1(x1, x2)
++        x1 = cuda_extension.cat_dim1(x1, x2)
++        yield 'step_002', cuda_extension.clone_tensor(x1)
++        x1 = cuda_extension.clone_tensor(x1)
++        yield 'step_003', x1

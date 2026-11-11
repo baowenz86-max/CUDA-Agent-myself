@@ -1,0 +1,208 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -38,8 +38,11 @@
+     float* __restrict__ y,
+     float eps,
+     int64_t batch_size,
+-    int64_t norm_size,          // number of elements per sample to normalize (C*H*W)
+-    int64_t spatial_stride_b,   // stride of batch dimension (usually norm_size, but may differ)
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t norm_size,          // C*H*W
++    int64_t spatial_stride_b,   // stride of batch dimension
+     int64_t spatial_stride_c,   // stride of channel dimension
+     int64_t spatial_stride_h,   // stride of height
+     int64_t spatial_stride_w,   // stride of width
+@@ -53,11 +56,11 @@
+     if (b >= batch_size) return;
+ 
+     int tid = threadIdx.x;
+-    int n_threads = blockDim.x;  // renamed to avoid shadowing
++    int n_threads = blockDim.x;
+ 
+     // Base pointer for this sample in x and y
+     const float* x_b = x + b * spatial_stride_b;
+-    float* y_b = y + b * norm_size;  // output is contiguous, so batch stride = norm_size
++    float* y_b = y + b * norm_size;  // output is contiguous
+ 
+     // -- Phase 1: compute mean and variance using Welford --
+     float mean = 0.0f;
+@@ -68,13 +71,13 @@
+     for (int64_t idx = tid; idx < norm_size; idx += n_threads) {
+         // Compute multi-dimensional indices for this sample
+         int64_t rem = idx;
+-        int w = rem % spatial_stride_w;
+-        rem /= spatial_stride_w;
+-        int h = rem % spatial_stride_h;
+-        rem /= spatial_stride_h;
+-        int c = rem;  // remaining is channel index (assuming norm_size = C*H*W)
++        int w = rem % W;
++        rem /= W;
++        int h = rem % H;
++        rem /= H;
++        int c = rem;  // c < C guaranteed by idx < norm_size
+ 
+-        float val = x_b[c * spatial_stride_c + h * spatial_stride_h + w];
++        float val = x_b[c * spatial_stride_c + h * spatial_stride_h + w * spatial_stride_w];
+         count++;
+         float delta = val - mean;
+         mean += delta / count;
+@@ -83,7 +86,6 @@
+     }
+ 
+     // -- Phase 2: block reduction of mean and m2 --
+-    // Use shared memory to reduce count, mean, m2 across threads
+     float* s_count = shared;
+     float* s_mean = shared + n_threads;
+     float* s_m2 = shared + 2 * n_threads;
+@@ -94,7 +96,6 @@
+ 
+     __syncthreads();
+ 
+-    // Reduce count first (could be combined but simpler separate)
+     for (int stride = n_threads / 2; stride > 0; stride >>= 1) {
+         if (tid < stride) {
+             float other_count = s_count[tid + stride];
+@@ -113,33 +114,29 @@
+         __syncthreads();
+     }
+ 
+-    // Thread 0 writes final mean, variance
+     float final_mean = s_mean[0];
+-    float final_var = s_m2[0] / (float)norm_size; // population variance
++    float final_var = s_m2[0] / (float)norm_size;
+     float inv_std = rsqrtf(final_var + eps);
+ 
+-    // Store final mean and inv_std in shared memory for all threads
+     s_mean[0] = final_mean;
+     s_m2[0] = inv_std;
+     __syncthreads();
+ 
+     // -- Phase 3: normalize and apply affine --
+-    // Need to loop over norm_size elements again, same mapping
+     for (int64_t idx = tid; idx < norm_size; idx += n_threads) {
+         int64_t rem = idx;
+-        int w = rem % spatial_stride_w;
+-        rem /= spatial_stride_w;
+-        int h = rem % spatial_stride_h;
+-        rem /= spatial_stride_h;
++        int w = rem % W;
++        rem /= W;
++        int h = rem % H;
++        rem /= H;
+         int c = rem;
+ 
+-        float x_val = x_b[c * spatial_stride_c + h * spatial_stride_h + w];
++        float x_val = x_b[c * spatial_stride_c + h * spatial_stride_h + w * spatial_stride_w];
+         float normalized = (x_val - final_mean) * inv_std;
+ 
+         if (has_affine) {
+-            // weight and bias are contiguous with same shape as normalized dims
+-            float w_val = weight[c * weight_stride_c + h * weight_stride_h + w];
+-            float b_val = bias[c * weight_stride_c + h * weight_stride_h + w];
++            float w_val = weight[c * weight_stride_c + h * weight_stride_h + w * weight_stride_w];
++            float b_val = bias[c * weight_stride_c + h * weight_stride_h + w * weight_stride_w];
+             normalized = normalized * w_val + b_val;
+         }
+         y_b[idx] = normalized; // output is contiguous
+@@ -157,7 +154,7 @@
+ 
+     const int block_size = 256;
+     int64_t grid_size = (numel + block_size - 1) / block_size;
+-    if (grid_size > 65535) grid_size = 65535; // grid-stride loop handles rest
++    if (grid_size > 65535) grid_size = 65535;
+     abs_kernel<<<(int)grid_size, block_size, 0, stream>>>(x, y, numel);
+ }
+ 
+@@ -168,6 +165,9 @@
+     float* y,
+     double eps,
+     int64_t batch_size,
++    int64_t C,
++    int64_t H,
++    int64_t W,
+     int64_t norm_size,
+     int64_t spatial_stride_b,
+     int64_t spatial_stride_c,
+@@ -179,15 +179,13 @@
+     bool has_affine,
+     cudaStream_t stream) {
+ 
+-    const int block_size = 256; // must be power of two for reduction
++    const int block_size = 256;
+     if (batch_size <= 0 || norm_size <= 0) return;
+ 
+-    // Each block processes one sample.
+-    // Shared memory: 3 floats per thread for reduction arrays.
+     size_t shared_mem_size = 3 * block_size * sizeof(float);
+ 
+     layer_norm_kernel<<<(int)batch_size, block_size, shared_mem_size, stream>>>(
+-        x, weight, bias, y, (float)eps, batch_size, norm_size,
++        x, weight, bias, y, (float)eps, batch_size, C, H, W, norm_size,
+         spatial_stride_b, spatial_stride_c, spatial_stride_h, spatial_stride_w,
+         weight_stride_c, weight_stride_h, weight_stride_w, has_affine);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -19,6 +19,9 @@
+     float* y,
+     double eps,
+     int64_t batch_size,
++    int64_t C,
++    int64_t H,
++    int64_t W,
+     int64_t norm_size,
+     int64_t spatial_stride_b,
+     int64_t spatial_stride_c,
+@@ -75,20 +78,18 @@
+     }
+ 
+     int64_t batch_size = x.size(0);
+-    int64_t norm_size = 1;
+-    for (int64_t i = 1; i < x.dim(); ++i) {
+-        norm_size *= x.size(i);
+-    }
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++    int64_t norm_size = C * H * W;
+ 
+     auto y = torch::empty_like(x);
+ 
+-    // Get strides (assume input may be non-contiguous but we handle in kernel via spatial strides)
+     int64_t spatial_stride_b = x.stride(0);
+     int64_t spatial_stride_c = x.stride(1);
+     int64_t spatial_stride_h = x.stride(2);
+     int64_t spatial_stride_w = x.stride(3);
+ 
+-    // weight/bias are expected shape (C,H,W) and we treat them as contiguous
+     int64_t weight_stride_c = 0, weight_stride_h = 0, weight_stride_w = 0;
+     const float* weight_ptr = nullptr;
+     const float* bias_ptr = nullptr;
+@@ -97,7 +98,6 @@
+     if (weight.has_value() && bias.has_value()) {
+         TORCH_CHECK(weight->numel() == norm_size, "custom_layer_norm: weight size mismatch");
+         TORCH_CHECK(bias->numel() == norm_size, "custom_layer_norm: bias size mismatch");
+-        // weight and bias are contiguous with shape (C,H,W), compute strides
+         weight_stride_c = weight->stride(0);
+         weight_stride_h = weight->stride(1);
+         weight_stride_w = weight->stride(2);
+@@ -107,7 +107,6 @@
+     } else if (weight.has_value() || bias.has_value()) {
+         TORCH_CHECK(false, "custom_layer_norm: weight and bias must both be provided or both None");
+     } else {
+-        // no affine, set weight/bias pointers to nullptr, strides irrelevant
+         weight_ptr = nullptr;
+         bias_ptr = nullptr;
+         has_affine = false;
+@@ -121,6 +120,9 @@
+         y.data_ptr<float>(),
+         eps,
+         batch_size,
++        C,
++        H,
++        W,
+         norm_size,
+         spatial_stride_b,
+         spatial_stride_c,

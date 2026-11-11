@@ -1,0 +1,418 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,231 @@
++// kernels/custom_ops.cu - CUDA kernels for custom PyTorch operations
++// Contains embedding forward, randn_like, and smooth_l1_loss kernels with C-style launchers.
++// No torch/ATen/c10/pybind dependencies. Binding layer will call these launchers.
++
++#include <cuda_runtime.h>
++#include <curand_kernel.h>
++#include <cstdint>
++
++// -----------------------------------------------------------------------------
++// Embedding forward kernel
++// Gather rows from weight according to indices. Supports non-contiguous weight
++// via row stride in elements.
++// weight: float pointer, shape [num_embeddings, embedding_dim], row stride = weight_row_stride
++// indices: int64 pointer, arbitrary shape flattened, total count = total_indices
++// output: float pointer, shape [total_indices, embedding_dim], row stride = out_row_stride
++// embedding_dim: number of features per row
++//
++// Kernel configuration: one thread per output element, i.e., total_indices * embedding_dim threads.
++__global__ void embedding_forward_kernel(
++    const float* __restrict__ weight,
++    const int64_t* __restrict__ indices,
++    float* __restrict__ output,
++    int embedding_dim,
++    int64_t weight_row_stride,
++    int64_t out_row_stride,
++    int64_t total_indices)
++{
++    // Grid-stride loop for robust large data handling
++    int64_t total_elements = total_indices * embedding_dim;
++    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++         idx < total_elements;
++         idx += gridDim.x * blockDim.x) {
++        int64_t row = idx / embedding_dim;
++        int col = idx - row * embedding_dim;
++        int64_t weight_row = indices[row]; // assumes valid index [0, num_embeddings)
++        output[row * out_row_stride + col] = weight[weight_row * weight_row_stride + col];
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Randn_like kernel: generate standard normal random numbers using cuRAND.
++// output: float pointer, total_numel elements
++// seed: seed for cuRAND, passed to each thread with a unique offset based on global index
++__global__ void randn_like_kernel(
++    float* __restrict__ output,
++    uint64_t seed,
++    int64_t total_numel)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < total_numel) {
++        curandStatePhilox4_32_10_t state;
++        // Use unique subsequence per thread by offsetting seed with idx.
++        curand_init(seed, idx, 0, &state);
++        // Generate 4 normal floats per call for efficiency, but only use one.
++        float4 rand4 = curand_normal4(&state);
++        output[idx] = rand4.x;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Smooth L1 loss reduction: computes mean over all elements of loss(input, target)
++// loss = 0.5 * (diff)^2 if |diff| < 1 else |diff| - 0.5
++// We perform a two-phase reduction: within-block reduce to partial sums, then
++// atomicAdd to a single float global accumulator, and finally divide by N in a
++// small kernel or by host launcher (host will write scalar output).
++// To avoid launch of a separate division kernel, we have the block that finishes
++// last perform division and write final result to output scalar.
++
++// Kernel 1: compute per-element loss and block reduction, accumulate to global atomically.
++// output_sum: pointer to a float accumulator initialized to 0 on device
++// count_valid: pointer to int64 accumulator; not needed if total_numel known, but we still
++// keep count for safety? Actually we know N exactly from total_numel, so no need for count.
++// We'll just add partial sums to output_sum atomically.
++__global__ void smooth_l1_loss_partial_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ target,
++    float* __restrict__ partial_sum,
++    int64_t total_numel,
++    float beta_inv) // 1.0 / beta, contract beta=1.0
++{
++    extern __shared__ float sdata[]; // shared memory for block reduction
++    int64_t tid = threadIdx.x;
++    int64_t idx = blockIdx.x * blockDim.x + tid;
++    float my_loss = 0.0f;
++
++    // Grid-stride loop over elements to handle large data and reduce per-thread work
++    for (int64_t i = idx; i < total_numel; i += blockDim.x * gridDim.x) {
++        float diff = input[i] - target[i];
++        float abs_diff = fabsf(diff);
++        // smooth l1 with beta=1.0: if abs_diff < 1 -> 0.5*abs_diff^2, else abs_diff - 0.5
++        float loss;
++        if (abs_diff < 1.0f) {
++            loss = 0.5f * abs_diff * abs_diff;
++        } else {
++            loss = abs_diff - 0.5f;
++        }
++        my_loss += loss;
++    }
++
++    // Block reduction
++    sdata[tid] = my_loss;
++    __syncthreads();
++
++    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sdata[tid] += sdata[tid + s];
++        }
++        __syncthreads();
++    }
++
++    // Thread 0 of each block atomically adds to global partial sum
++    if (tid == 0) {
++        atomicAdd(partial_sum, sdata[0]);
++    }
++}
++
++// Kernel 2: finalize mean by dividing partial_sum by total_numel and write scalar output.
++__global__ void smooth_l1_loss_finalize_kernel(
++    const float* __restrict__ partial_sum,
++    float* __restrict__ output,
++    int64_t total_numel)
++{
++    if (threadIdx.x == 0) {
++        output[0] = (*partial_sum) / (float)total_numel;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Host launchers (extern "C" so binding.cpp can call without name mangling)
++// These assume tensors are already on CUDA and pointers are valid.
++// They should be called with the current CUDA stream.
++
++// Embedding forward launcher
++// weight_ptr: pointer to weight tensor (float)
++// indices_ptr: pointer to indices tensor (int64)
++// output_ptr: pointer to allocated output tensor (float)
++// embedding_dim: int
++// num_indices: total number of indices (int64)
++// weight_row_stride: stride between weight rows in elements
++// out_row_stride: stride between output rows in elements (usually embedding_dim)
++// stream: CUDA stream
++extern "C" void custom_embedding_forward_launcher(
++    const float* weight_ptr,
++    const int64_t* indices_ptr,
++    float* output_ptr,
++    int embedding_dim,
++    int64_t num_indices,
++    int64_t weight_row_stride,
++    int64_t out_row_stride,
++    cudaStream_t stream)
++{
++    // Launch config: enough threads to cover total elements, grid-stride loop used.
++    int64_t total_elements = num_indices * embedding_dim;
++    const int threads = 256;
++    int blocks = (int)((total_elements + threads - 1) / threads);
++    // Cap grid to avoid exceeding max grid size (though grid-stride handles large)
++    if (blocks > 65535) blocks = 65535;
++
++    embedding_forward_kernel<<<blocks, threads, 0, stream>>>(
++        weight_ptr, indices_ptr, output_ptr,
++        embedding_dim, weight_row_stride, out_row_stride, num_indices);
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In a real binding, this would be turned into a C++ exception;
++        // here we just rely on cudaGetLastError being checked by caller after launcher.
++        // We'll leave as is but avoid calling cudaDeviceSynchronize here.
++    }
++}
++
++// Randn_like launcher
++// output_ptr: pointer to output tensor (float)
++// total_numel: number of elements
++// seed: random seed (uint64_t)
++// stream: CUDA stream
++extern "C" void custom_randn_like_launcher(
++    float* output_ptr,
++    int64_t total_numel,
++    uint64_t seed,
++    cudaStream_t stream)
++{
++    const int threads = 256;
++    int blocks = (int)((total_numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++
++    randn_like_kernel<<<blocks, threads, 0, stream>>>(
++        output_ptr, seed, total_numel);
++
++    cudaError_t err = cudaGetLastError();
++    (void)err;
++}
++
++// Smooth L1 loss launcher
++// input_ptr: pointer to input tensor (float)
++// target_ptr: pointer to target tensor (float)
++// output_ptr: pointer to scalar output tensor (float, 0-dim)
++// total_numel: number of elements
++// stream: CUDA stream
++extern "C" void custom_smooth_l1_loss_forward_launcher(
++    const float* input_ptr,
++    const float* target_ptr,
++    float* output_ptr,
++    int64_t total_numel,
++    cudaStream_t stream)
++{
++    // Allocate temporary device memory for partial sum (zero-initialized)
++    float* partial_sum_dev;
++    cudaMallocAsync(&partial_sum_dev, sizeof(float), stream);
++    cudaMemsetAsync(partial_sum_dev, 0, sizeof(float), stream);
++
++    const int threads = 256;
++    int blocks = (int)((total_numel + threads - 1) / threads);
++    // Cap blocks to reasonable number; grid-stride loop handles rest
++    int max_blocks = 1024;
++    if (blocks > max_blocks) blocks = max_blocks;
++
++    size_t shared_mem_size = threads * sizeof(float);
++
++    smooth_l1_loss_partial_kernel<<<blocks, threads, shared_mem_size, stream>>>(
++        input_ptr, target_ptr, partial_sum_dev, total_numel, 1.0f);
++
++    // Finalize: one block of one thread
++    smooth_l1_loss_finalize_kernel<<<1, 1, 0, stream>>>(
++        partial_sum_dev, output_ptr, total_numel);
++
++    // Clean up temporary memory after finalize completes (using stream-ordered semantics)
++    cudaFreeAsync(partial_sum_dev, stream);
++
++    cudaError_t err = cudaGetLastError();
++    (void)err;
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,146 @@
++// kernels/custom_ops_binding.cpp
++// PyTorch tensor wrappers and pybind registrations for custom_ops.cu launchers.
++// Conv/ConvTranspose are not relevant in this task; no cuDNN required.
++
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cstdint>
++#include <chrono>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_embedding_forward_launcher(
++    const float* weight_ptr,
++    const int64_t* indices_ptr,
++    float* output_ptr,
++    int embedding_dim,
++    int64_t num_indices,
++    int64_t weight_row_stride,
++    int64_t out_row_stride,
++    cudaStream_t stream);
++
++extern "C" void custom_randn_like_launcher(
++    float* output_ptr,
++    int64_t total_numel,
++    uint64_t seed,
++    cudaStream_t stream);
++
++extern "C" void custom_smooth_l1_loss_forward_launcher(
++    const float* input_ptr,
++    const float* target_ptr,
++    float* output_ptr,
++    int64_t total_numel,
++    cudaStream_t stream);
++
++// Helper: get current CUDA stream
++static inline cudaStream_t getCurrentStream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// -----------------------------------------------------------------------------
++// custom_embedding_forward
++// weight: CUDA float32 tensor [num_embeddings, embedding_dim]
++// indices: CUDA int64 tensor of arbitrary shape
++// returns: CUDA float32 tensor shape = indices.sizes() + [embedding_dim]
++torch::Tensor custom_embedding_forward(torch::Tensor weight, torch::Tensor indices) {
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(indices.dtype() == torch::kInt64, "indices must be int64");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
++
++    auto weight_contig = weight.contiguous();
++    int64_t embedding_dim = weight_contig.size(1);
++    int64_t num_indices = indices.numel();
++
++    // Construct output shape: indices.sizes() + [embedding_dim]
++    std::vector<int64_t> out_sizes(indices.sizes().begin(), indices.sizes().end());
++    out_sizes.push_back(embedding_dim);
++
++    auto output = torch::empty(out_sizes, weight_contig.options());
++
++    cudaStream_t stream = getCurrentStream();
++    custom_embedding_forward_launcher(
++        weight_contig.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        output.data_ptr<float>(),
++        static_cast<int>(embedding_dim),
++        num_indices,
++        embedding_dim,  // weight_row_stride (contiguous)
++        embedding_dim,  // out_row_stride (contiguous, last dim = embedding_dim)
++        stream
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// custom_randn_like
++// input: CUDA float32 tensor of any shape
++// returns: CUDA float32 tensor of same shape, filled with standard normal random numbers
++torch::Tensor custom_randn_like(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++
++    auto output = torch::empty_like(input);
++    int64_t total_numel = input.numel();
++
++    // Seed: combine current time and input data pointer to get a varying seed.
++    // This does not guarantee exact torch.randn_like distribution but is sufficient
++    // for the contract (no exact value matching required).
++    auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
++    uint64_t seed = static_cast<uint64_t>(now) ^ reinterpret_cast<uint64_t>(input.data_ptr<float>());
++
++    cudaStream_t stream = getCurrentStream();
++    custom_randn_like_launcher(
++        output.data_ptr<float>(),
++        total_numel,
++        seed,
++        stream
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// custom_smooth_l1_loss_forward
++// input, target: CUDA float32 tensors of same shape
++// returns: CUDA float32 scalar tensor (0-dim), mean of smooth l1 loss
++torch::Tensor custom_smooth_l1_loss_forward(torch::Tensor input, torch::Tensor target) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(target.is_cuda(), "target must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(target.dtype() == torch::kFloat32, "target must be float32");
++    TORCH_CHECK(input.sizes() == target.sizes(), "input and target must have the same shape");
++    TORCH_CHECK(input.numel() > 0, "input must have at least one element");
++
++    auto output = torch::empty({}, input.options());
++    cudaStream_t stream = getCurrentStream();
++    custom_smooth_l1_loss_forward_launcher(
++        input.data_ptr<float>(),
++        target.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input.numel(),
++        stream
++    );
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// Registration
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_embedding_forward", &custom_embedding_forward,
++          "Embedding forward (CUDA)",
++          py::arg("weight"), py::arg("indices"));
++    m.def("custom_randn_like", &custom_randn_like,
++          "Generate random tensor like input (CUDA)",
++          py::arg("input"));
++    m.def("custom_smooth_l1_loss_forward", &custom_smooth_l1_loss_forward,
++          "Smooth L1 loss forward (CUDA, mean reduction)",
++          py::arg("input"), py::arg("target"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,32 @@
++import torch
++import torch.nn as nn
++
++try:
++    import cuda_extension
++except ImportError:
++    cuda_extension = None
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim):
++        super().__init__()
++        self.num_embeddings = num_embeddings
++        self.embedding_dim = embedding_dim
++        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
++
++    def forward(self, x):
++        if cuda_extension is not None:
++            embedded = cuda_extension.custom_embedding_forward(self.embedding.weight, x)
++            target = cuda_extension.custom_randn_like(embedded)
++            loss = cuda_extension.custom_smooth_l1_loss_forward(embedded, target)
++            return loss
++        else:
++            # Fallback for environments without compiled extension (not used in verification)
++            raise RuntimeError('cuda_extension is not available')
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        embedded = cuda_extension.custom_embedding_forward(self.embedding.weight, x)
++        target = cuda_extension.custom_randn_like(embedded)
++        loss = cuda_extension.custom_smooth_l1_loss_forward(embedded, target)
++        yield 'step_001', loss

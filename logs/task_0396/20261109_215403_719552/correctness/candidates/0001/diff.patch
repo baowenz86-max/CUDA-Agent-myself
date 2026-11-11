@@ -1,0 +1,247 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,112 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel for max over dimension 1 (channels) with keepdim=True.
++// Input x: shape [N, C, H, W], float32, contiguous or with strides.
++// Output values: shape [N, 1, H, W], float32.
++// Output indices: shape [N, 1, H, W], int64.
++// The launcher passes raw pointers and logical dimensions/strides.
++// This kernel uses a grid-stride loop over the output elements (N*H*W).
++// Each output element computes max over C with its strides.
++__global__ void max_dim1_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ values,
++    int64_t* __restrict__ indices,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t total_output // N * H * W
++) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = gridDim.x * blockDim.x;
++    for (int64_t out_idx = idx; out_idx < total_output; out_idx += stride) {
++        // decompose out_idx into n, h, w
++        int64_t n = out_idx / (H * W);
++        int64_t rem = out_idx - n * (H * W);
++        int64_t h = rem / W;
++        int64_t w = rem - h * W;
++        
++        // start with first channel
++        float best_val = x[n * C * H * W + 0 * H * W + h * W + w];
++        int64_t best_idx = 0;
++        for (int64_t c = 1; c < C; ++c) {
++            float val = x[n * C * H * W + c * H * W + h * W + w];
++            if (val > best_val) {
++                best_val = val;
++                best_idx = c;
++            }
++        }
++        values[out_idx] = best_val;
++        indices[out_idx] = best_idx;
++    }
++}
++
++// Kernel for roll along dimension 2 (width) with shift = 1.
++// Input x: shape [N, C, H, W], float32.
++// Output y: same shape.
++// For each element, y[n,c,h,(w+1)%W] = x[n,c,h,w].
++// We iterate over all input elements and write to output with shifted index.
++__global__ void roll_dim2_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t total // N * C * H * W
++) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < total; i += stride) {
++        // decompose i into n,c,h,w
++        int64_t n = i / (C * H * W);
++        int64_t rem1 = i - n * C * H * W;
++        int64_t c = rem1 / (H * W);
++        int64_t rem2 = rem1 - c * H * W;
++        int64_t h = rem2 / W;
++        int64_t w = rem2 - h * W;
++        int64_t new_w = (w + 1) % W;
++        y[n * C * H * W + c * H * W + h * W + new_w] = x[i];
++    }
++}
++
++// Extern "C" launcher for custom_max_dim1
++// The binding layer will allocate output tensors and pass raw pointers.
++// The stream is the current CUDA stream.
++extern "C" void custom_max_dim1_launcher(
++    const float* x,
++    float* values,
++    int64_t* indices,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    cudaStream_t stream
++) {
++    int64_t total_output = N * H * W;
++    int block_size = 256;
++    int64_t grid_size = (total_output + block_size - 1) / block_size;
++    // cap grid size to 2^31-1 for safety, actual total_output for given shape is manageable
++    if (grid_size > 2147483647LL) grid_size = 2147483647LL;
++    max_dim1_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
++        x, values, indices, N, C, H, W, total_output);
++    // check for launch errors
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // The binding layer may want to know; we can't throw, but we can leave it.
++        // In production, the binding should check after call as well.
++        // We can just ignore here, but better to include a macro? Not allowed to include anything else.
++        // We'll leave a no-op that could be replaced if needed.
++    }
++}
++
++// Extern "C" launcher for custom_roll_dim2
++extern "C" void custom_roll_dim2_launcher(
++    const float* x,
++    float* y,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    cudaStream_t stream
++) {
++    int64_t total = N * C * H * W;
++    int block_size = 256;
++    int64_t grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 2147483647LL) grid_size = 2147483647LL;
++    roll_dim2_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
++        x, y, N, C, H, W, total);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // no-op
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,104 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <tuple>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_max_dim1_launcher(
++    const float* x,
++    float* values,
++    int64_t* indices,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    cudaStream_t stream
++);
++
++extern "C" void custom_roll_dim2_launcher(
++    const float* x,
++    float* y,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    cudaStream_t stream
++);
++
++// PyTorch wrapper for max over dim=1 keepdim=True
++torch::Tensor custom_max_dim1_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (N, C, H, W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    // The kernel assumes contiguous row-major layout for this specific shape.
++    // Ensure x is contiguous for correct indexing.
++    auto x_contig = x.contiguous();
++    const float* x_ptr = x_contig.data_ptr<float>();
++
++    auto values = torch::empty({N, 1, H, W}, x.options());
++    auto indices = torch::empty({N, 1, H, W}, x.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_max_dim1_launcher(
++        x_ptr,
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        N, C, H, W,
++        stream
++    );
++
++    // Check for launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_max_dim1 kernel launch failed: ", cudaGetErrorString(err));
++
++    return std::make_tuple(values, indices);
++}
++
++// PyTorch wrapper for roll along dim=2 with shift=1
++torch::Tensor custom_roll_dim2_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (N, C, H, W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    // Ensure contiguous
++    auto x_contig = x.contiguous();
++    const float* x_ptr = x_contig.data_ptr<float>();
++
++    auto y = torch::empty_like(x_contig);
++    float* y_ptr = y.data_ptr<float>();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_roll_dim2_launcher(
++        x_ptr,
++        y_ptr,
++        N, C, H, W,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "custom_roll_dim2 kernel launch failed: ", cudaGetErrorString(err));
++
++    return y;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_max_dim1", &custom_max_dim1_forward,
++          "Max over dim=1 with keepdim=True, returns (values, indices)",
++          py::arg("x"));
++    m.def("custom_roll_dim2", &custom_roll_dim2_forward,
++          "Roll along dim=2 by 1 (cyclic shift)",
++          py::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x):
++        max_result = cuda_extension.custom_max_dim1(x)
++        max_values = max_result[0]
++        rolled = cuda_extension.custom_roll_dim2(max_values)
++        return rolled
++
++    def debug_forward(self, x):
++        max_result = cuda_extension.custom_max_dim1(x)
++        yield 'step_001', max_result
++        max_values = max_result[0]
++        rolled = cuda_extension.custom_roll_dim2(max_values)
++        yield 'step_002', rolled
++        yield 'step_003', rolled

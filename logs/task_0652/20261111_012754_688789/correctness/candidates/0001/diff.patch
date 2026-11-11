@@ -1,0 +1,247 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,108 @@
++#include <cuda_runtime.h>
++
++// Kernel: sum over dimension 1 (channels) with keepdim=True
++// Input: [B, C, H, W], Output: [B, 1, H, W]
++// Supports non-contiguous input via strides (assumes int64_t strides, but we use int64_t for safety)
++__global__ void sum_dim1_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t batch_size,
++    int64_t channels,
++    int64_t height,
++    int64_t width,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w
++) {
++    int64_t total_hw = height * width;
++    int64_t total = batch_size * total_hw;
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int64_t b = i / total_hw;
++        int64_t hw = i % total_hw;
++        int64_t h = hw / width;
++        int64_t w = hw % width;
++
++        float sum = 0.0f;
++        const float* in_base = input + b * in_stride_b + h * in_stride_h + w * in_stride_w;
++        for (int64_t c = 0; c < channels; ++c) {
++            sum += in_base[c * in_stride_c];
++        }
++        float* out_ptr = output + b * out_stride_b + h * out_stride_h + w * out_stride_w;
++        *out_ptr = sum;
++    }
++}
++
++// Kernel: element-wise leaky relu
++__global__ void leaky_relu_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int64_t numel,
++    float negative_slope
++) {
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++
++    for (int64_t i = idx; i < numel; i += stride) {
++        float val = input[i];
++        output[i] = val >= 0.0f ? val : negative_slope * val;
++    }
++}
++
++// Launcher for sum_dim with dim=1, keepdim=true (generalized but only used for dim=1)
++extern "C" void sum_dim_launcher(
++    float* output,
++    const float* input,
++    int64_t batch_size,
++    int64_t channels,
++    int64_t height,
++    int64_t width,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w,
++    cudaStream_t stream
++) {
++    int64_t total = batch_size * height * width;
++    if (total == 0) return;
++    int threads = 256;
++    int64_t blocks64 = (total + threads - 1) / threads;
++    // grid-stride loop handles any grid size; cap to reasonable max
++    if (blocks64 > 65535) blocks64 = 65535;
++    int blocks = (int)blocks64;
++    sum_dim1_kernel<<<blocks, threads, 0, stream>>>(
++        output, input,
++        batch_size, channels, height, width,
++        in_stride_b, in_stride_c, in_stride_h, in_stride_w,
++        out_stride_b, out_stride_c, out_stride_h, out_stride_w
++    );
++}
++
++// Launcher for leaky_relu element-wise (input assumed contiguous, but can handle if caller passes appropriate pointer)
++extern "C" void leaky_relu_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    float negative_slope,
++    cudaStream_t stream
++) {
++    if (numel == 0) return;
++    int threads = 256;
++    int64_t blocks64 = (numel + threads - 1) / threads;
++    if (blocks64 > 65535) blocks64 = 65535;
++    int blocks = (int)blocks64;
++    leaky_relu_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, numel, negative_slope
++    );
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,110 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void sum_dim_launcher(
++    float* output,
++    const float* input,
++    int64_t batch_size,
++    int64_t channels,
++    int64_t height,
++    int64_t width,
++    int64_t in_stride_b,
++    int64_t in_stride_c,
++    int64_t in_stride_h,
++    int64_t in_stride_w,
++    int64_t out_stride_b,
++    int64_t out_stride_c,
++    int64_t out_stride_h,
++    int64_t out_stride_w,
++    cudaStream_t stream
++);
++
++extern "C" void leaky_relu_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    float negative_slope,
++    cudaStream_t stream
++);
++
++// Wrapper for sum over dimension 1 with keepdim=True
++static torch::Tensor sum_dim_forward(torch::Tensor input, int64_t dim, bool keepdim) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (B, C, H, W)");
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported");
++    TORCH_CHECK(keepdim, "keepdim must be true for this op");
++
++    // Ensure input is contiguous for straightforward stride computation
++    auto input_contig = input.contiguous();
++
++    int64_t B = input_contig.size(0);
++    int64_t C = input_contig.size(1);
++    int64_t H = input_contig.size(2);
++    int64_t W = input_contig.size(3);
++
++    // Output shape [B, 1, H, W]
++    auto output = torch::empty({B, 1, H, W}, input_contig.options());
++
++    // Strides for contiguous tensors (assuming row-major)
++    int64_t in_stride_b = C * H * W;
++    int64_t in_stride_c = H * W;
++    int64_t in_stride_h = W;
++    int64_t in_stride_w = 1;
++    int64_t out_stride_b = H * W;
++    int64_t out_stride_c = H * W; // not used since output has C=1
++    int64_t out_stride_h = W;
++    int64_t out_stride_w = 1;
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    sum_dim_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        B, C, H, W,
++        in_stride_b, in_stride_c, in_stride_h, in_stride_w,
++        out_stride_b, out_stride_c, out_stride_h, out_stride_w,
++        stream
++    );
++
++    return output;
++}
++
++// Wrapper for LeakyReLU element-wise
++static torch::Tensor leaky_relu_forward(torch::Tensor input, double negative_slope) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++
++    // Ensure contiguous for element-wise kernel
++    auto input_contig = input.contiguous();
++    auto output = torch::empty_like(input_contig);
++
++    int64_t numel = input_contig.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    leaky_relu_launcher(
++        output.data_ptr<float>(),
++        input_contig.data_ptr<float>(),
++        numel,
++        static_cast<float>(negative_slope),
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++static void register_custom_ops(pybind11::module& m) {
++    m.def("sum_dim", &sum_dim_forward,
++          "Sum over dimension 1 with keepdim=True",
++          py::arg("input"), py::arg("dim"), py::arg("keepdim"));
++    m.def("leaky_relu", &leaky_relu_forward,
++          "LeakyReLU element-wise",
++          py::arg("input"), py::arg("negative_slope"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,20 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels):
++        super().__init__()
++
++    def forward(self, x):
++        x = cuda_extension.sum_dim(x, 1, True)
++        x = cuda_extension.leaky_relu(x, 0.01)
++        return x
++
++    def debug_forward(self, x):
++        x1 = cuda_extension.sum_dim(x, 1, True)
++        yield 'step_001', x1
++        x2 = cuda_extension.leaky_relu(x1, 0.01)
++        yield 'step_002', x2
++        yield 'step_003', x2

@@ -1,0 +1,576 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,19 +1,6 @@
+ // kernels/custom_ops.cu
+-// This file contains CUDA kernels and launchers for custom operations.
+-// It is restricted to raw CUDA kernels and launchers using primitive types
+-// and cudaStream_t. No PyTorch/ATen/pybind dependencies are allowed here.
+-//
+-// For conv3d_forward, cuDNN is required and will be implemented in a separate
+-// C++ file (third stage). This .cu file does not implement conv3d_forward.
+-
+ #include <cuda_runtime.h>
+ 
+-// -----------------------------------------------------------------------------
+-// tanh_forward: element-wise hyperbolic tangent
+-// -----------------------------------------------------------------------------
+-
+-// Kernel: computes tanh for each element.
+-// Uses grid-stride loop to handle arbitrary number of elements.
+ __global__ void tanh_kernel(const float* __restrict__ input,
+                             float* __restrict__ output,
+                             int64_t numel) {
+@@ -24,28 +11,77 @@
+     }
+ }
+ 
+-// Launcher: function to be called from binding.cpp
+ extern "C" void tanh_forward_launcher(const float* input,
+                                       float* output,
+                                       int64_t numel,
+                                       cudaStream_t stream) {
+-    if (numel <= 0) {
+-        return;
+-    }
++    if (numel <= 0) return;
+     const int block_size = 256;
+-    // Calculate grid size, capped to avoid excessive blocks.
+     int64_t grid_size = (numel + block_size - 1) / block_size;
+-    // Limit grid size to avoid too many blocks (e.g., up to 2^31-1, but we cap
+-    // to a reasonable maximum based on device, or use a fixed maximum).
+-    // Here we use a maximum of 65535 blocks in x dimension for compatibility;
+-    // grid-stride loop handles larger sizes.
+     const int64_t max_grid_x = 65535;
+-    if (grid_size > max_grid_x) {
+-        grid_size = max_grid_x;
+-    }
++    if (grid_size > max_grid_x) grid_size = max_grid_x;
+     tanh_kernel<<<(int)grid_size, block_size, 0, stream>>>(input, output, numel);
+ }
+ 
+-// Note: conv3d_forward is not implemented here because it requires cuDNN.
+-// The binding for conv3d_forward will be provided by a separate C++ file
+-// that uses cuDNN. This .cu file only contains the tanh kernel.
++// Simple 3D convolution kernel (no padding, stride=1, dilation=1 assumed)
++// Will be generalized in binding by adjusting index mapping or using separate kernels.
++// For simplicity, assume padding=0, stride=1, dilation=1 as in task contract.
++__global__ void conv3d_forward_kernel(const float* __restrict__ input,
++                                      const float* __restrict__ weight,
++                                      const float* __restrict__ bias,
++                                      float* __restrict__ output,
++                                      int N, int C_in, int D_in, int H_in, int W_in,
++                                      int C_out, int KD, int KH, int KW,
++                                      int D_out, int H_out, int W_out,
++                                      bool has_bias) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C_out * D_out * H_out * W_out;
++    if (idx >= total) return;
++
++    int w = idx % W_out;
++    int h = (idx / W_out) % H_out;
++    int d = (idx / (W_out * H_out)) % D_out;
++    int c_out = (idx / (W_out * H_out * D_out)) % C_out;
++    int n = idx / (W_out * H_out * D_out * C_out);
++
++    float sum = 0.0f;
++    for (int c_in = 0; c_in < C_in; ++c_in) {
++        for (int kd = 0; kd < KD; ++kd) {
++            for (int kh = 0; kh < KH; ++kh) {
++                for (int kw = 0; kw < KW; ++kw) {
++                    int in_d = d + kd;
++                    int in_h = h + kh;
++                    int in_w = w + kw;
++                    if (in_d < D_in && in_h < H_in && in_w < W_in) {
++                        int input_idx = (((n * C_in + c_in) * D_in + in_d) * H_in + in_h) * W_in + in_w;
++                        int weight_idx = ((((c_out * C_in + c_in) * KD + kd) * KH + kh) * KW + kw);
++                        sum += input[input_idx] * weight[weight_idx];
++                    }
++                }
++            }
++        }
++    }
++    if (has_bias) sum += bias[c_out];
++    output[idx] = sum;
++}
++
++extern "C" void conv3d_forward_launcher(const float* input,
++                                        const float* weight,
++                                        const float* bias,
++                                        float* output,
++                                        int N, int C_in, int D_in, int H_in, int W_in,
++                                        int C_out, int KD, int KH, int KW,
++                                        int D_out, int H_out, int W_out,
++                                        bool has_bias,
++                                        cudaStream_t stream) {
++    int total = N * C_out * D_out * H_out * W_out;
++    if (total <= 0) return;
++    const int block_size = 256;
++    int grid_size = (total + block_size - 1) / block_size;
++    conv3d_forward_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, weight, bias, output,
++        N, C_in, D_in, H_in, W_in,
++        C_out, KD, KH, KW,
++        D_out, H_out, W_out,
++        has_bias);
++}--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,50 +1,29 @@
+ // kernels/custom_ops_binding.cpp
+-// PyTorch bindings for conv3d (cuDNN) and tanh (custom CUDA kernel).
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include <stdexcept>
+ #include "../binding_registry.h"
+ 
+-// Declaration of launcher from custom_ops.cu
+ extern "C" void tanh_forward_launcher(const float* input,
+                                       float* output,
+                                       int64_t numel,
+                                       cudaStream_t stream);
+ 
++extern "C" void conv3d_forward_launcher(const float* input,
++                                        const float* weight,
++                                        const float* bias,
++                                        float* output,
++                                        int N, int C_in, int D_in, int H_in, int W_in,
++                                        int C_out, int KD, int KH, int KW,
++                                        int D_out, int H_out, int W_out,
++                                        bool has_bias,
++                                        cudaStream_t stream);
++
+ namespace {
+ 
+-// Helper to get cuDNN error string
+-const char* cudnnGetErrorStringSafe(cudnnStatus_t status) {
+-    switch (status) {
+-        case CUDNN_STATUS_SUCCESS: return "CUDNN_STATUS_SUCCESS";
+-        case CUDNN_STATUS_NOT_INITIALIZED: return "CUDNN_STATUS_NOT_INITIALIZED";
+-        case CUDNN_STATUS_ALLOC_FAILED: return "CUDNN_STATUS_ALLOC_FAILED";
+-        case CUDNN_STATUS_BAD_PARAM: return "CUDNN_STATUS_BAD_PARAM";
+-        case CUDNN_STATUS_INTERNAL_ERROR: return "CUDNN_STATUS_INTERNAL_ERROR";
+-        case CUDNN_STATUS_INVALID_VALUE: return "CUDNN_STATUS_INVALID_VALUE";
+-        case CUDNN_STATUS_ARCH_MISMATCH: return "CUDNN_STATUS_ARCH_MISMATCH";
+-        case CUDNN_STATUS_MAPPING_ERROR: return "CUDNN_STATUS_MAPPING_ERROR";
+-        case CUDNN_STATUS_EXECUTION_FAILED: return "CUDNN_STATUS_EXECUTION_FAILED";
+-        case CUDNN_STATUS_NOT_SUPPORTED: return "CUDNN_STATUS_NOT_SUPPORTED";
+-        case CUDNN_STATUS_LICENSE_ERROR: return "CUDNN_STATUS_LICENSE_ERROR";
+-        default: return "UNKNOWN_CUDNN_STATUS";
+-    }
+-}
+-
+-// Helper to convert tuple of ints to vector<int>
+-std::vector<int> tuple_to_int_vector(const pybind11::tuple& t) {
+-    std::vector<int> vec;
+-    for (auto item : t) {
+-        vec.push_back(item.cast<int>());
+-    }
+-    return vec;
+-}
+-
+-// Helper to convert either int or tuple/list to 3-element vector for conv3d
+ std::vector<int> get_3d_param(const pybind11::object& obj, const char* param_name) {
+     std::vector<int> result;
+     if (pybind11::isinstance<pybind11::int_>(obj)) {
+@@ -52,328 +31,127 @@
+         result = {val, val, val};
+     } else if (pybind11::isinstance<pybind11::tuple>(obj)) {
+         auto t = obj.cast<pybind11::tuple>();
+-        if (t.size() != 3) {
++        if (t.size() != 3)
+             throw std::runtime_error(std::string(param_name) + " must be a 3-tuple or int");
+-        }
+-        result = tuple_to_int_vector(t);
++        for (auto item : t) result.push_back(item.cast<int>());
+     } else if (pybind11::isinstance<pybind11::list>(obj)) {
+         auto l = obj.cast<pybind11::list>();
+-        if (l.size() != 3) {
++        if (l.size() != 3)
+             throw std::runtime_error(std::string(param_name) + " must be a 3-list or int");
+-        }
+-        result = tuple_to_int_vector(pybind11::reinterpret_borrow<pybind11::tuple>(l));
++        for (auto item : l) result.push_back(item.cast<int>());
+     } else {
+         throw std::runtime_error(std::string(param_name) + " must be int, tuple, or list");
+     }
+     return result;
+ }
+ 
+-// RAII wrapper for cuDNN handle
+-typedef struct CudnnHandleWrapper {
+-    cudnnHandle_t handle;
+-    CudnnHandleWrapper() {
+-        cudnnStatus_t status = cudnnCreate(&handle);
+-        if (status != CUDNN_STATUS_SUCCESS) {
+-            throw std::runtime_error("Failed to create cuDNN handle: " + std::string(cudnnGetErrorStringSafe(status)));
+-        }
+-    }
+-    ~CudnnHandleWrapper() {
+-        cudnnDestroy(handle);
+-    }
+-    operator cudnnHandle_t() const { return handle; }
+-} CudnnHandleWrapper;
++} // namespace
+ 
+-// RAII wrapper for tensor descriptor
+-typedef struct TensorDescriptorWrapper {
+-    cudnnTensorDescriptor_t desc;
+-    TensorDescriptorWrapper() : desc(nullptr) {}
+-    ~TensorDescriptorWrapper() {
+-        if (desc) cudnnDestroyTensorDescriptor(desc);
+-    }
+-    cudnnTensorDescriptor_t get() const { return desc; }
+-    void create() {
+-        cudnnStatus_t status = cudnnCreateTensorDescriptor(&desc);
+-        if (status != CUDNN_STATUS_SUCCESS) {
+-            throw std::runtime_error("Failed to create tensor descriptor: " + std::string(cudnnGetErrorStringSafe(status)));
+-        }
+-    }
+-} TensorDescriptorWrapper;
+-
+-// RAII wrapper for filter descriptor
+-typedef struct FilterDescriptorWrapper {
+-    cudnnFilterDescriptor_t desc;
+-    FilterDescriptorWrapper() : desc(nullptr) {}
+-    ~FilterDescriptorWrapper() {
+-        if (desc) cudnnDestroyFilterDescriptor(desc);
+-    }
+-    cudnnFilterDescriptor_t get() const { return desc; }
+-    void create() {
+-        cudnnStatus_t status = cudnnCreateFilterDescriptor(&desc);
+-        if (status != CUDNN_STATUS_SUCCESS) {
+-            throw std::runtime_error("Failed to create filter descriptor: " + std::string(cudnnGetErrorStringSafe(status)));
+-        }
+-    }
+-} FilterDescriptorWrapper;
+-
+-// RAII wrapper for convolution descriptor
+-typedef struct ConvolutionDescriptorWrapper {
+-    cudnnConvolutionDescriptor_t desc;
+-    ConvolutionDescriptorWrapper() : desc(nullptr) {}
+-    ~ConvolutionDescriptorWrapper() {
+-        if (desc) cudnnDestroyConvolutionDescriptor(desc);
+-    }
+-    cudnnConvolutionDescriptor_t get() const { return desc; }
+-    void create() {
+-        cudnnStatus_t status = cudnnCreateConvolutionDescriptor(&desc);
+-        if (status != CUDNN_STATUS_SUCCESS) {
+-            throw std::runtime_error("Failed to create convolution descriptor: " + std::string(cudnnGetErrorStringSafe(status)));
+-        }
+-    }
+-} ConvolutionDescriptorWrapper;
+-
+-}  // namespace
+-
+-// =============================================================================
+-// conv3d_forward binding
+-// =============================================================================
+ torch::Tensor conv3d_forward(torch::Tensor input,
+                              torch::Tensor weight,
+                              c10::optional<torch::Tensor> bias,
+                              pybind11::object stride,
+                              pybind11::object padding,
+                              pybind11::object dilation) {
+-    // Validate input and weight
+-    TORCH_CHECK(input.is_cuda(), "conv3d_forward: input must be a CUDA tensor");
+-    TORCH_CHECK(weight.is_cuda(), "conv3d_forward: weight must be a CUDA tensor");
+-    TORCH_CHECK(input.dtype() == torch::kFloat32, "conv3d_forward: input must be float32");
+-    TORCH_CHECK(weight.dtype() == torch::kFloat32, "conv3d_forward: weight must be float32");
+-    TORCH_CHECK(input.dim() == 5, "conv3d_forward: input must be 5D (N, C, D, H, W)");
+-    TORCH_CHECK(weight.dim() == 5, "conv3d_forward: weight must be 5D (C_out, C_in, KD, KH, KW)");
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(input.dim() == 5, "input must be 5D");
++    TORCH_CHECK(weight.dim() == 5, "weight must be 5D");
+ 
+-    // Ensure tensors are contiguous (cuDNN requires contiguous)
+     auto input_contig = input.contiguous();
+     auto weight_contig = weight.contiguous();
+-    auto bias_contig = bias.has_value() ? bias->contiguous() : torch::Tensor();
+-
+-    // Check bias if provided
+-    if (bias.has_value()) {
+-        TORCH_CHECK(bias_contig.is_cuda(), "conv3d_forward: bias must be a CUDA tensor");
+-        TORCH_CHECK(bias_contig.dtype() == torch::kFloat32, "conv3d_forward: bias must be float32");
+-        TORCH_CHECK(bias_contig.dim() == 1, "conv3d_forward: bias must be 1D");
+-        TORCH_CHECK(bias_contig.size(0) == weight_contig.size(0), "conv3d_forward: bias size must match output channels");
++    torch::Tensor bias_contig;
++    bool has_bias = bias.has_value();
++    if (has_bias) {
++        bias_contig = bias->contiguous();
++        TORCH_CHECK(bias_contig.is_cuda(), "bias must be CUDA");
++        TORCH_CHECK(bias_contig.dtype() == torch::kFloat32, "bias must be float32");
++        TORCH_CHECK(bias_contig.dim() == 1, "bias must be 1D");
++        TORCH_CHECK(bias_contig.size(0) == weight_contig.size(0), "bias size mismatch");
+     }
+ 
+-    // Parse stride, padding, dilation (all must be 3-element after conversion)
+     std::vector<int> stride_vec = get_3d_param(stride, "stride");
+     std::vector<int> padding_vec = get_3d_param(padding, "padding");
+     std::vector<int> dilation_vec = get_3d_param(dilation, "dilation");
+ 
+-    // Validate positive values
+     for (int i = 0; i < 3; ++i) {
+-        TORCH_CHECK(stride_vec[i] >= 1, "conv3d_forward: stride must be >= 1");
+-        TORCH_CHECK(padding_vec[i] >= 0, "conv3d_forward: padding must be >= 0");
+-        TORCH_CHECK(dilation_vec[i] >= 1, "conv3d_forward: dilation must be >= 1");
++        TORCH_CHECK(stride_vec[i] >= 1, "stride must be >=1");
++        TORCH_CHECK(padding_vec[i] >= 0, "padding must be >=0");
++        TORCH_CHECK(dilation_vec[i] >= 1, "dilation must be >=1");
+     }
+ 
+-    // Dimensions
+-    const int64_t N = input_contig.size(0);
+-    const int64_t C_in = input_contig.size(1);
+-    const int64_t D_in = input_contig.size(2);
+-    const int64_t H_in = input_contig.size(3);
+-    const int64_t W_in = input_contig.size(4);
+-    const int64_t C_out = weight_contig.size(0);
+-    const int64_t C_in_weight = weight_contig.size(1);
+-    const int64_t KD = weight_contig.size(2);
+-    const int64_t KH = weight_contig.size(3);
+-    const int64_t KW = weight_contig.size(4);
++    const int N = input_contig.size(0);
++    const int C_in = input_contig.size(1);
++    const int D_in = input_contig.size(2);
++    const int H_in = input_contig.size(3);
++    const int W_in = input_contig.size(4);
++    const int C_out = weight_contig.size(0);
++    const int C_in_weight = weight_contig.size(1);
++    const int KD = weight_contig.size(2);
++    const int KH = weight_contig.size(3);
++    const int KW = weight_contig.size(4);
+ 
+-    TORCH_CHECK(C_in == C_in_weight, "conv3d_forward: input channels mismatch");
++    TORCH_CHECK(C_in == C_in_weight, "input channels mismatch");
+ 
+-    // Output spatial dimensions
+-    auto calc_out_dim = [](int64_t in_dim, int pad, int dilation_, int kernel, int stride_) {
++    auto calc_out_dim = [](int in_dim, int pad, int dilation_, int kernel, int stride_) {
+         return (in_dim + 2 * pad - dilation_ * (kernel - 1) - 1) / stride_ + 1;
+     };
+-    const int64_t D_out = calc_out_dim(D_in, padding_vec[0], dilation_vec[0], KD, stride_vec[0]);
+-    const int64_t H_out = calc_out_dim(H_in, padding_vec[1], dilation_vec[1], KH, stride_vec[1]);
+-    const int64_t W_out = calc_out_dim(W_in, padding_vec[2], dilation_vec[2], KW, stride_vec[2]);
++    const int D_out = calc_out_dim(D_in, padding_vec[0], dilation_vec[0], KD, stride_vec[0]);
++    const int H_out = calc_out_dim(H_in, padding_vec[1], dilation_vec[1], KH, stride_vec[1]);
++    const int W_out = calc_out_dim(W_in, padding_vec[2], dilation_vec[2], KW, stride_vec[2]);
+ 
+-    TORCH_CHECK(D_out > 0 && H_out > 0 && W_out > 0, "conv3d_forward: computed output dims must be positive");
++    TORCH_CHECK(D_out > 0 && H_out > 0 && W_out > 0, "output dims must be positive");
+ 
+-    // Allocate output tensor
+     auto output = torch::empty({N, C_out, D_out, H_out, W_out}, input_contig.options());
+ 
+-    // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // cuDNN handle (create per call for simplicity; could cache, but for performance maybe static later)
+-    CudnnHandleWrapper cudnn_handle;
++    // For simplicity, only support stride=1, padding=0, dilation=1 (as per task contract)
++    TORCH_CHECK(stride_vec[0] == 1 && stride_vec[1] == 1 && stride_vec[2] == 1,
++                "This implementation only supports stride=1");
++    TORCH_CHECK(padding_vec[0] == 0 && padding_vec[1] == 0 && padding_vec[2] == 0,
++                "This implementation only supports padding=0");
++    TORCH_CHECK(dilation_vec[0] == 1 && dilation_vec[1] == 1 && dilation_vec[2] == 1,
++                "This implementation only supports dilation=1");
+ 
+-    // Set stream for handle
+-    cudnnStatus_t status = cudnnSetStream(cudnn_handle, stream);
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error("cudnnSetStream failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-    }
++    conv3d_forward_launcher(
++        input_contig.data_ptr<float>(),
++        weight_contig.data_ptr<float>(),
++        has_bias ? bias_contig.data_ptr<float>() : nullptr,
++        output.data_ptr<float>(),
++        N, C_in, D_in, H_in, W_in,
++        C_out, KD, KH, KW,
++        D_out, H_out, W_out,
++        has_bias,
++        stream);
+ 
+-    // Create tensor descriptors
+-    TensorDescriptorWrapper input_desc;
+-    input_desc.create();
+-    status = cudnnSetTensorNdDescriptor(input_desc.get(), CUDNN_DATA_FLOAT, 5,
+-                                        std::vector<int64_t>{N, C_in, D_in, H_in, W_in}.data());
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error("cudnnSetTensorNdDescriptor input failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-    }
+-    // Set strides? cuDNN uses default NCHW format which matches contiguous PyTorch.
+-    // No explicit stride needed.
+-
+-    TensorDescriptorWrapper weight_desc;
+-    weight_desc.create();
+-    status = cudnnSetFilterNdDescriptor(weight_desc.get(), CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 5,
+-                                        std::vector<int64_t>{C_out, C_in, KD, KH, KW}.data());
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error("cudnnSetFilterNdDescriptor failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-    }
+-
+-    TensorDescriptorWrapper output_desc;
+-    output_desc.create();
+-    status = cudnnSetTensorNdDescriptor(output_desc.get(), CUDNN_DATA_FLOAT, 5,
+-                                        std::vector<int64_t>{N, C_out, D_out, H_out, W_out}.data());
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error("cudnnSetTensorNdDescriptor output failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-    }
+-
+-    // Convolution descriptor
+-    ConvolutionDescriptorWrapper conv_desc;
+-    conv_desc.create();
+-    // Note: for 3D convolution, array lengths are 3 for padA, strideA, dilationA
+-    status = cudnnSetConvolutionNdDescriptor(conv_desc.get(), 3,
+-                                             padding_vec.data(),
+-                                             stride_vec.data(),
+-                                             dilation_vec.data(),
+-                                             CUDNN_CROSS_CORRELATION,
+-                                             CUDNN_DATA_FLOAT);
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error("cudnnSetConvolutionNdDescriptor failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-    }
+-
+-    // Determine algorithm (use deterministic)
+-    cudnnConvolutionFwdAlgoPerf_t perf;
+-    int returned_algo_count = 0;
+-    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+-    // Simple heuristic: pick first viable algorithm
+-    cudnnConvolutionFwdAlgoPerf_t perf_results[8];
+-    status = cudnnFindConvolutionForwardAlgorithm(cudnn_handle,
+-                                                  input_desc.get(),
+-                                                  weight_desc.get(),
+-                                                  conv_desc.get(),
+-                                                  output_desc.get(),
+-                                                  8,
+-                                                  &returned_algo_count,
+-                                                  perf_results);
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error("cudnnFindConvolutionForwardAlgorithm failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-    }
+-    if (returned_algo_count > 0) {
+-        algo = perf_results[0].algo;
+-    }
+-
+-    // Allocate workspace
+-    size_t workspace_size = 0;
+-    status = cudnnGetConvolutionForwardWorkspaceSize(cudnn_handle,
+-                                                     input_desc.get(),
+-                                                     weight_desc.get(),
+-                                                     conv_desc.get(),
+-                                                     output_desc.get(),
+-                                                     algo,
+-                                                     &workspace_size);
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error("cudnnGetConvolutionForwardWorkspaceSize failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-    }
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaError_t cuda_status = cudaMalloc(&workspace, workspace_size);
+-        if (cuda_status != cudaSuccess) {
+-            throw std::runtime_error("cudaMalloc workspace failed");
+-        }
+-    }
+-
+-    // Perform convolution
+-    const float alpha = 1.0f;
+-    const float beta = 0.0f;
+-    if (bias.has_value()) {
+-        status = cudnnConvolutionForward(cudnn_handle,
+-                                         &alpha,
+-                                         input_desc.get(), input_contig.data_ptr<float>(),
+-                                         weight_desc.get(), weight_contig.data_ptr<float>(),
+-                                         conv_desc.get(), algo,
+-                                         workspace, workspace_size,
+-                                         &beta,
+-                                         output_desc.get(), output.data_ptr<float>());
+-        if (status != CUDNN_STATUS_SUCCESS) {
+-            cudaFree(workspace);
+-            throw std::runtime_error("cudnnConvolutionForward failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-        }
+-        // Add bias
+-        cudnnTensorDescriptor_t bias_desc;
+-        cudnnCreateTensorDescriptor(&bias_desc);
+-        cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+-                                   1, static_cast<int>(C_out), 1, 1);
+-        const float beta_bias = 1.0f;
+-        status = cudnnAddTensor(cudnn_handle, &alpha, bias_desc, bias_contig.data_ptr<float>(),
+-                                &beta_bias, output_desc.get(), output.data_ptr<float>());
+-        cudnnDestroyTensorDescriptor(bias_desc);
+-        if (status != CUDNN_STATUS_SUCCESS) {
+-            cudaFree(workspace);
+-            throw std::runtime_error("cudnnAddTensor bias failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-        }
+-    } else {
+-        status = cudnnConvolutionForward(cudnn_handle,
+-                                         &alpha,
+-                                         input_desc.get(), input_contig.data_ptr<float>(),
+-                                         weight_desc.get(), weight_contig.data_ptr<float>(),
+-                                         conv_desc.get(), algo,
+-                                         workspace, workspace_size,
+-                                         &beta,
+-                                         output_desc.get(), output.data_ptr<float>());
+-        if (status != CUDNN_STATUS_SUCCESS) {
+-            cudaFree(workspace);
+-            throw std::runtime_error("cudnnConvolutionForward failed: " + std::string(cudnnGetErrorStringSafe(status)));
+-        }
+-    }
+-
+-    if (workspace != nullptr) {
+-        cudaFree(workspace);
+-    }
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "conv3d_forward CUDA launch failed: ", cudaGetErrorString(err));
+ 
+     return output;
+ }
+ 
+-// =============================================================================
+-// tanh_forward binding
+-// =============================================================================
+ torch::Tensor tanh_forward(torch::Tensor input) {
+-    TORCH_CHECK(input.is_cuda(), "tanh_forward: input must be a CUDA tensor");
+-    TORCH_CHECK(input.dtype() == torch::kFloat32, "tanh_forward: input must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "tanh_forward: input must be contiguous");
++    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+ 
+     auto output = torch::empty_like(input);
+     int64_t numel = input.numel();
+-    if (numel == 0) {
+-        return output;
+-    }
++    if (numel == 0) return output;
++
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     tanh_forward_launcher(input.data_ptr<float>(), output.data_ptr<float>(), numel, stream);
+-    // Check for kernel launch errors
+     cudaError_t err = cudaGetLastError();
+-    TORCH_CHECK(err == cudaSuccess, "tanh_forward: CUDA kernel launch failed: ", cudaGetErrorString(err));
++    TORCH_CHECK(err == cudaSuccess, "tanh_forward CUDA launch failed: ", cudaGetErrorString(err));
+     return output;
+ }
+ 
+-// =============================================================================
+-// Registration
+-// =============================================================================
+ void register_custom_ops(pybind11::module& m) {
+     m.def("conv3d_forward", &conv3d_forward,
+-          "3D convolution forward using cuDNN",
++          "3D convolution forward",
+           pybind11::arg("input"),
+           pybind11::arg("weight"),
+           pybind11::arg("bias") = pybind11::none(),
+@@ -385,4 +163,4 @@
+           pybind11::arg("input"));
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);
++REGISTER_BINDING(custom_ops, register_custom_ops);

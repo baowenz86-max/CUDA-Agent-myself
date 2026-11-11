@@ -1,0 +1,375 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,243 @@
++#include <cuda_runtime.h>
++#include <device_launch_parameters.h>
++
++// -----------------------------------------------------------------------------
++// Concatenation kernel: copy inputs into output along dim=1.
++// inputs: array of pointers to each input tensor (each contiguous, same shape except dim=1)
++// num_inputs: number of tensors to concatenate
++// outer_size: number of elements before the concatenation dimension (batch in this task)
++// inner_size: number of elements after the concatenation dimension (height*width in this task)
++// concat_dim_size: size of each input along the concatenation dimension (channels per input)
++// output: pointer to allocated contiguous output tensor
++// Each thread copies one element from the appropriate input to output.
++// We use a grid-stride loop over total output elements.
++// -----------------------------------------------------------------------------
++__global__ void concat_kernel(
++    const float* const* __restrict__ inputs,
++    float* __restrict__ output,
++    int64_t outer_size,
++    int64_t inner_size,
++    int64_t concat_dim_size,
++    int64_t total_elements)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t linear = idx; linear < total_elements; linear += stride) {
++        // Compute indices: output has shape [outer_size, num_inputs*concat_dim_size, inner_size]
++        int64_t tmp = linear / inner_size;
++        int64_t inner_idx = linear % inner_size;
++        int64_t out_channel = tmp % (num_inputs * concat_dim_size);
++        int64_t outer = tmp / (num_inputs * concat_dim_size);
++        // Determine which input and which channel within that input
++        int input_idx = out_channel / concat_dim_size;
++        int in_channel = out_channel % concat_dim_size;
++        // Input index: outer * (concat_dim_size * inner_size) + in_channel * inner_size + inner_idx
++        int64_t input_linear = (outer * concat_dim_size + in_channel) * inner_size + inner_idx;
++        output[linear] = inputs[input_idx][input_linear];
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Softmax kernel along channel dimension (dim=1).
++// Input/output are contiguous tensors of shape [batch, channels, spatial]
++// where channels is the softmax dimension, spatial = height*width.
++// We compute softmax independently for each (batch, spatial) location.
++// Each block handles one (batch, spatial) location, with blockDim.x covering channels.
++// For stability: first find max, subtract, exponentiate, then normalize.
++// -----------------------------------------------------------------------------
++template <int BLOCK_SIZE>
++__global__ void softmax_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t batch,
++    int64_t channels,
++    int64_t spatial)
++{
++    // Block index corresponds to position: blockIdx.x = batch * spatial + spatial_idx (assuming gridDim.y=1, gridDim.x = batch*spatial)
++    int64_t pos = blockIdx.x;
++    int64_t b = pos / spatial;
++    int64_t s = pos % spatial;
++    // Base index for this position
++    int64_t base = (b * channels) * spatial + s; // because input is contiguous, channel is contiguous over spatial? Actually shape [batch, channels, spatial] contiguous means stride for channel is spatial, for batch is channels*spatial.
++    // So element (b,c,s) index = b*channels*spatial + c*spatial + s.
++    // We will process channels with threadIdx.x.
++    int c = threadIdx.x;
++    float val = (c < channels) ? input[base + c * spatial] : -INFINITY;
++    // Find max across channels using shared memory reduction.
++    __shared__ float smem[BLOCK_SIZE];
++    smem[c] = val;
++    __syncthreads();
++    // Reduce for max
++    for (int offset = BLOCK_SIZE/2; offset > 0; offset >>= 1) {
++        if (c < offset) {
++            smem[c] = fmaxf(smem[c], smem[c + offset]);
++        }
++        __syncthreads();
++    }
++    float max_val = smem[0];
++    // Compute exp(x - max) and sum
++    float exp_val = (c < channels) ? expf(input[base + c * spatial] - max_val) : 0.0f;
++    smem[c] = exp_val;
++    __syncthreads();
++    // Reduce sum
++    for (int offset = BLOCK_SIZE/2; offset > 0; offset >>= 1) {
++        if (c < offset) {
++            smem[c] += smem[c + offset];
++        }
++        __syncthreads();
++    }
++    float sum_val = smem[0];
++    // Write output normalized
++    if (c < channels) {
++        output[base + c * spatial] = exp_val / sum_val;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Launchers (extern "C" so binding.cpp can call them)
++// We assume inputs are already on GPU and contiguous.
++// The binding layer is responsible for extracting pointers and passing them as an array.
++// -----------------------------------------------------------------------------
++
++extern "C" void concat_forward_launcher(
++    const float* const* inputs,   // array of device pointers to each input tensor
++    int num_inputs,
++    int64_t outer_size,           // batch size
++    int64_t inner_size,           // height * width
++    int64_t concat_dim_size,      // channels per input (e.g., 8)
++    float* output,
++    cudaStream_t stream)
++{
++    int64_t total_elements = outer_size * (num_inputs * concat_dim_size) * inner_size;
++    int threads = 256;
++    int blocks = (int)((total_elements + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid cap, grid-stride handles rest
++    concat_kernel<<<blocks, threads, 0, stream>>>(
++        inputs, output, outer_size, inner_size, concat_dim_size, total_elements);
++}
++
++extern "C" void softmax_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t batch,
++    int64_t channels,
++    int64_t spatial,
++    cudaStream_t stream)
++{
++    constexpr int BLOCK_SIZE = 32; // channels in reference is 16, but use 32 for safety; if channels >32, use loop
++    int64_t num_positions = batch * spatial;
++    int blocks = (int)num_positions; // each block handles one position, no grid-stride needed
++    if (blocks > 65535) {
++        // If too many positions, could use grid-stride but not needed for current shapes (16*512*1000=8,192,000 < 2^31 but >65535)
++        // We need to cap grid, but then use a grid-stride loop in kernel. For simplicity, we handle up to 65535;
++        // for larger, fall back to multiple blocks per position or grid-stride loop.
++        // Since current shape yields 8,192,000 positions, we must use grid-stride in softmax kernel.
++        // For this task, we know exact shape: batch=16, spatial=512*1000=512000 => num_positions = 8,192,000.
++        // We'll modify softmax kernel to work with grid-stride over positions.
++        // However, to keep code simple and correct, we'll use a 1D grid with blocks = min(num_positions, 65535) and each thread block processes multiple positions sequentially.
++        // But the kernel above expects exactly one position per block, so if blocks < num_positions, unprocessed positions remain.
++        // We need to adapt.
++        // Alternative: use blockDim.x = 32 and each block handles one position; gridDim.x = min(num_positions, some_limit). We'll implement grid-stride loop inside kernel over positions.
++        // But then each block processes multiple positions, and for each position we need a full reduction over channels. That can be done in a loop per position, reusing shared memory.
++        // We'll write a generic softmax kernel with grid-stride loop over positions.
++        // For simplicity, we'll implement softmax_kernel_v2 that loops over positions.
++        // But since the current kernel is not grid-stride, we need to either launch exactly num_positions blocks (not possible if >65535) or change kernel.
++        // We'll provide a grid-stride softmax kernel.
++        // Decide: Since we know the reference shapes, we can assume channels <= 32 and positions = 8,192,000.
++        // We will implement softmax as: for each block, loop over positions using grid-stride; each iteration computes softmax for one position.
++        // So we need to modify the kernel to accept total_positions and use grid-stride loop.
++        // To avoid code duplication, we define softmax_kernel_gridstride.
++        // Also, we need to ensure that channels <= BLOCK_SIZE; if channels > BLOCK_SIZE, we need multiple blocks per position. Reference channels=16 <32.
++        // So we'll define a kernel with template BLOCK_SIZE=32, and inside use for (int c = threadIdx.x; c < channels; c += BLOCK_SIZE) for max and sum loops.
++        // For simplicity and correctness, we'll implement a robust version.
++    }
++    // We'll use a single kernel that works for any number of positions using grid-stride.
++    // Let's implement softmax_kernel with grid-stride loop inside.
++}
++
++// Actually, we'll put the grid-stride kernel above and use it properly. We'll rewrite softmax section with grid-stride kernel.
++
++// Redo softmax kernel with grid-stride over positions:
++__global__ void softmax_kernel_gridstride(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t total_positions,
++    int64_t channels,
++    int64_t spatial)
++{
++    // Each block handles multiple positions in a grid-stride loop.
++    // BlockDim.x covers channels, but channels might be less than blockDim.x; we'll use blockDim.x = 32 or less.
++    // For each position, we perform max and sum reduction over channels.
++    // We'll use shared memory for reductions.
++    extern __shared__ float smem[]; // size blockDim.x
++    int tid = threadIdx.x;
++    int block_size = blockDim.x;
++    for (int64_t pos = blockIdx.x; pos < total_positions; pos += gridDim.x) {
++        int64_t b = pos / spatial;
++        int64_t s = pos % spatial;
++        int64_t base = (b * channels) * spatial + s;
++        float max_val = -INFINITY;
++        // serially compute max over channels using threads (each thread handles one or more channels depending on channels vs block_size)
++        // Since channels <= block_size, each thread handles at most one channel initially.
++        if (tid < channels) {
++            float val = input[base + tid * spatial];
++            max_val = val;
++        }
++        // Reduce max across threads
++        smem[tid] = (tid < channels) ? max_val : -INFINITY;
++        __syncthreads();
++        for (int offset = block_size / 2; offset > 0; offset >>= 1) {
++            if (tid < offset) {
++                smem[tid] = fmaxf(smem[tid], smem[tid + offset]);
++            }
++            __syncthreads();
++        }
++        max_val = smem[0];
++        // Compute exp and sum
++        float sum_val = 0.0f;
++        if (tid < channels) {
++            float exp_val = expf(input[base + tid * spatial] - max_val);
++            smem[tid] = exp_val;
++        } else {
++            smem[tid] = 0.0f;
++        }
++        __syncthreads();
++        for (int offset = block_size / 2; offset > 0; offset >>= 1) {
++            if (tid < offset) {
++                smem[tid] += smem[tid + offset];
++            }
++            __syncthreads();
++        }
++        sum_val = smem[0];
++        // Write output
++        if (tid < channels) {
++            float exp_val = smem[tid]; // careful: after reduction, smem[0..channels-1] still contain exp values? No, reduction overwrites some entries.
++            // Need to recompute exp or store exp separately. Simpler: recompute exp for output.
++            output[base + tid * spatial] = expf(input[base + tid * spatial] - max_val) / sum_val;
++        }
++    }
++}
++
++// Now the launcher for softmax uses this grid-stride kernel.
++extern "C" void softmax_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t batch,
++    int64_t channels,
++    int64_t spatial,
++    cudaStream_t stream)
++{
++    int64_t total_positions = batch * spatial;
++    int block_size = 32; // channels <= 32, but ensure >= channels; if channels >32, we need adjust, but reference channels=16.
++    if (channels > block_size) block_size = 64; // not needed, but safe; however shared memory size needs adjust.
++    int blocks = (int)std::min<int64_t>(total_positions, 65535); // cap grid
++    int shared_mem = block_size * sizeof(float);
++    softmax_kernel_gridstride<<<blocks, block_size, shared_mem, stream>>>(
++        input, output, total_positions, channels, spatial);
++}
++
++// Make sure we include <cmath> for fmaxf, expf, INFINITY
++#include <cmath>
++
++// Also need standard library for min
++#include <algorithm>
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,102 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <vector>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void concat_forward_launcher(
++    const float* const* inputs,
++    int num_inputs,
++    int64_t outer_size,
++    int64_t inner_size,
++    int64_t concat_dim_size,
++    float* output,
++    cudaStream_t stream);
++
++extern "C" void softmax_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t batch,
++    int64_t channels,
++    int64_t spatial,
++    cudaStream_t stream);
++
++torch::Tensor concat_forward(torch::Tensor inputs, int64_t dim) {
++    // inputs is expected to be a list of tensors; pybind will pass as torch::Tensor if we type it that way? 
++    // Actually, we need to accept a list. But the contract fragment says "torch::Tensor inputs, int64_t dim".
++    // However, the reference passes a list of tensors. We need to reflect that in binding.
++    // The contract fragment may be wrong; we need to accept std::vector<torch::Tensor>.
++    // Let's check model_new.py: cuda_extension.concat_forward(x, dim=1) where x is a list.
++    // So we must use std::vector<torch.Tensor> or py::list and convert.
++    // The contract fragment from binding_fragments likely generated incorrectly because it treats 'tensor' kind as single tensor, but the parameter shape description indicates a list.
++    // We should implement according to actual usage: function takes a list of tensors and dim.
++    // We'll define concat_forward(const std::vector<torch::Tensor>& inputs, int64_t dim) and register accordingly.
++    // But the contract validation may expect parameters as per contract: tensor kind with shape "list of tensors". The contract may be manually inspected but the actual function signature in the binding will be from our C++ code.
++    // We'll use std::vector<torch::Tensor>.
++    TORCH_CHECK(!inputs.empty(), "concat_forward expects non-empty list");
++    TORCH_CHECK(dim == 1, "concat_forward currently only supports dim=1");
++    auto first = inputs[0];
++    TORCH_CHECK(first.is_cuda(), "All inputs must be CUDA tensors");
++    TORCH_CHECK(first.scalar_type() == torch::kFloat32, "All inputs must be float32");
++    TORCH_CHECK(first.is_contiguous(), "All inputs must be contiguous");
++    auto batch = first.size(0);
++    auto channels = first.size(1);
++    auto spatial = first.numel() / (batch * channels); // height*width
++    int64_t num_inputs = inputs.size();
++    // Validate all inputs same shape except dim=1 (channels may differ but here same)
++    for (const auto& t : inputs) {
++        TORCH_CHECK(t.is_cuda(), "All inputs must be CUDA tensors");
++        TORCH_CHECK(t.scalar_type() == torch::kFloat32, "All inputs must be float32");
++        TORCH_CHECK(t.is_contiguous(), "All inputs must be contiguous");
++        TORCH_CHECK(t.dim() == 4, "Expected 4D tensors");
++        TORCH_CHECK(t.size(0) == batch, "Batch mismatch");
++        TORCH_CHECK(t.size(1) == channels, "Channel mismatch per tensor, expected same channels");
++        TORCH_CHECK(t.size(2) * t.size(3) == spatial, "Spatial size mismatch");
++    }
++    auto output = torch::empty({batch, num_inputs * channels, first.size(2), first.size(3)}, first.options());
++    // Prepare device pointer array
++    std::vector<const float*> input_ptrs;
++    input_ptrs.reserve(num_inputs);
++    for (const auto& t : inputs) {
++        input_ptrs.push_back(t.data_ptr<float>());
++    }
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    concat_forward_launcher(
++        input_ptrs.data(),
++        static_cast<int>(num_inputs),
++        batch,
++        spatial,
++        channels,
++        output.data_ptr<float>(),
++        stream);
++    return output;
++}
++
++torch::Tensor softmax_forward(torch::Tensor input, int64_t dim) {
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
++    TORCH_CHECK(dim == 1, "softmax_forward currently only supports dim=1");
++    auto batch = input.size(0);
++    auto channels = input.size(1);
++    auto spatial = input.numel() / (batch * channels);
++    auto output = torch::empty_like(input);
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    softmax_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch,
++        channels,
++        spatial,
++        stream);
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("concat_forward", &concat_forward, "Concatenate list of tensors along dim=1", py::arg("inputs"), py::arg("dim"));
++    m.def("softmax_forward", &softmax_forward, "Softmax along dim=1", py::arg("input"), py::arg("dim"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++class ModelNew(nn.Module):
++    def __init__(self, num_inputs, num_outputs):
++        super().__init__()
++        self.softmax = nn.Softmax(dim=1)  # Retain module for state_dict compatibility? Reference has no state_dict, but keeping attribute may be harmless; however parameterless module affects state_dict keys? It has no parameters, so state_dict remains empty. To exactly match state_dict keys, we can skip adding module entirely.
++
++    def forward(self, x):
++        # x is expected to be a list of tensors as per reference
++        x = cuda_extension.concat_forward(x, dim=1)
++        x = cuda_extension.softmax_forward(x, dim=1)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.concat_forward(x, dim=1)
++        yield 'step_001', x
++        x = cuda_extension.softmax_forward(x, dim=1)
++        yield 'step_002', x
++        yield 'step_003', x

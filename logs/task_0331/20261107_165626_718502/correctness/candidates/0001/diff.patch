@@ -1,0 +1,365 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,148 @@
++// custom_ops.cu - CUDA kernels and launchers for ModelNew
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// -----------------------------------------------------------------------------
++// Linear forward: y = x @ weight.T + bias
++// x: [batch, in_features], weight: [in_features, in_features], bias: [in_features]
++// Output y: [batch, in_features]
++// We use a simple kernel with one thread per output element. For each output
++// element (row, col), we compute dot product of x[row, :] and weight[:, col],
++// then add bias[col].
++// -----------------------------------------------------------------------------
++__global__ void linear_forward_kernel(const float* __restrict__ x,
++                                      const float* __restrict__ weight,
++                                      const float* __restrict__ bias,
++                                      float* __restrict__ y,
++                                      int batch, int in_features) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    int total = batch * in_features;
++    for (int i = idx; i < total; i += stride) {
++        int row = i / in_features;
++        int col = i % in_features;
++        float sum = 0.0f;
++        for (int k = 0; k < in_features; ++k) {
++            sum += x[row * in_features + k] * weight[k * in_features + col];
++        }
++        y[i] = sum + bias[col];
++    }
++}
++
++// -----------------------------------------------------------------------------
++// GELU forward (default approximate='none'): y = x * Phi(x)
++// We use the erf-based approximation: Phi(x) = 0.5 * (1 + erf(x / sqrt(2)))
++// GELU(x) = x * Phi(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
++// -----------------------------------------------------------------------------
++__global__ void gelu_forward_kernel(const float* __restrict__ x,
++                                    float* __restrict__ y,
++                                    int n) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < n; i += stride) {
++        float v = x[i];
++        // Compute erf(v / sqrt(2))
++        float erf_val = erff(v * 0.7071067811865476f); // 1/sqrt(2)
++        y[i] = 0.5f * v * (1.0f + erf_val);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Greater-than scalar: y = (x > threshold) as bool tensor
++// x is float, threshold is float, output is bool (represented as uint8_t or bool)
++// We output as bool (C++ bool, which is 1 byte). PyTorch bool uses 1 byte.
++// -----------------------------------------------------------------------------
++__global__ void gt_scalar_forward_kernel(const float* __restrict__ x,
++                                         float threshold,
++                                         bool* __restrict__ y,
++                                         int n) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < n; i += stride) {
++        y[i] = (x[i] > threshold);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Bool add bias: x bool [batch, in_features], bias float [in_features, 1, 1]
++// Output: float [in_features, batch, in_features]
++// Each output element (b, r, c) corresponds to x[r, c] (bool) + bias[b]
++// We use one thread per output element. For index i in output:
++//   b = i / (batch * in_features)
++//   r = (i % (batch * in_features)) / in_features
++//   c = i % in_features
++//   out[i] = (x[r * in_features + c] ? 1.0f : 0.0f) + bias[b]
++// -----------------------------------------------------------------------------
++__global__ void bool_add_bias_forward_kernel(const bool* __restrict__ x,
++                                             const float* __restrict__ bias,
++                                             float* __restrict__ out,
++                                             int batch, int in_features) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    int total = in_features * batch * in_features; // Note: in_features * batch * in_features
++    int batch_times_in = batch * in_features;
++    for (int i = idx; i < total; i += stride) {
++        int b = i / batch_times_in;
++        int rem = i % batch_times_in;
++        int r = rem / in_features;
++        int c = rem % in_features;
++        float val = (x[r * in_features + c] ? 1.0f : 0.0f) + bias[b];
++        out[i] = val;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Host launchers (extern "C")
++// -----------------------------------------------------------------------------
++extern "C" void linear_forward_launcher(const float* x,
++                                         const float* weight,
++                                         const float* bias,
++                                         float* y,
++                                         int batch,
++                                         int in_features,
++                                         cudaStream_t stream) {
++    int total = batch * in_features;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    // Cap grid to a reasonable number to avoid too many blocks; grid-stride loop handles rest.
++    const int max_grid = 1024;
++    if (grid > max_grid) grid = max_grid;
++    linear_forward_kernel<<<grid, block, 0, stream>>>(x, weight, bias, y, batch, in_features);
++}
++
++extern "C" void gelu_forward_launcher(const float* x,
++                                       float* y,
++                                       int n,
++                                       cudaStream_t stream) {
++    int block = 256;
++    int grid = (n + block - 1) / block;
++    const int max_grid = 1024;
++    if (grid > max_grid) grid = max_grid;
++    gelu_forward_kernel<<<grid, block, 0, stream>>>(x, y, n);
++}
++
++extern "C" void gt_scalar_forward_launcher(const float* x,
++                                            float threshold,
++                                            bool* y,
++                                            int n,
++                                            cudaStream_t stream) {
++    int block = 256;
++    int grid = (n + block - 1) / block;
++    const int max_grid = 1024;
++    if (grid > max_grid) grid = max_grid;
++    gt_scalar_forward_kernel<<<grid, block, 0, stream>>>(x, threshold, y, n);
++}
++
++extern "C" void bool_add_bias_forward_launcher(const bool* x,
++                                               const float* bias,
++                                               float* out,
++                                               int batch,
++                                               int in_features,
++                                               cudaStream_t stream) {
++    int total = in_features * batch * in_features;
++    int block = 256;
++    int grid = (total + block - 1) / block;
++    const int max_grid = 1024;
++    if (grid > max_grid) grid = max_grid;
++    bool_add_bias_forward_kernel<<<grid, block, 0, stream>>>(x, bias, out, batch, in_features);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,178 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void linear_forward_launcher(const float* x,
++                                         const float* weight,
++                                         const float* bias,
++                                         float* y,
++                                         int batch,
++                                         int in_features,
++                                         cudaStream_t stream);
++
++extern "C" void gelu_forward_launcher(const float* x,
++                                       float* y,
++                                       int n,
++                                       cudaStream_t stream);
++
++extern "C" void gt_scalar_forward_launcher(const float* x,
++                                            float threshold,
++                                            bool* y,
++                                            int n,
++                                            cudaStream_t stream);
++
++extern "C" void bool_add_bias_forward_launcher(const bool* x,
++                                               const float* bias,
++                                               float* out,
++                                               int batch,
++                                               int in_features,
++                                               cudaStream_t stream);
++
++// Helper to check CUDA errors after kernel launch
++static void checkCudaError() {
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++}
++
++// -----------------------------------------------------------------------------
++// Linear forward: y = x @ weight.T + bias
++// -----------------------------------------------------------------------------
++torch::Tensor linear_forward(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
++    // Validate device
++    TORCH_CHECK(x.is_cuda(), "linear_forward: x must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "linear_forward: weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "linear_forward: bias must be a CUDA tensor");
++    // Validate dtype
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "linear_forward: x must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "linear_forward: weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "linear_forward: bias must be float32");
++    // Validate contiguity
++    TORCH_CHECK(x.is_contiguous(), "linear_forward: x must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "linear_forward: weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "linear_forward: bias must be contiguous");
++    // Validate shapes
++    TORCH_CHECK(x.dim() == 2, "linear_forward: x must be 2D [batch, in_features]");
++    TORCH_CHECK(weight.dim() == 2, "linear_forward: weight must be 2D [in_features, in_features]");
++    TORCH_CHECK(bias.dim() == 1, "linear_forward: bias must be 1D [in_features]");
++    int64_t batch = x.size(0);
++    int64_t in_features = x.size(1);
++    TORCH_CHECK(weight.size(0) == in_features && weight.size(1) == in_features,
++                "linear_forward: weight shape must be [in_features, in_features]");
++    TORCH_CHECK(bias.size(0) == in_features, "linear_forward: bias size must match in_features");
++
++    auto y = torch::empty({batch, in_features}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    linear_forward_launcher(
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        y.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(in_features),
++        stream
++    );
++    checkCudaError();
++    return y;
++}
++
++// -----------------------------------------------------------------------------
++// GELU forward (default approximate='none')
++// -----------------------------------------------------------------------------
++torch::Tensor gelu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "gelu_forward: x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "gelu_forward: x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "gelu_forward: x must be contiguous");
++    TORCH_CHECK(x.dim() == 2, "gelu_forward: x must be 2D [batch, in_features]");
++
++    auto y = torch::empty_like(x);
++    int64_t n = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    gelu_forward_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        static_cast<int>(n),
++        stream
++    );
++    checkCudaError();
++    return y;
++}
++
++// -----------------------------------------------------------------------------
++// Greater-than scalar: y = (x > threshold) as bool tensor
++// -----------------------------------------------------------------------------
++torch::Tensor gt_scalar_forward(torch::Tensor x, double threshold) {
++    TORCH_CHECK(x.is_cuda(), "gt_scalar_forward: x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "gt_scalar_forward: x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "gt_scalar_forward: x must be contiguous");
++    TORCH_CHECK(x.dim() == 2, "gt_scalar_forward: x must be 2D [batch, in_features]");
++
++    auto y = torch::empty(x.sizes(), x.options().dtype(torch::kBool));
++    int64_t n = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    gt_scalar_forward_launcher(
++        x.data_ptr<float>(),
++        static_cast<float>(threshold),
++        y.data_ptr<bool>(),
++        static_cast<int>(n),
++        stream
++    );
++    checkCudaError();
++    return y;
++}
++
++// -----------------------------------------------------------------------------
++// Bool add bias: x bool [batch, in_features], bias float [in_features,1,1]
++// Output: float [in_features, batch, in_features]
++// -----------------------------------------------------------------------------
++torch::Tensor bool_add_bias_forward(torch::Tensor x, torch::Tensor bias) {
++    TORCH_CHECK(x.is_cuda(), "bool_add_bias_forward: x must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bool_add_bias_forward: bias must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kBool, "bool_add_bias_forward: x must be bool");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bool_add_bias_forward: bias must be float32");
++    TORCH_CHECK(x.is_contiguous(), "bool_add_bias_forward: x must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bool_add_bias_forward: bias must be contiguous");
++    TORCH_CHECK(x.dim() == 2, "bool_add_bias_forward: x must be 2D [batch, in_features]");
++    TORCH_CHECK(bias.dim() == 3 && bias.size(1) == 1 && bias.size(2) == 1,
++                "bool_add_bias_forward: bias must be 3D [in_features, 1, 1]");
++    int64_t batch = x.size(0);
++    int64_t in_features = x.size(1);
++    int64_t bias_in_features = bias.size(0);
++    TORCH_CHECK(bias_in_features == in_features,
++                "bool_add_bias_forward: bias first dim must match x second dim");
++
++    auto out = torch::empty({bias_in_features, batch, in_features}, x.options().dtype(torch::kFloat32));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    bool_add_bias_forward_launcher(
++        x.data_ptr<bool>(),
++        bias.data_ptr<float>(),
++        out.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(in_features),
++        stream
++    );
++    checkCudaError();
++    return out;
++}
++
++// -----------------------------------------------------------------------------
++// Registration
++// -----------------------------------------------------------------------------
++void register_custom_ops(pybind11::module& m) {
++    m.def("linear_forward", &linear_forward, "Linear forward (CUDA)",
++          pybind11::arg("x"), pybind11::arg("weight"), pybind11::arg("bias"));
++    m.def("gelu_forward", &gelu_forward, "GELU forward (CUDA)",
++          pybind11::arg("x"));
++    m.def("gt_scalar_forward", &gt_scalar_forward, "Greater-than scalar forward (CUDA)",
++          pybind11::arg("x"), pybind11::arg("threshold"));
++    m.def("bool_add_bias_forward", &bool_add_bias_forward, "Bool add bias forward (CUDA)",
++          pybind11::arg("x"), pybind11::arg("bias"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,30 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features, bias_shape):
++        super().__init__()
++        self.fc = nn.Linear(in_features, in_features)
++        self.bias = nn.Parameter(torch.randn(bias_shape))
++
++    def forward(self, x):
++        x = cuda_extension.linear_forward(x, self.fc.weight, self.fc.bias)
++        x = cuda_extension.gelu_forward(x)
++        x = cuda_extension.gt_scalar_forward(x, 0.5)
++        x = cuda_extension.bool_add_bias_forward(x, self.bias)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.linear_forward(x, self.fc.weight, self.fc.bias)
++        yield 'step_001', x
++        x = cuda_extension.gelu_forward(x)
++        yield 'step_002', x
++        threshold = torch.tensor(0.5)
++        yield 'step_003', threshold
++        x = cuda_extension.gt_scalar_forward(x, 0.5)
++        yield 'step_004', x
++        x = cuda_extension.bool_add_bias_forward(x, self.bias)
++        yield 'step_005', x
++        yield 'step_006', x

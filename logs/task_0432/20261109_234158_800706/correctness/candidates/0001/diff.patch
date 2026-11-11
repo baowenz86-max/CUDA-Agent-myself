@@ -1,0 +1,421 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,162 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// -----------------------------------------------------------------------------
++// max_dim1_indices_launcher:
++//   Computes values and indices of maximum along dimension 1 (channels),
++//   keeping the dimension. Input x is 4D float32 tensor of shape [N, C, H, W]
++//   with arbitrary strides. Outputs:
++//     values: float32 [N, 1, H, W]
++//     indices: int64 [N, 1, H, W]
++//   The implementation uses one thread per output element (n, 0, h, w).
++//   Each thread iterates over all channels and finds max value and its index.
++//   The index is in [0, C-1].
++//   Memory accesses may be non-coalesced depending on strides, but this matches
++//   PyTorch semantics. The launcher assumes x is on current CUDA device and
++//   pointers are valid.
++// -----------------------------------------------------------------------------
++__global__ void max_dim1_indices_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ values,
++    int64_t* __restrict__ indices,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t stride_n,
++    int64_t stride_c,
++    int64_t stride_h,
++    int64_t stride_w,
++    int64_t out_stride_n,
++    int64_t out_stride_h,
++    int64_t out_stride_w)
++{
++    int64_t total = N * H * W;
++    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
++        // Decode n, h, w from flattened index
++        int64_t tmp = idx;
++        int64_t w = tmp % W;
++        tmp /= W;
++        int64_t h = tmp % H;
++        tmp /= H;
++        int64_t n = tmp;
++
++        const float* base = input + n * stride_n + h * stride_h + w * stride_w;
++        float max_val = base[0];
++        int64_t max_idx = 0;
++
++        for (int64_t c = 1; c < C; ++c) {
++            float val = base[c * stride_c];
++            // PyTorch's torch.max returns the first maximal index when there are ties.
++            if (val > max_val) {
++                max_val = val;
++                max_idx = c;
++            }
++        }
++
++        // Output layout: [N, 1, H, W] contiguous as produced by torch.max with keepdim=True.
++        int64_t out_idx = n * out_stride_n + h * out_stride_h + w * out_stride_w;
++        values[out_idx] = max_val;
++        indices[out_idx] = max_idx;
++    }
++}
++
++// Launcher for max_dim1_indices. Input and output pointers are device pointers.
++// All strides are element counts, not bytes.
++extern "C" void max_dim1_indices_launcher(
++    const float* input,
++    float* values,
++    int64_t* indices,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t input_stride_n,
++    int64_t input_stride_c,
++    int64_t input_stride_h,
++    int64_t input_stride_w,
++    int64_t output_stride_n,
++    int64_t output_stride_h,
++    int64_t output_stride_w,
++    cudaStream_t stream)
++{
++    int64_t total = N * H * W;
++    // Use a reasonable number of blocks. Grid-stride loop handles remainder.
++    int block_size = 256;
++    int64_t blocks = (total + block_size - 1) / block_size;
++    if (blocks > 65535) blocks = 65535; // grid cap
++    if (blocks == 0) return; // no output elements
++    max_dim1_indices_kernel<<<blocks, block_size, 0, stream>>>(
++        input, values, indices, N, C, H, W,
++        input_stride_n, input_stride_c, input_stride_h, input_stride_w,
++        output_stride_n, output_stride_h, output_stride_w);
++}
++
++// -----------------------------------------------------------------------------
++// one_hot_from_indices_launcher:
++//   Converts indices tensor of shape [N, 1, H, W] (int64) to one-hot tensor of
++//   shape [N, 1, H, W, num_classes] (int64). The indices input is assumed to
++//   have exactly 4 dimensions. The output is a new contiguous tensor with same
++//   batch/spatial dimensions plus an extra class dimension at the end.
++//   Each thread writes one entire one-hot vector for one spatial position,
++//   filling all num_classes entries to 0 except the entry at the class index.
++//   The output layout is contiguous: [N, 1, H, W, num_classes] with strides
++//   (1*H*W*num_classes, H*W*num_classes, W*num_classes, num_classes, 1).
++//   If indices contain out-of-range values (>= num_classes), PyTorch's
++//   F.one_hot raises error; we assume valid input due to earlier validation.
++// -----------------------------------------------------------------------------
++__global__ void one_hot_from_indices_kernel(
++    const int64_t* __restrict__ indices,
++    int64_t* __restrict__ output,
++    int64_t N,
++    int64_t H,
++    int64_t W,
++    int64_t num_classes,
++    int64_t indices_stride_n,
++    int64_t indices_stride_h,
++    int64_t indices_stride_w)
++{
++    int64_t spatial_total = N * H * W;
++    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < spatial_total; idx += blockDim.x * gridDim.x) {
++        int64_t tmp = idx;
++        int64_t w = tmp % W;
++        tmp /= W;
++        int64_t h = tmp % H;
++        tmp /= H;
++        int64_t n = tmp;
++
++        // Read the class index from indices tensor. Indices shape [N,1,H,W].
++        int64_t class_idx = indices[n * indices_stride_n + h * indices_stride_h + w * indices_stride_w];
++
++        // Output base pointer for this (n,h,w) position.
++        // Output is contiguous [N,1,H,W,num_classes], flatten to [N*H*W*num_classes].
++        int64_t out_base = ((n * H + h) * W + w) * num_classes;
++
++        // Initialize all classes to 0, then set one position to 1.
++        for (int64_t c = 0; c < num_classes; ++c) {
++            output[out_base + c] = (c == class_idx) ? 1 : 0;
++        }
++    }
++}
++
++extern "C" void one_hot_from_indices_launcher(
++    const int64_t* indices,
++    int64_t* output,
++    int64_t N,
++    int64_t H,
++    int64_t W,
++    int64_t num_classes,
++    int64_t indices_stride_n,
++    int64_t indices_stride_h,
++    int64_t indices_stride_w,
++    cudaStream_t stream)
++{
++    int64_t spatial_total = N * H * W;
++    int block_size = 256;
++    int64_t blocks = (spatial_total + block_size - 1) / block_size;
++    if (blocks > 65535) blocks = 65535;
++    if (blocks == 0) return;
++    one_hot_from_indices_kernel<<<blocks, block_size, 0, stream>>>(
++        indices, output, N, H, W, num_classes,
++        indices_stride_n, indices_stride_h, indices_stride_w);
++}
+--- before/kernels/max_dim1_indices_binding.cpp
++++ after/kernels/max_dim1_indices_binding.cpp
+@@ -0,0 +1,70 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void max_dim1_indices_launcher(
++    const float* input,
++    float* values,
++    int64_t* indices,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t input_stride_n,
++    int64_t input_stride_c,
++    int64_t input_stride_h,
++    int64_t input_stride_w,
++    int64_t output_stride_n,
++    int64_t output_stride_h,
++    int64_t output_stride_w,
++    cudaStream_t stream);
++
++std::tuple<torch::Tensor, torch::Tensor> max_dim1_indices(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    auto values = torch::empty({N, 1, H, W}, x.options());
++    auto indices = torch::empty({N, 1, H, W},
++                                x.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Strides are element counts, not bytes
++    int64_t input_stride_n = x.stride(0);
++    int64_t input_stride_c = x.stride(1);
++    int64_t input_stride_h = x.stride(2);
++    int64_t input_stride_w = x.stride(3);
++
++    // Output tensor is contiguous by construction
++    int64_t output_stride_n = values.stride(0);
++    int64_t output_stride_h = values.stride(2);
++    int64_t output_stride_w = values.stride(3);
++
++    max_dim1_indices_launcher(
++        x.data_ptr<float>(),
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        N, C, H, W,
++        input_stride_n, input_stride_c, input_stride_h, input_stride_w,
++        output_stride_n, output_stride_h, output_stride_w,
++        stream);
++
++    return std::make_tuple(values, indices);
++}
++
++void register_max_dim1_indices_binding(pybind11::module& m) {
++    m.def("max_dim1_indices", &max_dim1_indices,
++          "Compute max and indices along dim 1 with keepdim=True",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(max_dim1_indices, register_max_dim1_indices_binding);
+--- before/kernels/max_pool2d_binding.cpp
++++ after/kernels/max_pool2d_binding.cpp
+@@ -0,0 +1,90 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <cudnn.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// cuDNN error checking helper
++#define CHECK_CUDNN(expr)                                                       \
++  do {                                                                         \
++    cudnnStatus_t status = (expr);                                             \
++    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS,                                \
++                "cuDNN error: ", cudnnGetErrorString(status));                 \
++  } while (0)
++
++torch::Tensor max_pool2d_forward(torch::Tensor x, int64_t kernel_size) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    // MaxPool2d with stride=kernel_size, padding=0, dilation=1
++    int64_t out_h = (H - kernel_size) / kernel_size + 1;
++    int64_t out_w = (W - kernel_size) / kernel_size + 1;
++    TORCH_CHECK(out_h > 0 && out_w > 0, "Invalid output dimensions for pooling");
++
++    auto output = torch::empty({N, C, out_h, out_w}, x.options());
++
++    // Handle non-contiguous input by making contiguous if needed
++    auto x_contig = x.contiguous();
++
++    cudnnHandle_t handle;
++    CHECK_CUDNN(cudnnCreate(&handle));
++
++    cudnnTensorDescriptor_t x_desc, y_desc;
++    cudnnPoolingDescriptor_t pooling_desc;
++
++    CHECK_CUDNN(cudnnCreateTensorDescriptor(&x_desc));
++    CHECK_CUDNN(cudnnCreateTensorDescriptor(&y_desc));
++    CHECK_CUDNN(cudnnCreatePoolingDescriptor(&pooling_desc));
++
++    CHECK_CUDNN(cudnnSetTensor4dDescriptor(x_desc,
++                                           CUDNN_TENSOR_NCHW,
++                                           CUDNN_DATA_FLOAT,
++                                           N, C, H, W));
++    CHECK_CUDNN(cudnnSetTensor4dDescriptor(y_desc,
++                                           CUDNN_TENSOR_NCHW,
++                                           CUDNN_DATA_FLOAT,
++                                           N, C, out_h, out_w));
++
++    CHECK_CUDNN(cudnnSetPooling2dDescriptor(pooling_desc,
++                                            CUDNN_POOLING_MAX,
++                                            CUDNN_PROPAGATE_NAN,
++                                            kernel_size, kernel_size,
++                                            0, 0,
++                                            kernel_size, kernel_size));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    CHECK_CUDNN(cudnnSetStream(handle, stream));
++
++    float alpha = 1.0f, beta = 0.0f;
++    CHECK_CUDNN(cudnnPoolingForward(handle,
++                                    pooling_desc,
++                                    &alpha,
++                                    x_desc,
++                                    x_contig.data_ptr<float>(),
++                                    &beta,
++                                    y_desc,
++                                    output.data_ptr<float>()));
++
++    CHECK_CUDNN(cudnnDestroyTensorDescriptor(x_desc));
++    CHECK_CUDNN(cudnnDestroyTensorDescriptor(y_desc));
++    CHECK_CUDNN(cudnnDestroyPoolingDescriptor(pooling_desc));
++    CHECK_CUDNN(cudnnDestroy(handle));
++
++    return output;
++}
++
++void register_max_pool2d_binding(pybind11::module& m) {
++    m.def("max_pool2d_forward", &max_pool2d_forward,
++          "MaxPool2d forward using cuDNN",
++          py::arg("x"), py::arg("kernel_size"));
++}
++
++REGISTER_BINDING(max_pool2d, register_max_pool2d_binding);
+--- before/kernels/one_hot_from_indices_binding.cpp
++++ after/kernels/one_hot_from_indices_binding.cpp
+@@ -0,0 +1,58 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void one_hot_from_indices_launcher(
++    const int64_t* indices,
++    int64_t* output,
++    int64_t N,
++    int64_t H,
++    int64_t W,
++    int64_t num_classes,
++    int64_t indices_stride_n,
++    int64_t indices_stride_h,
++    int64_t indices_stride_w,
++    cudaStream_t stream);
++
++torch::Tensor one_hot_from_indices(torch::Tensor indices, int64_t num_classes) {
++    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
++    TORCH_CHECK(indices.dim() == 4, "indices must be 4D (N, 1, H, W)");
++    TORCH_CHECK(indices.scalar_type() == torch::kInt64, "indices must be int64");
++    TORCH_CHECK(num_classes > 0, "num_classes must be positive");
++
++    int64_t N = indices.size(0);
++    TORCH_CHECK(indices.size(1) == 1, "indices must have size 1 in dim 1");
++    int64_t H = indices.size(2);
++    int64_t W = indices.size(3);
++
++    // Output shape [N, 1, H, W, num_classes]
++    auto output = torch::empty({N, 1, H, W, num_classes},
++                               indices.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Strides are element counts, not bytes
++    int64_t indices_stride_n = indices.stride(0);
++    int64_t indices_stride_h = indices.stride(2);
++    int64_t indices_stride_w = indices.stride(3);
++
++    one_hot_from_indices_launcher(
++        indices.data_ptr<int64_t>(),
++        output.data_ptr<int64_t>(),
++        N, H, W, num_classes,
++        indices_stride_n, indices_stride_h, indices_stride_w,
++        stream);
++
++    return output;
++}
++
++void register_one_hot_from_indices_binding(pybind11::module& m) {
++    m.def("one_hot_from_indices", &one_hot_from_indices,
++          "Convert indices to one-hot encoding along last dimension",
++          py::arg("indices"), py::arg("num_classes"));
++}
++
++REGISTER_BINDING(one_hot_from_indices, register_one_hot_from_indices_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_dim, num_classes, dim):
++        super(ModelNew, self).__init__()
++        self.max_pool = nn.MaxPool2d(kernel_size=dim)
++        self.num_classes = num_classes
++        self.dim = dim
++
++    def forward(self, x):
++        x = cuda_extension.max_pool2d_forward(x, self.dim)
++        _, indices = cuda_extension.max_dim1_indices(x)
++        x = cuda_extension.one_hot_from_indices(indices, self.num_classes)
++        return x
++
++    def debug_forward(self, x):
++        x1 = cuda_extension.max_pool2d_forward(x, self.dim)
++        yield 'step_001', x1
++        _, indices = cuda_extension.max_dim1_indices(x1)
++        yield 'step_002', (_, indices)
++        x3 = cuda_extension.one_hot_from_indices(indices, self.num_classes)
++        yield 'step_003', x3
++        yield 'step_004', x3

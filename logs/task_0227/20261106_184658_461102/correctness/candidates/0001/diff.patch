@@ -1,0 +1,99 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,28 @@
++#include <cuda_runtime.h>
++
++// Hardshrink kernel: y = x if |x| > lambda else 0, lambda=0.5
++__global__ void hardshrink_kernel(float* output, const float* input, int64_t N) {
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < N; i += stride) {
++        float x = input[i];
++        output[i] = (x > 0.5f || x < -0.5f) ? x : 0.0f;
++    }
++}
++
++// Host launcher for binding layer
++extern "C" void hardshrink_launcher(
++    float* output,
++    const float* input,
++    int64_t N,
++    cudaStream_t stream
++) {
++    if (N <= 0) return;
++    const int threads = 256;
++    int64_t blocks64 = (N + threads - 1) / threads;
++    // Cap grid to avoid launch failure, use grid-stride loop above
++    if (blocks64 > 2147483647LL) blocks64 = 2147483647LL;
++    int blocks = (int)blocks64;
++    hardshrink_kernel<<<blocks, threads, 0, stream>>>(output, input, N);
++    cudaGetLastError(); // binding layer may also check, but this surfaces launch errors
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,46 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void hardshrink_launcher(
++    float* output,
++    const float* input,
++    int64_t N,
++    cudaStream_t stream
++);
++
++// PyTorch wrapper: hardshrink elementwise with lambda=0.5
++torch::Tensor hardshrink_forward(torch::Tensor x) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
++
++    auto output = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call CUDA launcher
++    hardshrink_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++void register_hardshrink(pybind11::module& m) {
++    m.def("hardshrink_forward", &hardshrink_forward,
++          "Hardshrink forward with lambda=0.5",
++          py::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(hardshrink, register_hardshrink);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,16 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, reduction="mean"):
++        super().__init__()
++        self.reduction = reduction
++
++    def forward(self, x):
++        return cuda_extension.hardshrink_forward(x)
++
++    def debug_forward(self, x):
++        y = cuda_extension.hardshrink_forward(x)
++        yield "step_001", y

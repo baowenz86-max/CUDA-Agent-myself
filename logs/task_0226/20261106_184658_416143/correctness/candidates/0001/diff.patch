@@ -1,0 +1,214 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,78 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Elementwise BatchNorm1d inference kernel.
++// Each block processes one channel; threads stride over N*L elements.
++// Formula: y = (x - mean[c]) * rsqrt(var[c] + eps) * weight[c] + bias[c]
++__global__ void batch_norm1d_inference_kernel(
++    float* __restrict__ y,
++    const float* __restrict__ x,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    float eps,
++    int C,
++    int NL)
++{
++    const int c = blockIdx.x;
++    if (c >= C) return;
++
++    const float mean = running_mean[c];
++    const float var = running_var[c];
++    const float invstd = rsqrtf(var + eps);
++    const float w = weight[c];
++    const float b = bias[c];
++    const float scale = w * invstd;
++    const float shift = b - mean * scale;
++
++    const float* x_c = x + (size_t)c * NL;
++    float* y_c = y + (size_t)c * NL;
++
++    for (int idx = threadIdx.x; idx < NL; idx += blockDim.x) {
++        y_c[idx] = x_c[idx] * scale + shift;
++    }
++}
++
++// C-interface launcher for Python binding layer.
++// Assumes x, weight, bias, running_mean, running_var are CUDA float32 tensors.
++// x is contiguous with shape [N, C, L], strides [C*L, L, 1].
++// weight, bias, running_mean, running_var are contiguous with shape [C].
++extern "C" void batchnorm1d_inference_launcher(
++    float* y,
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    int64_t N,
++    int64_t C,
++    int64_t L,
++    cudaStream_t stream)
++{
++    if (N <= 0 || C <= 0 || L <= 0) return;
++
++    const int64_t NL = N * L;
++    const int block_dim = 256;
++    // Each block handles one channel; enough parallelism for 64 channels.
++    const int grid_dim = static_cast<int>(C);
++
++    batch_norm1d_inference_kernel<<<grid_dim, block_dim, 0, stream>>>(
++        y,
++        x,
++        weight,
++        bias,
++        running_mean,
++        running_var,
++        eps,
++        static_cast<int>(C),
++        static_cast<int>(NL));
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // The binding layer should check this, but we include the check here
++        // for all launchers to surface launch errors early.
++        return;
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,94 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration matches kernels/custom_ops.cu
++extern "C" void batchnorm1d_inference_launcher(
++    float* y,
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    int64_t N,
++    int64_t C,
++    int64_t L,
++    cudaStream_t stream);
++
++torch::Tensor batchnorm1d_inference_forward(
++    torch::Tensor x,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    torch::Tensor running_mean,
++    torch::Tensor running_var,
++    double eps) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(running_mean.is_cuda(), "running_mean must be a CUDA tensor");
++    TORCH_CHECK(running_var.is_cuda(), "running_var must be a CUDA tensor");
++
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(running_mean.dtype() == torch::kFloat32, "running_mean must be float32");
++    TORCH_CHECK(running_var.dtype() == torch::kFloat32, "running_var must be float32");
++
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++    TORCH_CHECK(running_mean.is_contiguous(), "running_mean must be contiguous");
++    TORCH_CHECK(running_var.is_contiguous(), "running_var must be contiguous");
++
++    TORCH_CHECK(x.dim() == 3, "x must be 3D (N, C, L)");
++    const int64_t N = x.size(0);
++    const int64_t C = x.size(1);
++    const int64_t L = x.size(2);
++
++    TORCH_CHECK(weight.numel() == C, "weight must have C elements");
++    TORCH_CHECK(bias.numel() == C, "bias must have C elements");
++    TORCH_CHECK(running_mean.numel() == C, "running_mean must have C elements");
++    TORCH_CHECK(running_var.numel() == C, "running_var must have C elements");
++
++    // Allocate output
++    auto y = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    batchnorm1d_inference_launcher(
++        y.data_ptr<float>(),
++        x.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        running_mean.data_ptr<float>(),
++        running_var.data_ptr<float>(),
++        static_cast<float>(eps),
++        N,
++        C,
++        L,
++        stream);
++
++    // Check for launch errors
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA kernel launch failed");
++
++    return y;
++}
++
++void register_batchnorm1d_inference(pybind11::module& m) {
++    m.def("batchnorm1d_inference_forward", &batchnorm1d_inference_forward,
++          "BatchNorm1d inference forward",
++          pybind11::arg("x"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"),
++          pybind11::arg("running_mean"),
++          pybind11::arg("running_var"),
++          pybind11::arg("eps"));
++}
++
++REGISTER_BINDING(batchnorm1d_inference, register_batchnorm1d_inference);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,33 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features):
++        super(ModelNew, self).__init__()
++        self.batchnorm1d = torch.nn.BatchNorm1d(num_features)
++
++    def forward(self, x):
++        return cuda_extension.batchnorm1d_inference_forward(
++            x,
++            self.batchnorm1d.weight,
++            self.batchnorm1d.bias,
++            self.batchnorm1d.running_mean,
++            self.batchnorm1d.running_var,
++            self.batchnorm1d.eps,
++        )
++
++    def debug_forward(self, *inputs):
++        if len(inputs) != 1:
++            raise ValueError('debug_forward expects exactly one input tensor')
++        x = inputs[0]
++        out = cuda_extension.batchnorm1d_inference_forward(
++            x,
++            self.batchnorm1d.weight,
++            self.batchnorm1d.bias,
++            self.batchnorm1d.running_mean,
++            self.batchnorm1d.running_var,
++            self.batchnorm1d.eps,
++        )
++        yield 'step_001', out

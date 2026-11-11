@@ -1,0 +1,194 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,66 @@
++#include <cuda_runtime.h>
++
++// Elementwise multiplication kernel for two tensors with identical shape.
++// Supports arbitrary strides (non-contiguous) by computing per-dimension indices.
++// Grid-stride loop ensures all elements are covered even if grid is smaller than data.
++__global__ void elementwise_mul_kernel(
++    float* __restrict__ out,
++    const float* __restrict__ x,
++    const float* __restrict__ y,
++    int ndim,
++    const int64_t* __restrict__ shape,
++    const int64_t* __restrict__ stride_out,
++    const int64_t* __restrict__ stride_x,
++    const int64_t* __restrict__ stride_y,
++    int64_t numel)
++{
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t step = (int64_t)blockDim.x * gridDim.x;
++
++    for (; idx < numel; idx += step) {
++        // Convert linear index to multi-dimensional index
++        int64_t remaining = idx;
++        int64_t offset_out = 0;
++        int64_t offset_x = 0;
++        int64_t offset_y = 0;
++
++        // Dimension order: assume row-major, strides given in elements.
++        for (int d = 0; d < ndim; ++d) {
++            int64_t dim_size = shape[d];
++            int64_t coord = remaining % dim_size;
++            remaining /= dim_size;
++            offset_out += coord * stride_out[d];
++            offset_x += coord * stride_x[d];
++            offset_y += coord * stride_y[d];
++        }
++
++        out[offset_out] = x[offset_x] * y[offset_y];
++    }
++}
++
++// Launcher for mul_forward. All pointers are element offsets (float*).
++// shape, stride_out, stride_x, stride_y are arrays of length ndim (int64_t).
++// ndim is typically 4 for the provided tensor shape.
++// stream is the current CUDA stream.
++extern "C" void mul_forward_launcher(
++    float* out,
++    const float* x,
++    const float* y,
++    int ndim,
++    const int64_t* shape,
++    const int64_t* stride_out,
++    const int64_t* stride_x,
++    const int64_t* stride_y,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    const int block_size = 256;
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    // Limit grid size to a reasonable maximum (e.g., 2^31-1) to avoid launch failure.
++    if (grid_size > 2147483647LL) {
++        grid_size = 2147483647LL;
++    }
++
++    elementwise_mul_kernel<<<(unsigned int)grid_size, block_size, 0, stream>>>(
++        out, x, y, ndim, shape, stride_out, stride_x, stride_y, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,101 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declaration of launcher from custom_ops.cu
++extern "C" void mul_forward_launcher(
++    float* out,
++    const float* x,
++    const float* y,
++    int ndim,
++    const int64_t* shape,
++    const int64_t* stride_out,
++    const int64_t* stride_x,
++    const int64_t* stride_y,
++    int64_t numel,
++    cudaStream_t stream);
++
++torch::Tensor mul_forward(torch::Tensor x, torch::Tensor y) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(y.is_cuda(), "y must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(y.dtype() == torch::kFloat32, "y must be float32");
++    TORCH_CHECK(x.sizes() == y.sizes(), "x and y must have the same shape");
++
++    // Ensure tensors are contiguous for simpler stride handling; contract allows supporting strides,
++    // but our launcher handles arbitrary strides, so we can use the actual strides.
++    // We do not require contiguity, but for simplicity we can use .contiguous() to make strides standard.
++    // However, to preserve exact reference behavior for non-contiguous inputs, we should pass actual strides.
++    // The input tensors are expected to be contiguous from generation, but we will handle general case.
++    auto x_contig = x.contiguous();
++    auto y_contig = y.contiguous();
++
++    auto output = torch::empty_like(x_contig);
++
++    int64_t numel = x_contig.numel();
++    int ndim = x_contig.dim();
++
++    // Prepare shape and strides as int64_t arrays on host, then copy to device for launcher.
++    // The launcher expects device pointers for these arrays (defined as const int64_t* __restrict__).
++    // We allocate device memory using cudaMalloc.
++    std::vector<int64_t> shape_host(ndim);
++    std::vector<int64_t> stride_out_host(ndim);
++    std::vector<int64_t> stride_x_host(ndim);
++    std::vector<int64_t> stride_y_host(ndim);
++
++    for (int i = 0; i < ndim; ++i) {
++        shape_host[i] = x_contig.size(i);
++        stride_out_host[i] = output.stride(i);
++        stride_x_host[i] = x_contig.stride(i);
++        stride_y_host[i] = y_contig.stride(i);
++    }
++
++    int64_t* d_shape;
++    int64_t* d_stride_out;
++    int64_t* d_stride_x;
++    int64_t* d_stride_y;
++
++    cudaMalloc(&d_shape, ndim * sizeof(int64_t));
++    cudaMalloc(&d_stride_out, ndim * sizeof(int64_t));
++    cudaMalloc(&d_stride_x, ndim * sizeof(int64_t));
++    cudaMalloc(&d_stride_y, ndim * sizeof(int64_t));
++
++    cudaMemcpyAsync(d_shape, shape_host.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, c10::cuda::getCurrentCUDAStream().stream());
++    cudaMemcpyAsync(d_stride_out, stride_out_host.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, c10::cuda::getCurrentCUDAStream().stream());
++    cudaMemcpyAsync(d_stride_x, stride_x_host.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, c10::cuda::getCurrentCUDAStream().stream());
++    cudaMemcpyAsync(d_stride_y, stride_y_host.data(), ndim * sizeof(int64_t), cudaMemcpyHostToDevice, c10::cuda::getCurrentCUDAStream().stream());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    mul_forward_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        y_contig.data_ptr<float>(),
++        ndim,
++        d_shape,
++        d_stride_out,
++        d_stride_x,
++        d_stride_y,
++        numel,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "mul_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    cudaFree(d_shape);
++    cudaFree(d_stride_out);
++    cudaFree(d_stride_x);
++    cudaFree(d_stride_y);
++
++    return output;
++}
++
++void register_mul_forward(pybind11::module& m) {
++    m.def("mul_forward", &mul_forward, "Elementwise multiplication of two CUDA tensors",
++          py::arg("x"), py::arg("y"));
++}
++
++REGISTER_BINDING(mul_forward, register_mul_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,18 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_shape, scaling_factor):
++        super().__init__()
++        self.scaling_factor = scaling_factor
++
++    def forward(self, x, y):
++        x = cuda_extension.mul_forward(x, y)
++        return x
++
++    def debug_forward(self, x, y):
++        z = cuda_extension.mul_forward(x, y)
++        yield ('step_001', z)
++        yield ('step_002', z)

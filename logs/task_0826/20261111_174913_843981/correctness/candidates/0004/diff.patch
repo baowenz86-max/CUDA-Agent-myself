@@ -1,0 +1,78 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,25 +1,28 @@
+ #include <cuda_runtime.h>
+ 
+ // Correct rot90_clone_forward: out[b,w,c,h] = in[b,c,H-1-h,w]
+-// torch.rot90(x, k=1, dims=(1,2)) = transpose(dims 1,2) then flip on new dim2
++// We produce a contiguous base tensor of shape [batch, channels, width, height]
++// Then PyTorch binding returns base.permute({0,2,1,3}) to get expected shape [batch,width,channels,height]
++// with expected strides [307200,320,102400,1].
+ __global__ void rot90_clone_kernel(const float* __restrict__ input,
+                                    float* __restrict__ output,
+                                    int batch,
+                                    int channels,
+                                    int height,
+                                    int width) {
+-    int64_t total = (int64_t)batch * width * channels * height;
++    // output is base tensor [batch, channels, width, height]
++    // So linear index i decomposes as: i = ((b*C + c)*W + w)*H + h
++    int64_t total = (int64_t)batch * channels * width * height;
+     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * gridDim.x;
+ 
+     for (int64_t i = idx; i < total; i += stride) {
+-        // Decompose output linear index: i = ((b * W + w) * C + c) * H + h
+         int h = (int)(i % height);
+         int64_t tmp = i / height;
++        int w = (int)(tmp % width);
++        tmp /= width;
+         int c = (int)(tmp % channels);
+-        tmp /= channels;
+-        int w = (int)(tmp % width);
+-        int b = (int)(tmp / width);
++        int b = (int)(tmp / channels);
+ 
+         // Input index: ((b * C + c) * H + (H-1-h)) * W + w
+         int64_t in_idx = (((int64_t)b * channels + c) * height + (height - 1 - h)) * width + w;
+@@ -34,7 +37,7 @@
+                                        int height,
+                                        int width,
+                                        cudaStream_t stream) {
+-    int64_t total = (int64_t)batch * width * channels * height;
++    int64_t total = (int64_t)batch * channels * width * height;
+     if (total <= 0) return;
+ 
+     int block_size = 256;
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -25,14 +25,16 @@
+     int height = x.size(2);
+     int width = x.size(3);
+ 
+-    // Output shape: [batch, width, channels, height]
+-    auto output = torch::empty({batch, width, channels, height}, x.options());
++    // Allocate base tensor [batch, channels, width, height] contiguous.
++    // We will write the rotated/cloned data into this base, then return a permuted view
++    // with shape [batch, width, channels, height] and strides [307200, 320, 102400, 1].
++    auto base = torch::empty({batch, channels, width, height}, x.options());
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     rot90_clone_launcher(
+         x.data_ptr<float>(),
+-        output.data_ptr<float>(),
++        base.data_ptr<float>(),
+         batch,
+         channels,
+         height,
+@@ -40,7 +42,8 @@
+         stream
+     );
+ 
+-    return output;
++    // Return view with expected shape and strides: permute dims (0,2,1,3)
++    return base.permute({0, 2, 1, 3});
+ }
+ 
+ void register_rot90_clone(pybind11::module& m) {

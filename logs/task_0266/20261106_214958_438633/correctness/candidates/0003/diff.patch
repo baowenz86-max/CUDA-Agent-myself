@@ -1,0 +1,130 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -37,6 +37,7 @@
+     const float* weight_cpu,
+     int64_t num_bags,
+     int64_t embedding_dim,
++    int64_t num_embeddings,
+     float* output_cuda,
+     cudaStream_t stream)
+ {
+@@ -45,28 +46,12 @@
+     int64_t* offsets_cuda = nullptr;
+     float* weight_cuda = nullptr;
+ 
+-    // Input size: offsets[num_bags] is the total number of indices. We know offsets has length num_bags+1.
+-    // Since we don't have total input length explicitly, we can read the last offset from CPU.
+-    int64_t total_indices = 0;
+-    cudaMemcpyAsync(&total_indices, offsets_cpu + num_bags, sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+-    // This async copy is to device memory (we pass host pointer as dst), which is incorrect! We need to read host value first.
+-    // Instead, we'll copy the whole offsets array to device and then read from device after using? Better to allocate offsets_cuda and copy it.
+-    // For simplicity, we assume binding passes total_indices as a separate parameter; but contract doesn't include it.
+-    // We'll copy the offsets array to device first, then use it in kernel; but we need total_indices for input copy size.
+-    // Actually, we can allocate input_cuda with size equal to total number of indices; we need to know it from host.
+-    // Since launcher receives only CPU pointers, we can read total_indices from host using cudaMemcpy (synchronous) before async operations.
+-    cudaMemcpy(&total_indices, offsets_cpu + num_bags, sizeof(int64_t), cudaMemcpyHostToHost); // just use host copy: total_indices = offsets_cpu[num_bags];
+-    total_indices = offsets_cpu[num_bags]; // direct host access (may be on CPU, okay for launcher)
++    // Total number of input indices is given by the last offset.
++    int64_t total_indices = offsets_cpu[num_bags];
+ 
+     // Allocate device memory
+     cudaMalloc(&input_cuda, total_indices * sizeof(int64_t));
+     cudaMalloc(&offsets_cuda, (num_bags + 1) * sizeof(int64_t));
+-    cudaMalloc(&weight_cuda, 10 * embedding_dim * sizeof(float)); // Hardcoded 10? Need proper num_embeddings.
+-    // Alternative: weight is known shape [10,5] from contract; but better to pass num_embeddings.
+-    // However launcher signature doesn't include num_embeddings; the binding.cpp could pass it, but we don't modify binding.cpp.
+-    // We can derive num_embeddings from weight pointer? Not possible. But contract ensures weight has 10 rows.
+-    // For correctness, we'll use 10 as fixed from contract; could be parameterized later.
+-    int64_t num_embeddings = 10;
+     cudaMalloc(&weight_cuda, num_embeddings * embedding_dim * sizeof(float));
+ 
+     // Copy data to device asynchronously
+@@ -88,4 +73,4 @@
+     cudaFreeAsync(weight_cuda, stream);
+ 
+     // Note: The caller (binding) is responsible for synchronizing if needed; we don't wait here.
+-}
++}--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -16,41 +16,51 @@
+     cudaStream_t stream);
+ 
+ torch::Tensor embedding_bag_forward(torch::Tensor input, torch::Tensor offsets, torch::Tensor weight) {
+-    TORCH_CHECK(input.is_cpu(), "input must be a CPU tensor");
+-    TORCH_CHECK(offsets.is_cpu(), "offsets must be a CPU tensor");
+-    TORCH_CHECK(weight.is_cpu(), "weight must be a CPU tensor");
+-    TORCH_CHECK(input.dtype() == torch::kInt64, "input must be int64");
+-    TORCH_CHECK(offsets.dtype() == torch::kInt64, "offsets must be int64");
+-    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+-    TORCH_CHECK(offsets.is_contiguous(), "offsets must be contiguous");
+-    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+-    TORCH_CHECK(input.dim() == 1, "input must be 1D");
+-    TORCH_CHECK(offsets.dim() == 1, "offsets must be 1D");
+-    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+-    int64_t num_bags = offsets.numel() - 1;
++    // Move tensors to CPU if they are not already on CPU
++    auto input_cpu = input.is_cpu() ? input : input.cpu();
++    auto offsets_cpu = offsets.is_cpu() ? offsets : offsets.cpu();
++    auto weight_cpu = weight.is_cpu() ? weight : weight.cpu();
++
++    // Validate dtypes
++    TORCH_CHECK(input_cpu.dtype() == torch::kInt64, "input must be int64");
++    TORCH_CHECK(offsets_cpu.dtype() == torch::kInt64, "offsets must be int64");
++    TORCH_CHECK(weight_cpu.dtype() == torch::kFloat32, "weight must be float32");
++
++    // Validate contiguity
++    TORCH_CHECK(input_cpu.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(offsets_cpu.is_contiguous(), "offsets must be contiguous");
++    TORCH_CHECK(weight_cpu.is_contiguous(), "weight must be contiguous");
++
++    // Validate dimensions
++    TORCH_CHECK(input_cpu.dim() == 1, "input must be 1D");
++    TORCH_CHECK(offsets_cpu.dim() == 1, "offsets must be 1D");
++    TORCH_CHECK(weight_cpu.dim() == 2, "weight must be 2D");
++
++    int64_t num_bags = offsets_cpu.numel() - 1;
+     TORCH_CHECK(num_bags > 0, "offsets must have at least 2 elements");
+-    int64_t embedding_dim = weight.size(1);
+-    int64_t num_embeddings = weight.size(0);
+-    TORCH_CHECK(offsets[0].item<int64_t>() == 0, "offsets[0] must be 0");
+-    // Validate offsets monotonic and within input length
+-    auto offsets_acc = offsets.accessor<int64_t, 1>();
++    int64_t embedding_dim = weight_cpu.size(1);
++    int64_t num_embeddings = weight_cpu.size(0);
++
++    // Validate offsets: first element must be 0, non-decreasing, last <= input.numel()
++    auto offsets_acc = offsets_cpu.accessor<int64_t, 1>();
++    TORCH_CHECK(offsets_acc[0] == 0, "offsets[0] must be 0");
+     for (int64_t i = 0; i < num_bags; ++i) {
+         TORCH_CHECK(offsets_acc[i] <= offsets_acc[i + 1], "offsets must be non-decreasing");
+     }
+-    TORCH_CHECK(offsets_acc[num_bags] <= input.numel(), "offsets last element must be <= input length");
++    TORCH_CHECK(offsets_acc[num_bags] <= input_cpu.numel(), "offsets last element must be <= input length");
+ 
+-    // Allocate output on CUDA
+-    auto output = torch::empty({num_bags, embedding_dim}, torch::dtype(torch::kFloat32).device(torch::kCUDA, 0));
++    // Determine output device: use current CUDA device (since execution_device is cuda)
++    auto output = torch::empty({num_bags, embedding_dim},
++                               torch::dtype(torch::kFloat32).device(torch::kCUDA, 0));
+ 
+     // Get current CUDA stream
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+     // Call launcher
+     embedding_bag_forward_launcher(
+-        input.data_ptr<int64_t>(),
+-        offsets.data_ptr<int64_t>(),
+-        weight.data_ptr<float>(),
++        input_cpu.data_ptr<int64_t>(),
++        offsets_cpu.data_ptr<int64_t>(),
++        weight_cpu.data_ptr<float>(),
+         num_bags,
+         embedding_dim,
+         num_embeddings,
+@@ -67,4 +77,4 @@
+           py::arg("input"), py::arg("offsets"), py::arg("weight"));
+ }
+ 
+-REGISTER_BINDING(embedding_bag, register_embedding_bag);
++REGISTER_BINDING(embedding_bag, register_embedding_bag);

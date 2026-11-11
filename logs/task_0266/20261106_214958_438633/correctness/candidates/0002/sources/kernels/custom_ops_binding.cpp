@@ -1,0 +1,82 @@
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include "../binding_registry.h"
+
+// Declare launcher from custom_ops.cu
+extern "C" void embedding_bag_forward_launcher(
+    const int64_t* input_cpu,
+    const int64_t* offsets_cpu,
+    const float* weight_cpu,
+    int64_t num_bags,
+    int64_t embedding_dim,
+    int64_t num_embeddings,
+    float* output_cuda,
+    cudaStream_t stream);
+
+torch::Tensor embedding_bag_forward(torch::Tensor input, torch::Tensor offsets, torch::Tensor weight) {
+    // Ensure input, offsets, weight are on CPU (move if necessary)
+    if (!input.is_cpu()) {
+        input = input.cpu();
+    }
+    if (!offsets.is_cpu()) {
+        offsets = offsets.cpu();
+    }
+    if (!weight.is_cpu()) {
+        weight = weight.cpu();
+    }
+
+    TORCH_CHECK(input.is_cpu(), "input must be a CPU tensor");
+    TORCH_CHECK(offsets.is_cpu(), "offsets must be a CPU tensor");
+    TORCH_CHECK(weight.is_cpu(), "weight must be a CPU tensor");
+    TORCH_CHECK(input.dtype() == torch::kInt64, "input must be int64");
+    TORCH_CHECK(offsets.dtype() == torch::kInt64, "offsets must be int64");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(offsets.is_contiguous(), "offsets must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(input.dim() == 1, "input must be 1D");
+    TORCH_CHECK(offsets.dim() == 1, "offsets must be 1D");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+
+    int64_t num_bags = offsets.numel() - 1;
+    TORCH_CHECK(num_bags > 0, "offsets must have at least 2 elements");
+    int64_t embedding_dim = weight.size(1);
+    int64_t num_embeddings = weight.size(0);
+    TORCH_CHECK(offsets[0].item<int64_t>() == 0, "offsets[0] must be 0");
+    // Validate offsets monotonic and within input length
+    auto offsets_acc = offsets.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < num_bags; ++i) {
+        TORCH_CHECK(offsets_acc[i] <= offsets_acc[i + 1], "offsets must be non-decreasing");
+    }
+    TORCH_CHECK(offsets_acc[num_bags] <= input.numel(), "offsets last element must be <= input length");
+
+    // Allocate output on CUDA
+    auto output = torch::empty({num_bags, embedding_dim}, torch::dtype(torch::kFloat32).device(torch::kCUDA, 0));
+
+    // Get current CUDA stream
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    // Call launcher with raw CPU pointers
+    embedding_bag_forward_launcher(
+        input.data_ptr<int64_t>(),
+        offsets.data_ptr<int64_t>(),
+        weight.data_ptr<float>(),
+        num_bags,
+        embedding_dim,
+        num_embeddings,
+        output.data_ptr<float>(),
+        stream
+    );
+
+    return output;
+}
+
+void register_embedding_bag(pybind11::module& m) {
+    m.def("embedding_bag_forward", &embedding_bag_forward,
+          "EmbeddingBag forward (sum mode)",
+          py::arg("input"), py::arg("offsets"), py::arg("weight"));
+}
+
+REGISTER_BINDING(embedding_bag, register_embedding_bag);

@@ -1,0 +1,187 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,92 @@
++#include <cuda_runtime.h>
++
++// Elementwise cosine kernel
++// Each thread processes multiple elements using a grid-stride loop.
++// Vectorized (float4) loads/stores if pointers are 16-byte aligned and numel divisible by 4,
++// otherwise scalar path.
++__global__ void elementwise_cos_kernel(const float* __restrict__ input,
++                                       float* __restrict__ output,
++                                       long numel) {
++    long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long stride = blockDim.x * gridDim.x;
++
++    // Vectorized path: assumes 16-byte alignment and numel % 4 == 0
++    const float4* in4 = reinterpret_cast<const float4*>(input);
++    float4* out4 = reinterpret_cast<float4*>(output);
++    long numel4 = numel / 4;
++    long idx4 = idx;
++    long stride4 = stride;
++
++    if ((reinterpret_cast<unsigned long long>(input) & 0xF) == 0 &&
++        (reinterpret_cast<unsigned long long>(output) & 0xF) == 0 &&
++        (numel & 3) == 0) {
++        for (long i = idx4; i < numel4; i += stride4) {
++            float4 val = in4[i];
++            val.x = cosf(val.x);
++            val.y = cosf(val.y);
++            val.z = cosf(val.z);
++            val.w = cosf(val.w);
++            out4[i] = val;
++        }
++    } else {
++        // Scalar fallback for misaligned or non-multiple-of-4 lengths
++        for (long i = idx; i < numel; i += stride) {
++            output[i] = cosf(input[i]);
++        }
++    }
++}
++
++// Elementwise copy (identity) kernel, same vectorization approach
++__global__ void elementwise_copy_kernel(const float* __restrict__ input,
++                                        float* __restrict__ output,
++                                        long numel) {
++    long idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long stride = blockDim.x * gridDim.x;
++
++    const float4* in4 = reinterpret_cast<const float4*>(input);
++    float4* out4 = reinterpret_cast<float4*>(output);
++    long numel4 = numel / 4;
++    long idx4 = idx;
++    long stride4 = stride;
++
++    if ((reinterpret_cast<unsigned long long>(input) & 0xF) == 0 &&
++        (reinterpret_cast<unsigned long long>(output) & 0xF) == 0 &&
++        (numel & 3) == 0) {
++        for (long i = idx4; i < numel4; i += stride4) {
++            out4[i] = in4[i];
++        }
++    } else {
++        for (long i = idx; i < numel; i += stride) {
++            output[i] = input[i];
++        }
++    }
++}
++
++// Launcher for cosine
++// input: device pointer to input float32 tensor (any stride, but we treat as flat)
++// output: device pointer to output float32 tensor (same shape as input)
++// numel: total number of elements
++// stream: CUDA stream to launch on
++extern "C" void custom_cos_launcher(const float* input,
++                                   float* output,
++                                   long numel,
++                                   cudaStream_t stream) {
++    const int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++    // Cap blocks to avoid launching too many; grid-stride loop handles rest
++    if (blocks > 65535) blocks = 65535;
++    if (blocks < 1) blocks = 1;
++    elementwise_cos_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++// Launcher for identity copy
++extern "C" void custom_identity_launcher(const float* input,
++                                          float* output,
++                                          long numel,
++                                          cudaStream_t stream) {
++    const int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    if (blocks < 1) blocks = 1;
++    elementwise_copy_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,53 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_cos_launcher(const float* input, float* output, long numel, cudaStream_t stream);
++extern "C" void custom_identity_launcher(const float* input, float* output, long numel, cudaStream_t stream);
++
++// Wrapper for custom_cos
++torch::Tensor custom_cos_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    
++    // Ensure contiguous; if not, make contiguous (preserves data)
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++    
++    auto output = torch::empty_like(x);
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_cos_launcher(x.data_ptr<float>(), output.data_ptr<float>(), x.numel(), stream);
++    
++    return output;
++}
++
++// Wrapper for custom_identity
++torch::Tensor custom_identity_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    
++    // Ensure contiguous; if not, make contiguous (preserves data)
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++    
++    auto output = torch::empty_like(x);
++    
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_identity_launcher(x.data_ptr<float>(), output.data_ptr<float>(), x.numel(), stream);
++    
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_cos", &custom_cos_forward, "Custom cosine forward", py::arg("x"));
++    m.def("custom_identity", &custom_identity_forward, "Custom identity forward", py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,33 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.identity = nn.Identity()
++
++    def forward(self, x):
++        x = cuda_extension.custom_cos(x)
++        x = cuda_extension.custom_identity(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_cos(x)
++        yield 'step_001', x
++        x = cuda_extension.custom_identity(x)
++        yield 'step_002', x
++        yield 'step_003', x
++
++
++batch_size = 512
++height, width = 1024, 1024
++
++
++def get_inputs():
++    return [torch.randn(batch_size, 1, height, width)]
++
++
++def get_init_inputs():
++    return []

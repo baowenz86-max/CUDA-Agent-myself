@@ -1,0 +1,274 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,128 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++// ---------------- Upsample bilinear 2x (NCHW, float32) ----------------
++// 参考 PyTorch align_corners=False 的坐标映射：
++//   src_x = (dst_x + 0.5) / scale - 0.5 = (dst_x + 0.5) * 0.5 - 0.5
++//   src_y 同理
++//   对源坐标先 floor 再线性插值，边界 clamp 到 [0, W-1] / [0, H-1]
++// 输入支持任意 stride，输出为连续 NCHW。
++// 线程映射：每个线程负责一个输出像素 (w, h)，block 维度为 (32, 8)，grid 维度覆盖整个输出平面。
++
++template <typename T>
++__global__ void upsample_bilinear2x_kernel(
++    const T* __restrict__ input,
++    T* __restrict__ output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    const long long* __restrict__ in_strides, // 数组 [strideN, strideC, strideH, strideW]
++    const long long* __restrict__ out_strides // 数组 [strideN, strideC, strideH, strideW]
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int idy = blockIdx.y * blockDim.y + threadIdx.y;
++    if (idx >= outW || idy >= outH) return;
++
++    int dst_x = idx;
++    int dst_y = idy;
++
++    // 坐标映射
++    float src_x_f = (dst_x + 0.5f) * 0.5f - 0.5f;
++    float src_y_f = (dst_y + 0.5f) * 0.5f - 0.5f;
++
++    // 处理边界：clamp 到 [0, W-1] 和 [0, H-1]
++    if (src_x_f < 0.f) src_x_f = 0.f;
++    if (src_y_f < 0.f) src_y_f = 0.f;
++    int W_minus_1 = W - 1;
++    int H_minus_1 = H - 1;
++    if (src_x_f > W_minus_1) src_x_f = W_minus_1;
++    if (src_y_f > H_minus_1) src_y_f = H_minus_1;
++
++    int x0 = (int)src_x_f;
++    int y0 = (int)src_y_f;
++    int x1 = x0 + 1;
++    int y1 = y0 + 1;
++    if (x1 > W_minus_1) x1 = W_minus_1;
++    if (y1 > H_minus_1) y1 = H_minus_1;
++
++    float wx1 = src_x_f - x0;
++    float wy1 = src_y_f - y0;
++    float wx0 = 1.0f - wx1;
++    float wy0 = 1.0f - wy1;
++
++    // 对 N 和 C 维度进行循环（通常一个 block 覆盖整个输出图像的块，但 N*C 较大时 grid.z 使用）
++    // 为了简单和高效，我们让 blockIdx.z 遍历 N*C 平面，每个平面内 blockIdx.x/y 覆盖 outW/outH
++    int plane = blockIdx.z;
++    if (plane >= N * C) return;
++    int n = plane / C;
++    int c = plane - n * C;
++
++    const T* in_plane = input + n * in_strides[0] + c * in_strides[1];
++    T* out_plane = output + n * out_strides[0] + c * out_strides[1];
++
++    // 读取四个源像素
++    T v00 = in_plane[y0 * in_strides[2] + x0 * in_strides[3]];
++    T v01 = in_plane[y0 * in_strides[2] + x1 * in_strides[3]];
++    T v10 = in_plane[y1 * in_strides[2] + x0 * in_strides[3]];
++    T v11 = in_plane[y1 * in_strides[2] + x1 * in_strides[3]];
++
++    float result = wx0 * (wy0 * (float)v00 + wy1 * (float)v10) +
++                   wx1 * (wy0 * (float)v01 + wy1 * (float)v11);
++
++    // 输出位置：连续输出使用 out_strides，通常 strideW=1，strideH=outW，strideC=outH*outW，strideN=outC*outH*outW
++    out_plane[dst_y * out_strides[2] + dst_x * out_strides[3]] = (T)result;
++}
++
++// ---------------- Ceil kernel ----------------
++// 逐元素 ceil，支持任意 stride，输出连续。
++// 为了高效，我们使用一维 grid-stride 循环，每个线程处理多个元素。
++template <typename T>
++__global__ void ceil_kernel(
++    const T* __restrict__ input,
++    T* __restrict__ output,
++    long long numel
++) {
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)blockDim.x * gridDim.x;
++    for (; idx < numel; idx += stride) {
++        output[idx] = ceilf((float)input[idx]);
++    }
++}
++
++// ---------------- Launchers (extern C) ----------------
++
++extern "C" void upsample_bilinear2x_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    const long long* in_strides,
++    const long long* out_strides,
++    cudaStream_t stream
++) {
++    dim3 block(32, 8);
++    dim3 grid((outW + block.x - 1) / block.x,
++              (outH + block.y - 1) / block.y,
++              N * C);
++
++    // 注意：如果 N*C 很大（此处 512*3=1536），grid.z 在支持范围内（最大 65535），但为了保险可以限制并循环
++    // 但直接这样没问题，因为 1536 < 65535。
++    upsample_bilinear2x_kernel<float><<<grid, block, 0, stream>>>(
++        input, output, N, C, H, W, outH, outW, in_strides, out_strides);
++}
++
++extern "C" void ceil_launcher(
++    const float* input,
++    float* output,
++    long long numel,
++    cudaStream_t stream
++) {
++    const int block_size = 256;
++    // 计算足够覆盖的 grid 大小，同时避免太多 block（使用 grid-stride 循环处理）
++    long long total_blocks = (numel + block_size - 1) / block_size;
++    // 限制 grid 维度，使用 grid-stride 循环
++    int grid_size = (int)min(total_blocks, (long long)65535 * 32768); // 最大 grid 维度，但保守
++    // 为了避免 grid 过大，使用最大 65535*若干？实际上可以直接用 total_blocks 但是若超过 2^31-1 会溢出，但 numel 最大 100M 不至于
++    // 为了符合 grid dim 限制 (x 最大 2^31-1)，100M/256≈390625，远小于限制，可以直接使用 int
++    int grid = (int)total_blocks;
++    ceil_kernel<float><<<grid, block_size, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,107 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// 声明 custom_ops.cu 中导出的 launcher
++extern "C" void upsample_bilinear2x_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    const long long* in_strides,
++    const long long* out_strides,
++    cudaStream_t stream
++);
++
++extern "C" void ceil_launcher(
++    const float* input,
++    float* output,
++    long long numel,
++    cudaStream_t stream
++);
++
++// 包装函数：upsample_bilinear2x_forward
++torch::Tensor upsample_bilinear2x_forward(torch::Tensor input) {
++    // 输入检查
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    int N = input.size(0);
++    int C = input.size(1);
++    int H = input.size(2);
++    int W = input.size(3);
++    int outH = H * 2;
++    int outW = W * 2;
++
++    // 创建连续输出张量
++    auto output = torch::empty({N, C, outH, outW}, input.options());
++
++    // 准备 stride 数组（输入使用实际 stride，输出使用连续 stride）
++    long long in_strides[4];
++    long long out_strides[4];
++    for (int i = 0; i < 4; ++i) {
++        in_strides[i] = input.stride(i);
++        out_strides[i] = output.stride(i);
++    }
++
++    // 获取当前 CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // 调用 launcher
++    upsample_bilinear2x_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        outH, outW,
++        in_strides,
++        out_strides,
++        stream
++    );
++
++    // 检查 kernel 启动错误
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "upsample_bilinear2x_launcher failed");
++
++    return output;
++}
++
++// 包装函数：ceil_forward
++torch::Tensor ceil_forward(torch::Tensor input) {
++    // 输入检查
++    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
++
++    // 创建连续输出张量，保留 shape
++    auto output = torch::empty_like(input);
++
++    // 获取当前 CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // 调用 launcher
++    ceil_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        input.numel(),
++        stream
++    );
++
++    // 检查 kernel 启动错误
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "ceil_launcher failed");
++
++    return output;
++}
++
++// 注册函数
++void register_custom_ops(pybind11::module& m) {
++    m.def("upsample_bilinear2x_forward", &upsample_bilinear2x_forward,
++          "Upsample bilinear 2x forward",
++          py::arg("input"));
++    m.def("ceil_forward", &ceil_forward,
++          "Ceil forward",
++          py::arg("input"));
++}
++
++// 自动注册
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,30 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, scale_factor, mode, align_corners):
++        super().__init__()
++        # 保留构造参数但实际不使用，确保签名与参考一致；state_dict 为空
++        self.scale_factor = scale_factor
++        self.mode = mode
++        self.align_corners = align_corners
++
++    def forward(self, x):
++        # 参考第一步: x = self.upsample(x) -> bilinear 2x 上采样
++        x = cuda_extension.upsample_bilinear2x_forward(x)
++        # 参考第二步: x = torch.ceil(x)
++        x = cuda_extension.ceil_forward(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        # step_001: 上采样后结果
++        x = cuda_extension.upsample_bilinear2x_forward(x)
++        yield 'step_001', x
++        # step_002: ceil 后结果
++        x = cuda_extension.ceil_forward(x)
++        yield 'step_002', x
++        # step_003: 最终返回结果
++        yield 'step_003', x

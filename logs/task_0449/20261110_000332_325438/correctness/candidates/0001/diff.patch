@@ -1,0 +1,244 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,137 @@
++#include <cuda_runtime.h>
++#include <cmath>
++
++// LRN across channels for 4D tensor [N,C,H,W]
++// Each thread computes one output element.
++__global__ void lrn_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int N, int C, int H, int W,
++    int size, float alpha, float beta, float k,
++    long long total_elements)
++{
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    int half_size = (size - 1) / 2;
++    int ceil_half = size / 2;  // for even size, but reference uses floor/ceil as per PyTorch? PyTorch uses: start = max(0, c - (size-1)/2), end = min(C-1, c + size/2)
++    // Actually from PyTorch source: int start = c - (size - 1)/2; int end = c + size/2; start = max(0, start); end = min(C-1, end);
++
++    for (; idx < total_elements; idx += stride) {
++        // decode n,c,h,w from linear index assuming contiguous row-major: idx = ((n*C + c)*H + h)*W + w
++        int w = idx % W;
++        long long tmp = idx / W;
++        int h = tmp % H;
++        tmp /= H;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        // Compute channel window boundaries
++        int start = c - half_size;
++        int end = c + (size / 2);
++        if (start < 0) start = 0;
++        if (end >= C) end = C - 1;
++
++        // Sum of squares over channel window at (n, h, w)
++        float sum_sq = 0.0f;
++        const float* base = input + ((long long)n * C * H * W) + (h * W) + w;
++        for (int cc = start; cc <= end; ++cc) {
++            float val = base[(long long)cc * H * W];
++            sum_sq += val * val;
++        }
++
++        float denom = powf(k + alpha * sum_sq, beta);
++        float in_val = base[(long long)c * H * W];
++        output[idx] = in_val / denom;
++    }
++}
++
++// Launcher for LRN forward. All tensors are assumed to be contiguous; binding ensures contiguity or we use strides? Contract says supports strides (contiguous or otherwise). Since binding may pass non-contiguous, we should handle strides. But for simplicity and because task input is contiguous, we can require contiguity in binding and call .contiguous() on input if needed. However, launcher only gets raw pointer, cannot see strides. We can add stride parameters for each dimension to support non-contiguous input. But contract says launcher signature should be robust. We'll include stride parameters as int64_t for N,C,H,W dims. The binding will pass strides.
++
++// Updated launcher with strides
++__global__ void lrn_kernel_strided(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int N, int C, int H, int W,
++    int size, float alpha, float beta, float k,
++    long long total_elements,
++    int stride_n, int stride_c, int stride_h, int stride_w)
++{
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++
++    int half_size = (size - 1) / 2;
++
++    for (; idx < total_elements; idx += stride) {
++        int w = idx % W;
++        long long tmp = idx / W;
++        int h = tmp % H;
++        tmp /= H;
++        int c = tmp % C;
++        int n = tmp / C;
++
++        int start = c - half_size;
++        int end = c + (size / 2);
++        if (start < 0) start = 0;
++        if (end >= C) end = C - 1;
++
++        float sum_sq = 0.0f;
++        const float* base = input + (long long)n * stride_n + (long long)h * stride_h + (long long)w * stride_w;
++        for (int cc = start; cc <= end; ++cc) {
++            float val = base[(long long)cc * stride_c];
++            sum_sq += val * val;
++        }
++
++        float denom = powf(k + alpha * sum_sq, beta);
++        float in_val = base[(long long)c * stride_c];
++        output[idx] = in_val / denom;
++    }
++}
++
++// Simple launcher for contiguous input only (strides default to contiguous)
++extern "C" void lrn_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int size, float alpha, float beta, float k,
++    cudaStream_t stream)
++{
++    // Assume contiguous tensors, so strides: stride_w=1, stride_h=W, stride_c=H*W, stride_n=C*H*W
++    int stride_w = 1;
++    int stride_h = W;
++    int stride_c = H * W;
++    int stride_n = C * H * W;
++
++    long long total = (long long)N * C * H * W;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 2147483647) grid = 2147483647; // grid cap; kernel uses grid-stride loop, but if grid capped, still works but may need multiple iterations; we'll use a grid-stride loop with fixed max grid, but here we set grid accordingly and loop handles remainder. Actually if total > block * max_grid, we need grid-stride loop over all. We'll set grid = min(65535, (total+block-1)/block) maybe? Better: use grid-stride loop with grid = min(32000, (total+block-1)/block). Actually we can set grid to cover total, but if total huge and grid > max allowed, kernel launch fails; we cap grid and rely on stride loop. However, the kernel loop is set to iterate with stride = grid*block, so if grid capped below needed, some elements might not be processed if total > grid*block? The loop condition idx < total_elements and idx increments by stride, so if initial idx covers only up to grid*block-1 then increments by stride which is less than total, so all elements will eventually be covered. Yes works.
++
++    int grid_size = (int)((total + block - 1) / block);
++    if (grid_size > 2147483647) grid_size = 2147483647;
++    if (grid_size < 1) grid_size = 1;
++
++    lrn_kernel_strided<<<grid_size, block, 0, stream>>>(
++        output, input, N, C, H, W, size, alpha, beta, k, total,
++        stride_n, stride_c, stride_h, stride_w);
++}
++
++// Strided version launcher (for non-contiguous)
++extern "C" void lrn_forward_strided_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int size, float alpha, float beta, float k,
++    int stride_n, int stride_c, int stride_h, int stride_w,
++    cudaStream_t stream)
++{
++    long long total = (long long)N * C * H * W;
++    int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 2147483647) grid = 2147483647;
++    if (grid < 1) grid = 1;
++
++    lrn_kernel_strided<<<grid, block, 0, stream>>>(
++        output, input, N, C, H, W, size, alpha, beta, k, total,
++        stride_n, stride_c, stride_h, stride_w);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,77 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void lrn_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int size, float alpha, float beta, float k,
++    cudaStream_t stream);
++
++extern "C" void lrn_forward_strided_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H, int W,
++    int size, float alpha, float beta, float k,
++    int stride_n, int stride_c, int stride_h, int stride_w,
++    cudaStream_t stream);
++
++// PyTorch wrapper for LRN forward
++torch::Tensor lrn_forward(torch::Tensor x, int64_t size, double alpha, double beta, double k) {
++    TORCH_CHECK(x.is_cuda(), "Input tensor must be CUDA");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input tensor must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input tensor must be 4-dimensional (N, C, H, W)");
++    TORCH_CHECK(size > 0, "size must be positive");
++
++    auto output = torch::empty_like(x);
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Determine if contiguous; if not, use strided launcher with actual strides
++    if (x.is_contiguous()) {
++        lrn_forward_launcher(
++            output.data_ptr<float>(),
++            x.data_ptr<float>(),
++            N, C, H, W,
++            static_cast<int>(size),
++            static_cast<float>(alpha),
++            static_cast<float>(beta),
++            static_cast<float>(k),
++            stream);
++    } else {
++        int stride_n = x.stride(0);
++        int stride_c = x.stride(1);
++        int stride_h = x.stride(2);
++        int stride_w = x.stride(3);
++        lrn_forward_strided_launcher(
++            output.data_ptr<float>(),
++            x.data_ptr<float>(),
++            N, C, H, W,
++            static_cast<int>(size),
++            static_cast<float>(alpha),
++            static_cast<float>(beta),
++            static_cast<float>(k),
++            stride_n, stride_c, stride_h, stride_w,
++            stream);
++    }
++
++    return output;
++}
++
++// Registration
++void register_lrn_forward(pybind11::module& m) {
++    m.def("lrn_forward", &lrn_forward,
++          "Local Response Normalization forward",
++          py::arg("x"), py::arg("size"), py::arg("alpha"), py::arg("beta"), py::arg("k"));
++}
++
++REGISTER_BINDING(lrn_forward, register_lrn_forward);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, norm_size, alpha, beta, k):
++        super().__init__()
++        self.norm_size = norm_size
++        self.alpha = alpha
++        self.beta = beta
++        self.k = k
++
++    def forward(self, x):
++        x = cuda_extension.lrn_forward(x, self.norm_size, self.alpha, self.beta, self.k)
++        return x
++
++    def debug_forward(self, x):
++        out = cuda_extension.lrn_forward(x, self.norm_size, self.alpha, self.beta, self.k)
++        yield ('step_001', out)
++        yield ('step_002', out)

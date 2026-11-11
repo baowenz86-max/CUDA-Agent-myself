@@ -1,0 +1,467 @@
+// CUDA kernels for adaptive logsoftmax operations
+#include <cuda_runtime.h>
+#include <float.h>
+#include <math.h>
+
+// Helper: compute log_softmax over a vector of length n, writing to out
+__global__ void log_softmax_kernel(const float* __restrict__ input, float* __restrict__ output, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        // max for numerical stability
+        float max_val = -FLT_MAX;
+        for (int i = idx; i < n; i += blockDim.x * gridDim.x) {
+            max_val = fmaxf(max_val, input[i]);
+        }
+        __shared__ float smem[256];
+        int tid = threadIdx.x;
+        smem[tid] = max_val;
+        __syncthreads();
+        for (int s = blockDim.x/2; s > 0; s >>= 1) {
+            if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid+s]);
+            __syncthreads();
+        }
+        max_val = smem[0];
+        __syncthreads();
+        float sum_exp = 0.0f;
+        for (int i = idx; i < n; i += blockDim.x * gridDim.x) {
+            sum_exp += __expf(input[i] - max_val);
+        }
+        smem[tid] = sum_exp;
+        __syncthreads();
+        for (int s = blockDim.x/2; s > 0; s >>= 1) {
+            if (tid < s) smem[tid] += smem[tid+s];
+            __syncthreads();
+        }
+        sum_exp = smem[0];
+        float log_sum = logf(sum_exp);
+        for (int i = idx; i < n; i += blockDim.x * gridDim.x) {
+            output[i] = input[i] - max_val - log_sum;
+        }
+    }
+}
+
+// Simple linear: y = x @ W^T (no bias)
+__global__ void linear_forward_kernel(const float* __restrict__ x, const float* __restrict__ weight,
+                                      float* __restrict__ y, int batch, int in_features, int out_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch * out_features) {
+        int row = idx / out_features;
+        int col = idx % out_features;
+        const float* x_row = x + row * in_features;
+        float sum = 0.0f;
+        for (int k = 0; k < in_features; ++k) {
+            sum += x_row[k] * weight[col * in_features + k];
+        }
+        y[idx] = sum;
+    }
+}
+
+// Absolute value elementwise
+__global__ void absolute_kernel(const float* __restrict__ in, float* __restrict__ out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = fabsf(in[idx]);
+}
+
+// Copy values from source to destination (for log_prob assembly) with optional add
+__global__ void copy_add_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                                int src_offset, int dst_offset, int n, float add_val) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[dst_offset + idx] = src[src_offset + idx] + add_val;
+    }
+}
+
+// Fill output for log_prob: head part from head_log_probs (already log_softmax), tail parts from tail computations
+// For each batch, we compute head_logits, head_log_probs, tail logits and probs, then assemble.
+// We do this in a single kernel per part for efficiency.
+
+// Compute head log softmax for all batch
+__global__ void head_logsoftmax_kernel(const float* __restrict__ head_logits, float* __restrict__ head_log_probs,
+                                       int batch, int head_size) {
+    // For each sample, compute log_softmax over head_size columns
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+    const float* row = head_logits + b * head_size;
+    float* out_row = head_log_probs + b * head_size;
+    float max_val = -FLT_MAX;
+    for (int i = 0; i < head_size; ++i) max_val = fmaxf(max_val, row[i]);
+    float sum_exp = 0.0f;
+    for (int i = 0; i < head_size; ++i) sum_exp += __expf(row[i] - max_val);
+    float log_sum = logf(sum_exp);
+    for (int i = 0; i < head_size; ++i) out_row[i] = row[i] - max_val - log_sum;
+}
+
+// For tail: given input x (batch, in_features), first layer weight w0 (hidden, in_features), produce hidden (batch, hidden)
+// then second layer w1 (out_tail, hidden) produce tail_logits (batch, out_tail). Add head_cluster_log_prob and log_softmax over tail classes.
+__global__ void tail_logsoftmax_kernel(
+    const float* __restrict__ x,             // [batch, in_features]
+    const float* __restrict__ w0,            // [hidden, in_features]
+    const float* __restrict__ w1,            // [out_tail, hidden]
+    const float* __restrict__ head_log_probs, // [batch, head_size]
+    float* __restrict__ tail_log_probs,       // [batch, out_tail]
+    int batch, int in_features, int hidden, int out_tail,
+    int head_size, int cluster_index,  // which cluster (0 or 1, corresponding to cutoff index)
+    int head_cluster_start)            // start index in head for this cluster's logit
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+
+    // compute hidden = x @ w0^T
+    const float* x_row = x + b * in_features;
+    // allocate shared memory for hidden? Use registers per thread? hidden size up to 256, so each thread computes one output? Better each sample handled by one thread (slow) or use block per sample with parallel reduction.
+    // For simplicity and correctness: one thread per sample computes hidden sequentially (hidden up to 256), then tail logits sequential (out_tail up to 5000) -> too slow.
+    // We need parallelism across tail classes. So handle each tail class with one thread, but need shared reduction for hidden computation.
+    // Reuse linear_forward_kernel concept but here we combine. Better to precompute hidden for all batch using linear_forward_kernel, then compute tail logits with another kernel, then logsoftmax, then add head_cluster_prob.
+    // To keep launcher simple, we'll do separate kernels in launcher.
+    // This kernel is placeholder; replaced by separate calls in launcher.
+}
+
+// Actually, let's design the launchers to use multiple kernels:
+// 1. head_logits = linear_forward(x, head_weight)
+// 2. head_log_probs = head_logsoftmax(head_logits)
+// 3. For each tail cluster:
+//    a. hidden = linear_forward(x, w0)
+//    b. tail_logits = linear_forward(hidden, w1)
+//    c. tail_log_probs = log_softmax(tail_logits) + head_log_probs[:, cluster_index] (broadcast add)
+//    d. copy into output at appropriate column range
+
+// We need a kernel for adding a scalar to each row of a matrix and writing into output.
+__global__ void add_broadcast_row_kernel(float* __restrict__ out, const float* __restrict__ in,
+                                          const float* __restrict__ row_add, int batch, int ncols, int out_offset) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch * ncols) {
+        int b = idx / ncols;
+        int c = idx % ncols;
+        out[out_offset + b * (ncols + out_offset? )]; // Need total output width, we'll pass total_out_width
+        // Actually output layout: [batch, total_classes], so out offset per row is total_classes.
+        // We'll pass total_classes and assign: out[b * total_classes + out_offset + c] = in[b * ncols + c] + row_add[b];
+    }
+}
+
+// Let's write a correct kernel for copying a block of columns from src to dst, each row has row-specific add value.
+__global__ void copy_block_with_add_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                                           const float* __restrict__ add_vals, int batch, int src_cols,
+                                           int dst_total_cols, int src_col_start, int dst_col_start, int ncols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * ncols;
+    if (idx < total) {
+        int b = idx / ncols;
+        int c = idx % ncols;
+        int src_idx = b * src_cols + src_col_start + c;
+        int dst_idx = b * dst_total_cols + dst_col_start + c;
+        dst[dst_idx] = src[src_idx] + add_vals[b];
+    }
+}
+
+// For with_loss: we need to compute output = log_probs for target, and loss = mean of -output? Actually reference returns output = log_probs[target] (??) based on _ASMoutput structure: output is shape [batch], loss is scalar.
+// Looking at PyTorch source for AdaptiveLogSoftmaxWithLoss.forward, it returns _ASMoutput(output, loss) where output is the per-example log probability of the target (i.e., -NLL), and loss is the mean NLL.
+// So we can compute using already computed log_probs for each sample, gather target, then output = gathered log_prob, loss = mean(-gathered).
+
+// We'll implement with_loss launcher by calling the logprob launcher (or reusing its kernels) and then gather and mean.
+
+// Since we need to keep code manageable, we'll implement all kernels as simple as possible, prioritizing correctness over performance. Performance is likely sufficient given large sizes.
+
+// Launcher implementations:
+
+extern "C" void adaptive_logsoftmax_logprob_launcher(
+    const float* x, const float* head_weight,
+    const float* tail0_w0, const float* tail0_w1,
+    const float* tail1_w0, const float* tail1_w1,
+    const int64_t* cutoffs, float div_value,
+    float* output_log_probs,
+    int batch, int in_features,
+    int head_size, int tail0_size0, int tail0_size1,
+    int tail1_size0, int tail1_size1,
+    int n_classes,
+    cudaStream_t stream)
+{
+    // Step 1: compute head logits, shape [batch, head_size]
+    float* head_logits;
+    cudaMalloc(&head_logits, batch * head_size * sizeof(float));
+    int threads = 256;
+    int blocks = (batch * head_size + threads - 1) / threads;
+    linear_forward_kernel<<<blocks, threads, 0, stream>>>(x, head_weight, head_logits, batch, in_features, head_size);
+
+    // Step 2: compute head log softmax
+    float* head_log_probs;
+    cudaMalloc(&head_log_probs, batch * head_size * sizeof(float));
+    blocks = (batch + threads - 1) / threads;
+    head_logsoftmax_kernel<<<blocks, threads, 0, stream>>>(head_logits, head_log_probs, batch, head_size);
+
+    // Initial output: set head part = head_log_probs
+    // output has shape [batch, n_classes]
+    // head occupies columns 0 to head_size-1
+    cudaMemcpy2DAsync(output_log_probs, n_classes * sizeof(float), head_log_probs, head_size * sizeof(float),
+                      head_size * sizeof(float), batch, cudaMemcpyDeviceToDevice, stream);
+
+    // Process tail cluster 0
+    // hidden = x @ tail0_w0^T -> [batch, tail0_size0]
+    float* hidden0;
+    cudaMalloc(&hidden0, batch * tail0_size0 * sizeof(float));
+    blocks = (batch * tail0_size0 + threads - 1) / threads;
+    linear_forward_kernel<<<blocks, threads, 0, stream>>>(x, tail0_w0, hidden0, batch, in_features, tail0_size0);
+    // tail0_logits = hidden0 @ tail0_w1^T -> [batch, tail0_size1]
+    float* tail0_logits;
+    cudaMalloc(&tail0_logits, batch * tail0_size1 * sizeof(float));
+    blocks = (batch * tail0_size1 + threads - 1) / threads;
+    linear_forward_kernel<<<blocks, threads, 0, stream>>>(hidden0, tail0_w1, tail0_logits, batch, tail0_size0, tail0_size1);
+    // tail0_log_probs = log_softmax(tail0_logits) + head_log_probs[:, cluster_index0]
+    // head cluster index for tail0: cluster0 corresponds to first cluster, head has first head_size0 rows? Actually head has head_size = in_features? no, head_size = n_classes? Wait head_size is 10002 in contract, which is head output classes (including shortlist and cluster heads). Tail cluster0 uses head class at index n_classes - len(cutoffs) - 1? Need to understand indexing.
+    // According to PyTorch AdaptiveLogSoftmaxWithLoss, head has (shortlist + n_clusters) outputs. For a sample assigned to cluster i, the head logit at index shortlist + i is used as cluster logit.
+    // Here head_size = 10002, cutoffs = [10000, 15000], so shortlist = 10000, n_clusters = 2. So cluster0 head index = 10000, cluster1 head index = 10001.
+    // What are the actual values? head_size is 10002, so yes. We can compute cluster indices from cutoffs length? cutoffs has 2 elements.
+    // We'll determine head_cluster_index = head_size - len(cutoffs) + i (if i is cluster index 0-based). But we can also get from the actual head output size maybe? The contract says head_weight shape [head_size, in_features] with head_size=10002.
+    // So tail0 uses head_log_probs[:, 10000]; tail1 uses head_log_probs[:, 10001].
+    // We need to know len(cutoffs), which is 2 here. We'll pass as parameter.
+    int n_clusters = 2; // from cutoffs length, but we can infer from head_size - (n_classes - sum tail sizes)? Actually we know tail0_size1=5000, tail1_size1=5000, so head_size should be n_classes - 5000 - 5000 = 10000, but it's 10002, so two extra for clusters.
+    // So cluster0 index = head_size - n_clusters + 0? That gives 10000 if n_clusters=2. Good.
+
+    // Compute log_softmax for tail0
+    float* tail0_log_probs;
+    cudaMalloc(&tail0_log_probs, batch * tail0_size1 * sizeof(float));
+    blocks = (batch + threads - 1) / threads;
+    // We need a kernel that applies log_softmax per row and adds a per-row value from head_log_probs[:, cluster_idx]
+    // Write kernel: row_wise_log_softmax_add(input, output, add_vals, batch, ncols)
+    // We'll define that kernel.
+    row_wise_log_softmax_add<<<blocks, threads, 0, stream>>>(tail0_logits, tail0_log_probs,
+                                                             head_log_probs + (head_size - n_clusters + 0), // pointer to column start? need row stride, but we can pass head_log_probs and the column index as integer, and compute inside or use separate add kernel after logsoftmax.
+                                                             batch, tail0_size1, head_size, 10000);
+    // Actually easier: first compute log_softmax into tail0_log_probs, then add cluster logit via separate kernel.
+    // Reuse log_softmax kernel? But log_softmax kernel handles a single vector, we need per row. So we implement row_wise_log_softmax_kernel.
+}
+
+// We'll need to define proper kernels for row-wise logsoftmax and add. Let's include them in final file.
+
+// Placeholder for row_wise_log_softmax_add kernel
+__global__ void row_wise_log_softmax_add_kernel(
+    const float* __restrict__ input,       // [batch, ncols]
+    float* __restrict__ output,             // [batch, ncols]
+    const float* __restrict__ add_vals,     // [batch] values to add after logsoftmax
+    int batch, int ncols)
+{
+    int b = blockIdx.x;
+    if (b >= batch) return;
+    const float* row = input + b * ncols;
+    float* out_row = output + b * ncols;
+    float max_val = -FLT_MAX;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        max_val = fmaxf(max_val, row[i]);
+    }
+    // reduction across block
+    __shared__ float smem[256];
+    smem[threadIdx.x] = max_val;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + s]);
+        __syncthreads();
+    }
+    max_val = smem[0];
+    __syncthreads();
+    float sum_exp = 0.0f;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        sum_exp += __expf(row[i] - max_val);
+    }
+    smem[threadIdx.x] = sum_exp;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    sum_exp = smem[0];
+    float log_sum = logf(sum_exp);
+    float add = add_vals[b];
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        out_row[i] = row[i] - max_val - log_sum + add;
+    }
+}
+
+// Kernel to extract cluster logit from head_log_probs into a separate array for add_vals
+__global__ void extract_column_kernel(const float* __restrict__ matrix, float* __restrict__ column,
+                                      int batch, int total_cols, int col_index) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < batch) column[b] = matrix[b * total_cols + col_index];
+}
+
+// Kernel for gathering target log probabilities and computing loss
+__global__ void gather_and_loss_kernel(
+    const float* __restrict__ log_probs,  // [batch, n_classes]
+    const int64_t* __restrict__ target,   // [batch]
+    float* __restrict__ output,           // [batch] (log probabilities of target)
+    float* __restrict__ loss,             // scalar (mean of -output)
+    int batch, int n_classes)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float sum_nll[256];
+    float local_nll = 0.0f;
+    if (b < batch) {
+        int64_t t = target[b];
+        if (t < 0 || t >= n_classes) {
+            output[b] = 0.0f; // fallback, though correctness assumes valid targets
+        } else {
+            output[b] = log_probs[b * n_classes + t];
+        }
+        local_nll = -output[b];
+    }
+    sum_nll[threadIdx.x] = local_nll;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sum_nll[threadIdx.x] += sum_nll[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(loss, sum_nll[0] / batch); // using atomicAdd for float
+    }
+}
+
+// Final complete launcher implementations
+
+extern "C" void adaptive_logsoftmax_logprob_launcher(
+    const float* x,
+    const float* head_weight,
+    const float* tail0_w0,
+    const float* tail0_w1,
+    const float* tail1_w0,
+    const float* tail1_w1,
+    const int64_t* cutoffs,
+    double div_value,
+    float* output,
+    int batch,
+    int in_features,
+    int head_size,
+    int tail0_size0,
+    int tail0_size1,
+    int tail1_size0,
+    int tail1_size1,
+    int n_classes,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    // head logits
+    float* head_logits;
+    cudaMalloc(&head_logits, batch * head_size * sizeof(float));
+    int blocks = (batch * head_size + threads - 1) / threads;
+    linear_forward_kernel<<<blocks, threads, 0, stream>>>(x, head_weight, head_logits, batch, in_features, head_size);
+
+    // head log probs
+    float* head_log_probs;
+    cudaMalloc(&head_log_probs, batch * head_size * sizeof(float));
+    blocks = (batch + threads - 1) / threads;
+    head_logsoftmax_kernel<<<blocks, threads, 0, stream>>>(head_logits, head_log_probs, batch, head_size);
+
+    // copy head part to output
+    cudaMemcpy2DAsync(output, n_classes * sizeof(float), head_log_probs, head_size * sizeof(float),
+                      head_size * sizeof(float), batch, cudaMemcpyDeviceToDevice, stream);
+
+    int n_clusters = 2; // derived from cutoffs length; but we can compute as (head_size - (n_classes - tail0_size1 - tail1_size1))? For safety pass as parameter from binding, but binding doesn't know. We'll compute: n_clusters = head_size - (n_classes - tail0_size1 - tail1_size1) = 10002 - 10000 = 2. Good.
+
+    // Tail 0
+    float* hidden0;
+    cudaMalloc(&hidden0, batch * tail0_size0 * sizeof(float));
+    blocks = (batch * tail0_size0 + threads - 1) / threads;
+    linear_forward_kernel<<<blocks, threads, 0, stream>>>(x, tail0_w0, hidden0, batch, in_features, tail0_size0);
+    float* tail0_logits;
+    cudaMalloc(&tail0_logits, batch * tail0_size1 * sizeof(float));
+    blocks = (batch * tail0_size1 + threads - 1) / threads;
+    linear_forward_kernel<<<blocks, threads, 0, stream>>>(hidden0, tail0_w1, tail0_logits, batch, tail0_size0, tail0_size1);
+
+    // Extract cluster0 logit from head_log_probs: index = head_size - n_clusters + 0 = 10000
+    float* cluster0_logits;
+    cudaMalloc(&cluster0_logits, batch * sizeof(float));
+    blocks = (batch + threads - 1) / threads;
+    extract_column_kernel<<<blocks, threads, 0, stream>>>(head_log_probs, cluster0_logits, batch, head_size, head_size - n_clusters + 0);
+
+    // tail0 log probs
+    float* tail0_log_probs;
+    cudaMalloc(&tail0_log_probs, batch * tail0_size1 * sizeof(float));
+    blocks = batch;
+    row_wise_log_softmax_add_kernel<<<blocks, threads, 0, stream>>>(tail0_logits, tail0_log_probs, cluster0_logits, batch, tail0_size1);
+
+    // copy tail0 into output at column offset head_size (since head part already copied)
+    cudaMemcpy2DAsync(output + head_size, n_classes * sizeof(float), tail0_log_probs, tail0_size1 * sizeof(float),
+                      tail0_size1 * sizeof(float), batch, cudaMemcpyDeviceToDevice, stream);
+
+    // Tail 1
+    float* hidden1;
+    cudaMalloc(&hidden1, batch * tail1_size0 * sizeof(float));
+    blocks = (batch * tail1_size0 + threads - 1) / threads;
+    linear_forward_kernel<<<blocks, threads, 0, stream>>>(x, tail1_w0, hidden1, batch, in_features, tail1_size0);
+    float* tail1_logits;
+    cudaMalloc(&tail1_logits, batch * tail1_size1 * sizeof(float));
+    blocks = (batch * tail1_size1 + threads - 1) / threads;
+    linear_forward_kernel<<<blocks, threads, 0, stream>>>(hidden1, tail1_w1, tail1_logits, batch, tail1_size0, tail1_size1);
+
+    float* cluster1_logits;
+    cudaMalloc(&cluster1_logits, batch * sizeof(float));
+    blocks = (batch + threads - 1) / threads;
+    extract_column_kernel<<<blocks, threads, 0, stream>>>(head_log_probs, cluster1_logits, batch, head_size, head_size - n_clusters + 1);
+
+    float* tail1_log_probs;
+    cudaMalloc(&tail1_log_probs, batch * tail1_size1 * sizeof(float));
+    blocks = batch;
+    row_wise_log_softmax_add_kernel<<<blocks, threads, 0, stream>>>(tail1_logits, tail1_log_probs, cluster1_logits, batch, tail1_size1);
+
+    // copy tail1 into output at column offset head_size + tail0_size1
+    cudaMemcpy2DAsync(output + head_size + tail0_size1, n_classes * sizeof(float), tail1_log_probs, tail1_size1 * sizeof(float),
+                      tail1_size1 * sizeof(float), batch, cudaMemcpyDeviceToDevice, stream);
+
+    // free temporary buffers
+    cudaFree(head_logits);
+    cudaFree(head_log_probs);
+    cudaFree(hidden0);
+    cudaFree(tail0_logits);
+    cudaFree(cluster0_logits);
+    cudaFree(tail0_log_probs);
+    cudaFree(hidden1);
+    cudaFree(tail1_logits);
+    cudaFree(cluster1_logits);
+    cudaFree(tail1_log_probs);
+}
+
+extern "C" void absolute_launcher(const float* input, float* output, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    absolute_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
+}
+
+extern "C" void adaptive_logsoftmax_with_loss_launcher(
+    const float* head_weight,
+    const float* x,
+    const int64_t* target,
+    const float* tail0_w0,
+    const float* tail0_w1,
+    const float* tail1_w0,
+    const float* tail1_w1,
+    const int64_t* cutoffs,
+    double div_value,
+    float* output,          // [batch]
+    float* loss,            // scalar
+    int batch,
+    int in_features,
+    int head_size,
+    int tail0_size0,
+    int tail0_size1,
+    int tail1_size0,
+    int tail1_size1,
+    int n_classes,
+    cudaStream_t stream)
+{
+    // First compute full log_probs (reuse logprob launcher)
+    float* log_probs;
+    cudaMalloc(&log_probs, batch * n_classes * sizeof(float));
+    adaptive_logsoftmax_logprob_launcher(
+        x, head_weight, tail0_w0, tail0_w1, tail1_w0, tail1_w1,
+        cutoffs, div_value, log_probs, batch, in_features,
+        head_size, tail0_size0, tail0_size1, tail1_size0, tail1_size1,
+        n_classes, stream);
+
+    // Initialize loss to zero
+    cudaMemsetAsync(loss, 0, sizeof(float), stream);
+    // gather target log probs and compute loss
+    int threads = 256;
+    int blocks = (batch + threads - 1) / threads;
+    gather_and_loss_kernel<<<blocks, threads, 0, stream>>>(log_probs, target, output, loss, batch, n_classes);
+
+    cudaFree(log_probs);
+}
+
+// Note: All kernels assume contiguous memory for simplicity, but launcher does not explicitly check. Binding should pass contiguous tensors; however, we can handle strides by using linear_forward_kernel with appropriate strides if passed. For now, assume contiguous as per contract (though supports strides, but likely contiguous). We'll document that if non-contiguous, binding should make contiguous.

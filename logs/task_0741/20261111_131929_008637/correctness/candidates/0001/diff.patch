@@ -1,0 +1,275 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,142 @@
++#include <cuda_runtime.h>
++
++// Softmax along dimension 1 (channels) for 3D tensor [batch, channels, length]
++// Input and output are contiguous float32 tensors.
++__global__ void softmax_forward_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int batch,
++    int channels,
++    int length)
++{
++    // Each thread block handles one (batch, length) position, reducing over channels.
++    // blockIdx.x = batch*length + length_idx, or use 2D grid for clarity.
++    int total_positions = batch * length;
++    int pos = blockIdx.x;
++    if (pos >= total_positions) return;
++
++    int b = pos / length;
++    int l = pos % length;
++
++    const float* in_ptr = input + b * channels * length + l;
++    float* out_ptr = output + b * channels * length + l;
++
++    // Compute max over channels using block reduction.
++    extern __shared__ float smem[];
++    float* s_max = smem;
++    float* s_sum = smem + blockDim.x;
++
++    int tid = threadIdx.x;
++    float local_max = -INFINITY;
++    for (int c = tid; c < channels; c += blockDim.x) {
++        float val = in_ptr[c * length];
++        if (val > local_max) local_max = val;
++    }
++
++    // Block reduction for max
++    s_max[tid] = local_max;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            if (s_max[tid + stride] > s_max[tid]) s_max[tid] = s_max[tid + stride];
++        }
++        __syncthreads();
++    }
++    float block_max = s_max[0];
++
++    // Compute exp(x - max) and sum
++    float local_sum = 0.0f;
++    for (int c = tid; c < channels; c += blockDim.x) {
++        float val = in_ptr[c * length];
++        float exp_val = expf(val - block_max);
++        local_sum += exp_val;
++        // Store exp values in shared memory for second pass (optional, we recompute)
++        // To avoid recomputing exp, we can write to shared memory but channels may be large.
++        // Recomputing exp is acceptable for now.
++    }
++
++    // Block reduction for sum
++    s_sum[tid] = local_sum;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            s_sum[tid] += s_sum[tid + stride];
++        }
++        __syncthreads();
++    }
++    float block_sum = s_sum[0];
++
++    // Normalize and write output
++    float inv_sum = 1.0f / block_sum;
++    for (int c = tid; c < channels; c += blockDim.x) {
++        float val = in_ptr[c * length];
++        out_ptr[c * length] = expf(val - block_max) * inv_sum;
++    }
++}
++
++// ConstantPad1d kernel: pads the last dimension with a constant value on both sides.
++// padding is the number of elements to add on each side (same left and right).
++__global__ void pad_forward_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int batch,
++    int channels,
++    int length,
++    int padding,
++    float value)
++{
++    int output_length = length + 2 * padding;
++    int total_elements = batch * channels * output_length;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total_elements) return;
++
++    int l = idx % output_length;
++    int rem = idx / output_length;
++    int c = rem % channels;
++    int b = rem / channels;
++
++    if (l < padding || l >= padding + length) {
++        output[idx] = value;
++    } else {
++        int input_l = l - padding;
++        int input_idx = (b * channels + c) * length + input_l;
++        output[idx] = input[input_idx];
++    }
++}
++
++extern "C" void softmax_forward_launcher(
++    float* output,
++    const float* input,
++    int batch,
++    int channels,
++    int length,
++    cudaStream_t stream)
++{
++    int total_positions = batch * length;
++    int threads = 256;
++    int blocks = total_positions;
++    size_t shared_mem_size = 2 * threads * sizeof(float);
++
++    softmax_forward_kernel<<<blocks, threads, shared_mem_size, stream>>>(
++        input, output, batch, channels, length);
++}
++
++extern "C" void pad_forward_launcher(
++    float* output,
++    const float* input,
++    int batch,
++    int channels,
++    int length,
++    int padding,
++    double value,
++    cudaStream_t stream)
++{
++    int output_length = length + 2 * padding;
++    int total_elements = batch * channels * output_length;
++    int threads = 256;
++    int blocks = (total_elements + threads - 1) / threads;
++    float value_float = (float)value;
++
++    pad_forward_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, batch, channels, length, padding, value_float);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,98 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void softmax_forward_launcher(
++    float* output,
++    const float* input,
++    int batch,
++    int channels,
++    int length,
++    cudaStream_t stream
++);
++
++extern "C" void pad_forward_launcher(
++    float* output,
++    const float* input,
++    int batch,
++    int channels,
++    int length,
++    int padding,
++    double value,
++    cudaStream_t stream
++);
++
++// Wrapper for softmax_forward
++torch::Tensor softmax_forward(torch::Tensor x, int64_t dim) {
++    TORCH_CHECK(x.is_cuda(), "softmax_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "softmax_forward: input must be float32");
++    TORCH_CHECK(x.dim() == 3, "softmax_forward: input must be 3D (batch, channels, length)");
++    TORCH_CHECK(x.is_contiguous(), "softmax_forward: input must be contiguous");
++    TORCH_CHECK(dim == 1, "softmax_forward: only dim=1 is supported");
++
++    int batch = x.size(0);
++    int channels = x.size(1);
++    int length = x.size(2);
++
++    auto output = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    softmax_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        batch,
++        channels,
++        length,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "softmax_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Wrapper for pad_forward
++torch::Tensor pad_forward(torch::Tensor x, int64_t padding, double value) {
++    TORCH_CHECK(x.is_cuda(), "pad_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "pad_forward: input must be float32");
++    TORCH_CHECK(x.dim() == 3, "pad_forward: input must be 3D (batch, channels, length)");
++    TORCH_CHECK(x.is_contiguous(), "pad_forward: input must be contiguous");
++    TORCH_CHECK(padding >= 0, "pad_forward: padding must be non-negative");
++
++    int batch = x.size(0);
++    int channels = x.size(1);
++    int length = x.size(2);
++    int output_length = length + 2 * padding;
++
++    auto output = torch::empty({batch, channels, output_length}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    pad_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        batch,
++        channels,
++        length,
++        static_cast<int>(padding),
++        value,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "pad_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("softmax_forward", &softmax_forward, "Softmax along dim=1",
++          py::arg("x"), py::arg("dim"));
++    m.def("pad_forward", &pad_forward, "Constant pad along last dimension",
++          py::arg("x"), py::arg("padding"), py::arg("value"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, padding, value):
++        super().__init__()
++        self.padding = padding
++        self.value = value
++
++    def forward(self, x):
++        x = cuda_extension.softmax_forward(x, dim=1)
++        x = cuda_extension.pad_forward(x, padding=self.padding, value=self.value)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        step = 0
++        yield ('step_001', cuda_extension.softmax_forward(x, dim=1))
++        x = cuda_extension.softmax_forward(x, dim=1)
++        step += 1
++        yield ('step_002', cuda_extension.pad_forward(x, padding=self.padding, value=self.value))
++        x = cuda_extension.pad_forward(x, padding=self.padding, value=self.value)
++        step += 1
++        yield ('step_003', x)

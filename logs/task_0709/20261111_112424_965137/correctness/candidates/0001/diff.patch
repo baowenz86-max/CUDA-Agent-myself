@@ -1,0 +1,234 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,112 @@
++#include <cuda_runtime.h>
++
++// 计算直方图：输入 float32 张量，统计 bins 个区间 [min + i*width, min + (i+1)*width)
++// 最后一个区间包含 max，超出 [min, max] 的值忽略。
++// 原子加累加，输出 float32 数组。
++__global__ void histc_kernel(
++    const float* __restrict__ input,
++    int64_t total_elements,
++    float* __restrict__ output,
++    int64_t bins,
++    float min_val,
++    float max_val
++) {
++    // 计算 bin 宽度
++    float width = (max_val - min_val) / static_cast<float>(bins);
++    // 使用 grid-stride loop
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        float value = input[i];
++        // 检查是否在 [min_val, max_val] 范围内
++        if (value < min_val || value > max_val) {
++            continue;
++        }
++        // 计算 bin 索引
++        int64_t bin;
++        if (value == max_val) {
++            // 最后一个 bin 包含 max
++            bin = bins - 1;
++        } else {
++            bin = static_cast<int64_t>((value - min_val) / width);
++            // 数值容错，确保 bin 不超过 bins-1
++            if (bin >= bins) {
++                bin = bins - 1;
++            }
++            if (bin < 0) {
++                bin = 0;
++            }
++        }
++        atomicAdd(&output[bin], 1.0f);
++    }
++}
++
++// launcher: compute_histc
++// 输入：input 指针，total_elements, bins, min, max, stream
++// 输出：output 指针（需预先分配 bins 个 float 并初始化为 0）
++extern "C" void compute_histc_launcher(
++    const float* input,
++    int64_t total_elements,
++    float* output,
++    int64_t bins,
++    float min_val,
++    float max_val,
++    cudaStream_t stream
++) {
++    // 检查 bins 合法性
++    if (bins <= 0 || total_elements <= 0) {
++        return;
++    }
++    // 初始化 output 为 0（调用者可能传入未初始化的 tensor，需要先归零）
++    // 这里用 cudaMemsetAsync 在 launcher 中完成
++    cudaMemsetAsync(output, 0, bins * sizeof(float), stream);
++
++    // 配置 kernel launch
++    int threads = 256;
++    int blocks = static_cast<int>((total_elements + threads - 1) / threads);
++    // 限制最大 blocks 数量，避免一次性启动过多
++    const int max_blocks = 65535;
++    if (blocks > max_blocks) {
++        blocks = max_blocks;
++    }
++    // 启动 kernel（使用 grid-stride loop，所以 blocks 可以限制）
++    histc_kernel<<<blocks, threads, 0, stream>>>(
++        input,
++        total_elements,
++        output,
++        bins,
++        min_val,
++        max_val
++    );
++}
++
++// cat_histc 的 launcher：输入已经是扁平连续张量，语义为原样返回，
++// 但绑定层可能调用此 launcher 进行复制（实现见 binding.cpp）。
++// 此处提供空操作，binding 阶段可直接返回输入或调用复制。
++extern "C" void cat_histc_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    cudaStream_t stream
++) {
++    // 简单拷贝 kernel，也可由 binding 直接返回输入，但为了演示提供 launcher
++    // 如果 output != input，则进行拷贝
++    if (input == output) {
++        return;
++    }
++    int threads = 256;
++    int blocks = static_cast<int>((total_elements + threads - 1) / threads);
++    const int max_blocks = 65535;
++    if (blocks > max_blocks) {
++        blocks = max_blocks;
++    }
++    // 定义拷贝 kernel
++    auto copy_kernel = [=] __global__ (const float* in, float* out, int64_t n) {
++        int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
++        int64_t stride = blockDim.x * gridDim.x;
++        for (; i < n; i += stride) {
++            out[i] = in[i];
++        }
++    };
++    copy_kernel<<<blocks, threads, 0, stream>>>(input, output, total_elements);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,87 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// 声明 launcher 函数
++extern "C" void compute_histc_launcher(
++    const float* input,
++    int64_t total_elements,
++    float* output,
++    int64_t bins,
++    float min_val,
++    float max_val,
++    cudaStream_t stream
++);
++
++extern "C" void cat_histc_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    cudaStream_t stream
++);
++
++// compute_histc 包装函数
++torch::Tensor compute_histc(torch::Tensor input, int64_t bins, double min, double max) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(bins > 0, "bins must be positive");
++
++    auto output = torch::empty({bins}, input.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    compute_histc_launcher(
++        input.data_ptr<float>(),
++        input.numel(),
++        output.data_ptr<float>(),
++        bins,
++        static_cast<float>(min),
++        static_cast<float>(max),
++        stream
++    );
++
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "compute_histc_launcher failed");
++    return output;
++}
++
++// cat_histc 包装函数
++torch::Tensor cat_histc(torch::Tensor histc_list, int64_t num_images, int64_t bins) {
++    TORCH_CHECK(histc_list.is_cuda(), "histc_list must be a CUDA tensor");
++    TORCH_CHECK(histc_list.dtype() == torch::kFloat32, "histc_list must be float32");
++    TORCH_CHECK(histc_list.is_contiguous(), "histc_list must be contiguous");
++    TORCH_CHECK(num_images > 0, "num_images must be positive");
++    TORCH_CHECK(bins > 0, "bins must be positive");
++    TORCH_CHECK(histc_list.numel() == num_images * bins, "histc_list numel mismatch");
++
++    auto output = torch::empty({num_images * bins}, histc_list.options());
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    cat_histc_launcher(
++        histc_list.data_ptr<float>(),
++        output.data_ptr<float>(),
++        histc_list.numel(),
++        stream
++    );
++
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "cat_histc_launcher failed");
++    return output;
++}
++
++// 注册函数
++void register_custom_ops(pybind11::module& m) {
++    m.def("compute_histc", &compute_histc,
++          "Compute histogram of a CUDA tensor",
++          py::arg("input"),
++          py::arg("bins"),
++          py::arg("min"),
++          py::arg("max"));
++    m.def("cat_histc", &cat_histc,
++          "Concatenate histograms along dim 0",
++          py::arg("histc_list"),
++          py::arg("num_images"),
++          py::arg("bins"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_images, num_bins, bins_range):
++        super().__init__()
++        self.num_images = num_images
++        self.num_bins = num_bins
++        self.bins_range = bins_range
++
++    def forward(self, x):
++        xs = torch.chunk(x, chunks=self.num_images, dim=0)
++        ys = [cuda_extension.compute_histc(chunk, self.num_bins, self.bins_range[0], self.bins_range[1]) for chunk in xs]
++        y = cuda_extension.cat_histc(torch.stack(ys), self.num_images, self.num_bins)
++        return y
++
++    def debug_forward(self, x):
++        xs = torch.chunk(x, chunks=self.num_images, dim=0)
++        yield 'step_001', xs
++        ys = [cuda_extension.compute_histc(chunk, self.num_bins, self.bins_range[0], self.bins_range[1]) for chunk in xs]
++        yield 'step_002', ys
++        y = cuda_extension.cat_histc(torch.stack(ys), self.num_images, self.num_bins)
++        yield 'step_003', y
++        yield 'step_004', y

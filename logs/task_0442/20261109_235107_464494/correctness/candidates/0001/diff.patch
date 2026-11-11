@@ -1,0 +1,310 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,144 @@
++// CUDA kernels for custom_abs_forward and custom_pad_forward operations.
++// This file contains only CUDA kernels and host launchers with raw pointers.
++// No PyTorch/Tensor dependencies.
++
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// -----------------------------------------------------------------------------
++// Kernel: abs_forward_kernel
++// Computes output[i] = fabsf(input[i]) for all elements.
++// Supports arbitrary input strides by using a linear index over the total number
++// of elements; assumes input and output have identical shape and strides.
++// -----------------------------------------------------------------------------
++__global__ void abs_forward_kernel(
++    float* output,
++    const float* input,
++    int64_t numel)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = fabsf(input[i]);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Kernel: pad_forward_kernel
++// Copies input tensor into output tensor with zero padding.
++// Output tensor shape: [N, C, H_out, W_out] where
++// H_out = H + pad_top + pad_bottom, W_out = W + pad_left + pad_right.
++// Input and output are assumed to be in contiguous row-major layout.
++// The kernel launches one thread per output element, but grid may be limited;
++// uses grid-stride loop to handle all elements.
++// -----------------------------------------------------------------------------
++__global__ void pad_forward_kernel(
++    float* output,
++    const float* input,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t H_out,
++    int64_t W_out,
++    int64_t pad_left,
++    int64_t pad_top)
++{
++    int64_t total = N * C * H_out * W_out;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        // Decompose linear index into n,c,oh,ow
++        int64_t ow = i % W_out;
++        int64_t tmp = i / W_out;
++        int64_t oh = tmp % H_out;
++        tmp /= H_out;
++        int64_t c = tmp % C;
++        int64_t n = tmp / C;
++
++        float val = 0.0f;
++        if (oh >= pad_top && oh < pad_top + H &&
++            ow >= pad_left && ow < pad_left + W) {
++            int64_t ih = oh - pad_top;
++            int64_t iw = ow - pad_left;
++            int64_t in_index = ((n * C + c) * H + ih) * W + iw;
++            val = input[in_index];
++        }
++        output[i] = val;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Host launcher for custom_abs_forward.
++// Parameters:
++//   output: pointer to output tensor (same shape as input), must be CUDA memory.
++//   input: pointer to input tensor, CUDA memory.
++//   numel: total number of elements.
++//   stream: CUDA stream on which to launch kernel.
++// -----------------------------------------------------------------------------
++extern "C" void custom_abs_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    int block_size = 256;
++    // Compute grid size, capped to a reasonable maximum to avoid excessive grids,
++    // then use grid-stride loop inside kernel.
++    int64_t grid_size = (numel + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535; // kernel handles via loop
++    if (grid_size < 1) grid_size = 1;
++
++    abs_forward_kernel<<<(int)grid_size, block_size, 0, stream>>>(
++        output, input, numel);
++}
++
++// -----------------------------------------------------------------------------
++// Host launcher for custom_pad_forward.
++// Parameters:
++//   output: pointer to output tensor, shape [N,C,H_out,W_out], CUDA memory.
++//   input: pointer to input tensor, shape [N,C,H,W], CUDA memory.
++//   N, C, H, W: input dimensions.
++//   pad_left, pad_right, pad_top, pad_bottom: padding amounts (right and bottom are
++//     implicitly used to compute output shape; kernel needs only left and top for
++//     offset but we pass all for clarity).
++//   stream: CUDA stream.
++// -----------------------------------------------------------------------------
++extern "C" void custom_pad_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t pad_left,
++    int64_t pad_right,
++    int64_t pad_top,
++    int64_t pad_bottom,
++    cudaStream_t stream)
++{
++    int64_t H_out = H + pad_top + pad_bottom;
++    int64_t W_out = W + pad_left + pad_right;
++    int64_t total = N * C * H_out * W_out;
++
++    // Initialize output to zero using cudaMemsetAsync; then kernel fills interior.
++    // This is efficient and avoids writing zeros in kernel for padding regions.
++    cudaMemsetAsync(output, 0, total * sizeof(float), stream);
++
++    int block_size = 256;
++    int64_t grid_size = (total + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535;
++    if (grid_size < 1) grid_size = 1;
++
++    pad_forward_kernel<<<(int)grid_size, block_size, 0, stream>>>(
++        output, input, N, C, H, W, H_out, W_out, pad_left, pad_top);
++}
++
++// -----------------------------------------------------------------------------
++// Utility to retrieve last CUDA error after kernel launch; binding code may call
++// this if needed. Not required for operation but helpful for debugging.
++// -----------------------------------------------------------------------------
++extern "C" cudaError_t get_last_cuda_error() {
++    return cudaGetLastError();
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,123 @@
++// Include necessary PyTorch headers without torch/extension.h
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_abs_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void custom_pad_forward_launcher(
++    float* output,
++    const float* input,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t pad_left,
++    int64_t pad_right,
++    int64_t pad_top,
++    int64_t pad_bottom,
++    cudaStream_t stream);
++
++// -----------------------------------------------------------------------------
++// custom_abs_forward: element-wise absolute value
++// -----------------------------------------------------------------------------
++torch::Tensor custom_abs_forward(torch::Tensor x) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++
++    // Assume contiguous; if not, make contiguous for simple elementwise op
++    auto x_contig = x.contiguous();
++
++    // Allocate output with same shape
++    auto output = torch::empty_like(x_contig);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_abs_forward_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        x_contig.numel(),
++        stream);
++
++    // Check for CUDA errors after launch
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "custom_abs_forward kernel launch failed");
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// custom_pad_forward: zero padding (constant mode)
++// -----------------------------------------------------------------------------
++torch::Tensor custom_pad_forward(
++    torch::Tensor x,
++    int64_t pad_left,
++    int64_t pad_right,
++    int64_t pad_top,
++    int64_t pad_bottom) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N, C, H, W)");
++    TORCH_CHECK(pad_left >= 0 && pad_right >= 0 && pad_top >= 0 && pad_bottom >= 0,
++                "Padding values must be non-negative");
++
++    // Ensure contiguous input
++    auto x_contig = x.contiguous();
++
++    int64_t N = x_contig.size(0);
++    int64_t C = x_contig.size(1);
++    int64_t H = x_contig.size(2);
++    int64_t W = x_contig.size(3);
++
++    int64_t H_out = H + pad_top + pad_bottom;
++    int64_t W_out = W + pad_left + pad_right;
++
++    // Allocate output
++    auto output = torch::empty({N, C, H_out, W_out}, x_contig.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_pad_forward_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        N, C, H, W,
++        pad_left, pad_right, pad_top, pad_bottom,
++        stream);
++
++    // Check for CUDA errors after launch
++    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "custom_pad_forward kernel launch failed");
++
++    return output;
++}
++
++// -----------------------------------------------------------------------------
++// Registration
++// -----------------------------------------------------------------------------
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_abs_forward", &custom_abs_forward,
++          "Element-wise absolute value",
++          py::arg("x"));
++
++    m.def("custom_pad_forward", &custom_pad_forward,
++          "Constant zero padding",
++          py::arg("x"),
++          py::arg("pad_left") = 1,
++          py::arg("pad_right") = 2,
++          py::arg("pad_top") = 3,
++          py::arg("pad_bottom") = 4);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,34 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels):
++        super().__init__()
++        self.in_channels = in_channels
++
++    def forward(self, x):
++        x = cuda_extension.custom_abs_forward(x)
++        x = cuda_extension.custom_pad_forward(
++            x,
++            pad_left=1,
++            pad_right=2,
++            pad_top=3,
++            pad_bottom=4,
++        )
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.custom_abs_forward(x)
++        yield 'step_001', x
++        x = cuda_extension.custom_pad_forward(
++            x,
++            pad_left=1,
++            pad_right=2,
++            pad_top=3,
++            pad_bottom=4,
++        )
++        yield 'step_002', x
++        yield 'step_003', x

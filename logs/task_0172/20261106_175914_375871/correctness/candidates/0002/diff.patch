@@ -1,0 +1,403 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -73,3 +73,99 @@
+         // In a production binding, we'd throw or log. Here we leave as is.
+     }
+ }
++
++// ------------------ Conv2d custom kernel implementation ------------------
++// Since cuDNN is unavailable, we implement a straightforward 2D convolution.
++// This kernel assumes input and weight are contiguous.
++// Parameters: stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w.
++__global__ void conv2d_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int batch,
++    int in_channels,
++    int in_h,
++    int in_w,
++    int out_channels,
++    int out_h,
++    int out_w,
++    int k_h,
++    int k_w,
++    int stride_h,
++    int stride_w,
++    int pad_h,
++    int pad_w,
++    int dilation_h,
++    int dilation_w
++) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = batch * out_channels * out_h * out_w;
++    if (idx >= total) return;
++
++    // Decompose idx into n, oc, oh, ow
++    int ow = idx % out_w;
++    int tmp = idx / out_w;
++    int oh = tmp % out_h;
++    tmp /= out_h;
++    int oc = tmp % out_channels;
++    int n = tmp / out_channels;
++
++    float sum = 0.0f;
++    for (int ic = 0; ic < in_channels; ++ic) {
++        for (int kh = 0; kh < k_h; ++kh) {
++            for (int kw = 0; kw < k_w; ++kw) {
++                int ih = oh * stride_h - pad_h + kh * dilation_h;
++                int iw = ow * stride_w - pad_w + kw * dilation_w;
++                if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
++                    int input_idx = ((n * in_channels + ic) * in_h + ih) * in_w + iw;
++                    int weight_idx = ((oc * in_channels + ic) * k_h + kh) * k_w + kw;
++                    sum += input[input_idx] * weight[weight_idx];
++                }
++            }
++        }
++    }
++    output[idx] = sum;
++}
++
++// Launcher for conv2d.
++extern "C" void conv2d_launcher(
++    const float* input,
++    const float* weight,
++    float* output,
++    int batch,
++    int in_channels,
++    int in_h,
++    int in_w,
++    int out_channels,
++    int out_h,
++    int out_w,
++    int k_h,
++    int k_w,
++    int stride_h,
++    int stride_w,
++    int pad_h,
++    int pad_w,
++    int dilation_h,
++    int dilation_w,
++    cudaStream_t stream
++) {
++    int total = batch * out_channels * out_h * out_w;
++    if (total == 0) return;
++
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++
++    conv2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, weight, output,
++        batch, in_channels, in_h, in_w,
++        out_channels, out_h, out_w,
++        k_h, k_w,
++        stride_h, stride_w, pad_h, pad_w,
++        dilation_h, dilation_w
++    );
++
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // leave for binding to check
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -4,7 +4,6 @@
+ #include <torch/csrc/utils/pybind.h>
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ #include <vector>
+ #include <stdexcept>
+ #include "../binding_registry.h"
+@@ -13,7 +12,6 @@
+ // Forward declarations for launchers defined in custom_ops.cu
+ // -----------------------------------------------------------------------------
+ 
+-// triu_last2d: applies torch.triu to the last two dimensions for each batch/channel.
+ extern "C" void triu_last2d_launcher(
+     const float* x,
+     float* output,
+@@ -28,6 +26,28 @@
+     cudaStream_t stream
+ );
+ 
++extern "C" void conv2d_launcher(
++    const float* input,
++    const float* weight,
++    float* output,
++    int batch,
++    int in_channels,
++    int in_h,
++    int in_w,
++    int out_channels,
++    int out_h,
++    int out_w,
++    int k_h,
++    int k_w,
++    int stride_h,
++    int stride_w,
++    int pad_h,
++    int pad_w,
++    int dilation_h,
++    int dilation_w,
++    cudaStream_t stream
++);
++
+ // -----------------------------------------------------------------------------
+ // Helper: check CUDA error
+ // -----------------------------------------------------------------------------
+@@ -37,137 +57,8 @@
+     }
+ }
+ 
+-static void checkCudnnError(cudnnStatus_t status, const char* msg) {
+-    if (status != CUDNN_STATUS_SUCCESS) {
+-        throw std::runtime_error(std::string(msg) + ": " + cudnnGetErrorString(status));
+-    }
+-}
+-
+ // -----------------------------------------------------------------------------
+-// cuDNN conv2d implementation
+-// -----------------------------------------------------------------------------
+-
+-static torch::Tensor conv2d_cudnn(
+-    const torch::Tensor& input,
+-    const torch::Tensor& weight
+-) {
+-    // Validate inputs
+-    TORCH_CHECK(input.is_cuda(), "conv2d input must be CUDA tensor");
+-    TORCH_CHECK(weight.is_cuda(), "conv2d weight must be CUDA tensor");
+-    TORCH_CHECK(input.dtype() == torch::kFloat32, "conv2d input must be float32");
+-    TORCH_CHECK(weight.dtype() == torch::kFloat32, "conv2d weight must be float32");
+-    TORCH_CHECK(input.dim() == 4, "conv2d input must be 4D (NCHW)");
+-    TORCH_CHECK(weight.dim() == 4, "conv2d weight must be 4D");
+-
+-    int batch = input.size(0);
+-    int in_channels = input.size(1);
+-    int in_h = input.size(2);
+-    int in_w = input.size(3);
+-    int out_channels = weight.size(0);
+-    int k_h = weight.size(2);
+-    int k_w = weight.size(3);
+-    TORCH_CHECK(weight.size(1) == in_channels, "weight has wrong in_channels");
+-
+-    // Fixed convolution parameters from reference: stride=(1,1), padding=(1,2), dilation=(2,1)
+-    int stride_h = 1, stride_w = 1;
+-    int pad_h = 1, pad_w = 2;
+-    int dilation_h = 2, dilation_w = 1;
+-
+-    // Compute output dimensions (same formula as PyTorch)
+-    int out_h = (in_h + 2 * pad_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;
+-    int out_w = (in_w + 2 * pad_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;
+-
+-    // Create output tensor (contiguous)
+-    auto output = torch::empty({batch, out_channels, out_h, out_w}, input.options());
+-
+-    // Get current CUDA stream
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-
+-    // Create cuDNN handle
+-    cudnnHandle_t cudnn;
+-    checkCudnnError(cudnnCreate(&cudnn), "cudnnCreate");
+-    checkCudnnError(cudnnSetStream(cudnn, stream), "cudnnSetStream");
+-
+-    // Set tensor descriptors (NCHW format)
+-    cudnnTensorDescriptor_t x_desc, y_desc;
+-    cudnnFilterDescriptor_t w_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    checkCudnnError(cudnnCreateTensorDescriptor(&x_desc), "cudnnCreateTensorDescriptor");
+-    checkCudnnError(cudnnCreateTensorDescriptor(&y_desc), "cudnnCreateTensorDescriptor");
+-    checkCudnnError(cudnnCreateFilterDescriptor(&w_desc), "cudnnCreateFilterDescriptor");
+-    checkCudnnError(cudnnCreateConvolutionDescriptor(&conv_desc), "cudnnCreateConvolutionDescriptor");
+-
+-    checkCudnnError(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, batch, in_channels, in_h, in_w), "cudnnSetTensor4dDescriptor x");
+-    checkCudnnError(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, batch, out_channels, out_h, out_w), "cudnnSetTensor4dDescriptor y");
+-    checkCudnnError(cudnnSetFilter4dDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, out_channels, in_channels, k_h, k_w), "cudnnSetFilter4dDescriptor");
+-    checkCudnnError(cudnnSetConvolution2dDescriptor(
+-        conv_desc,
+-        pad_h, pad_w,
+-        stride_h, stride_w,
+-        dilation_h, dilation_w,
+-        CUDNN_CROSS_CORRELATION,
+-        CUDNN_DATA_FLOAT
+-    ), "cudnnSetConvolution2dDescriptor");
+-
+-    // Find an appropriate convolution algorithm
+-    const int requested_algo_count = 1;
+-    int returned_algo_count = 0;
+-    cudnnConvolutionFwdAlgoPerf_t perf_results[1];
+-    checkCudnnError(cudnnGetConvolutionForwardAlgorithm_v7(
+-        cudnn,
+-        x_desc, w_desc, conv_desc, y_desc,
+-        requested_algo_count,
+-        &returned_algo_count,
+-        perf_results
+-    ), "cudnnGetConvolutionForwardAlgorithm_v7");
+-    if (returned_algo_count == 0) {
+-        throw std::runtime_error("cuDNN returned no convolution algorithm");
+-    }
+-    cudnnConvolutionFwdAlgo_t algo = perf_results[0].algo;
+-
+-    // Query workspace size
+-    size_t workspace_size = 0;
+-    checkCudnnError(cudnnGetConvolutionForwardWorkspaceSize(
+-        cudnn,
+-        x_desc, w_desc, conv_desc, y_desc,
+-        algo,
+-        &workspace_size
+-    ), "cudnnGetConvolutionForwardWorkspaceSize");
+-
+-    // Allocate workspace if needed
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        checkCudaError(cudaMalloc(&workspace, workspace_size), "cudaMalloc workspace");
+-    }
+-
+-    // Perform convolution
+-    float alpha = 1.0f, beta = 0.0f;
+-    checkCudnnError(cudnnConvolutionForward(
+-        cudnn,
+-        &alpha,
+-        x_desc, input.data_ptr<float>(),
+-        w_desc, weight.data_ptr<float>(),
+-        conv_desc, algo,
+-        workspace, workspace_size,
+-        &beta,
+-        y_desc, output.data_ptr<float>()
+-    ), "cudnnConvolutionForward");
+-
+-    // Cleanup
+-    if (workspace) cudaFree(workspace);
+-    cudnnDestroyTensorDescriptor(x_desc);
+-    cudnnDestroyTensorDescriptor(y_desc);
+-    cudnnDestroyFilterDescriptor(w_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn);
+-    checkCudaError(cudaGetLastError(), "cudaGetLastError after conv");
+-
+-    return output;
+-}
+-
+-// -----------------------------------------------------------------------------
+-// PyTorch wrapper functions (exposed to Python)
++// PyTorch wrapper functions
+ // -----------------------------------------------------------------------------
+ 
+ // triu_last2d
+@@ -190,32 +81,15 @@
+         channels = x.size(0);
+         height = x.size(1);
+         width = x.size(2);
+-    } else if (x.dim() >= 4) {
+-        // Usually NCHW: all dims before last two are treated as batch*channels for the mask.
+-        batch = 1;
+-        channels = 1;
+-        for (int i = 0; i < x.dim() - 2; ++i) {
+-            // flatten all leading dimensions into channels? But we need to preserve strides.
+-            // The launcher expects batch and channels separately. We can pass batch = number of leading groups,
+-            // channels = 1 if we squeeze. But better: follow common NCHW case from task.
+-            // We'll assume the standard NCHW for now; general case requires more complex handling.
+-            // For safety, we handle only 4D here, throw otherwise.
+-        }
+-        TORCH_CHECK(x.dim() == 4, "triu_last2d only supports 4D (NCHW) tensors in this binding");
++    } else if (x.dim() == 4) {
+         batch = x.size(0);
+         channels = x.size(1);
+         height = x.size(2);
+         width = x.size(3);
+     } else {
+-        TORCH_CHECK(false, "Unsupported dim");
++        TORCH_CHECK(false, "triu_last2d only supports 2D, 3D, or 4D tensors");
+     }
+ 
+-    // Output tensor: same shape as input, contiguous? Actually torch.triu returns a tensor with same strides as input
+-    // (view), so we should preserve strides. But our launcher writes elementwise assuming same strides as input,
+-    // which is correct if we allocate a contiguous tensor and copy? Wait, the launcher assumes output uses same strides as input.
+-    // To avoid mismatch, we can allocate output with the same strides as input by using empty_like, which copies strides only if memory_format is preserved.
+-    // torch::empty_like(x) will produce contiguous unless x has non-standard memory format? It does not copy strides by default; it uses same options but contiguous.
+-    // Better: use torch::empty_strided(x.sizes(), x.strides(), x.options()) to preserve strides.
+     auto output = torch::empty_strided(x.sizes(), x.strides(), x.options());
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+@@ -238,15 +112,67 @@
+ 
+ // conv2d wrapper
+ static torch::Tensor conv2d(torch::Tensor input, torch::Tensor weight) {
+-    // Input may be non-contiguous due to triu_last2d preserving strides; cuDNN requires contiguous input.
+-    // We make it contiguous if needed.
++    TORCH_CHECK(input.is_cuda(), "conv2d input must be CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "conv2d weight must be CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "conv2d input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "conv2d weight must be float32");
++    TORCH_CHECK(input.dim() == 4, "conv2d input must be 4D (NCHW)");
++    TORCH_CHECK(weight.dim() == 4, "conv2d weight must be 4D");
++
++    // Make contiguous (required by our custom kernel and also typical for cuDNN)
+     if (!input.is_contiguous()) {
+         input = input.contiguous();
+     }
+     if (!weight.is_contiguous()) {
+         weight = weight.contiguous();
+     }
+-    return conv2d_cudnn(input, weight);
++
++    int batch = input.size(0);
++    int in_channels = input.size(1);
++    int in_h = input.size(2);
++    int in_w = input.size(3);
++    int out_channels = weight.size(0);
++    int k_h = weight.size(2);
++    int k_w = weight.size(3);
++    TORCH_CHECK(weight.size(1) == in_channels, "weight has wrong in_channels");
++
++    // Fixed convolution parameters from reference: stride=(1,1), padding=(1,2), dilation=(2,1)
++    int stride_h = 1, stride_w = 1;
++    int pad_h = 1, pad_w = 2;
++    int dilation_h = 2, dilation_w = 1;
++
++    // Compute output dimensions
++    int out_h = (in_h + 2 * pad_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;
++    int out_w = (in_w + 2 * pad_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;
++
++    // Create output tensor (contiguous)
++    auto output = torch::empty({batch, out_channels, out_h, out_w}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    conv2d_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch,
++        in_channels,
++        in_h,
++        in_w,
++        out_channels,
++        out_h,
++        out_w,
++        k_h,
++        k_w,
++        stride_h,
++        stride_w,
++        pad_h,
++        pad_w,
++        dilation_h,
++        dilation_w,
++        stream
++    );
++    checkCudaError(cudaGetLastError(), "conv2d_launcher");
++    return output;
+ }
+ 
+ // -----------------------------------------------------------------------------
+@@ -255,7 +181,7 @@
+ 
+ void register_custom_ops(pybind11::module& m) {
+     m.def("triu_last2d", &triu_last2d, "Apply torch.triu to last two dimensions", py::arg("x"));
+-    m.def("conv2d", &conv2d, "2D convolution using cuDNN", py::arg("input"), py::arg("weight"));
++    m.def("conv2d", &conv2d, "2D convolution using custom CUDA kernel", py::arg("input"), py::arg("weight"));
+ }
+ 
+ REGISTER_BINDING(custom_ops, register_custom_ops);

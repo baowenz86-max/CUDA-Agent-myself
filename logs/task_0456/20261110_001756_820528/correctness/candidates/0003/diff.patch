@@ -1,0 +1,317 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -28,31 +28,28 @@
+     }
+ }
+ 
+-// Triplet margin loss with Lp distance (p=2), reduction='sum'
+-// For each sample n: d_pos = sqrt(sum((anchor - positive)^2)), d_neg = sqrt(sum((anchor - negative)^2))
+-// loss_n = max(d_pos - d_neg + margin, 0)
+-// total_loss = sum(loss_n)
+-__global__ void triplet_margin_loss_sum_kernel(
++// Triplet margin loss kernel: one block per sample computes loss_i.
++// Then a reduction kernel sums the losses.
++__global__ void triplet_margin_loss_partial_kernel(
+     const float* __restrict__ anchor,
+     const float* __restrict__ positive,
+     const float* __restrict__ negative,
+     float margin,
+     int N,
+     int D,
+-    float* __restrict__ partial_sums)  // length = number of blocks in final reduction, or preallocated per-block buffer
++    float* __restrict__ partial_losses)
+ {
+-    // One block per sample, or grid-stride with atomics? Use one block per sample for simplicity and stable result.
+-    // Assume blockDim.x >= 32, each block processes one sample.
+     int n = blockIdx.x;
+     if (n >= N) return;
+ 
+-    __shared__ float smem[256]; // enough for block reduction, blockDim.x <= 256
++    int tid = threadIdx.x;
++    int block_size = blockDim.x;
+ 
+-    int tid = threadIdx.x;
+     float pos_sum = 0.0f;
+     float neg_sum = 0.0f;
+-    // grid-stride loop within thread over D elements
+-    for (int i = tid; i < D; i += blockDim.x) {
++
++    // Each thread accumulates its portion of the squared differences
++    for (int i = tid; i < D; i += block_size) {
+         int64_t idx = (int64_t)n * D + i;
+         float diff_pos = anchor[idx] - positive[idx];
+         float diff_neg = anchor[idx] - negative[idx];
+@@ -60,36 +57,34 @@
+         neg_sum += diff_neg * diff_neg;
+     }
+ 
+-    // Reduce pos_sum and neg_sum within block
+-    // First pos_sum
+-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+-        __syncthreads();
+-        if (tid < offset) {
+-            smem[tid] = pos_sum;
+-            __syncthreads();
+-            pos_sum += smem[tid + offset];
+-        }
+-    }
+-    // Actually better to use warp shuffle, but simple reduction is fine.
+-    // Let's implement efficient warp reduction and then cross-warp.
+-    __shared__ float pos_block[32];
+-    __shared__ float neg_block[32];
++    // Reduce pos_sum and neg_sum within the block using warp shuffle and shared memory.
++    // We'll use an array of two floats per warp in shared memory for pos and neg partial sums.
++    __shared__ float warp_pos[32];
++    __shared__ float warp_neg[32];
++
++    int lane = tid & 31;
++    int warp_id = tid >> 5;
++    int num_warps = (block_size + 31) >> 5;
+ 
+     // Warp reduction
+     for (int offset = 16; offset > 0; offset >>= 1) {
+         pos_sum += __shfl_down_sync(0xffffffff, pos_sum, offset);
+         neg_sum += __shfl_down_sync(0xffffffff, neg_sum, offset);
+     }
+-    if ((tid % 32) == 0) {
+-        pos_block[tid / 32] = pos_sum;
+-        neg_block[tid / 32] = neg_sum;
++
++    // Write warp result to shared memory
++    if (lane == 0) {
++        warp_pos[warp_id] = pos_sum;
++        warp_neg[warp_id] = neg_sum;
+     }
+     __syncthreads();
+ 
+-    if (tid < blockDim.x / 32) {
+-        float p = pos_block[tid];
+-        float q = neg_block[tid];
+-        for (int offset = (blockDim.x / 32) / 2; offset > 0; offset >>= 1) {
++    // First warp reduces the warp sums
++    if (tid < num_warps) {
++        float p = warp_pos[tid];
++        float q = warp_neg[tid];
++        // Reduce within the first warp (active threads 0..num_warps-1)
++        for (int offset = num_warps / 2; offset > 0; offset >>= 1) {
+             p += __shfl_down_sync(0xffffffff, p, offset);
+             q += __shfl_down_sync(0xffffffff, q, offset);
+         }
+@@ -97,12 +92,12 @@
+             float d_pos = sqrtf(p);
+             float d_neg = sqrtf(q);
+             float loss = fmaxf(d_pos - d_neg + margin, 0.0f);
+-            partial_sums[blockIdx.x] = loss;
++            partial_losses[n] = loss;
+         }
+     }
+ }
+ 
+-// Final reduction kernel for triplet loss partial sums
++// Final reduction: sum all partial losses into output[0]
+ __global__ void reduce_sum_kernel(const float* __restrict__ input, float* __restrict__ output, int size) {
+     extern __shared__ float smem[];
+     int tid = threadIdx.x;
+@@ -119,7 +114,7 @@
+         __syncthreads();
+     }
+     if (tid == 0) {
+-        output[blockIdx.x] = smem[0];
++        output[0] = smem[0];
+     }
+ }
+ 
+@@ -142,14 +137,12 @@
+     int64_t total = (int64_t)N * C * HW;
+     int threads = 256;
+     int blocks = (int)((total + threads - 1) / threads);
+-    // Cap blocks to avoid launching too many, use grid-stride in kernel anyway
+     if (blocks > 65535) blocks = 65535;
+     batch_norm_eval_2d_kernel<<<blocks, threads, 0, stream>>>(
+         x, y, weight, bias, running_mean, running_var, eps, N, C, HW);
+ }
+ 
+-// Launcher for triplet_margin_loss_sum
+-// Returns sum of losses across batch as a single float scalar, stored in output[0]
++// Launcher for triplet margin loss: computes partial losses and reduces them
+ extern "C" void triplet_margin_loss_sum_launcher(
+     const float* anchor,
+     const float* positive,
+@@ -158,124 +151,22 @@
+     int p,
+     int N,
+     int D,
++    float* partial_losses,
+     float* output,
+     cudaStream_t stream)
+ {
+-    // For p=2 only, as per contract; ignore p argument if not 2? Assert? We'll handle p=2 only.
+-    // Use partial_sums array of length N, then reduce to scalar.
+-    // We'll allocate temporary device memory inside launcher? Better to use fixed-size shared or use a small kernel with atomics.
+-    // Simpler: use a single block reduces N partial sums. But we need partial_sums array in device memory.
+-    // We'll use a temporary device allocation via cudaMallocAsync or static? Since binding layer will provide output scalar,
+-    // we'll allocate a temporary workspace and copy. But binding layer should allocate workspace, not launcher.
+-    // To keep launcher self-contained, we can use a two-pass approach: first kernel writes partial sums to a preallocated buffer
+-    // supplied by the binding. But contract specifies launcher signature with only output pointer and no workspace.
+-    // Alternative: Use a single kernel with atomicAdd on output and zero-initialize output. That is stable enough for summing losses,
+-    // but order of atomicAdd does not affect sum (floating point associativity may cause slight differences, but acceptable).
+-    // We'll use atomicAdd to accumulate loss directly into output[0], and we need to zero output before launch.
+-    // The binding layer should zero the output tensor before calling launcher, or we can do it inside launcher via cudaMemset.
+-    // For ease, we'll zero output using cudaMemsetAsync (allowed, no kernel).
+-    cudaMemsetAsync(output, 0, sizeof(float), stream);
+-
++    // p is assumed 2; ignore for now
+     int threads = 256;
+     int blocks = N; // one block per sample
+-    triplet_margin_loss_sum_kernel<<<blocks, threads, 0, stream>>>(
+-        anchor, positive, negative, margin, N, D, output);
+-    // But our kernel currently writes to partial_sums array, not atomically to output.
+-    // We can modify kernel to accept an array and then a final reduction, or use a different kernel that atomically adds.
+-    // Let's adapt: we'll use a kernel that directly atomically adds block loss to output[0].
+-    // Since we only have one output scalar, each block computes loss for its sample and does atomicAdd(&output[0], loss).
+-    // The kernel below does that.
++    triplet_margin_loss_partial_kernel<<<blocks, threads, 0, stream>>>(
++        anchor, positive, negative, margin, N, D, partial_losses);
++
++    // Reduce partial losses into scalar
++    // Since N=16, a single block with 256 threads is enough, but to be safe use one block with 256 threads
++    // and shared memory size = threads * sizeof(float)
++    int reduce_blocks = 1;
++    int reduce_threads = 256;
++    int smem_size = reduce_threads * sizeof(float);
++    reduce_sum_kernel<<<reduce_blocks, reduce_threads, smem_size, stream>>>(
++        partial_losses, output, N);
+ }
+-
+-// Alternative triplet kernel with atomicAdd
+-extern "C" void triplet_margin_loss_sum_launcher_atomic(
+-    const float* anchor,
+-    const float* positive,
+-    const float* negative,
+-    float margin,
+-    int p,
+-    int N,
+-    int D,
+-    float* output,
+-    cudaStream_t stream)
+-{
+-    cudaMemsetAsync(output, 0, sizeof(float), stream);
+-    int threads = 256;
+-    int blocks = N; // one block per sample
+-    triplet_margin_loss_sum_kernel<<<blocks, threads, 0, stream>>>(
+-        anchor, positive, negative, margin, N, D, output);
+-}
+-
+-// Kernel that uses atomicAdd to output
+-template<typename T>
+-__global__ void triplet_margin_loss_sum_atomic_kernel(
+-    const T* __restrict__ anchor,
+-    const T* __restrict__ positive,
+-    const T* __restrict__ negative,
+-    float margin,
+-    int N,
+-    int D,
+-    T* __restrict__ output)
+-{
+-    int n = blockIdx.x;
+-    if (n >= N) return;
+-
+-    int tid = threadIdx.x;
+-    float pos_sum = 0.0f;
+-    float neg_sum = 0.0f;
+-    for (int i = tid; i < D; i += blockDim.x) {
+-        int64_t idx = (int64_t)n * D + i;
+-        float diff_pos = (float)(anchor[idx] - positive[idx]);
+-        float diff_neg = (float)(anchor[idx] - negative[idx]);
+-        pos_sum += diff_pos * diff_pos;
+-        neg_sum += diff_neg * diff_neg;
+-    }
+-
+-    // Block reduction using shared memory
+-    __shared__ float sdata[256];
+-    sdata[tid] = pos_sum;
+-    __syncthreads();
+-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] += sdata[tid + s];
+-        __syncthreads();
+-    }
+-    float d_pos_sq = sdata[0];
+-
+-    __syncthreads();
+-    sdata[tid] = neg_sum;
+-    __syncthreads();
+-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+-        if (tid < s) sdata[tid] += sdata[tid + s];
+-        __syncthreads();
+-    }
+-    float d_neg_sq = sdata[0];
+-    __syncthreads();
+-
+-    if (tid == 0) {
+-        float loss = fmaxf(sqrtf(d_pos_sq) - sqrtf(d_neg_sq) + margin, 0.0f);
+-        atomicAdd(output, loss);
+-    }
+-}
+-
+-// Launcher for triplet using atomicAdd
+-extern "C" void triplet_margin_loss_sum_atomic_launcher(
+-    const float* anchor,
+-    const float* positive,
+-    const float* negative,
+-    float margin,
+-    int p,
+-    int N,
+-    int D,
+-    float* output,
+-    cudaStream_t stream)
+-{
+-    cudaMemsetAsync(output, 0, sizeof(float), stream);
+-    int threads = 256;
+-    int blocks = N;
+-    triplet_margin_loss_sum_atomic_kernel<float><<<blocks, threads, 0, stream>>>(
+-        anchor, positive, negative, margin, N, D, output);
+-}
+-
+-// Note: We include multiple launcher implementations; binding should call the final one intended.
+-// The following launcher signatures will be used by binding: batch_norm_eval_2d_launcher and triplet_margin_loss_sum_atomic_launcher
+-// Ensure they match the declaration in binding.cpp (not shown here, but expected).
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -19,7 +19,7 @@
+     int W,
+     cudaStream_t stream);
+ 
+-extern "C" void triplet_margin_loss_sum_atomic_launcher(
++extern "C" void triplet_margin_loss_sum_launcher(
+     const float* anchor,
+     const float* positive,
+     const float* negative,
+@@ -27,6 +27,7 @@
+     int p,
+     int N,
+     int D,
++    float* partial_losses,
+     float* output,
+     cudaStream_t stream);
+ 
+@@ -114,9 +115,11 @@
+     int64_t D = anchor.numel() / N;
+ 
+     auto loss = torch::empty({}, anchor.options());
++    auto partial_losses = torch::empty({N}, anchor.options());
++
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    triplet_margin_loss_sum_atomic_launcher(
++    triplet_margin_loss_sum_launcher(
+         anchor.data_ptr<float>(),
+         positive.data_ptr<float>(),
+         negative.data_ptr<float>(),
+@@ -124,6 +127,7 @@
+         static_cast<int>(p),
+         static_cast<int>(N),
+         static_cast<int>(D),
++        partial_losses.data_ptr<float>(),
+         loss.data_ptr<float>(),
+         stream);
+ 

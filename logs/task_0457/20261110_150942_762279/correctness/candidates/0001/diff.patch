@@ -1,0 +1,662 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,412 @@
++// Custom CUDA kernels for LSTM forward and cat_hidden_cell
++// Only float32, batch_first=True, zero initial states.
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// Constants for this model: hidden_size=50, input_size=100, num_layers=2, batch=16.
++// But we keep as runtime parameters where possible.
++
++// Kernel for LSTM layer 1 (input from x, layer=0) and layer 2 (input from previous layer output)
++// Each block handles one (batch, time) position, computing all hidden units for that position.
++// Layer 0: input_size = input_dim (100); Layer 1: input_size = hidden_size (50).
++// Weights are stored row-major: weight_ih has shape [4*hidden, input_dim], weight_hh [4*hidden, hidden].
++// Biases are length 4*hidden: order i, f, g, o.
++// We compute h_t and c_t for all batch elements sequentially across time.
++// Because hidden size is 50, we can use one block per layer with threads covering hidden units.
++// Each block processes one batch and one timestep sequentially, but we need to update hidden and cell for next timestep.
++// Better: each block handles one batch and all timesteps, using internal loop over time, storing h and c in registers/global.
++// We launch num_layers kernels, one per layer. The first kernel processes all batches and seq_len, writing hidden states to output and saving final hidden/cell.
++// Second kernel reads output of previous layer as input.
++
++// Since hidden size is small (50), we allocate shared memory for weights to reduce global memory traffic.
++// For layer 0: weight_ih 200x100 = 20000 floats = 80KB, weight_hh 200x50=10000 floats=40KB, total 120KB > 48KB shared memory, so we cannot fit all.
++// Alternative: use global reads; each thread computes one hidden unit. For 50 hidden units, we use 128 threads per block (some idle).
++// blockDim.x = 128, blockIdx.x = batch index (0..15), blockIdx.y = layer index (0,1) maybe.
++// We'll launch one kernel for all layers? But weights differ by layer; we can pass arrays of pointers.
++
++// Simpler: two separate kernels: lstm_layer0 and lstm_layer1.
++// Each kernel processes entire batch and seq_len. We can have block per batch, threads compute all 50 hidden units across time sequential.
++// But thread-level parallelization only over hidden units (50) is poor; use one warp per batch? We have batch=16, maybe grid = batch*seq_len blocks, each block computes one timestep for one batch with 64 threads for hidden units.
++// For each block, we need previous h and c. We can use global memory to store h and c for all batches/timesteps, or each block computes sequentially over time (but then dependencies across blocks).
++// To keep parallelism, we compute h_t and c_t recursively but can process all batches parallel if we use a grid-stride loop over time inside each batch block.
++// Design: grid of blocks = batch (16 blocks). Each block processes a single batch across all timesteps sequentially, maintaining h and c in registers or shared memory.
++// Threads within block = hidden_size (50), use 64 threads (some idle). This gives low occupancy but only 16 blocks, poor utilization. Could increase batch parallelism by assigning multiple warps per batch? Hidden size small, but we can use one warp per batch (32 threads) to cover 50 hidden units? Not enough threads.
++// Better: process multiple batches per block? Or use a 2D grid: blockIdx.x = batch, blockIdx.y = chunk of hidden? Hidden size 50, we can split hidden computation into 2 chunks of 25 using 32 threads? Still small.
++// The total work is batch*seq_len*hidden_size = 16*1024*50 = 819,200 output elements. That's small. Performance may be memory-bound but okay.
++// We can launch one block per (batch, time) pair, that gives 16*1024 = 16,384 blocks. Each block computes 50 hidden cells using 64 threads. The previous h and c for that batch are needed. We can store h and c arrays in global memory of size [batch, hidden] updated after each timestep, but blocks for same batch different time need synchronization. Could use two kernels: first compute all gates using current h,c; then update h,c; but sequential dependency remains.
++// Instead, use a single kernel with __syncthreads barrier across the entire grid? Not possible. Only block-level sync.
++// Persistent kernel: one block per batch, each block loops over time storing h,c in local arrays and producing output for each timestep. This gives 16 blocks, each with maybe 64 threads, working sequentially. Low parallelism but simple; total threads 16*64=1024, very low. GPU idle.
++// Alternative: use cuBLAS for GEMMs, but we must not include torch; cuBLAS allowed. But we want a single .cu with custom kernels. We could use cuBLAS for matrix multiplications, but the instructions say cuBLAS allowed for GEMM. We can implement LSTM using cuBLAS calls from the launcher? But launcher can call cuBLAS? The .cu can include cublas_v2.h and do cuBLAS operations. This might be more efficient than naive kernels.
++// However, the task says "Conv/ConvTranspose must use cuDNN, non-conv CUDA kernels"; it does not explicitly mention cuBLAS for LSTM, but it's allowed for GEMM. Since LSTM is inherently GEMM-heavy, using cuBLAS is recommended.
++// But we must implement in .cu with raw pointers and no torch. We can use cuBLAS. Then kernel only for element-wise gate activations. But we still need to handle sequential dependency; cuBLAS can compute matrix multiplication for each timestep.
++// This may be more complex but yields better performance. However, the contract expects a custom op that does the whole LSTM. We can implement the launcher to perform the entire LSTM using cuBLAS and a small elementwise kernel for gate calculations.
++
++// Given time constraints, I will implement a simple custom kernel approach that is correct and reasonably efficient, if not maximally optimized. The model size is small, so even naive kernel may be okay.
++
++// Implementation plan:
++// Kernel 1: lstm_gates_kernel computes all gates for a given layer, given input (x_t or h_prev_t) and previous hidden states. It computes pre-activation gates: W_ih * x_t + b_ih + W_hh * h_{t-1} + b_hh, then applies activations to get i,f,g,o and updates c_t,h_t. It writes output for that timestep and updates global h and c for next timestep (or outputs to a separate array).
++// We will have a global array prev_h [batch, hidden] and prev_c [batch, hidden] for each layer. Initially zero.
++// For each timestep, we launch a kernel over batch and hidden to compute gates and new states, then copy new states to prev for next step. But launching 1024 kernels per layer is too many (2048 kernels). Could fuse timesteps in a single kernel per batch as described.
++
++// Let's go with one block per batch, each block has 50 threads (use 64 threads for alignment). Each block loops over seq_len, maintaining h and c in registers (each thread keeps its dimension value). We'll store h and c in local arrays of size hidden_size (50) per thread? Actually each thread is responsible for one hidden unit, so it can keep its own h and c values in registers across the loop. Then for each timestep, each thread needs to compute gates for its hidden unit, which require dot products with input vector and previous h vector. That means each thread must read the entire input vector (size input_dim) and previous h vector (size hidden_size) to compute its four gate pre-activations. That results in high memory traffic: each thread reads input_dim+hidden_size floats per timestep. For layer 0: 150 floats per thread per timestep, 50 threads => 7500 floats per timestep per batch. For 16 batches and 1024 steps: 122,880,000 floats ~ 491 MB. Fine.
++// But threads reading the same input vector could use shared memory to load input once per block per timestep. Similarly, h vector can be shared. Weight matrices are read per gate; each thread reads its corresponding rows for four gates, that's 4*(input_dim+hidden_size) floats per timestep per thread, but weights are shared across threads for different hidden units? Actually weight_ih row j is used only by thread j, so no reuse across threads. So weight reads are coalesced if threads access consecutive rows? If row-major, thread j reads weight_ih[gate*H+j][:]? The weight layout is [4*H, input_dim]. Gate ordering: i=0:H, f=H:2H, g=2H:3H, o=3H:4H. Thread j needs rows j, H+j, 2H+j, 3H+j for each gate. Those rows are not consecutive in memory (they are offset by H). So coalescing may be poor. We can rearrange weight storage? But weights come as given; we could transpose or reorganize in a preprocessing kernel, but maybe not necessary.
++// Given the small size, performance may still be acceptable relative to torch.compile baseline? We need 5% faster. The baseline LSTM is likely optimized using cuDNN or cuBLAS; beating it with a naive kernel is unlikely.
++// We could use cuBLAS in the launcher: for each timestep, perform GEMM of input (batch x input_dim) with weight_ih^T to get pre_ih (batch x 4H), and GEMM of hidden (batch x hidden) with weight_hh^T to get pre_hh (batch x 4H), add biases and combine, apply activations, update states. cuBLAS is highly optimized and may beat torch LSTM? But torch LSTM likely uses cuDNN RNN which is optimized. We might not beat it. However, the task requires at least 5% faster than torch.compile baseline. The baseline is torch.compile of the original model, not the original eager. torch.compile may already be fast. Hard to say.
++// We'll implement using cuBLAS in launcher for maximum performance. Since .cu can include cublas_v2.h, we can perform GEMMs. We'll need workspace for intermediate matrices. The launcher receives raw pointers and a stream; it can allocate device memory using cudaMallocAsync or cudaMalloc? We have no torch allocation. We can use cudaMalloc for temporary buffers.
++
++// Let's design launcher using cuBLAS:
++// Input x is [batch=16, seq_len=1024, input_size=100], contiguous? It may be contiguous. We'll require contiguous but handle strides? Contract says layout supports strides, so we should handle non-contiguous. We can make a contiguous copy if needed, or use cuBLAS with appropriate strides? Easier: if not contiguous, copy to contiguous buffer using a kernel.
++// For each layer, for each timestep:
++//   - x_t shape [batch, input_dim]; but x is stored as [batch, seq_len, input_dim], so we need to extract x_t for all batch. That is a strided slice along seq dimension.
++//   We can avoid copying by using cuBLAS GEMM with matrix A = x[:, t, :]? cuBLAS expects column-major, but we can use row-major with transa/transb appropriately. Since x is row-major, x_t is a submatrix of size batch x input_dim with leading dimension = input_size*seq_len? Actually x is [batch, seq, input], row-major, so element (b,t,j) at offset b*seq*input + t*input + j. For fixed t, we have batch rows, each of length input_dim, with stride between rows = seq*input. cuBLAS can handle custom leading dimensions. We can set lda = seq*input.
++// Similarly, weight_ih is [4H, input_dim] row-major; we want W_ih * x_t^T, but we can compute x_t * W_ih^T. Using cuBLAS in column-major convention, we can treat matrices as column-major by using transa/transb.
++// Ensure correctness: cuBLAS uses column-major storage. If a matrix is row-major, we can pass it as transposed column-major. For example, to compute C = A * B in row-major, we can do cublasSgemm with op(A)=CUBLAS_OP_T, op(B)=CUBLAS_OP_T? Let's work simpler: we will create contiguous temporary matrices for x_t (batch x input_dim) by copying from x with a simple kernel or using cudaMemcpy2D. Since seq_len large, copying each timestep may add overhead. Alternatively, we can process all timesteps in a batched GEMM? But LSTM is sequential.
++// For each timestep, we need computing gates for all batches. The input for current timestep can be viewed as batch x input_dim with leading dimension = seq*input. We can set cuBLAS parameters: C = alpha * op(A) * op(B) + beta * C. If we want D (batch x 4H) = x_t (batch x input_dim) * W^T (input_dim x 4H). In column-major, we can set A as column-major matrix of shape (input_dim x batch) from x_t by using transa = CUBLAS_OP_T? Actually, if we pass row-major pointer but tell cuBLAS it is column-major with dimensions transposed, we can use appropriate ops.
++// We'll likely need to handle transposing carefully. To simplify, we can write a small kernel to copy x_t to a contiguous buffer of shape [batch, input_dim] each timestep. Given batch*input_dim = 16*100=1600 floats per timestep, copying 1600 floats * 1024 = 1.6M floats per layer, negligible. So we'll maintain a temporary buffer for x_t of size batch*input_dim, and for hidden h of size batch*hidden.
++// Similarly for weight matrices, they are given as contiguous? Likely yes. We'll assume contiguous weights but can handle strides by copying if not.
++// We'll allocate device memory for:
++//   - x_t_contig: batch*input_dim (for layer0) or batch*hidden (layer1)
++//   - h_prev: batch*hidden (initial zero)
++//   - c_prev: batch*hidden (initial zero)
++//   - gates_pre: batch*4H (pre-activation)
++//   - tmp for GEMM results: batch*4H
++//   - new_h, new_c: batch*hidden
++//   - output for each timestep: shape [batch, seq, hidden]; we need to write into output tensor eventually. We can write directly to output memory with stride, using a kernel after computing new_h.
++// Actually output is [batch, seq, hidden] row-major. So after computing new_h (batch x hidden), we can copy it to output[:, t, :] using a kernel.
++// Sequence:
++// For layer in 0..1:
++//   set h_prev=0, c_prev=0
++//   for t in 0..seq_len-1:
++//      copy x[:,t,:] to x_t_contig (if input to this layer is x for layer0, or output_prev_layer[:,t,:] for layer1)
++//      cublasSgemm: gates_pre = W_ih^T * x_t_contig? Weights W_ih is [4H, input_dim]. Need to compute (batch x 4H) = x_t (batch x input_dim) * W_ih^T (input_dim x 4H). In column-major, this is equivalent to C = B^T * A^T? Let's use cuBLAS with row-major emulation.
++// We can treat all matrices as column-major by using leading dimensions and transpose flags. Easier: we can rearrange weights in column-major order in a preprocessing step (one-time per forward). Since weights are small, we can create column-major copies of W_ih and W_hh (and possibly biases) to simplify GEMM.
++// Let's create column-major copies: W_ih_col of shape [4H, input_dim] column-major (i.e., transposed). Then GEMM: C (batch x 4H) = x_t (batch x input_dim) * W_ih_col^T. In column-major, cuBLAS expects matrices stored column-major: x_t is batch x input_dim, stored row-major? If we store x_t in column-major as input_dim x batch, then compute C^T = W_ih_col * x_t_col. We'll set transa=CUBLAS_OP_N, transb=CUBLAS_OP_N, m=4H, n=batch, k=input_dim, lda=4H, ldb=input_dim, ldc=4H, and pointers: A = W_ih_col (column-major, shape 4H x input_dim), B = x_t_col (column-major, shape input_dim x batch). Then result C (column-major, shape 4H x batch) is gates_pre^T. We then need gates_pre row-major batch x 4H. We can keep it column-major and adjust elementwise kernel to read accordingly, or copy/transpose. Simpler: create gates_pre as column-major buffer of shape 4H x batch. The elementwise kernel can compute using column-major indexing.
++// Similarly, hidden to 4H: C_h (4H x batch) = W_hh_col (4H x hidden) * h_prev_col (hidden x batch), where h_prev_col is column-major copy of h_prev (batch x hidden). We'll maintain h_prev as column-major (hidden x batch) to avoid transposing each timestep.
++// This introduces copying of h and x each step, but small.
++// Then we add biases (length 4H) to each column. Since biases are per gate unit, we add to rows of gate_pre.
++// Then elementwise kernel: for each batch b and hidden unit j, compute gates i,f,g,o using sigmoid/tanh, update c and h, and write h to output (which we need to store as row-major or column-major? Output must be row-major [batch, seq, hidden]. We'll write directly to output memory with appropriate strides using a kernel that reads from column-major h_new or we maintain h_new row-major? We can compute new_h as row-major (batch x hidden) in the elementwise kernel and then copy to output[:,t,:]; also set h_prev_col to column-major for next iteration. We can either store both or write to output and then transpose for next GEMM. Transposing each step adds cost.
++// Alternative: keep hidden state in row-major and perform GEMM using row-major with transa/transb. cuBLAS supports row-major via CUBLAS_OP_T/N with appropriate leading dimensions? Actually cuBLAS always assumes column-major, but you can get row-major by passing transposed flags. If we have row-major matrices, we can treat them as column-major with swapped dimensions and use transa/transb accordingly.
++// For x_t row-major [batch, input_dim], we can treat as column-major [input_dim, batch] by setting lda = input_dim, and using transa = CUBLAS_OP_T? Let's test: cuBLAS column-major matrix A is m x k with leading dimension lda. If we store row-major data of size (batch x input_dim), and we want to compute C = x_t * W^T, we can set A as column-major with m=batch, k=input_dim, but data is row-major, meaning actual column-major interpretation would be wrong because memory layout differs. To correctly compute, we can use cublasSgemm with op(A)=CUBLAS_OP_T when A is row-major but we pass it as column-major with dimensions m=input_dim, n=batch? This gets confusing.
++// Easiest: we will copy x_t to column-major contiguous buffer of shape (input_dim x batch) using a small kernel or cudaMemcpy2D with custom strides. Since input_dim* batch = 1600 floats, copying is cheap. We'll do that.
++
++// So launcher steps:
++// 1. Check inputs: assume float32, CUDA, contiguous? We can require contiguous from binding.cpp (they will enforce). If not contiguous, binding.cpp will make contiguous before calling.
++// 2. Allocate device memory using cudaMalloc for all buffers: x_col (input_dim x batch for layer0; hidden x batch for layer1), h_col (hidden x batch), c_col (hidden x batch), gates_pre_col (4H x batch), h_new_row (batch x hidden), c_new_row (batch x hidden), W_ih_col (4H x input_dim), W_hh_col (4H x hidden) for each layer. Actually we can allocate per-layer buffers as needed.
++// 3. Copy weights to column-major format: since weights are row-major [4H, input_dim], we can treat as column-major [input_dim, 4H]? For GEMM, we need W_ih_col as column-major of shape 4H x input_dim. So we transpose weights. We can use cublasSgeam or a simple kernel to transpose, or use cuBLAS with transa/transb directly without transposing. Since weights are small, transposing once is fine.
++// 4. Initialize h_col and c_col to zero.
++// 5. For layer=0:
++//    for t in 0..seq_len-1:
++//       copy x[:,t,:] to x_col (input_dim x batch). We can use cudaMemcpy2D with appropriate pitch: source has batch rows, each row length input_dim, row pitch = seq_len*input_dim*sizeof(float), but we need column-major? To convert to column-major shape input_dim x batch, we need to transpose. We can use a kernel: thread per (b,j) writes x_col[j* batch + b] = x[b, t, j]. This kernel is simple.
++//       call cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 4H, batch, input_dim, &alpha, W_ih_col, 4H, x_col, input_dim, &beta, gates_pre_col, 4H)   // note beta=0
++//       call cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 4H, batch, hidden, &alpha, W_hh_col, 4H, h_col, hidden, &beta=1, gates_pre_col, 4H) // add
++//       add biases to gates_pre_col: each row gets bias_ih+j? Actually biases are length 4H, for each row of gates_pre_col. We'll do this in the elementwise kernel.
++//       launch elementwise kernel: for each b (0..batch-1), for each h (0..hidden-1), compute gate values from gates_pre_col, update c and h, store h in h_new_row[b* hidden + h] and c_new_row[b* hidden + h]. Then copy h_new_row to output[:,t,:] (row-major, stride batch_dim? Output is [batch, seq, hidden], so element (b,t,h) at b*seq*hidden + t*hidden + h. We can write directly from elementwise kernel if we have output pointer and strides. But elementwise kernel produces h_new_row; we can have it also write to output. To avoid extra kernel, combine: elementwise kernel takes gates_pre_col, bias, current c_col, h_col, and output pointer, writes output and updates h_col_new, c_col_new. But h_col is column-major hidden x batch, while h_new_row is row-major. We may need both: for next GEMM, h_col (hidden x batch) is needed; for output, h_new_row. We can store h_col_new in column-major within same kernel by writing to h_col[hidden*batch] appropriately. Then no need for h_new_row separate.
++//       So elementwise kernel updates h_col and c_col in place (or writes to new and swap). We'll use double buffering: allocate h_col_next and c_col_next, compute, then swap pointers.
++//       After kernel, we need to copy h_col (column-major) to output row-major. We can have the elementwise kernel write directly to output using the output tensor's memory layout: output is [batch, seq, hidden], row-major, so we can compute output_offset = b*seq*hidden + t*hidden + h, and write h value. That avoids separate copy.
++//       So elementwise kernel takes: gates_pre_col (4H x batch), bias pointer (length 4H), c_col (hidden x batch), h_col (hidden x batch), output pointer, batch, hidden, seq, current t, and writes output and new c_col_next, h_col_next.
++//    After loop for layer, we need to store final h and c for all batches into hidden and cell output tensors of shape [num_layers, batch, hidden]. For layer 0, store h_col (column-major) into hidden[0] and c_col into cell[0]. Since hidden output tensor is [num_layers, batch, hidden] row-major? Contract says shape [num_layers, batch, hidden], but PyTorch LSTM returns hidden as [num_layers, batch, hidden] with layer first. We'll need to copy column-major h_col to row-major appropriate slice. We can do this after each layer.
++//    For layer 1, input is output of layer0 for each timestep, which we have written to output tensor. We can then process layer1 using output as input. We need to copy output[:, t, :] to x_col for layer1. Since output is row-major [batch, seq, hidden], we can use a kernel to load x_col from output.
++// 6. After both layers, we have hidden and cell tensors filles.
++// 7. Free temporary memory.
++
++// cat_hidden_cell: simple kernel copying hidden and cell into output [num_layers, 2*batch, hidden] with hidden first then cell along dim1.
++
++// This approach uses cuBLAS, which should be efficient. We'll implement launchers as extern "C".
++
++// We'll include cublas_v2.h and use cublasHandle_t. The launcher will create/destroy handle per call? Better to create static handle once using cublasCreate and cublasSetStream, but handle creation overhead per call may be high. We can have a static cublasHandle_t and initialize on first call, set stream accordingly. However, thread-safety? We assume same stream. Use static handle with std::call_once or just cublasCreate in launcher each time; overhead may be acceptable given small LSTM? Actually LSTM has 1024 steps, cuBLAS calls many; handle creation once is better. We can use a global handle with cublasCreate, and set stream each call.
++
++// Since we must avoid C++ runtime init complexities, we can create handle lazily in launcher using a static flag.
++
++// Also need to check CUDA errors after each call.
++
++// Because this is a single .cu file, we can include all kernels and launchers.
++
++// Let's write the code.
++
++#include <stdio.h>
++#include <cmath>
++#include <cuda_runtime.h>
++#include <cublas_v2.h>
++
++// Kernel to copy x[:, t, :] to column-major x_col (shape input_dim x batch)
++__global__ void copy_x_to_col(const float* __restrict__ x, float* __restrict__ x_col,
++                             int batch, int seq_len, int input_dim, int t) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = batch * input_dim;
++    if (idx >= total) return;
++    int b = idx / input_dim;
++    int j = idx % input_dim;
++    x_col[j * batch + b] = x[(size_t)b * seq_len * input_dim + (size_t)t * input_dim + j];
++}
++
++// Kernel to copy output[:, t, :] (row-major) to x_col column-major (for layer >0)
++__global__ void copy_output_to_col(const float* __restrict__ output, float* __restrict__ x_col,
++                                  int batch, int seq_len, int hidden, int t) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = batch * hidden;
++    if (idx >= total) return;
++    int b = idx / hidden;
++    int j = idx % hidden;
++    x_col[j * batch + b] = output[(size_t)b * seq_len * hidden + (size_t)t * hidden + j];
++}
++
++// Kernel to elementwise compute gates, update c and h, and write output.
++// gates_pre_col: shape 4H x batch, column-major.
++// bias: length 4H.
++// c_col: hidden x batch, column-major, current cell state.
++// h_col: hidden x batch, column-major, current hidden state.
++// c_col_next, h_col_next: same layout for next time.
++// output: [batch, seq_len, hidden] row-major.
++// t: current timestep.
++__global__ void lstm_cell_elementwise(const float* __restrict__ gates_pre_col,
++                                      const float* __restrict__ bias,
++                                      const float* __restrict__ c_col,
++                                      const float* __restrict__ h_col,
++                                      float* __restrict__ c_col_next,
++                                      float* __restrict__ h_col_next,
++                                      float* __restrict__ output,
++                                      int batch, int seq_len, int hidden, int t) {
++    int b = blockIdx.x;
++    int j = threadIdx.x;
++    if (b >= batch || j >= hidden) return;
++    int H = hidden;
++    // indices in gates_pre_col: row j (i gate), H+j (f), 2H+j (g), 3H+j (o)
++    int col = b;
++    float gi = gates_pre_col[(size_t)j * batch + col] + bias[j];
++    float gf = gates_pre_col[(size_t)(H + j) * batch + col] + bias[H + j];
++    float gg = gates_pre_col[(size_t)(2 * H + j) * batch + col] + bias[2 * H + j];
++    float go = gates_pre_col[(size_t)(3 * H + j) * batch + col] + bias[3 * H + j];
++
++    float i = 1.0f / (1.0f + expf(-gi));
++    float f = 1.0f / (1.0f + expf(-gf));
++    float g = tanhf(gg);
++    float o = 1.0f / (1.0f + expf(-go));
++
++    float c_prev = c_col[(size_t)j * batch + b];
++    float h_prev = h_col[(size_t)j * batch + b];
++    float c_new = f * c_prev + i * g;
++    float h_new = o * tanhf(c_new);
++
++    c_col_next[(size_t)j * batch + b] = c_new;
++    h_col_next[(size_t)j * batch + b] = h_new;
++
++    // write to output tensor: output[b, t, j]
++    output[(size_t)b * seq_len * hidden + (size_t)t * hidden + j] = h_new;
++}
++
++// Kernel to transpose weight matrix from row-major [rows, cols] to column-major [rows, cols]? 
++// For GEMM, we need W_col of shape (4H, input_dim) in column-major. Since input weight is row-major [4H, input_dim], to convert to column-major we need to write W_col[j][i] = W_row[i][j]? Actually column-major storage means element (i,j) is at offset j*lda + i, where i is row (0..4H-1), j col (0..input_dim-1). If we have row-major W_row of shape (4H, input_dim), element (i,j) at offset i*input_dim + j. To get column-major with same logical dimensions, we need to copy such that W_col[j*4H + i] = W_row[i*input_dim + j]. This is a transpose.
++__global__ void transpose_weight(const float* __restrict__ src, float* __restrict__ dst,
++                                int rows, int cols) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = rows * cols;
++    if (idx >= total) return;
++    int i = idx / cols;
++    int j = idx % cols;
++    dst[(size_t)j * rows + i] = src[(size_t)i * cols + j];
++}
++
++// Kernel to copy column-major state (hidden x batch) to row-major hidden/cell output slice.
++// For layer l, we write hidden[l, b, j] = h_col[j*batch + b], row-major layout of hidden tensor is [num_layers, batch, hidden].
++// Hidden tensor pointer is row-major: offset = l * batch * hidden + b * hidden + j.
++__global__ void copy_state_to_output(const float* __restrict__ state_col, float* __restrict__ state_out,
++                                     int batch, int hidden, int layer, int num_layers) {
++    int b = blockIdx.x;
++    int j = threadIdx.x;
++    if (b >= batch || j >= hidden) return;
++    int val = state_col[(size_t)j * batch + b];
++    state_out[(size_t)layer * batch * hidden + (size_t)b * hidden + j] = val;
++}
++
++// cat_hidden_cell kernel: output[num_layers, 2*batch, hidden], first batch dimension from hidden, second from cell.
++// hidden and cell are row-major [num_layers, batch, hidden].
++__global__ void cat_hidden_cell_kernel(const float* __restrict__ hidden,
++                                       const float* __restrict__ cell,
++                                       float* __restrict__ output,
++                                       int num_layers, int batch, int hidden) {
++    int b = blockIdx.x;
++    int l = blockIdx.y;
++    int j = threadIdx.x;
++    if (b >= batch || l >= num_layers || j >= hidden) return;
++    int out_b = b;
++    output[(size_t)l * (2 * batch) * hidden + (size_t)out_b * hidden + j] = hidden[(size_t)l * batch * hidden + (size_t)b * hidden + j];
++    output[(size_t)l * (2 * batch) * hidden + (size_t)(batch + out_b) * hidden + j] = cell[(size_t)l * batch * hidden + (size_t)b * hidden + j];
++}
++
++// Launcher for LSTM forward.
++extern "C" void lstm_forward_launcher(
++    const float* x,           // [batch, seq_len, input_size]
++    const float* weight_ih_l0, // [4H, input_size]
++    const float* weight_hh_l0, // [4H, H]
++    const float* bias_ih_l0,   // [4H]
++    const float* bias_hh_l0,   // [4H]
++    const float* weight_ih_l1, // [4H, H]
++    const float* weight_hh_l1, // [4H, H]
++    const float* bias_ih_l1,   // [4H]
++    const float* bias_hh_l1,   // [4H]
++    int64_t hidden_size,
++    int64_t num_layers,       // should be 2
++    float* output,            // [batch, seq_len, hidden_size]
++    float* hidden_out,        // [num_layers, batch, hidden_size]
++    float* cell_out,          // [num_layers, batch, hidden_size]
++    int64_t batch_size,
++    int64_t seq_len,
++    int64_t input_size,
++    cudaStream_t stream
++) {
++    // Only support num_layers=2 as per contract.
++    int H = (int)hidden_size;
++    int B = (int)batch_size;
++    int S = (int)seq_len;
++    int D0 = (int)input_size;
++    int L = (int)num_layers;
++
++    // Create cuBLAS handle (static to avoid repeated creation)
++    static cublasHandle_t handle = nullptr;
++    if (!handle) {
++        cublasCreate(&handle);
++    }
++    cublasSetStream(handle, stream);
++
++    // Allocate temporary buffers
++    float *d_x_col, *d_h_col, *d_c_col, *d_h_col_next, *d_c_col_next, *d_gates_pre;
++    float *d_W_ih_col, *d_W_hh_col;
++    cudaMalloc(&d_x_col, sizeof(float) * D0 * B); // max input dim for layer0, for layer1 we'll allocate H*B
++    cudaMalloc(&d_h_col, sizeof(float) * H * B);
++    cudaMalloc(&d_c_col, sizeof(float) * H * B);
++    cudaMalloc(&d_h_col_next, sizeof(float) * H * B);
++    cudaMalloc(&d_c_col_next, sizeof(float) * H * B);
++    cudaMalloc(&d_gates_pre, sizeof(float) * (4 * H) * B);
++    cudaMalloc(&d_W_ih_col, sizeof(float) * (4 * H) * D0); // for layer0
++    cudaMalloc(&d_W_hh_col, sizeof(float) * (4 * H) * H);
++
++    // Initialize h and c to zero for first layer
++    cudaMemsetAsync(d_h_col, 0, sizeof(float) * H * B, stream);
++    cudaMemsetAsync(d_c_col, 0, sizeof(float) * H * B, stream);
++
++    // Set cuBLAS parameters
++    float alpha = 1.0f, beta = 0.0f;
++
++    // Loop over layers
++    for (int l = 0; l < L; ++l) {
++        int D = (l == 0) ? D0 : H;
++        const float* w_ih = (l == 0) ? weight_ih_l0 : weight_ih_l1;
++        const float* w_hh = (l == 0) ? weight_hh_l0 : weight_hh_l1;
++        const float* b_ih = (l == 0) ? bias_ih_l0 : bias_ih_l1;
++        const float* b_hh = (l == 0) ? bias_hh_l0 : bias_hh_l1;
++
++        // Transpose weights to column-major format
++        if (l == 0) {
++            int threads = 256;
++            int blocks = ((4 * H * D) + threads - 1) / threads;
++            transpose_weight<<<blocks, threads, 0, stream>>>(w_ih, d_W_ih_col, 4 * H, D);
++        } else {
++            // reuse d_W_ih_col with size (4H, H)
++            int threads = 256;
++            int blocks = ((4 * H * D) + threads - 1) / threads;
++            transpose_weight<<<blocks, threads, 0, stream>>>(w_ih, d_W_ih_col, 4 * H, D);
++        }
++        int threads = 256;
++        int blocks = ((4 * H * H) + threads - 1) / threads;
++        transpose_weight<<<blocks, threads, 0, stream>>>(w_hh, d_W_hh_col, 4 * H, H);
++
++        // For each timestep
++        for (int t = 0; t < S; ++t) {
++            // Copy input for current timestep to x_col
++            if (l == 0) {
++                int total = B * D;
++                int t_threads = 256;
++                int t_blocks = (total + t_threads - 1) / t_threads;
++                copy_x_to_col<<<t_blocks, t_threads, 0, stream>>>(x, d_x_col, B, S, D, t);
++            } else {
++                // input is output of previous layer
++                int total = B * H;
++                int t_threads = 256;
++                int t_blocks = (total + t_threads - 1) / t_threads;
++                copy_output_to_col<<<t_blocks, t_threads, 0, stream>>>(output, d_x_col, B, S, H, t);
++            }
++
++            // GEMM: gates_pre = W_ih_col * x_col (4H x B)
++            // Need to allocate gates_pre as (4H x B) column-major.
++            cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
++                        4 * H, B, D,
++                        &alpha, d_W_ih_col, 4 * H,
++                        d_x_col, D,
++                        &beta, d_gates_pre, 4 * H);
++
++            // GEMM: gates_pre += W_hh_col * h_col
++            beta = 1.0f;
++            cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
++                        4 * H, B, H,
++                        &alpha, d_W_hh_col, 4 * H,
++                        d_h_col, H,
++                        &beta, d_gates_pre, 4 * H);
++            beta = 0.0f; // reset for next iteration start
++
++            // Add biases in elementwise kernel; update c,h, write output.
++            // Launch kernel with grid = B, threads = H (or more for alignment).
++            int cell_threads = H;
++            int cell_blocks = B;
++            // Ensure threads >= 32? hidden=50, so 50 threads is fine but not a multiple of warp, but we can launch 64 threads and check bound in kernel.
++            if (cell_threads < 64) cell_threads = 64;
++            lstm_cell_elementwise<<<cell_blocks, cell_threads, 0, stream>>>(
++                d_gates_pre, b_ih, d_c_col, d_h_col,
++                d_c_col_next, d_h_col_next, output,
++                B, S, H, t);
++
++            // Swap h and c pointers for next timestep
++            float* tmp = d_h_col; d_h_col = d_h_col_next; d_h_col_next = tmp;
++            tmp = d_c_col; d_c_col = d_c_col_next; d_c_col_next = tmp;
++        }
++
++        // After finishing layer, copy final h and c to hidden_out and cell_out rows for this layer.
++        int state_threads = (H < 64) ? 64 : H;
++        copy_state_to_output<<<B, state_threads, 0, stream>>>(d_h_col, hidden_out, B, H, l, L);
++        copy_state_to_output<<<B, state_threads, 0, stream>>>(d_c_col, cell_out, B, H, l, L);
++
++        // Reset h and c for next layer (if any). We can reuse by setting to zero.
++        if (l < L - 1) {
++            cudaMemsetAsync(d_h_col, 0, sizeof(float) * H * B, stream);
++            cudaMemsetAsync(d_c_col, 0, sizeof(float) * H * B, stream);
++        }
++    }
++
++    // Free temporary buffers
++    cudaFree(d_x_col);
++    cudaFree(d_h_col);
++    cudaFree(d_c_col);
++    cudaFree(d_h_col_next);
++    cudaFree(d_c_col_next);
++    cudaFree(d_gates_pre);
++    cudaFree(d_W_ih_col);
++    cudaFree(d_W_hh_col);
++
++    // Check errors
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // Handle error? Binding layer can check; but we can print.
++        fprintf(stderr, "CUDA error in lstm_forward: %s\n", cudaGetErrorString(err));
++    }
++}
++
++// Launcher for cat_hidden_cell.
++extern "C" void cat_hidden_cell_launcher(
++    const float* hidden, // [num_layers, batch, hidden]
++    const float* cell,   // [num_layers, batch, hidden]
++    float* output,       // [num_layers, 2*batch, hidden]
++    int64_t num_layers,
++    int64_t batch_size,
++    int64_t hidden_size,
++    cudaStream_t stream
++) {
++    int L = (int)num_layers;
++    int B = (int)batch_size;
++    int H = (int)hidden_size;
++    dim3 grid(B, L);
++    int threads = (H < 64) ? 64 : H;
++    cat_hidden_cell_kernel<<<grid, threads, 0, stream>>>(hidden, cell, output, L, B, H);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        fprintf(stderr, "CUDA error in cat_hidden_cell: %s\n", cudaGetErrorString(err));
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,178 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declarations from custom_ops.cu
++extern "C" void lstm_forward_launcher(
++    const float* x,
++    const float* weight_ih_l0,
++    const float* weight_hh_l0,
++    const float* bias_ih_l0,
++    const float* bias_hh_l0,
++    const float* weight_ih_l1,
++    const float* weight_hh_l1,
++    const float* bias_ih_l1,
++    const float* bias_hh_l1,
++    int64_t hidden_size,
++    int64_t num_layers,
++    float* output,
++    float* hidden_out,
++    float* cell_out,
++    int64_t batch_size,
++    int64_t seq_len,
++    int64_t input_size,
++    cudaStream_t stream
++);
++
++extern "C" void cat_hidden_cell_launcher(
++    const float* hidden,
++    const float* cell,
++    float* output,
++    int64_t num_layers,
++    int64_t batch_size,
++    int64_t hidden_size,
++    cudaStream_t stream
++);
++
++static void check_cuda_float_contiguous(const torch::Tensor& t, const char* name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++
++std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> lstm_forward_wrapper(
++    torch::Tensor x,
++    torch::Tensor weight_ih_l0,
++    torch::Tensor weight_hh_l0,
++    torch::Tensor bias_ih_l0,
++    torch::Tensor bias_hh_l0,
++    torch::Tensor weight_ih_l1,
++    torch::Tensor weight_hh_l1,
++    torch::Tensor bias_ih_l1,
++    torch::Tensor bias_hh_l1,
++    int64_t hidden_size,
++    int64_t num_layers
++) {
++    // Check all tensors
++    check_cuda_float_contiguous(x, "x");
++    check_cuda_float_contiguous(weight_ih_l0, "weight_ih_l0");
++    check_cuda_float_contiguous(weight_hh_l0, "weight_hh_l0");
++    check_cuda_float_contiguous(bias_ih_l0, "bias_ih_l0");
++    check_cuda_float_contiguous(bias_hh_l0, "bias_hh_l0");
++    check_cuda_float_contiguous(weight_ih_l1, "weight_ih_l1");
++    check_cuda_float_contiguous(weight_hh_l1, "weight_hh_l1");
++    check_cuda_float_contiguous(bias_ih_l1, "bias_ih_l1");
++    check_cuda_float_contiguous(bias_hh_l1, "bias_hh_l1");
++
++    // Extract dimensions from x (batch, seq, input) and hidden_size/num_layers
++    int64_t batch_size = x.size(0);
++    int64_t seq_len = x.size(1);
++    int64_t input_size = x.size(2);
++
++    TORCH_CHECK(batch_size > 0 && seq_len > 0 && input_size > 0, "Invalid input dimensions");
++    TORCH_CHECK(hidden_size > 0 && num_layers > 0, "hidden_size and num_layers must be positive");
++
++    // Validate parameter shapes
++    TORCH_CHECK(weight_ih_l0.size(0) == 4 * hidden_size && weight_ih_l0.size(1) == input_size,
++                "weight_ih_l0 shape mismatch");
++    TORCH_CHECK(weight_hh_l0.size(0) == 4 * hidden_size && weight_hh_l0.size(1) == hidden_size,
++                "weight_hh_l0 shape mismatch");
++    TORCH_CHECK(bias_ih_l0.size(0) == 4 * hidden_size, "bias_ih_l0 shape mismatch");
++    TORCH_CHECK(bias_hh_l0.size(0) == 4 * hidden_size, "bias_hh_l0 shape mismatch");
++    TORCH_CHECK(weight_ih_l1.size(0) == 4 * hidden_size && weight_ih_l1.size(1) == hidden_size,
++                "weight_ih_l1 shape mismatch");
++    TORCH_CHECK(weight_hh_l1.size(0) == 4 * hidden_size && weight_hh_l1.size(1) == hidden_size,
++                "weight_hh_l1 shape mismatch");
++    TORCH_CHECK(bias_ih_l1.size(0) == 4 * hidden_size, "bias_ih_l1 shape mismatch");
++    TORCH_CHECK(bias_hh_l1.size(0) == 4 * hidden_size, "bias_hh_l1 shape mismatch");
++
++    // Allocate output tensors
++    auto output = torch::empty({batch_size, seq_len, hidden_size}, x.options());
++    auto hidden = torch::empty({num_layers, batch_size, hidden_size}, x.options());
++    auto cell = torch::empty({num_layers, batch_size, hidden_size}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    lstm_forward_launcher(
++        x.data_ptr<float>(),
++        weight_ih_l0.data_ptr<float>(),
++        weight_hh_l0.data_ptr<float>(),
++        bias_ih_l0.data_ptr<float>(),
++        bias_hh_l0.data_ptr<float>(),
++        weight_ih_l1.data_ptr<float>(),
++        weight_hh_l1.data_ptr<float>(),
++        bias_ih_l1.data_ptr<float>(),
++        bias_hh_l1.data_ptr<float>(),
++        hidden_size,
++        num_layers,
++        output.data_ptr<float>(),
++        hidden.data_ptr<float>(),
++        cell.data_ptr<float>(),
++        batch_size,
++        seq_len,
++        input_size,
++        stream
++    );
++
++    // Check for launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA error in lstm_forward: ", cudaGetErrorString(err));
++
++    return std::make_tuple(output, hidden, cell);
++}
++
++torch::Tensor cat_hidden_cell_wrapper(torch::Tensor hidden, torch::Tensor cell) {
++    check_cuda_float_contiguous(hidden, "hidden");
++    check_cuda_float_contiguous(cell, "cell");
++
++    int64_t num_layers = hidden.size(0);
++    int64_t batch_size = hidden.size(1);
++    int64_t hidden_size = hidden.size(2);
++
++    TORCH_CHECK(cell.size(0) == num_layers && cell.size(1) == batch_size && cell.size(2) == hidden_size,
++                "cell shape must match hidden shape");
++
++    auto output = torch::empty({num_layers, 2 * batch_size, hidden_size}, hidden.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    cat_hidden_cell_launcher(
++        hidden.data_ptr<float>(),
++        cell.data_ptr<float>(),
++        output.data_ptr<float>(),
++        num_layers,
++        batch_size,
++        hidden_size,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA error in cat_hidden_cell: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("lstm_forward", &lstm_forward_wrapper,
++          py::arg("x"),
++          py::arg("weight_ih_l0"),
++          py::arg("weight_hh_l0"),
++          py::arg("bias_ih_l0"),
++          py::arg("bias_hh_l0"),
++          py::arg("weight_ih_l1"),
++          py::arg("weight_hh_l1"),
++          py::arg("bias_ih_l1"),
++          py::arg("bias_hh_l1"),
++          py::arg("hidden_size"),
++          py::arg("num_layers"));
++
++    m.def("cat_hidden_cell", &cat_hidden_cell_wrapper,
++          py::arg("hidden"),
++          py::arg("cell"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,63 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, hidden_size, num_layers):
++        super().__init__()
++        self.input_size = input_size
++        self.hidden_size = hidden_size
++        self.num_layers = num_layers
++
++        # LSTM parameters: weights and biases for each layer
++        # Shapes: weight_ih_l<layer>: [4*hidden_size, input_size]
++        #         weight_hh_l<layer>: [4*hidden_size, hidden_size]
++        #         bias_ih_l<layer>:   [4*hidden_size]
++        #         bias_hh_l<layer>:   [4*hidden_size]
++        for layer in range(num_layers):
++            input_dim = input_size if layer == 0 else hidden_size
++            setattr(self, f'lstm.weight_ih_l{layer}', nn.Parameter(torch.empty(4 * hidden_size, input_dim)))
++            setattr(self, f'lstm.weight_hh_l{layer}', nn.Parameter(torch.empty(4 * hidden_size, hidden_size)))
++            setattr(self, f'lstm.bias_ih_l{layer}', nn.Parameter(torch.empty(4 * hidden_size)))
++            setattr(self, f'lstm.bias_hh_l{layer}', nn.Parameter(torch.empty(4 * hidden_size)))
++
++        # Initialize parameters (same as PyTorch LSTM default initialization)
++        # PyTorch uses uniform(-1/sqrt(hidden_size), 1/sqrt(hidden_size))
++        stdv = 1.0 / (hidden_size ** 0.5)
++        for param in self.parameters():
++            nn.init.uniform_(param, -stdv, stdv)
++
++    def forward(self, x):
++        # Move all parameters to CUDA if x is CUDA; state_dict remains on CPU until moved.
++        device = x.device
++        weights = [getattr(self, f'lstm.weight_ih_l{l}').to(device) for l in range(self.num_layers)]
++        weights += [getattr(self, f'lstm.weight_hh_l{l}').to(device) for l in range(self.num_layers)]
++        biases = [getattr(self, f'lstm.bias_ih_l{l}').to(device) for l in range(self.num_layers)]
++        biases += [getattr(self, f'lstm.bias_hh_l{l}').to(device) for l in range(self.num_layers)]
++
++        # Call custom LSTM op: returns outputs, hidden, cell
++        outputs, hidden, cell = cuda_extension.lstm_forward(
++            x, *weights, *biases,
++            self.input_size, self.hidden_size, self.num_layers
++        )
++
++        # Concatenate hidden and cell along dim 1
++        result = cuda_extension.cat_hidden_cell(hidden, cell)
++        return result
++
++    def debug_forward(self, x):
++        device = x.device
++        weights = [getattr(self, f'lstm.weight_ih_l{l}').to(device) for l in range(self.num_layers)]
++        weights += [getattr(self, f'lstm.weight_hh_l{l}').to(device) for l in range(self.num_layers)]
++        biases = [getattr(self, f'lstm.bias_ih_l{l}').to(device) for l in range(self.num_layers)]
++        biases += [getattr(self, f'lstm.bias_hh_l{l}').to(device) for l in range(self.num_layers)]
++
++        outputs, hidden, cell = cuda_extension.lstm_forward(
++            x, *weights, *biases,
++            self.input_size, self.hidden_size, self.num_layers
++        )
++        yield 'step_001', (outputs, (hidden, cell))
++
++        result = cuda_extension.cat_hidden_cell(hidden, cell)
++        yield 'step_002', result

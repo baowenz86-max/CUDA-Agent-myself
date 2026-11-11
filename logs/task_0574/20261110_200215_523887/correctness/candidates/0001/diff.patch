@@ -1,0 +1,266 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,85 @@
++// CUDA kernels for custom ops: isnan and BatchNorm1d forward (eval mode with running stats)
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// Element-wise isnan: output bool as unsigned char (1 if NaN, else 0)
++__global__ void isnan_kernel(const float* __restrict__ input, uint8_t* __restrict__ output, int64_t numel) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        output[i] = (uint8_t)(isnan(input[i]) ? 1 : 0);
++    }
++}
++
++// BatchNorm1d forward for eval mode (training=false) using running statistics.
++// Input x shape: [N, C, L], output shape same. weight, bias, running_mean, running_var are per-channel arrays of length C.
++// y[n,c,l] = weight[c] * (x[n,c,l] - running_mean[c]) / sqrt(running_var[c] + eps) + bias[c]
++// If weight/bias null, use identity scale/shift: scale=1, shift=0.
++// running_mean/running_var must be non-null in eval mode; contract guarantees non-null in our calls.
++__global__ void batch_norm_eval_kernel(
++    const float* __restrict__ x,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    const float* __restrict__ running_mean,
++    const float* __restrict__ running_var,
++    float eps,
++    int64_t N,
++    int64_t C,
++    int64_t L,
++    float* __restrict__ out
++) {
++    int64_t total = N * C * L;
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total; i += stride) {
++        // Compute channel index c = (i / L) % C
++        int64_t c = (i / L) % C;
++        float mean = running_mean[c];
++        float var = running_var[c];
++        float inv_std = rsqrtf(var + eps);
++        float scale = (weight != nullptr) ? weight[c] : 1.0f;
++        float shift = (bias != nullptr) ? bias[c] : 0.0f;
++        float x_val = x[i];
++        out[i] = scale * (x_val - mean) * inv_std + shift;
++    }
++}
++
++// Launcher for isnan: input is float32, output is bool (stored as uint8_t)
++// The binding layer will provide a torch::Tensor of bool type; data_ptr<bool> corresponds to uint8_t in CUDA.
++extern "C" void isnan_forward_launcher(
++    const float* input,
++    uint8_t* output,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    if (numel <= 0) return;
++    int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 1048576) blocks = 1048576;
++    isnan_kernel<<<blocks, threads, 0, stream>>>(input, output, numel);
++}
++
++// Launcher for batch_norm_forward in eval mode.
++// N, C, L are dimensions. weight/bias/running_mean/running_var may be null (but not in our contract).
++extern "C" void batch_norm_forward_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    float momentum, // unused in eval mode, but kept for signature compatibility
++    int64_t N,
++    int64_t C,
++    int64_t L,
++    float* out,
++    cudaStream_t stream
++) {
++    int64_t total = N * C * L;
++    if (total <= 0) return;
++    int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    if (blocks > 1048576) blocks = 1048576;
++    batch_norm_eval_kernel<<<blocks, threads, 0, stream>>>(
++        x, weight, bias, running_mean, running_var, eps, N, C, L, out);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,125 @@
++// PyTorch bindings for custom CUDA kernels: isnan and BatchNorm1d forward
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void isnan_forward_launcher(
++    const float* input,
++    uint8_t* output,
++    int64_t numel,
++    cudaStream_t stream);
++
++extern "C" void batch_norm_forward_launcher(
++    const float* x,
++    const float* weight,
++    const float* bias,
++    const float* running_mean,
++    const float* running_var,
++    float eps,
++    float momentum,
++    int64_t N,
++    int64_t C,
++    int64_t L,
++    float* out,
++    cudaStream_t stream);
++
++// Element-wise isnan forward
++torch::Tensor isnan_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++
++    auto out = torch::empty_like(x, x.options().dtype(torch::kBool));
++    int64_t numel = x.numel();
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    isnan_forward_launcher(
++        x.data_ptr<float>(),
++        reinterpret_cast<uint8_t*>(out.data_ptr<bool>()),
++        numel,
++        stream);
++
++    return out;
++}
++
++// BatchNorm1d forward (eval mode only as per contract)
++torch::Tensor batch_norm_forward(
++    torch::Tensor x,
++    c10::optional<torch::Tensor> weight,
++    c10::optional<torch::Tensor> bias,
++    c10::optional<torch::Tensor> running_mean,
++    c10::optional<torch::Tensor> running_var,
++    bool training,
++    double eps,
++    double momentum) {
++
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(x.dim() == 3, "x must be 3D (N, C, L)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t L = x.size(2);
++
++    auto check_optional_channel_tensor = [C](const c10::optional<torch::Tensor>& t, const char* name) {
++        if (t.has_value()) {
++            TORCH_CHECK(t->is_cuda(), name, " must be a CUDA tensor");
++            TORCH_CHECK(t->scalar_type() == torch::kFloat32, name, " must be float32");
++            TORCH_CHECK(t->is_contiguous(), name, " must be contiguous");
++            TORCH_CHECK(t->numel() == C, name, " must have numel equal to C");
++        }
++    };
++
++    check_optional_channel_tensor(weight, "weight");
++    check_optional_channel_tensor(bias, "bias");
++    check_optional_channel_tensor(running_mean, "running_mean");
++    check_optional_channel_tensor(running_var, "running_var");
++
++    // In eval mode, running stats are required. In training mode, they may be null but this kernel does not support training.
++    if (!training) {
++        TORCH_CHECK(running_mean.has_value(), "running_mean is required in eval mode");
++        TORCH_CHECK(running_var.has_value(), "running_var is required in eval mode");
++    }
++
++    auto out = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    batch_norm_forward_launcher(
++        x.data_ptr<float>(),
++        weight.has_value() ? weight->data_ptr<float>() : nullptr,
++        bias.has_value() ? bias->data_ptr<float>() : nullptr,
++        running_mean.has_value() ? running_mean->data_ptr<float>() : nullptr,
++        running_var.has_value() ? running_var->data_ptr<float>() : nullptr,
++        static_cast<float>(eps),
++        static_cast<float>(momentum),
++        N,
++        C,
++        L,
++        out.data_ptr<float>(),
++        stream);
++
++    return out;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("isnan_forward", &isnan_forward,
++          "Element-wise isnan forward",
++          py::arg("x"));
++
++    m.def("batch_norm_forward", &batch_norm_forward,
++          "BatchNorm1d forward (eval mode)",
++          py::arg("x"),
++          py::arg("weight"),
++          py::arg("bias"),
++          py::arg("running_mean"),
++          py::arg("running_var"),
++          py::arg("training"),
++          py::arg("eps"),
++          py::arg("momentum") = 0.1);
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,47 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
++        super().__init__()
++        self.batch_norm = nn.BatchNorm1d(num_features, eps, momentum, affine, track_running_stats)
++
++    def forward(self, x):
++        # Move input to CUDA if necessary. This is not a computational operation.
++        x = x.cuda()
++        # Check for NaNs in the input tensor and return the indices
++        nan_indices = cuda_extension.isnan_forward(x)
++        # Apply batch normalization using custom CUDA operator
++        x = cuda_extension.batch_norm_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.training,
++            self.batch_norm.eps,
++            self.batch_norm.momentum
++        )
++        return x, nan_indices
++
++    def debug_forward(self, x):
++        x = x.cuda()
++        # checkpoint step_001
++        nan_indices = cuda_extension.isnan_forward(x)
++        yield 'step_001', nan_indices
++        # checkpoint step_002
++        x = cuda_extension.batch_norm_forward(
++            x,
++            self.batch_norm.weight,
++            self.batch_norm.bias,
++            self.batch_norm.running_mean,
++            self.batch_norm.running_var,
++            self.training,
++            self.batch_norm.eps,
++            self.batch_norm.momentum
++        )
++        yield 'step_002', x
++        # checkpoint step_003 (final return)
++        yield 'step_003', (x, nan_indices)

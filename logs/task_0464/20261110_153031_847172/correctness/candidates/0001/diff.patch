@@ -1,0 +1,126 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,32 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// CUDA kernel for LeakyReLU forward: out[i] = in[i] >= 0 ? in[i] : negative_slope * in[i]
++__global__ void leaky_relu_kernel(float* __restrict__ out,
++                                 const float* __restrict__ in,
++                                 int64_t n,
++                                 float negative_slope) {
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += stride) {
++        float v = in[i];
++        out[i] = (v >= 0.0f) ? v : (negative_slope * v);
++    }
++}
++
++// Launcher with C linkage for binding layer
++extern "C" void custom_leaky_relu_launcher(float* out,
++                                           const float* in,
++                                           int64_t n,
++                                           double negative_slope,
++                                           cudaStream_t stream) {
++    if (n == 0) return;
++
++    const int block_size = 256;
++    // Calculate grid size, cap to maximum grid dimension (2^31-1) per block dim, but use grid-stride loop anyway
++    int64_t blocks64 = (n + block_size - 1) / block_size;
++    int grid_size = (int)((blocks64 > 2147483647LL) ? 2147483647 : blocks64);
++    if (grid_size < 1) grid_size = 1;
++
++    float slope = (float)negative_slope;
++    leaky_relu_kernel<<<grid_size, block_size, 0, stream>>>(out, in, n, slope);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,54 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void custom_leaky_relu_launcher(float* out,
++                                           const float* in,
++                                           int64_t n,
++                                           double negative_slope,
++                                           cudaStream_t stream);
++
++// Wrapper function
++static torch::Tensor custom_leaky_relu(torch::Tensor x, double negative_slope) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    
++    // Make contiguous if necessary (handles non-contiguous strides)
++    auto x_contig = x.contiguous();
++    
++    // Allocate output tensor with same sizes and options as contiguous input
++    auto output = torch::empty_like(x_contig);
++    
++    int64_t n = x_contig.numel();
++    if (n == 0) {
++        return output;
++    }
++    
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    
++    // Call launcher with raw pointers
++    custom_leaky_relu_launcher(
++        output.data_ptr<float>(),
++        x_contig.data_ptr<float>(),
++        n,
++        negative_slope,
++        stream
++    );
++    
++    return output;
++}
++
++// Registration function
++static void register_custom_leaky_relu(pybind11::module& m) {
++    m.def("custom_leaky_relu", &custom_leaky_relu,
++          "LeakyReLU forward",
++          py::arg("x"),
++          py::arg("negative_slope"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_leaky_relu, register_custom_leaky_relu);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,31 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features, leakiness):
++        super().__init__()
++        self.in_features = in_features
++        self.negative_slope = leakiness
++
++    def forward(self, x):
++        return cuda_extension.custom_leaky_relu(x, self.negative_slope)
++
++    def debug_forward(self, x):
++        y = self.forward(x)
++        yield 'step_001', y
++
++
++batch_size = 1024
++in_features = 128
++height, width = 64, 64
++leakiness = 0.01
++
++
++def get_inputs():
++    return [torch.randn(batch_size, in_features, height, width)]
++
++
++def get_init_inputs():
++    return [in_features, leakiness]

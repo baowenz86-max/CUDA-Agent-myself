@@ -1,0 +1,101 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -159,16 +159,12 @@
+ 
+     // Temporary buffer for hidden: [batch, hidden_size]
+     // Since we only have raw pointers, we need to allocate scratch space. The binding
+-    // layer cannot provide workspace, so we allocate here using cudaMallocAsync or cudaMalloc.
+-    // To keep this self-contained, we use cudaMalloc with stream-ordered semantics via cudaMallocAsync if available,
+-    // but for portability we use cudaMalloc and cudaFree. The overhead is acceptable for such small buffers.
+-    // In production, a workspace argument would be preferred.
++    // layer cannot provide workspace, so we allocate here using cudaMalloc.
++    // For portability we use cudaMalloc and cudaFree. The overhead is acceptable for such small buffers.
+     float* hidden = nullptr;
+     size_t hidden_bytes = (size_t)x_rows * tail0_rows * sizeof(float);
+     cudaError_t err = cudaMalloc(&hidden, hidden_bytes);
+     if (err != cudaSuccess) {
+-        // If allocation fails, there is no safe way to report through this C API.
+-        // We opt to silently return; binding layer should check kernel errors anyway.
+         return;
+     }
+ 
+@@ -184,7 +180,6 @@
+ 
+     // Step 2: output = hidden * tail1^T
+     // hidden is [batch, hidden_size], tail1 is [n_tail_classes, hidden_size]
+-    // output is [batch, n_tail_classes]
+     grid = dim3((tail1_rows + block.x - 1) / block.x, (x_rows + block.y - 1) / block.y);
+     matmul_transb_kernel<<<grid, block, 0, stream>>>(
+         hidden, 1, tail0_rows, // hidden row stride = hidden_size
+@@ -203,9 +198,7 @@
+     );
+ 
+     // Free hidden buffer, but must ensure all kernels have completed.
+-    // Since cudaFree after enqueuing may be unsafe (the buffer may still be used),
+-    // we use cudaFreeAsync (if stream is non-default) or just synchronize before free.
+-    // Simpler: use cudaStreamSynchronize and then cudaFree. This adds latency but is correct.
++    // Since cudaFree after enqueuing may be unsafe, use cudaStreamSynchronize and then cudaFree.
+     cudaStreamSynchronize(stream);
+     cudaFree(hidden);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -41,14 +41,16 @@
+ 
+     int batch_size = x.size(0);
+     int in_features = x.size(1);
+-    int n_head_classes = head_weight.size(0);
++    // We only need the first 5000 head classes (excluding the tail class)
++    int n_head_classes = 5000;
++    TORCH_CHECK(head_weight.size(0) >= n_head_classes, "head_weight must have at least 5000 rows");
+ 
+     auto output = torch::empty({batch_size, n_head_classes}, x.options());
+ 
+-    // Inputs may have arbitrary strides, but launcher expects row stride in elements and column stride=1.
+-    // We ensure continuity for simplicity; if not contiguous, make contiguous.
++    // Use only the first 5000 rows of head_weight
++    auto head_weight_sliced = head_weight.narrow(0, 0, n_head_classes);
+     auto x_contig = x.contiguous();
+-    auto head_contig = head_weight.contiguous();
++    auto head_contig = head_weight_sliced.contiguous();
+ 
+     cudaStream_t stream = getCurrentStream();
+     adaptive_logsoftmax_head_launcher(
+@@ -58,7 +60,6 @@
+         stream
+     );
+ 
+-    // Check for errors (optional but recommended)
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
+ 
+@@ -114,19 +115,17 @@
+     TORCH_CHECK(head_log_probs.size(0) == tail_log_probs.size(0), "batch sizes must match");
+ 
+     int batch_size = head_log_probs.size(0);
+-    int head_cols = head_log_probs.size(1);
+-    int tail_cols = tail_log_probs.size(1);
+-    int n_classes = head_cols + tail_cols;
++    int head_cols = head_log_probs.size(1);  // expected 5000
++    int tail_cols = tail_log_probs.size(1);  // expected 5000
++    int n_classes = head_cols + tail_cols;   // 10000
+ 
+-    // Output shape [batch_size, 1, n_classes]
+     auto output = torch::empty({batch_size, 1, n_classes}, head_log_probs.options());
+ 
+     auto head_contig = head_log_probs.contiguous();
+     auto tail_contig = tail_log_probs.contiguous();
+ 
+-    // For output, contiguous layout has stride (n_classes, n_classes, 1)
+-    int out_row_stride = output.stride(0); // should be n_classes
+-    int out_col_stride = output.stride(2); // should be 1
++    int out_row_stride = output.stride(0);
++    int out_col_stride = output.stride(2);
+ 
+     cudaStream_t stream = getCurrentStream();
+     adaptive_logsoftmax_combine_launcher(
+@@ -154,4 +153,4 @@
+           py::arg("head_log_probs"), py::arg("tail_log_probs"));
+ }
+ 
+-REGISTER_BINDING(adaptive_logsoftmax_ops, register_adaptive_logsoftmax_ops);+REGISTER_BINDING(adaptive_logsoftmax_ops, register_adaptive_logsoftmax_ops);

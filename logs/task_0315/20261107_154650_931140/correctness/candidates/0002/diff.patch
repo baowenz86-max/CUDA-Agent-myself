@@ -1,0 +1,123 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,14 +1,17 @@
+ #include <cuda_runtime.h>
++#include <cmath>
+ 
+ // Fused tanh + LeakyReLU (negative_slope = 0.01) kernel.
+-// Input and output may have arbitrary strides. The launcher receives
+-// a pointer to an int64_t array containing input strides of length ndim.
+-// Input is not modified; output is written.
++// Input may have arbitrary strides; output is assumed to have the same shape as input,
++// and we write in row-major order based on linear index.
++// We are given input_strides (array of length ndim) and shape (array of length ndim)
++// so that we can compute the input offset for each linear output index.
+ __global__ void fused_tanh_leaky_relu_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+     int64_t total_elements,
+     const int64_t* __restrict__ input_strides,
++    const int64_t* __restrict__ shape,
+     int ndim)
+ {
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+@@ -17,19 +20,41 @@
+     for (int64_t linear = idx; linear < total_elements; linear += stride) {
+         int64_t rem = linear;
+         int64_t in_offset = 0;
+-        // Compute multi-dimensional index and input offset using input strides.
+-        // Assumes linear index enumerates output in row-major order, which is
+-        // correct because output is created as empty_like and has same shape.
++        // Compute input offset from linear index and input strides.
++        // Output linear index assumes row-major order with shape.
+         for (int d = ndim - 1; d >= 0; --d) {
+-            // We need shape[d], but we don't have shape explicitly. Since input
+-            // and output have same shape and same total_elements, we can infer
+-            // each dimension's size from the strides? No, strides alone cannot
+-            // reconstruct arbitrary shape. Binding layer must pass shape array too.
+-            // To maintain kernel purity, we reconsider launcher signature:
+-            // we will pass shape as well. But we cannot change contract beyond
+-            // providing a clear launcher. The binding layer knows shape, so it
+-            // can pass shape and strides. We'll define launcher with shape.
+-            // This kernel needs shape to compute indices. We'll add shape parameter.
++            int64_t coord = rem % shape[d];
++            rem /= shape[d];
++            in_offset += coord * input_strides[d];
+         }
++        float val = input[in_offset];
++        float tanh_val = tanhf(val);
++        float out_val = (tanh_val > 0.0f) ? tanh_val : 0.01f * tanh_val;
++        output[linear] = out_val;
+     }
+ }
++
++// Launcher function called from binding.
++extern "C" void fused_tanh_leaky_relu_launcher(
++    const float* input,
++    float* output,
++    int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* shape,
++    int ndim,
++    cudaStream_t stream)
++{
++    const int block_size = 256;
++    // Grid size capped at 2^31-1, but use a reasonable number based on total_elements.
++    int64_t grid_size = (total_elements + block_size - 1) / block_size;
++    // Cap grid size to avoid exceeding max grid dimension.
++    const int64_t max_grid_x = 2147483647; // 2^31 - 1
++    if (grid_size > max_grid_x) {
++        grid_size = max_grid_x;
++    }
++    dim3 grid(static_cast<unsigned int>(grid_size));
++    dim3 block(block_size);
++
++    fused_tanh_leaky_relu_kernel<<<grid, block, 0, stream>>>(
++        input, output, total_elements, input_strides, shape, ndim);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
++#include <vector>
+ #include "../binding_registry.h"
+ 
+ // Declare launcher from custom_ops.cu
+@@ -10,6 +11,9 @@
+     const float* input,
+     float* output,
+     int64_t total_elements,
++    const int64_t* input_strides,
++    const int64_t* shape,
++    int ndim,
+     cudaStream_t stream);
+ 
+ torch::Tensor fused_tanh_leaky_relu(torch::Tensor x) {
+@@ -19,14 +23,23 @@
+ 
+     auto output = torch::empty_like(x);
+ 
+-    // Get current CUDA stream
++    int ndim = x.dim();
++    std::vector<int64_t> input_strides(ndim);
++    std::vector<int64_t> shape(ndim);
++    for (int i = 0; i < ndim; ++i) {
++        input_strides[i] = x.stride(i);
++        shape[i] = x.size(i);
++    }
++
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Call launcher
+     fused_tanh_leaky_relu_launcher(
+         x.data_ptr<float>(),
+         output.data_ptr<float>(),
+         x.numel(),
++        input_strides.data(),
++        shape.data(),
++        ndim,
+         stream
+     );
+ 

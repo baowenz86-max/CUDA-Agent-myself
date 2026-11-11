@@ -1,0 +1,438 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -6,8 +6,7 @@
+ // -----------------------------------------------------------------------------
+ // BatchNorm2d (evaluation mode): y = (x - running_mean[c]) / sqrt(running_var[c] + eps) * weight[c] + bias[c]
+ // Supports arbitrary strides on x; output has same strides as x.
+-// The binding allocates output with the same strides as x (typically contiguous).
+-// We pass strides explicitly to be safe. Assumes float32.
++// Strides passed as value parameters to avoid pointer issues.
+ // -----------------------------------------------------------------------------
+ __global__ void batchnorm2d_forward_kernel(
+     const float* __restrict__ x,
+@@ -18,39 +17,22 @@
+     float eps,
+     float* __restrict__ out,
+     int N, int C, int H, int W,
+-    const int64_t* __restrict__ strides_x,   // strides of input (bytes?), we need element stride
+-    const int64_t* __restrict__ strides_out) // strides of output
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3,
++    int64_t stride_out0, int64_t stride_out1, int64_t stride_out2, int64_t stride_out3)
+ {
+     int64_t total = (int64_t)N * C * H * W;
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * gridDim.x;
+ 
+-    // Precompute scale and shift per channel? Better to compute from weight, bias, mean, var for each channel.
+-    // But channels are C, each thread can load them; more efficient to precompute in launcher and pass as arrays.
+-    // For simplicity, compute inside kernel: each thread needs channel index c.
+-    // To avoid recomputation, we can compute scale and shift per channel in shared memory,
+-    // but for simplicity each thread computes its own scale and shift from global memory; C is small (32).
+-    // However, weight, bias, mean, var are contiguous arrays of length C; coalesced access may be poor if threads have different c but c changes slowly.
+-    // Better: precompute scale and shift arrays in launcher and pass to kernel? But launcher would need to allocate device memory.
+-    // We can instead compute scale and shift inside the kernel using a small loop over channels? Not necessary.
+-    // We'll use per-thread computation; it's fine because C is small and the kernel is memory-bound.
+-
+     for (int64_t i = idx; i < total; i += stride) {
+-        // Compute coordinates from linear index using output strides? Actually we know x strides, output strides must match x strides (same shape).
+-        // We'll compute the linear index i in contiguous order, then map to actual memory using strides.
+-        // We can compute n, c, h, w from i assuming contiguous layout (C*H*W etc.) but that is only for indexing, actual memory uses strides.
+-        // The output tensor is created with same strides as x, so its memory layout is the same as x.
+-        // So the linear index i corresponds to the same logical position in both. We need to compute the actual offset from strides and logical coords.
+-
+         int64_t tmp = i;
+         int w = tmp % W; tmp /= W;
+         int h = tmp % H; tmp /= H;
+         int c = tmp % C; tmp /= C;
+         int n = tmp;
+ 
+-        // Compute input and output memory offsets using strides (in elements).
+-        int64_t in_offset = ((int64_t)n * strides_x[0] + (int64_t)c * strides_x[1] + (int64_t)h * strides_x[2] + (int64_t)w * strides_x[3]);
+-        int64_t out_offset = ((int64_t)n * strides_out[0] + (int64_t)c * strides_out[1] + (int64_t)h * strides_out[2] + (int64_t)w * strides_out[3]);
++        int64_t in_offset = (int64_t)n * stride_x0 + (int64_t)c * stride_x1 + (int64_t)h * stride_x2 + (int64_t)w * stride_x3;
++        int64_t out_offset = (int64_t)n * stride_out0 + (int64_t)c * stride_out1 + (int64_t)h * stride_out2 + (int64_t)w * stride_out3;
+ 
+         float val = x[in_offset];
+         float mean = running_mean[c];
+@@ -63,41 +45,15 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// Square: y = x * x, elementwise, supports arbitrary strides (but we can just use linear if contiguous?)
+-// Since shape can be arbitrary but same strides for input and output, we can accept numel and use linear index.
+-// But we need to handle strides: output tensor has same strides as input. So we can just copy elementwise using linear offset if both are contiguous? Actually if input is non-contiguous, we need to use strides. But we can treat as flat arrays if both have the same memory layout? Not necessarily if input is a view with non-contiguous strides, output created with same strides will have same non-contiguous layout, so flat linear access using the physical pointer with linear index will not be correct because the logical order differs from physical order. So we must use strides.
+-// Alternative: square_forward_contract says "Supports arbitrary strides". We'll implement a kernel that takes strides and uses coordinates.
++// Square: y = x * x, elementwise, supports arbitrary strides.
++// Strides passed as value parameters.
+ // -----------------------------------------------------------------------------
+-__global__ void square_forward_kernel(
+-    const float* __restrict__ x,
+-    float* __restrict__ out,
+-    int64_t total,
+-    const int64_t* __restrict__ strides_x,
+-    const int64_t* __restrict__ strides_out)
+-{
+-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+-
+-    for (int64_t i = idx; i < total; i += stride) {
+-        int64_t offset_x = 0;
+-        int64_t offset_out = 0;
+-        int64_t tmp = i;
+-        // We need dimension sizes; number of dims may vary. We assume shape is provided as a set of dims? We don't know number of dims.
+-        // To support arbitrary dims, we would need a shape array. But contract says shape any, but actual inputs in this task are 4D [N,C,H,W].
+-        // We'll implement only for 4D for now, but launcher can pass total and strides assuming 4D. The model_new.py uses square_forward on [N,C,H,W].
+-        // Since the task only exercises 4D, we implement 4D version.
+-        // We'll pass N,C,H,W in launcher and compute coordinates.
+-    }
+-}
+-
+-// We need a more generic square kernel; we can implement using same approach as batchnorm but without channel-specific ops.
+-// We'll define a kernel that takes N, C, H, W and strides, and computes square.
+ __global__ void square_forward_kernel_4d(
+     const float* __restrict__ x,
+     float* __restrict__ out,
+     int N, int C, int H, int W,
+-    const int64_t* __restrict__ strides_x,
+-    const int64_t* __restrict__ strides_out)
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3,
++    int64_t stride_out0, int64_t stride_out1, int64_t stride_out2, int64_t stride_out3)
+ {
+     int64_t total = (int64_t)N * C * H * W;
+     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+@@ -109,18 +65,16 @@
+         int h = tmp % H; tmp /= H;
+         int c = tmp % C; tmp /= C;
+         int n = tmp;
+-        int64_t in_offset = ((int64_t)n * strides_x[0] + (int64_t)c * strides_x[1] + (int64_t)h * strides_x[2] + (int64_t)w * strides_x[3]);
+-        int64_t out_offset = ((int64_t)n * strides_out[0] + (int64_t)c * strides_out[1] + (int64_t)h * strides_out[2] + (int64_t)w * strides_out[3]);
++        int64_t in_offset = (int64_t)n * stride_x0 + (int64_t)c * stride_x1 + (int64_t)h * stride_x2 + (int64_t)w * stride_x3;
++        int64_t out_offset = (int64_t)n * stride_out0 + (int64_t)c * stride_out1 + (int64_t)h * stride_out2 + (int64_t)w * stride_out3;
+         float val = x[in_offset];
+         out[out_offset] = val * val;
+     }
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// AvgPool2d: kernel_size, stride, padding. Output is contiguous with standard strides. Input can have arbitrary strides (but we will read using provided strides).
+-// Output dimensions: outH = floor((H + 2*padding - kernel_size) / stride) + 1; outW similarly.
+-// Kernel assumes count_include_pad is false; if padding>0 and count_include_pad=false, we need to exclude padded positions from denominator. But in this task padding=0 (model_new passes padding=0), so we can implement a simple version that ignores count_include_pad if padding=0.
+-// To be safe, implement the general case but only used for padding=0.
++// AvgPool2d: kernel_size, stride, padding. Output is contiguous with standard strides.
++// Input strides passed as values.
+ // -----------------------------------------------------------------------------
+ __global__ void avgpool2d_forward_kernel(
+     const float* __restrict__ x,
+@@ -128,7 +82,7 @@
+     int N, int C, int H, int W,
+     int kernel_size, int stride, int padding,
+     bool count_include_pad,
+-    const int64_t* __restrict__ strides_x) // input strides in elements
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3)
+ {
+     int outH = (H + 2 * padding - kernel_size) / stride + 1;
+     int outW = (W + 2 * padding - kernel_size) / stride + 1;
+@@ -149,7 +103,7 @@
+             int ih = oh * stride - padding + kh;
+             if (ih < 0 || ih >= H) {
+                 if (count_include_pad) {
+-                    sum += 0.0f; // padding contributes zero to sum
++                    sum += 0.0f;
+                     count++;
+                 }
+                 continue;
+@@ -163,13 +117,12 @@
+                     }
+                     continue;
+                 }
+-                int64_t in_offset = ((int64_t)n * strides_x[0] + (int64_t)c * strides_x[1] + (int64_t)ih * strides_x[2] + (int64_t)iw * strides_x[3]);
++                int64_t in_offset = (int64_t)n * stride_x0 + (int64_t)c * stride_x1 + (int64_t)ih * stride_x2 + (int64_t)iw * stride_x3;
+                 sum += x[in_offset];
+                 count++;
+             }
+         }
+-        // If count_include_pad is false and padding>0, count may be less than kernel_size*kernel_size. But here padding=0, count should always be full.
+-        int64_t out_offset = ((int64_t)n * C + c) * outH * outW + (int64_t)oh * outW + ow; // contiguous output
++        int64_t out_offset = ((int64_t)n * C + c) * outH * outW + (int64_t)oh * outW + ow;
+         out[out_offset] = sum / (float)count;
+     }
+ }
+@@ -187,27 +140,28 @@
+     float eps,
+     float* out,
+     int N, int C, int H, int W,
+-    const int64_t* strides_x,   // element strides, length 4 (or 0 for null, not used)
+-    const int64_t* strides_out, // element strides, length 4
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3,
++    int64_t stride_out0, int64_t stride_out1, int64_t stride_out2, int64_t stride_out3,
+     cudaStream_t stream)
+ {
+-    // Use grid-stride loop with block size 256.
+     int64_t total = (int64_t)N * C * H * W;
+     int block_size = 256;
+     int64_t grid_size = (total + block_size - 1) / block_size;
+-    if (grid_size > 1024) grid_size = 1024; // cap grid, grid-stride loop handles rest
++    if (grid_size > 1024) grid_size = 1024;
+ 
+     batchnorm2d_forward_kernel<<<(int)grid_size, block_size, 0, stream>>>(
+         x, weight, bias, running_mean, running_var, eps, out,
+-        N, C, H, W, strides_x, strides_out);
++        N, C, H, W,
++        stride_x0, stride_x1, stride_x2, stride_x3,
++        stride_out0, stride_out1, stride_out2, stride_out3);
+ }
+ 
+ extern "C" void square_forward_cuda(
+     const float* x,
+     float* out,
+     int N, int C, int H, int W,
+-    const int64_t* strides_x,
+-    const int64_t* strides_out,
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3,
++    int64_t stride_out0, int64_t stride_out1, int64_t stride_out2, int64_t stride_out3,
+     cudaStream_t stream)
+ {
+     int64_t total = (int64_t)N * C * H * W;
+@@ -216,7 +170,9 @@
+     if (grid_size > 1024) grid_size = 1024;
+ 
+     square_forward_kernel_4d<<<(int)grid_size, block_size, 0, stream>>>(
+-        x, out, N, C, H, W, strides_x, strides_out);
++        x, out, N, C, H, W,
++        stride_x0, stride_x1, stride_x2, stride_x3,
++        stride_out0, stride_out1, stride_out2, stride_out3);
+ }
+ 
+ extern "C" void avgpool2d_forward_cuda(
+@@ -225,7 +181,7 @@
+     int N, int C, int H, int W,
+     int kernel_size, int stride, int padding,
+     bool count_include_pad,
+-    const int64_t* strides_x,
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3,
+     cudaStream_t stream)
+ {
+     int outH = (H + 2 * padding - kernel_size) / stride + 1;
+@@ -236,5 +192,6 @@
+     if (grid_size > 1024) grid_size = 1024;
+ 
+     avgpool2d_forward_kernel<<<(int)grid_size, block_size, 0, stream>>>(
+-        x, out, N, C, H, W, kernel_size, stride, padding, count_include_pad, strides_x);
++        x, out, N, C, H, W, kernel_size, stride, padding, count_include_pad,
++        stride_x0, stride_x1, stride_x2, stride_x3);
+ }
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -19,16 +19,16 @@
+     float eps,
+     float* out,
+     int N, int C, int H, int W,
+-    const int64_t* strides_x,
+-    const int64_t* strides_out,
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3,
++    int64_t stride_out0, int64_t stride_out1, int64_t stride_out2, int64_t stride_out3,
+     cudaStream_t stream);
+ 
+ extern "C" void square_forward_cuda(
+     const float* x,
+     float* out,
+     int N, int C, int H, int W,
+-    const int64_t* strides_x,
+-    const int64_t* strides_out,
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3,
++    int64_t stride_out0, int64_t stride_out1, int64_t stride_out2, int64_t stride_out3,
+     cudaStream_t stream);
+ 
+ extern "C" void avgpool2d_forward_cuda(
+@@ -37,7 +37,7 @@
+     int N, int C, int H, int W,
+     int kernel_size, int stride, int padding,
+     bool count_include_pad,
+-    const int64_t* strides_x,
++    int64_t stride_x0, int64_t stride_x1, int64_t stride_x2, int64_t stride_x3,
+     cudaStream_t stream);
+ 
+ // Helper: create a tensor with the same sizes and strides as input (for elementwise ops)
+@@ -83,31 +83,27 @@
+     check_1d(running_mean, "running_mean");
+     check_1d(running_var, "running_var");
+ 
+-    // Optional: check contiguous for parameters (contract requires contiguous)
++    // Optional: check contiguous for parameters
+     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+     TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+     TORCH_CHECK(running_mean.is_contiguous(), "running_mean must be contiguous");
+     TORCH_CHECK(running_var.is_contiguous(), "running_var must be contiguous");
+ 
+-    // Prepare strides for x (in elements)
+-    // x can have arbitrary strides, we need to pass its strides to the kernel.
+-    // We create output tensor with same strides as x.
+-    // We need to pass strides arrays to launcher. We can use a temporary std::vector or stack array.
+-    int64_t strides_x[4];
+-    int64_t strides_out[4];
+-    for (int i = 0; i < 4; ++i) {
+-        strides_x[i] = x.stride(i);
+-    }
+-    // output will have same strides as x
++    // Get strides (in elements) as value
++    int64_t stride_x0 = x.stride(0);
++    int64_t stride_x1 = x.stride(1);
++    int64_t stride_x2 = x.stride(2);
++    int64_t stride_x3 = x.stride(3);
++
++    // Allocate output with same strides as x
+     torch::Tensor out = empty_like_same_strides(x);
+-    for (int i = 0; i < 4; ++i) {
+-        strides_out[i] = out.stride(i);
+-    }
+-
+-    // Get current CUDA stream
++    int64_t stride_out0 = out.stride(0);
++    int64_t stride_out1 = out.stride(1);
++    int64_t stride_out2 = out.stride(2);
++    int64_t stride_out3 = out.stride(3);
++
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+-    // Call launcher
+     batchnorm2d_forward_cuda(
+         x.data_ptr<float>(),
+         weight.data_ptr<float>(),
+@@ -116,16 +112,12 @@
+         running_var.data_ptr<float>(),
+         static_cast<float>(eps),
+         out.data_ptr<float>(),
+-        static_cast<int>(N),
+-        static_cast<int>(C),
+-        static_cast<int>(H),
+-        static_cast<int>(W),
+-        strides_x,
+-        strides_out,
++        static_cast<int>(N), static_cast<int>(C), static_cast<int>(H), static_cast<int>(W),
++        stride_x0, stride_x1, stride_x2, stride_x3,
++        stride_out0, stride_out1, stride_out2, stride_out3,
+         stream
+     );
+ 
+-    // Check for kernel launch errors
+     cudaError_t err = cudaGetLastError();
+     TORCH_CHECK(err == cudaSuccess, "batchnorm2d_forward kernel failed: ", cudaGetErrorString(err));
+ 
+@@ -134,30 +126,24 @@
+ 
+ // ===================== square_forward =====================
+ torch::Tensor square_forward(torch::Tensor x) {
+-    // Check CUDA
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+-    // Check dtype
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+-
+-    // Contract says shape any, but our kernel only supports 4D.
+-    // However, the task only uses 4D after batchnorm. To be safe we could support arbitrary dims,
+-    // but the launcher signature only supports 4D. We can treat any shape as a 1D vector if we use
+-    // a different launcher? But our .cu only has 4D square kernel.
+-    // Since the contract says any shape but the actual usage is 4D, we enforce 4D here.
+     TORCH_CHECK(x.dim() == 4, "square_forward currently only supports 4D tensors");
+     int64_t N = x.size(0);
+     int64_t C = x.size(1);
+     int64_t H = x.size(2);
+     int64_t W = x.size(3);
+ 
+-    // Prepare strides
+-    int64_t strides_x[4];
+-    for (int i = 0; i < 4; ++i) strides_x[i] = x.stride(i);
+-
+-    // Allocate output with same strides as x
++    int64_t stride_x0 = x.stride(0);
++    int64_t stride_x1 = x.stride(1);
++    int64_t stride_x2 = x.stride(2);
++    int64_t stride_x3 = x.stride(3);
++
+     torch::Tensor out = empty_like_same_strides(x);
+-    int64_t strides_out[4];
+-    for (int i = 0; i < 4; ++i) strides_out[i] = out.stride(i);
++    int64_t stride_out0 = out.stride(0);
++    int64_t stride_out1 = out.stride(1);
++    int64_t stride_out2 = out.stride(2);
++    int64_t stride_out3 = out.stride(3);
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ 
+@@ -165,7 +151,8 @@
+         x.data_ptr<float>(),
+         out.data_ptr<float>(),
+         static_cast<int>(N), static_cast<int>(C), static_cast<int>(H), static_cast<int>(W),
+-        strides_x, strides_out,
++        stride_x0, stride_x1, stride_x2, stride_x3,
++        stride_out0, stride_out1, stride_out2, stride_out3,
+         stream
+     );
+ 
+@@ -182,7 +169,6 @@
+     int64_t stride,
+     int64_t padding,
+     bool count_include_pad) {
+-    // Check CUDA
+     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+     TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+     TORCH_CHECK(x.dim() == 4, "x must be 4D (N, C, H, W)");
+@@ -192,23 +178,20 @@
+     int64_t H = x.size(2);
+     int64_t W = x.size(3);
+ 
+-    // Validate parameters: positive integers
+     TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
+     TORCH_CHECK(stride > 0, "stride must be positive");
+     TORCH_CHECK(padding >= 0, "padding must be non-negative");
+ 
+-    // Compute output spatial dimensions
+     int64_t outH = (H + 2 * padding - kernel_size) / stride + 1;
+     int64_t outW = (W + 2 * padding - kernel_size) / stride + 1;
+     TORCH_CHECK(outH > 0 && outW > 0, "Invalid pooling parameters: output dimension <= 0");
+ 
+-    // Prepare input strides (x can have arbitrary strides)
+-    int64_t strides_x[4];
+-    for (int i = 0; i < 4; ++i) strides_x[i] = x.stride(i);
+-
+-    // Output tensor: contiguous with shape [N, C, outH, outW]
++    int64_t stride_x0 = x.stride(0);
++    int64_t stride_x1 = x.stride(1);
++    int64_t stride_x2 = x.stride(2);
++    int64_t stride_x3 = x.stride(3);
++
+     torch::Tensor out = torch::empty({N, C, outH, outW}, x.options());
+-    // Ensure contiguous (should be by default)
+     TORCH_CHECK(out.is_contiguous(), "Internal error: output not contiguous");
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+@@ -219,7 +202,7 @@
+         static_cast<int>(N), static_cast<int>(C), static_cast<int>(H), static_cast<int>(W),
+         static_cast<int>(kernel_size), static_cast<int>(stride), static_cast<int>(padding),
+         count_include_pad,
+-        strides_x,
++        stride_x0, stride_x1, stride_x2, stride_x3,
+         stream
+     );
+ 
+@@ -238,17 +221,17 @@
+           py::arg("bias"),
+           py::arg("running_mean"),
+           py::arg("running_var"),
+-          py::arg("eps"));  // no default: eps is required
++          py::arg("eps"));  // required, no default
+     m.def("square_forward", &square_forward,
+           "Element-wise square",
+           py::arg("x"));
+     m.def("avgpool2d_forward", &avgpool2d_forward,
+           "AvgPool2d forward",
+           py::arg("x"),
+-          py::arg("kernel_size"),       // no default
+-          py::arg("stride"),             // no default
+-          py::arg("padding"),            // no default
++          py::arg("kernel_size"),       // required
++          py::arg("stride"),             // required
++          py::arg("padding"),            // required
+           py::arg("count_include_pad") = true); // optional with default
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops);+REGISTER_BINDING(custom_ops, register_custom_ops);

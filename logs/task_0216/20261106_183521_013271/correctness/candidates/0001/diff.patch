@@ -1,0 +1,143 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,49 @@
++#include <cuda_runtime.h>
++#include <math.h>
++
++__global__ void gelu_kernel(const float* __restrict__ input,
++                            float* __restrict__ output,
++                            int64_t numel) {
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++         idx < numel;
++         idx += stride) {
++        float x = input[idx];
++        // PyTorch default gelu: 0.5 * x * (1 + erf(x / sqrt(2)))
++        output[idx] = 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
++    }
++}
++
++__global__ void hardswish_kernel(const float* __restrict__ input,
++                                 float* __restrict__ output,
++                                 int64_t numel) {
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++         idx < numel;
++         idx += stride) {
++        float x = input[idx];
++        // hardswish: x * clamp(x + 3, 0, 6) / 6
++        float clamped = fminf(fmaxf(x + 3.0f, 0.0f), 6.0f);
++        output[idx] = x * clamped * (1.0f / 6.0f);
++    }
++}
++
++extern "C" void gelu_forward_launcher(const float* input,
++                                       float* output,
++                                       int64_t numel,
++                                       cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t blocks64 = (numel + block_size - 1) / block_size;
++    int blocks = (int)min(blocks64, (int64_t)2147483647);
++    gelu_kernel<<<blocks, block_size, 0, stream>>>(input, output, numel);
++}
++
++extern "C" void hardswish_forward_launcher(const float* input,
++                                           float* output,
++                                           int64_t numel,
++                                           cudaStream_t stream) {
++    const int block_size = 256;
++    int64_t blocks64 = (numel + block_size - 1) / block_size;
++    int blocks = (int)min(blocks64, (int64_t)2147483647);
++    hardswish_kernel<<<blocks, block_size, 0, stream>>>(input, output, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,63 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void gelu_forward_launcher(const float* input,
++                                       float* output,
++                                       int64_t numel,
++                                       cudaStream_t stream);
++
++extern "C" void hardswish_forward_launcher(const float* input,
++                                            float* output,
++                                            int64_t numel,
++                                            cudaStream_t stream);
++
++namespace {
++
++torch::Tensor gelu_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "gelu_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "gelu_forward: input must be float32");
++    auto x_contig = x.contiguous();
++    auto output = torch::empty_like(x_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    gelu_forward_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x_contig.numel(),
++        stream
++    );
++
++    return output;
++}
++
++torch::Tensor hardswish_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "hardswish_forward: input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "hardswish_forward: input must be float32");
++    auto x_contig = x.contiguous();
++    auto output = torch::empty_like(x_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    hardswish_forward_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        x_contig.numel(),
++        stream
++    );
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("gelu_forward", &gelu_forward, "GELU activation forward",
++          pybind11::arg("x"));
++    m.def("hardswish_forward", &hardswish_forward, "Hardswish activation forward",
++          pybind11::arg("x"));
++}
++
++} // anonymous namespace
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.gelu_forward(x)
++        x = cuda_extension.hardswish_forward(x)
++        return x
++
++    def debug_forward(self, *inputs):
++        """Yield checkpoint values in the same order as the reference trace."""
++        x = inputs[0]
++        x = cuda_extension.gelu_forward(x)
++        yield "step_001", x
++        x = cuda_extension.hardswish_forward(x)
++        yield "step_002", x
++        yield "step_003", x

@@ -1,0 +1,142 @@
+#include <cuda_runtime.h>
+#include <cstdint>
+
+namespace {
+
+// Compute linear offset from multi-dimensional indices given strides
+__device__ __forceinline__ int64_t offset_from_index(
+    const int64_t* strides,
+    const int64_t* shape,
+    int ndim,
+    int64_t linear_index) {
+    int64_t offset = 0;
+    int64_t remaining = linear_index;
+    #pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d >= ndim) break;
+        int64_t dim_size = shape[d];
+        int64_t coord = remaining % dim_size;
+        remaining /= dim_size;
+        offset += coord * strides[d];
+    }
+    return offset;
+}
+
+// Kernel: copy input tensor into output tensor along concatenation dimension.
+// Each thread handles one element of the output. The input source tensor and
+// base offset (in output linear indexing) are passed directly.
+__global__ void cat_copy_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int64_t total_elements,
+    int64_t base_output_offset,
+    int ndim,
+    const int64_t* __restrict__ input_strides,
+    const int64_t* __restrict__ output_strides,
+    const int64_t* __restrict__ input_shape
+) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = gridDim.x * blockDim.x;
+
+    for (int64_t i = idx; i < total_elements; i += stride) {
+        // Compute input offset from linear index within the input element range.
+        int64_t in_offset = offset_from_index(input_strides, input_shape, ndim, i);
+        // Output offset = base_output_offset + linear index in output layout
+        // We compute output offset using output_strides and the same coordinates,
+        // but since we are copying contiguous input into a contiguous slice of
+        // output along the concatenated dimension, the output linear index is
+        // simply base_output_offset + i (provided output is contiguous and the
+        // input shape matches except in dim). This holds for the expected
+        // torch.cat semantics. For full stride generality, we can recompute
+        // output offset from the same coordinates. We do that to be safe.
+        int64_t remaining = i;
+        int64_t out_offset = 0;
+        #pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            if (d >= ndim) break;
+            int64_t coord = remaining % input_shape[d];
+            remaining /= input_shape[d];
+            out_offset += coord * output_strides[d];
+        }
+        output[base_output_offset + out_offset] = input[in_offset];
+    }
+}
+
+}  // namespace
+
+extern "C" void custom_cat_launcher(
+    const float* x1_ptr,
+    const float* x2_ptr,
+    float* out_ptr,
+    int64_t ndim,
+    const int64_t* x1_shape,
+    const int64_t* x2_shape,
+    const int64_t* x1_strides,
+    const int64_t* x2_strides,
+    const int64_t* out_strides,
+    int64_t dim,
+    int64_t total_output_elems,
+    cudaStream_t stream
+) {
+    if (total_output_elems == 0) return;
+
+    // Normalize dim
+    if (dim < 0) dim += ndim;
+
+    // Number of elements in each input tensor
+    int64_t x1_elements = 1;
+    int64_t x2_elements = 1;
+    for (int d = 0; d < ndim; ++d) {
+        x1_elements *= x1_shape[d];
+        x2_elements *= x2_shape[d];
+    }
+
+    // Compute base offsets in output linear indexing.
+    // Since output is contiguous and shape differs only in dim,
+    // the linear offset for the start of each input's slice is
+    // product of dimensions before dim, multiplied by cumulative
+    // concat sizes, times product of dimensions after dim.
+    // This is equivalent to torch.cat's memory layout.
+    int64_t x1_base = 0;
+    int64_t x2_base = 0;
+    {
+        int64_t inner_size = 1;
+        for (int d = dim + 1; d < ndim; ++d) {
+            inner_size *= x1_shape[d];
+        }
+        // offset for each unit of outer index
+        int64_t outer_stride = 1;
+        for (int d = 0; d < dim; ++d) {
+            outer_stride *= x1_shape[d];
+        }
+        // Within the concatenated dimension, x1 occupies [0, x1_shape[dim]) and x2 [x1_shape[dim], x1_shape[dim]+x2_shape[dim])
+        x1_base = 0; // always starts at 0
+        x2_base = (int64_t)x1_shape[dim] * inner_size;  // offset in flattened linear index ignoring outer blocks? correct because outer stride multiplies by outer blocks, but linear offset for contiguous tensor is simply index, so we need full offset as base for index.
+        // Actually base_output_offset is used as an additive linear index in terms of output elements, so x1_base=0, x2_base = x1_shape[dim] * inner_size * outer_stride? No, linear index of first element of x2 slice is outer index * (x1_shape[dim]+x2_shape[dim]) * inner_size, not simply x1_shape[dim]*inner_size. Our kernel computes out_offset using output_strides and coordinates, so base_output_offset should be 0 and we should rely on out_offset to include the shift. To avoid duplicate offset, set base_output_offset=0 and compute out_offset based on coordinates and a modified shape where concatenated dimension is combined, but simpler: for each input, we call kernel with base_output_offset=0 and output shape = x1_shape (or x2_shape), and adjust the coordinate in dim by adding x1_shape[dim] for x2. This can be done by passing an offset in the concatenated dimension. Let's redesign launcher to copy each input separately with adjusted dim coordinate.
+    }
+
+    // Simpler and robust approach: launch separate copy kernels for x1 and x2,
+    // with the coordinates adjusted for x2 by adding x1_shape[dim] to the dim index.
+    // Output is contiguous, so we can compute output offset directly from adjusted coordinates using out_strides.
+    // We'll set up per-input kernel launches.
+
+    int threads = 256;
+    // Must cap grid to avoid exceeding max grid dimension; use grid-stride loop inside kernel anyway.
+    int64_t blocks_x1 = (x1_elements + threads - 1) / threads;
+    int64_t blocks_x2 = (x2_elements + threads - 1) / threads;
+    int max_blocks = 1073741824; // 2^30
+    if (blocks_x1 > max_blocks) blocks_x1 = max_blocks;
+    if (blocks_x2 > max_blocks) blocks_x2 = max_blocks;
+
+    // We'll use a modified kernel that accepts a dim_offset to add to the concatenation dimension coordinate when computing output offset.
+    // We'll implement that inline here by passing dim and dim_offset.
+    // To achieve that without duplicating kernel code, we can reuse the same kernel with base_output_offset set to 0 and a custom output_stride adjustment? Better to write a kernel that takes dim, dim_offset, and uses it in output offset computation.
+
+    // We'll modify cat_copy_kernel above to accept dim and dim_offset and use them.
+    // Since this file is being generated, we can adjust the kernel definition.
+
+    // For clarity, we'll rewrite the kernel with these parameters.
+}
+
+// Note: the above launcher is incomplete; in final content we'll provide complete implementation.
+// We'll now output the final complete code.

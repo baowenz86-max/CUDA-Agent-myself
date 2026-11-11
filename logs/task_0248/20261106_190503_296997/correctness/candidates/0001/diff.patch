@@ -1,0 +1,636 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,258 @@
++// kernels/custom_ops.cu
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Forward declaration of conv3d_forward launcher (implemented in _binding.cpp using cuDNN)
++extern "C" void conv3d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int D, int H, int W,
++    int C_out,
++    int kD, int kH, int kW,
++    int strideD, int strideH, int strideW,
++    int padD, int padH, int padW,
++    int D_out, int H_out, int W_out,
++    cudaStream_t stream);
++
++// GELU kernel: elementwise, supports arbitrary strides
++template <typename scalar_t>
++__global__ void gelu_kernel(
++    const scalar_t* __restrict__ input,
++    scalar_t* __restrict__ output,
++    int64_t numel,
++    int64_t inner_size,
++    int64_t stride0,
++    int64_t stride1,
++    int64_t stride2,
++    int64_t stride3,
++    int64_t stride4) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t grid_stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += grid_stride) {
++        // Compute multi-dimensional indices from linear index
++        // assuming tensor is 5D with strides given (for non-contiguous support)
++        // But for GELU, shape can be arbitrary; we accept 5D as per contract
++        int64_t rem = i;
++        int64_t n = rem / inner_size; // inner_size = D*H*W
++        rem -= n * inner_size;
++        int64_t d = rem / (stride3 / stride4); // H*W
++        rem -= d * (stride3 / stride4);
++        int64_t h = rem / stride4;
++        int64_t w = rem - h * stride4;
++        // Apply strides
++        int64_t index = n * stride0 + d * stride1 + h * stride2 + w * stride3;
++        // Wait: stride mapping: input tensor strides are [s0,s1,s2,s3,s4]? In contract input is 5D [N,C,D,H,W] for conv output, but gelu can be any but here it's 5D.
++        // We'll assume output has same strides as input, and compute index accordingly.
++        // But for simplicity and because contract says "layout supports strides", we need to handle non-contiguous properly.
++        // We'll use a generic approach: use input.strides() and output.strides() passed as arguments.
++        // However, the kernel below assumes 5D contiguous? To be safe, we'll implement a simpler approach:
++        // Use a pointer-based elementwise with byte offsets, but that requires output layout to match input.
++        // The contract says output same layout as input, so we can assume output strides == input strides, and we can just write to output at same offset.
++        // So we can compute input index using strides, then output at same index (since output has same shape and strides).
++        // But to be general, we could just pass strides for both and compute separate indices, but output is same layout so same strides.
++        // However, the launcher will receive input and output tensors possibly non-contiguous, so we need to compute index from strides.
++        // For simplicity and because the only use case is after conv3d which returns contiguous, and bias_add also works on contiguous? But contract says supports strides for input to gelu and bias_add, so we must handle non-contiguous.
++        // We'll implement a generic strided elementwise using the provided strides, assuming both input and output have identical strides and shapes.
++        // We need to pass strides as int64_t arguments.
++        // For GELU, the shape is [N, C, D, H, W], so we have 5 strides.
++        // We'll compute the input offset as n*s0 + c*s1 + d*s2 + h*s3 + w*s4, and output offset same.
++        // To do this, we need to decompose linear index into coordinates, which requires dimensions.
++        // We can pass dimensions as well. For GELU, dimensions are N,C,D,H,W.
++        // But we can simplify: since GELU is elementwise and we don't need to know shape if we assume output uses same strides, we can treat the tensor as a flat array with a single stride? No, non-contiguous requires explicit strides.
++        // Alternative: Use the fact that the total number of elements is numel, and we can iterate over the flattened index and compute the offset using a precomputed mapping? That would require storing strides and dimensions.
++        // Since the contract says "shape: any" for GELU, we need to support arbitrary number of dimensions, but in this specific model it's 5D. We can implement a generic version that takes num_dims and arrays of strides and dims, but that would require dynamic arrays in constant memory? Not feasible for a simple kernel.
++        // For this task, we know all calls are 5D tensors of shape [N,C,D,H,W]. So we can assume 5D in the kernel and pass the strides and dims accordingly.
++        // We'll implement gelu kernel that assumes 5D input with given strides and dimensions. The launcher will extract these from tensors in the binding layer.
++    }
++}
++
++// But we cannot include torch headers, so we cannot get strides from tensor in .cu. The binding layer will pass raw strides as int64_t.
++// So we declare launcher with strides.
++
++// GELU launcher (to be called from binding) using exact Erf-based GELU:
++extern "C" void gelu_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    const int64_t* in_strides,
++    const int64_t* out_strides,
++    int ndims,
++    cudaStream_t stream);
++
++// Bias add kernel: adds bias[C] to input[N,C,D,H,W] with broadcasting
++template <typename scalar_t>
++__global__ void bias_add_kernel(
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ bias,
++    scalar_t* __restrict__ output,
++    int64_t numel,
++    int64_t C,
++    int64_t inner_size, // D*H*W
++    int64_t stride0,
++    int64_t stride1,
++    int64_t stride2,
++    int64_t stride3,
++    int64_t stride4,
++    int64_t out_stride0,
++    int64_t out_stride1,
++    int64_t out_stride2,
++    int64_t out_stride3,
++    int64_t out_stride4) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t grid_stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += grid_stride) {
++        // Decompose i into n,c,d,h,w using inner_size = D*H*W, and W dim = stride4 (if contiguous) but we need actual dims.
++        // We'll assume contiguous dimensions: D,H,W are known via inner_size and strides.
++        // This kernel is specialized for 5D [N,C,D,H,W]. We'll compute c = (i / inner_size) % C, n = i / (C*inner_size)
++        // But that only works if the tensor is contiguous in N,C,D,H,W order. Since input could be non-contiguous, we need to handle strides.
++        // However, in the model, input to bias_add is output of gelu, which is contiguous? Gelu output should be contiguous if we allocate as empty_like? Actually, the contract says output has same shape and layout as input, but gelu_forward returns a new tensor (probably contiguous? The binding will likely allocate contiguous). So input to bias_add will be contiguous. But contract says "layout supports strides", but for simplicity, we can assume contiguous for bias_add because the input comes from a custom op that we control to be contiguous. But to be safe, we should support strides.
++        // Yet implementing a fully generic strided bias_add without knowing dimensions is tricky. We can pass strides and dimensions similar to gelu.
++        // Since the model uses 5D contiguous tensors (conv output is contiguous, gelu output should be contiguous if we allocate empty and write in order), we can assume contiguous for bias_add as well. However, to strictly follow contract, we should support non-contiguous. We can implement a generic version using a loop over offsets? The bias is along channel dimension, so we need to know the channel index for each linear index. If we have strides, we can compute the channel index by dividing the linear index somehow? Not straightforward without dimensions.
++        // We'll implement bias_add kernel that assumes input is 5D with known dimensions and strides, and output has same strides (since "same shape and layout as input"). So we can compute the channel index using the strides: we can iterate over linear index and compute the original coordinates using strides, but that requires the actual dimensions. We can pass N,C,D,H,W as arguments.
++        // We'll do that.
++    }
++}
++
++// Bias add launcher (to be called from binding)
++extern "C" void bias_add_forward_launcher(
++    const float* input,
++    const float* bias,
++    float* output,
++    int64_t numel,
++    int64_t C,
++    int64_t D,
++    int64_t H,
++    int64_t W,
++    int64_t N,
++    const int64_t* in_strides,
++    const int64_t* out_strides,
++    cudaStream_t stream);
++
++// Since we cannot include torch, we cannot use at::Tensor. We only provide kernel definitions and launcher declarations.
++// The binding layer will provide implementations for the launchers that call these kernels.
++
++// But the task says "all CUDA kernel and launcher must be placed in this file". Does that include launcher definitions? Yes, we should define the launchers here, not just declare. However, for conv3d, the implementation uses cuDNN, which is not allowed in .cu? Actually the task says Conv/ConvTranspose must use cuDNN, by third stage C++. But in this stage, we are only generating .cu, not .cpp. So perhaps we should not implement conv3d here, only kernel for gelu and bias_add. The conv3d launcher will be in a later _binding.cpp, but that .cpp cannot have CUDA kernels. However, cuDNN calls are C++ API calls, not CUDA kernels, so they could go in _binding.cpp. The contract says operator "conv3d_forward" uses cuDNN, and the binding layer will implement that. In the .cu we may not need to provide anything for conv, except maybe a declaration. But the requirement "all CUDA kernel and launcher must be placed in this file" might imply that even launchers for cuDNN should be here? But cuDNN code is C++ and can be in .cpp. The instruction says .cu only CUDA kernel and launcher, .cpp for cuDNN/cuBLAS API calls. So conv3d launcher should be in .cpp, not .cu. Therefore, in this .cu we only implement gelu and bias_add kernels and their launchers.
++
++// We'll implement the kernels and launchers for GELU and bias_add.
++
++// GELU kernel using erf approximation (exact GELU: x * 0.5 * (1 + erf(x/sqrt(2))))
++__global__ void gelu_kernel_5d(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t numel,
++    int64_t stride0,
++    int64_t stride1,
++    int64_t stride2,
++    int64_t stride3,
++    int64_t stride4,
++    int64_t out_stride0,
++    int64_t out_stride1,
++    int64_t out_stride2,
++    int64_t out_stride3,
++    int64_t out_stride4,
++    int64_t dim0,
++    int64_t dim1,
++    int64_t dim2,
++    int64_t dim3,
++    int64_t dim4) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t grid_stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += grid_stride) {
++        // Compute 5D coordinates from linear index assuming row-major order of dimensions
++        // Note: This assumes the tensor's logical order is [dim0, dim1, dim2, dim3, dim4], which matches strides.
++        int64_t tmp = i;
++        int64_t i4 = tmp % dim4; tmp /= dim4;
++        int64_t i3 = tmp % dim3; tmp /= dim3;
++        int64_t i2 = tmp % dim2; tmp /= dim2;
++        int64_t i1 = tmp % dim1; tmp /= dim1;
++        int64_t i0 = tmp;
++        int64_t in_idx = i0 * stride0 + i1 * stride1 + i2 * stride2 + i3 * stride3 + i4 * stride4;
++        int64_t out_idx = i0 * out_stride0 + i1 * out_stride1 + i2 * out_stride2 + i3 * out_stride3 + i4 * out_stride4;
++        float x = input[in_idx];
++        // GELU approximation: x * 0.5 * (1 + erf(x * 0.70710678118654752440))
++        float y = 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
++        output[out_idx] = y;
++    }
++}
++
++// Bias add kernel for 5D [N, C, D, H, W] with broadcasting bias [C]
++__global__ void bias_add_kernel_5d(
++    const float* __restrict__ input,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int64_t numel,
++    int64_t C,
++    int64_t inner_size, // D*H*W
++    int64_t stride0,
++    int64_t stride1,
++    int64_t stride2,
++    int64_t stride3,
++    int64_t stride4,
++    int64_t out_stride0,
++    int64_t out_stride1,
++    int64_t out_stride2,
++    int64_t out_stride3,
++    int64_t out_stride4,
++    int64_t dim0,
++    int64_t dim1,
++    int64_t dim2,
++    int64_t dim3,
++    int64_t dim4) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t grid_stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += grid_stride) {
++        int64_t tmp = i;
++        int64_t i4 = tmp % dim4; tmp /= dim4;
++        int64_t i3 = tmp % dim3; tmp /= dim3;
++        int64_t i2 = tmp % dim2; tmp /= dim2;
++        int64_t i1 = tmp % dim1; tmp /= dim1;
++        int64_t i0 = tmp;
++        int64_t in_idx = i0 * stride0 + i1 * stride1 + i2 * stride2 + i3 * stride3 + i4 * stride4;
++        int64_t out_idx = i0 * out_stride0 + i1 * out_stride1 + i2 * out_stride2 + i3 * out_stride3 + i4 * out_stride4;
++        // bias index is channel dimension (i1)
++        output[out_idx] = input[in_idx] + bias[i1];
++    }
++}
++
++// Launcher for GELU: assume input and output are 5D with given dims and strides
++extern "C" void gelu_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    int64_t dim0, int64_t dim1, int64_t dim2, int64_t dim3, int64_t dim4,
++    int64_t in_stride0, int64_t in_stride1, int64_t in_stride2, int64_t in_stride3, int64_t in_stride4,
++    int64_t out_stride0, int64_t out_stride1, int64_t out_stride2, int64_t out_stride3, int64_t out_stride4,
++    cudaStream_t stream) {
++    const int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++    // cap blocks to reasonable number and use grid-stride loop
++    if (blocks > 65535) blocks = 65535;
++    gelu_kernel_5d<<<blocks, threads, 0, stream>>>(
++        input, output, numel,
++        in_stride0, in_stride1, in_stride2, in_stride3, in_stride4,
++        out_stride0, out_stride1, out_stride2, out_stride3, out_stride4,
++        dim0, dim1, dim2, dim3, dim4);
++}
++
++// Launcher for bias_add: assume input/output 5D, bias length C
++extern "C" void bias_add_forward_launcher(
++    const float* input,
++    const float* bias,
++    float* output,
++    int64_t numel,
++    int64_t C,
++    int64_t D, int64_t H, int64_t W, int64_t N,
++    int64_t in_stride0, int64_t in_stride1, int64_t in_stride2, int64_t in_stride3, int64_t in_stride4,
++    int64_t out_stride0, int64_t out_stride1, int64_t out_stride2, int64_t out_stride3, int64_t out_stride4,
++    cudaStream_t stream) {
++    const int threads = 256;
++    int blocks = (numel + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    bias_add_kernel_5d<<<blocks, threads, 0, stream>>>(
++        input, bias, output, numel, C, D*H*W,
++        in_stride0, in_stride1, in_stride2, in_stride3, in_stride4,
++        out_stride0, out_stride1, out_stride2, out_stride3, out_stride4,
++        N, C, D, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,345 @@
++// kernels/custom_ops_binding.cpp
++
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cudnn.h>
++#include <vector>
++#include <cstdint>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void gelu_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t numel,
++    int64_t dim0, int64_t dim1, int64_t dim2, int64_t dim3, int64_t dim4,
++    int64_t in_stride0, int64_t in_stride1, int64_t in_stride2, int64_t in_stride3, int64_t in_stride4,
++    int64_t out_stride0, int64_t out_stride1, int64_t out_stride2, int64_t out_stride3, int64_t out_stride4,
++    cudaStream_t stream);
++
++extern "C" void bias_add_forward_launcher(
++    const float* input,
++    const float* bias,
++    float* output,
++    int64_t numel,
++    int64_t C,
++    int64_t D, int64_t H, int64_t W, int64_t N,
++    int64_t in_stride0, int64_t in_stride1, int64_t in_stride2, int64_t in_stride3, int64_t in_stride4,
++    int64_t out_stride0, int64_t out_stride1, int64_t out_stride2, int64_t out_stride3, int64_t out_stride4,
++    cudaStream_t stream);
++
++// Helper function to convert Python int/tuple to int array of size 3
++static std::vector<int> parse_3_int(const pybind11::handle& obj, const char* name) {
++    std::vector<int> result(3);
++    if (pybind11::isinstance<pybind11::int_>(obj)) {
++        int v = obj.cast<int>();
++        result = {v, v, v};
++    } else if (pybind11::isinstance<pybind11::tuple>(obj)) {
++        auto tup = obj.cast<pybind11::tuple>();
++        TORCH_CHECK(tup.size() == 3, name, " must be int or tuple of 3 ints");
++        for (int i = 0; i < 3; ++i) {
++            result[i] = tup[i].cast<int>();
++        }
++    } else {
++        TORCH_CHECK(false, name, " must be int or tuple of 3 ints");
++    }
++    return result;
++}
++
++// cuDNN error checking macro
++#define CUDNN_CHECK(expr)                                                        \
++    do {                                                                          \
++        cudnnStatus_t status = (expr);                                           \
++        TORCH_CHECK(status == CUDNN_STATUS_SUCCESS,                              \
++                    "cuDNN error at ", __FILE__, ":", __LINE__, ": ",          \
++                    cudnnGetErrorString(status));                                \
++    } while (0)
++
++// conv3d_forward wrapper
++static torch::Tensor conv3d_forward(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor bias,
++    pybind11::object stride,
++    pybind11::object padding) {
++
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(input.dim() == 5, "input must be 5D");
++    TORCH_CHECK(weight.dim() == 5, "weight must be 5D");
++    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
++    TORCH_CHECK(weight.size(1) == input.size(1), "input/weight channel mismatch");
++    TORCH_CHECK(weight.size(0) == bias.size(0), "weight/bias channel mismatch");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++
++    // Parse stride and padding
++    std::vector<int> stride_arr = parse_3_int(stride, "stride");
++    std::vector<int> padding_arr = parse_3_int(padding, "padding");
++    const int strideD = stride_arr[0], strideH = stride_arr[1], strideW = stride_arr[2];
++    const int padD = padding_arr[0], padH = padding_arr[1], padW = padding_arr[2];
++
++    // Get dimensions
++    const int N = input.size(0);
++    const int C_in = input.size(1);
++    const int D = input.size(2);
++    const int H = input.size(3);
++    const int W = input.size(4);
++    const int C_out = weight.size(0);
++    const int kD = weight.size(2);
++    const int kH = weight.size(3);
++    const int kW = weight.size(4);
++
++    const int D_out = (D + 2 * padD - kD) / strideD + 1;
++    const int H_out = (H + 2 * padH - kH) / strideH + 1;
++    const int W_out = (W + 2 * padW - kW) / strideW + 1;
++
++    // Allocate output (contiguous)
++    auto output = torch::empty({N, C_out, D_out, H_out, W_out}, input.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // cuDNN handle (per call but fine)
++    cudnnHandle_t cudnn_handle;
++    CUDNN_CHECK(cudnnCreate(&cudnn_handle));
++    CUDNN_CHECK(cudnnSetStream(cudnn_handle, stream));
++
++    // Tensor descriptors
++    cudnnTensorDescriptor_t x_desc, y_desc, b_desc;
++    CUDNN_CHECK(cudnnCreateTensorDescriptor(&x_desc));
++    CUDNN_CHECK(cudnnCreateTensorDescriptor(&y_desc));
++    CUDNN_CHECK(cudnnCreateTensorDescriptor(&b_desc));
++
++    // Filter descriptor
++    cudnnFilterDescriptor_t w_desc;
++    CUDNN_CHECK(cudnnCreateFilterDescriptor(&w_desc));
++
++    // Convolution descriptor
++    cudnnConvolutionDescriptor_t conv_desc;
++    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&conv_desc));
++
++    // Set tensor descriptors: NCDHW is standard
++    CUDNN_CHECK(cudnnSetTensor4dDescriptor(x_desc,
++                                           CUDNN_TENSOR_NCHW,
++                                           CUDNN_DATA_FLOAT,
++                                           N,
++                                           C_in,
++                                           D,
++                                           H * W));
++    // Need 5D? Actually cuDNN requires dims differently, use SetTensorNdDescriptor.
++    // For clarity we use the 5D version with CUDNN_TENSOR_NCDHW.
++    // Recreate properly:
++    cudnnDestroyTensorDescriptor(x_desc);
++    cudnnDestroyTensorDescriptor(y_desc);
++    cudnnDestroyTensorDescriptor(b_desc);
++
++    // Recreate with 5D
++    CUDNN_CHECK(cudnnCreateTensorDescriptor(&x_desc));
++    CUDNN_CHECK(cudnnCreateTensorDescriptor(&y_desc));
++    CUDNN_CHECK(cudnnCreateTensorDescriptor(&b_desc));
++
++    int x_dims[5] = {N, C_in, D, H, W};
++    int x_strides[5] = {C_in*D*H*W, D*H*W, H*W, W, 1};
++    CUDNN_CHECK(cudnnSetTensorNdDescriptor(x_desc, CUDNN_DATA_FLOAT, 5, x_dims, x_strides));
++
++    int y_dims[5] = {N, C_out, D_out, H_out, W_out};
++    int y_strides[5] = {C_out*D_out*H_out*W_out, D_out*H_out*W_out, H_out*W_out, W_out, 1};
++    CUDNN_CHECK(cudnnSetTensorNdDescriptor(y_desc, CUDNN_DATA_FLOAT, 5, y_dims, y_strides));
++
++    int b_dims[5] = {1, C_out, 1, 1, 1};
++    int b_strides[5] = {C_out, 1, 1, 1, 1};
++    CUDNN_CHECK(cudnnSetTensorNdDescriptor(b_desc, CUDNN_DATA_FLOAT, 5, b_dims, b_strides));
++
++    // Filter descriptor: weight shape [C_out, C_in, kD, kH, kW]
++    int w_dims[5] = {C_out, C_in, kD, kH, kW};
++    CUDNN_CHECK(cudnnSetFilterNdDescriptor(w_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 5, w_dims));
++
++    // Convolution descriptor
++    int conv_pad[3] = {padD, padH, padW};
++    int conv_stride[3] = {strideD, strideH, strideW};
++    int conv_dilation[3] = {1, 1, 1};
++    CUDNN_CHECK(cudnnSetConvolutionNdDescriptor(conv_desc,
++                                                3,
++                                                conv_pad,
++                                                conv_stride,
++                                                conv_dilation,
++                                                CUDNN_CROSS_CORRELATION,
++                                                CUDNN_DATA_FLOAT));
++
++    // Algorithm selection
++    cudnnConvolutionFwdAlgo_t algo;
++    CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm(cudnn_handle,
++                                                     x_desc,
++                                                     w_desc,
++                                                     conv_desc,
++                                                     y_desc,
++                                                     CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
++                                                     0,
++                                                     &algo));
++
++    // Workspace size
++    size_t workspace_size = 0;
++    CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(cudnn_handle,
++                                                         x_desc,
++                                                         w_desc,
++                                                         conv_desc,
++                                                         y_desc,
++                                                         algo,
++                                                         &workspace_size));
++
++    // Allocate workspace if needed
++    void* workspace = nullptr;
++    if (workspace_size > 0) {
++        cudaMalloc(&workspace, workspace_size);
++        TORCH_CHECK(workspace != nullptr, "cudaMalloc failed for workspace");
++    }
++
++    // Perform convolution
++    float alpha = 1.0f, beta = 0.0f;
++    CUDNN_CHECK(cudnnConvolutionForward(cudnn_handle,
++                                        &alpha,
++                                        x_desc,
++                                        input.data_ptr<float>(),
++                                        w_desc,
++                                        weight.data_ptr<float>(),
++                                        conv_desc,
++                                        algo,
++                                        workspace,
++                                        workspace_size,
++                                        &beta,
++                                        y_desc,
++                                        output.data_ptr<float>()));
++
++    // Add bias (beta = 1.0)
++    beta = 1.0f;
++    CUDNN_CHECK(cudnnAddTensor(cudnn_handle,
++                               &alpha,
++                               b_desc,
++                               bias.data_ptr<float>(),
++                               &beta,
++                               y_desc,
++                               output.data_ptr<float>()));
++
++    // Cleanup
++    if (workspace) cudaFree(workspace);
++    cudnnDestroyTensorDescriptor(x_desc);
++    cudnnDestroyTensorDescriptor(y_desc);
++    cudnnDestroyTensorDescriptor(b_desc);
++    cudnnDestroyFilterDescriptor(w_desc);
++    cudnnDestroyConvolutionDescriptor(conv_desc);
++    cudnnDestroy(cudnn_handle);
++
++    return output;
++}
++
++// gelu_forward wrapper
++static torch::Tensor gelu_forward(torch::Tensor input) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++
++    auto output = torch::empty_like(input);
++
++    int64_t numel = input.numel();
++    if (numel == 0) return output;
++
++    // Get dimensions and strides
++    std::vector<int64_t> dims, input_strides, output_strides;
++    for (int i = 0; i < input.dim(); ++i) {
++        dims.push_back(input.size(i));
++        input_strides.push_back(input.stride(i));
++        output_strides.push_back(output.stride(i));
++    }
++    // If tensor has fewer than 5 dims, pad leading dims with 1 and stride 0? Actually we assume 5D based on contract.
++    if (input.dim() != 5) {
++        TORCH_CHECK(false, "gelu_forward expects 5D tensor as per contract");
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    gelu_forward_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        dims[0], dims[1], dims[2], dims[3], dims[4],
++        input_strides[0], input_strides[1], input_strides[2], input_strides[3], input_strides[4],
++        output_strides[0], output_strides[1], output_strides[2], output_strides[3], output_strides[4],
++        stream
++    );
++
++    return output;
++}
++
++// bias_add_forward wrapper
++static torch::Tensor bias_add_forward(torch::Tensor input, torch::Tensor bias) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
++    TORCH_CHECK(input.dim() == 5, "input must be 5D");
++    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
++
++    // bias shape is [C] or [C,1,1,1] but effectively length C
++    TORCH_CHECK(bias.numel() == input.size(1), "bias size must match channel dim");
++
++    auto output = torch::empty_like(input);
++
++    int64_t numel = input.numel();
++    if (numel == 0) return output;
++
++    const int64_t N = input.size(0);
++    const int64_t C = input.size(1);
++    const int64_t D = input.size(2);
++    const int64_t H = input.size(3);
++    const int64_t W = input.size(4);
++
++    // Get strides
++    std::vector<int64_t> input_strides(5), output_strides(5);
++    for (int i = 0; i < 5; ++i) {
++        input_strides[i] = input.stride(i);
++        output_strides[i] = output.stride(i);
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    bias_add_forward_launcher(
++        input.data_ptr<float>(),
++        bias.data_ptr<float>(),
++        output.data_ptr<float>(),
++        numel,
++        C,
++        D, H, W, N,
++        input_strides[0], input_strides[1], input_strides[2], input_strides[3], input_strides[4],
++        output_strides[0], output_strides[1], output_strides[2], output_strides[3], output_strides[4],
++        stream
++    );
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("conv3d_forward", &conv3d_forward,
++          "Conv3d forward using cuDNN",
++          pybind11::arg("input"),
++          pybind11::arg("weight"),
++          pybind11::arg("bias"),
++          pybind11::arg("stride"),
++          pybind11::arg("padding"));
++    m.def("gelu_forward", &gelu_forward,
++          "GELU activation forward",
++          pybind11::arg("input"));
++    m.def("bias_add_forward", &bias_add_forward,
++          "Bias add forward",
++          pybind11::arg("input"),
++          pybind11::arg("bias"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,24 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
++        super().__init__()
++        self.conv3d = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=True)
++        self.bias = nn.Parameter(torch.randn(bias_shape))
++
++    def forward(self, x):
++        x = torch.ops.cuda_extension.conv3d_forward(x, self.conv3d.weight, self.conv3d.bias, self.conv3d.stride, self.conv3d.padding)
++        x = torch.ops.cuda_extension.gelu_forward(x)
++        x = torch.ops.cuda_extension.bias_add_forward(x, self.bias)
++        return x
++
++    def debug_forward(self, x):
++        x = torch.ops.cuda_extension.conv3d_forward(x, self.conv3d.weight, self.conv3d.bias, self.conv3d.stride, self.conv3d.padding)
++        yield 'step_001', x
++        x = torch.ops.cuda_extension.gelu_forward(x)
++        yield 'step_002', x
++        x = torch.ops.cuda_extension.bias_add_forward(x, self.bias)
++        yield 'step_003', x
++        yield 'step_004', x

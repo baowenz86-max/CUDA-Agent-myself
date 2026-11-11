@@ -1,0 +1,272 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,107 @@
++#include <cuda_runtime.h>
++
++// channel_mean_forward: 沿 dim=1 (通道维) 求均值, keepdim=True
++// 输入: x [N, C, H, W], 输出: out [N, 1, H, W]
++// 假设 C=3, 但代码支持任意 C
++__global__ void channel_mean_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    int total = N * H * W;
++    for (int i = idx; i < total; i += stride) {
++        int n = i / (H * W);
++        int hw = i % (H * W);
++        int h = hw / W;
++        int w = hw % W;
++        const float* base = input + n * C * H * W + h * W + w;
++        float sum = 0.0f;
++        for (int c = 0; c < C; ++c) {
++            sum += base[c * H * W];
++        }
++        output[i] = sum / C;
++    }
++}
++
++// max_pool2d_forward: 标准 2D 最大池化
++// 输入: x [N, C, H, W], 输出: out [N, C, outH, outW]
++// 参数: kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w
++__global__ void max_pool2d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int N, int C, int H, int W,
++    int outH, int outW,
++    int kernel_h, int kernel_w,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    int total = N * C * outH * outW;
++    for (int i = idx; i < total; i += stride) {
++        int ow = i % outW;
++        int oh = (i / outW) % outH;
++        int oc = (i / (outW * outH)) % C;
++        int n = i / (outW * outH * C);
++
++        int h_start = oh * stride_h - padding_h;
++        int w_start = ow * stride_w - padding_w;
++        int h_end = h_start + kernel_h;
++        int w_end = w_start + kernel_w;
++
++        float max_val = -3.402823466e+38F; // -FLT_MAX
++        bool found = false;
++
++        for (int kh = 0; kh < kernel_h; ++kh) {
++            int h = h_start + kh;
++            if (h < 0 || h >= H) continue;
++            for (int kw = 0; kw < kernel_w; ++kw) {
++                int w = w_start + kw;
++                if (w < 0 || w >= W) continue;
++                float val = input[n * C * H * W + oc * H * W + h * W + w];
++                if (!found || val > max_val) {
++                    max_val = val;
++                    found = true;
++                }
++            }
++        }
++        // 如果整个 kernel 窗口都在 padding 外，输出 -inf? 参考 PyTorch 行为：
++        // 实际上 MaxPool2d 不会出现完全 padding 的情况，因为输出尺寸定义保证了至少一个有效元素。
++        // 但为安全起见，若未找到任何有效值，输出 -inf。
++        output[i] = found ? max_val : -3.402823466e+38F;
++    }
++}
++
++// launcher for channel_mean_forward
++extern "C" void channel_mean_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    cudaStream_t stream) {
++    int total = N * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    // 限制 blocks 不超过 GPU 上限，使用 grid-stride 循环处理所有元素
++    if (blocks > 65535) blocks = 65535;
++    channel_mean_kernel<<<blocks, threads, 0, stream>>>(input, output, N, C, H, W);
++}
++
++// launcher for max_pool2d_forward
++extern "C" void max_pool2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int kernel_h, int kernel_w,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    cudaStream_t stream) {
++    int outH = (H + 2 * padding_h - kernel_h) / stride_h + 1;
++    int outW = (W + 2 * padding_w - kernel_w) / stride_w + 1;
++    int total = N * C * outH * outW;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    if (blocks > 65535) blocks = 65535;
++    max_pool2d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output, N, C, H, W, outH, outW,
++        kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,116 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void channel_mean_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    cudaStream_t stream);
++
++extern "C" void max_pool2d_launcher(
++    const float* input,
++    float* output,
++    int N, int C, int H, int W,
++    int kernel_h, int kernel_w,
++    int stride_h, int stride_w,
++    int padding_h, int padding_w,
++    cudaStream_t stream);
++
++// channel_mean_forward wrapper
++torch::Tensor channel_mean_forward(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (N, C, H, W)");
++
++    auto N = x.size(0);
++    auto C = x.size(1);
++    auto H = x.size(2);
++    auto W = x.size(3);
++
++    // Allocate output [N, 1, H, W] with same options as input
++    auto output = torch::empty({N, 1, H, W}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    channel_mean_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        stream
++    );
++
++    return output;
++}
++
++// max_pool2d_forward wrapper
++torch::Tensor max_pool2d_forward(
++    torch::Tensor x,
++    int64_t kernel_h,
++    int64_t kernel_w,
++    int64_t stride_h,
++    int64_t stride_w,
++    int64_t padding_h,
++    int64_t padding_w) {
++
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (N, C, H, W)");
++    TORCH_CHECK(kernel_h > 0 && kernel_w > 0, "kernel size must be positive");
++    TORCH_CHECK(stride_h > 0 && stride_w > 0, "stride must be positive");
++    TORCH_CHECK(padding_h >= 0 && padding_w >= 0, "padding must be non-negative");
++
++    auto N = x.size(0);
++    auto C = x.size(1);
++    auto H = x.size(2);
++    auto W = x.size(3);
++
++    int64_t outH = (H + 2 * padding_h - kernel_h) / stride_h + 1;
++    int64_t outW = (W + 2 * padding_w - kernel_w) / stride_w + 1;
++
++    TORCH_CHECK(outH > 0 && outW > 0, "invalid pooling parameters");
++
++    auto output = torch::empty({N, C, outH, outW}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    max_pool2d_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H),
++        static_cast<int>(W),
++        static_cast<int>(kernel_h),
++        static_cast<int>(kernel_w),
++        static_cast<int>(stride_h),
++        static_cast<int>(stride_w),
++        static_cast<int>(padding_h),
++        static_cast<int>(padding_w),
++        stream
++    );
++
++    return output;
++}
++
++// Register bindings
++void register_custom_ops_binding(pybind11::module& m) {
++    m.def("channel_mean_forward", &channel_mean_forward, "Channel mean forward",
++          py::arg("x"));
++    m.def("max_pool2d_forward", &max_pool2d_forward, "MaxPool2d forward",
++          py::arg("x"),
++          py::arg("kernel_h"),
++          py::arg("kernel_w"),
++          py::arg("stride_h"),
++          py::arg("stride_w"),
++          py::arg("padding_h"),
++          py::arg("padding_w"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops_binding);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,40 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, channels: int, kernel_size: tuple, stride: int = 1, padding: tuple = (0, 0)):
++        super().__init__()
++        self.channels = channels
++        self.kernel_size = kernel_size
++        self.stride = stride
++        self.padding = padding
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = cuda_extension.channel_mean_forward(x)
++        x = cuda_extension.max_pool2d_forward(
++            x,
++            self.kernel_size[0],
++            self.kernel_size[1],
++            self.stride,
++            self.stride,
++            self.padding[0],
++            self.padding[1],
++        )
++        return x
++
++    def debug_forward(self, x: torch.Tensor):
++        x = cuda_extension.channel_mean_forward(x)
++        yield "step_001", x
++        x = cuda_extension.max_pool2d_forward(
++            x,
++            self.kernel_size[0],
++            self.kernel_size[1],
++            self.stride,
++            self.stride,
++            self.padding[0],
++            self.padding[1],
++        )
++        yield "step_002", x
++        yield "step_003", x

@@ -1,0 +1,86 @@
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include "../binding_registry.h"
+
+extern "C" void custom_stack_launcher(float* out,
+                                      const float* x1,
+                                      const float* x2,
+                                      int rows,
+                                      int cols,
+                                      cudaStream_t stream);
+
+extern "C" void custom_bmm_transpose_launcher(float* out,
+                                              const float* stacked,
+                                              int batch_size,
+                                              int rows,
+                                              int cols,
+                                              cudaStream_t stream);
+
+namespace {
+
+torch::Tensor custom_stack(torch::Tensor x1, torch::Tensor x2) {
+    TORCH_CHECK(x1.is_cuda(), "x1 must be a CUDA tensor");
+    TORCH_CHECK(x2.is_cuda(), "x2 must be a CUDA tensor");
+    TORCH_CHECK(x1.dtype() == torch::kFloat32, "x1 must be float32");
+    TORCH_CHECK(x2.dtype() == torch::kFloat32, "x2 must be float32");
+    TORCH_CHECK(x1.is_contiguous(), "x1 must be contiguous");
+    TORCH_CHECK(x2.is_contiguous(), "x2 must be contiguous");
+    TORCH_CHECK(x1.dim() == 2 && x2.dim() == 2, "inputs must be 2D");
+    TORCH_CHECK(x1.size(0) == 8192 && x1.size(1) == 128,
+                "x1 must have shape [8192, 128]");
+    TORCH_CHECK(x2.size(0) == 8192 && x2.size(1) == 128,
+                "x2 must have shape [8192, 128]");
+
+    const int rows = 8192;
+    const int cols = 128;
+    auto out = torch::empty({2, rows, cols}, x1.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    custom_stack_launcher(out.data_ptr<float>(),
+                          x1.data_ptr<float>(),
+                          x2.data_ptr<float>(),
+                          rows,
+                          cols,
+                          stream);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+                "custom_stack kernel launch failed");
+    return out;
+}
+
+torch::Tensor custom_bmm_transpose(torch::Tensor stacked) {
+    TORCH_CHECK(stacked.is_cuda(), "stacked must be a CUDA tensor");
+    TORCH_CHECK(stacked.dtype() == torch::kFloat32, "stacked must be float32");
+    TORCH_CHECK(stacked.is_contiguous(), "stacked must be contiguous");
+    TORCH_CHECK(stacked.dim() == 3, "stacked must be 3D");
+    TORCH_CHECK(stacked.size(0) == 2 && stacked.size(1) == 8192 && stacked.size(2) == 128,
+                "stacked must have shape [2, 8192, 128]");
+
+    const int batch_size = 2;
+    const int rows = 8192;
+    const int cols = 128;
+    auto out = torch::empty({batch_size, rows, rows}, stacked.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    custom_bmm_transpose_launcher(out.data_ptr<float>(),
+                                  stacked.data_ptr<float>(),
+                                  batch_size,
+                                  rows,
+                                  cols,
+                                  stream);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+                "custom_bmm_transpose kernel launch failed");
+    return out;
+}
+
+void register_custom_ops(pybind11::module& m) {
+    m.def("custom_stack", &custom_stack, "Stack two tensors along dim 0",
+          py::arg("x1"), py::arg("x2"));
+    m.def("custom_bmm_transpose", &custom_bmm_transpose, "Batch matmul with transpose",
+          py::arg("stacked"));
+}
+
+}  // namespace
+
+REGISTER_BINDING(custom_ops, register_custom_ops);

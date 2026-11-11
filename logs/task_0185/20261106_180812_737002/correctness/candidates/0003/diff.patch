@@ -1,0 +1,105 @@
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -48,31 +48,35 @@
+     int W = x.size(3);
+     TORCH_CHECK(C > 0, "Channel dimension must be positive");
+ 
+-    // Output shape [B,1,H,W] with reference strides [B*C? Actually stride:
+-    // reference stride [65536, 65536, 256, 1] for B=512, H=256, W=256, C=3.
+-    // Here output dim1 stride equals input dim0 stride (H*W typically), and output dim0 stride = H*W.
+-    // More generally, to mimic torch.mean keepdim output which preserves memory format,
+-    // we allocate contiguous [B,1,H,W] but then as_strided to broadcast-like strides matching reference.
+-    auto out_shape = torch::IntArrayRef({B, 1, H, W});
++    // Output shape [B,1,H,W] with reference strides [H*W, H*W, W, 1]
++    // for the fixed input shape. We create a contiguous tensor and then
++    // as_strided with the desired strides to produce a view with those strides,
++    // matching the reference output stride.
++    std::vector<int64_t> out_shape_vec = {static_cast<int64_t>(B), 1, static_cast<int64_t>(H), static_cast<int64_t>(W)};
++    std::vector<int64_t> out_strides_vec = {
++        static_cast<int64_t>(H) * W,
++        static_cast<int64_t>(H) * W,
++        static_cast<int64_t>(W),
++        1
++    };
++
+     auto options = x.options();
+-    auto out_contig = torch::empty(out_shape, options);
++    auto out_contig = torch::empty(out_shape_vec, options);
+ 
+-    // Reference stride pattern: [H*W, H*W, W, 1] when input is contiguous NCHW and output is not?
+-    // For this task input is contiguous NCHW with strides [C*H*W, H*W, W, 1] = [196608,65536,256,1].
+-    // torch.mean keepdim output for such input has strides [C*H*W, H*W, W, 1]? Actually let's verify:
+-    // torch.mean with keepdim on contiguous input returns a view with stride [C*H*W, H*W, W, 1]
+-    // and shape [B,1,H,W]. The reference output stride is [65536,65536,256,1] for B=512, H=256, W=256, C=3.
+-    // Note: 65536 = H*W, so output stride[0]=H*W, stride[1]=H*W. This indicates non-contiguous but in our case
+-    // we can simply create as_strided from contiguous storage with those strides. We'll allocate contiguous [B,1,H,W]
+-    // and then create view with desired strides.
+-    std::vector<long long> out_strides = {static_cast<long long>(H) * W, static_cast<long long>(H) * W, static_cast<long long>(W), 1};
+-    auto out = out_contig.as_strided(out_shape, out_strides);
++    // as_strided expects c10::IntArrayRef (ArrayRef<int64_t>), so we pass
++    // at::IntArrayRef constructed from vectors.
++    auto out = out_contig.as_strided(at::IntArrayRef(out_shape_vec), at::IntArrayRef(out_strides_vec));
+ 
+     // Input strides (in elements)
+     long long x_strides[4];
+     fill_strides(x, x_strides);
+ 
+-    long long out_strides_arr[4] = {out_strides[0], out_strides[1], out_strides[2], out_strides[3]};
++    long long out_strides_arr[4] = {
++        out_strides_vec[0],
++        out_strides_vec[1],
++        out_strides_vec[2],
++        out_strides_vec[3]
++    };
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     mean_dim1_keepdim_launcher(
+@@ -97,26 +101,27 @@
+     int H = x.size(2);
+     int W = x.size(3);
+ 
+-    // Output shape [B, repeats, H, W]
+-    auto out_shape = torch::IntArrayRef({B, repeats, H, W});
++    // Output shape [B, repeats, H, W] with contiguous strides,
++    // which match the reference stride for the fixed input shape.
++    std::vector<int64_t> out_shape_vec = {
++        static_cast<int64_t>(B),
++        static_cast<int64_t>(repeats),
++        static_cast<int64_t>(H),
++        static_cast<int64_t>(W)
++    };
++
+     auto options = x.options();
+-    auto out_contig = torch::empty(out_shape, options);
+-
+-    // Desired output strides for reference: for B=512, repeats=8, H=256, W=256 => [524288, 65536, 256, 1].
+-    // General case: out_stride[0] = repeats * H * W, out_stride[1] = H * W, out_stride[2] = W, out_stride[3] = 1.
+-    // This is the same as contiguous strides for shape [B, repeats, H, W] BUT dim1 stride is H*W (not repeats*H*W).
+-    // This indicates broadcasting along dim1: the same data is shared across repeats with stride 0 in memory,
+-    // but PyTorch tile returns a view with stride[1] equal to input stride[1]? Actually reference stride is [524288,65536,256,1].
+-    // For contiguous output with repeats=8, contiguous stride would be [8*H*W, H*W, W, 1] = [524288, 65536, 256, 1] exactly!
+-    // Wait: that's identical. So reference output is contiguous. Let's check: [512,8,256,256] total elements 268435456;
+-    // contiguous strides are [repeats*H*W, H*W, W, 1] = [524288, 65536, 256, 1]. So output is contiguous in reference.
+-    // However, the semantics say non-contiguous view, but stride matches contiguous for this shape. So we can allocate contiguous.
+-    auto out = out_contig;
++    auto out = torch::empty(out_shape_vec, options);
+ 
+     // Input strides
+     long long x_strides[4];
+     fill_strides(x, x_strides);
+-    long long out_strides_arr[4] = {static_cast<long long>(repeats) * H * W, static_cast<long long>(H) * W, static_cast<long long>(W), 1};
++    long long out_strides_arr[4] = {
++        static_cast<long long>(repeats) * H * W,
++        static_cast<long long>(H) * W,
++        static_cast<long long>(W),
++        1
++    };
+ 
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+     tile_dim1_launcher(
+@@ -140,4 +145,4 @@
+           py::arg("repeats") = 8);
+ }
+ 
+-REGISTER_BINDING(custom_ops, register_custom_ops_ops);
++REGISTER_BINDING(custom_ops, register_custom_ops_ops);

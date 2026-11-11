@@ -1,0 +1,254 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,124 @@
++// CUDA kernels for max_dim1 and round_tensor
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Helper to round half to even (torch.round semantics)
++__device__ __forceinline__ float round_even(float x) {
++    // Use nearbyintf with FE_TONEAREST for correct behavior; default is nearest even
++    return nearbyintf(x);
++}
++
++// Kernel for max over dim=1
++// Input: x (batch, C, H, W) with arbitrary strides
++// Output: values (batch, H, W), indices (batch, H, W) int64
++// Each thread handles multiple (b, h, w) locations (grid-stride loop).
++__global__ void max_dim1_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ values,
++    int64_t* __restrict__ indices,
++    int batch,
++    int C,
++    int H,
++    int W,
++    int64_t stride_b,
++    int64_t stride_c,
++    int64_t stride_h,
++    int64_t stride_w
++) {
++    int64_t total = (int64_t)batch * H * W;
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < total; i += stride) {
++        int b = i / (H * W);
++        int rem = i % (H * W);
++        int h = rem / W;
++        int w = rem % W;
++
++        float max_val = -3.402823466e38f; // -FLT_MAX
++        int64_t max_idx = 0;
++
++        for (int c = 0; c < C; ++c) {
++            int64_t linear = (int64_t)b * stride_b + (int64_t)c * stride_c + (int64_t)h * stride_h + (int64_t)w * stride_w;
++            float val = x[linear];
++            // Tie-breaking: choose first occurrence (torch.max behavior: first maximum)
++            if (val > max_val) {
++                max_val = val;
++                max_idx = c;
++            }
++        }
++
++        values[i] = max_val;
++        indices[i] = max_idx;
++    }
++}
++
++// Kernel for elementwise round (half to even)
++__global__ void round_tensor_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int64_t numel
++) {
++    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)blockDim.x * gridDim.x;
++
++    for (int64_t i = idx; i < numel; i += stride) {
++        out[i] = nearbyintf(x[i]);
++    }
++}
++
++// Launcher for max_dim1: expects valid pointers and stream.
++// Outputs are assumed preallocated by the binding (values and indices contiguous).
++extern "C" void max_dim1_launcher(
++    const float* x,
++    float* values,
++    int64_t* indices,
++    int batch,
++    int C,
++    int H,
++    int W,
++    int64_t stride_b,
++    int64_t stride_c,
++    int64_t stride_h,
++    int64_t stride_w,
++    cudaStream_t stream
++) {
++    int64_t total = (int64_t)batch * H * W;
++    if (total == 0) return;
++
++    int threads = 256;
++    int blocks = static_cast<int>((total + threads - 1) / threads);
++    if (blocks > 0) {
++        max_dim1_kernel<<<blocks, threads, 0, stream>>>(
++            x, values, indices, batch, C, H, W,
++            stride_b, stride_c, stride_h, stride_w
++        );
++        cudaError_t err = cudaGetLastError();
++        if (err != cudaSuccess) {
++            // In a real binding, this would throw a Python exception.
++            // Here we cannot include torch, so we simply return a flag via an output? We'll just ignore for now.
++            // The binding should check cudaGetLastError() before returning.
++        }
++    }
++}
++
++// Launcher for round_tensor: x and out are assumed contiguous 1D of numel elements.
++extern "C" void round_tensor_launcher(
++    const float* x,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream
++) {
++    if (numel == 0) return;
++
++    int threads = 256;
++    int64_t blocks64 = (numel + threads - 1) / threads;
++    int blocks = static_cast<int>(blocks64);
++    if (blocks > 0) {
++        round_tensor_kernel<<<blocks, threads, 0, stream>>>(x, out, numel);
++        cudaError_t err = cudaGetLastError();
++        if (err != cudaSuccess) {
++            // ignore; binding should check
++        }
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,100 @@
++#include <torch/types.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void max_dim1_launcher(
++    const float* x,
++    float* values,
++    int64_t* indices,
++    int batch,
++    int C,
++    int H,
++    int W,
++    int64_t stride_b,
++    int64_t stride_c,
++    int64_t stride_h,
++    int64_t stride_w,
++    cudaStream_t stream
++);
++
++extern "C" void round_tensor_launcher(
++    const float* x,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream
++);
++
++// Wrapper for max over dim=1
++std::tuple<torch::Tensor, torch::Tensor> max_dim1(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (batch, C, H, W)");
++
++    int batch = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    auto values = torch::empty({batch, H, W}, x.options());
++    auto indices = torch::empty({batch, H, W}, x.options().dtype(torch::kInt64));
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    max_dim1_launcher(
++        x.data_ptr<float>(),
++        values.data_ptr<float>(),
++        indices.data_ptr<int64_t>(),
++        batch,
++        C,
++        H,
++        W,
++        x.stride(0),
++        x.stride(1),
++        x.stride(2),
++        x.stride(3),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "max_dim1 kernel launch failed: ", cudaGetErrorString(err));
++
++    return std::make_tuple(values, indices);
++}
++
++// Wrapper for round (half-to-even)
++torch::Tensor round_tensor(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++
++    // Launcher assumes contiguous 1D memory, so make contiguous if necessary.
++    if (!x.is_contiguous()) {
++        x = x.contiguous();
++    }
++
++    auto out = torch::empty_like(x);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    round_tensor_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        x.numel(),
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "round_tensor kernel launch failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("max_dim1", &max_dim1, "Max over dim=1 returning (values, indices)",
++          py::arg("x"));
++    m.def("round_tensor", &round_tensor, "Round tensor half-to-even",
++          py::arg("x"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features):
++        super(ModelNew, self).__init__()
++        self.in_features = in_features
++
++    def forward(self, x):
++        x, _ = cuda_extension.max_dim1(x)
++        x = cuda_extension.round_tensor(x)
++        return x
++
++    def debug_forward(self, x):
++        values, indices = cuda_extension.max_dim1(x)
++        yield 'step_001', (values, indices)
++        rounded = cuda_extension.round_tensor(values)
++        yield 'step_002', rounded
++        yield 'step_003', rounded

@@ -1,0 +1,197 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,73 @@
++#include <cuda_runtime.h>
++
++// Kernel: zero padding for 4D tensor (N, C, H, W)
++// Input may have arbitrary strides, output is contiguous with shape (N, C, H_out, W_out)
++// pad_top, pad_bottom, pad_left, pad_right are non-negative ints
++// Blocks: 2D grid over output width and height (max 65535 per dim, but output width/height small enough)
++// Each thread handles one output element.
++__global__ void zero_pad_kernel(
++    float* __restrict__ output,
++    const float* __restrict__ input,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    int pad_top, int pad_left,
++    long long input_n_stride, long long input_c_stride,
++    long long input_h_stride, long long input_w_stride)
++{
++    int out_h = blockIdx.y * blockDim.y + threadIdx.y;
++    int out_w = blockIdx.x * blockDim.x + threadIdx.x;
++
++    if (out_h >= H_out || out_w >= W_out) return;
++
++    // Determine corresponding input coordinates
++    int in_h = out_h - pad_top;
++    int in_w = out_w - pad_left;
++
++    // Input index offset
++    long long input_offset = 0;
++
++    // For each batch and channel: need to loop over N and C? 
++    // Instead we flatten N,C into blockIdx.z or use grid-stride? Since N*C can be large (48), use blockIdx.z to cover N*C.
++    // We'll use blockIdx.z to index n and c combined, or better use linear block index and compute n,c inside.
++    int nc = blockIdx.z; // up to N*C, limited to 65535 for grid z, but N*C=48 ok.
++    if (nc >= N * C) return;
++
++    int n = nc / C;
++    int c = nc % C;
++
++    long long base_input = n * input_n_stride + c * input_c_stride;
++    long long base_output = ((long long)n * C + c) * H_out * W_out;
++
++    if (in_h >= 0 && in_h < H_in && in_w >= 0 && in_w < W_in) {
++        long long input_idx = base_input + in_h * input_h_stride + in_w * input_w_stride;
++        output[base_output + (long long)out_h * W_out + out_w] = input[input_idx];
++    } else {
++        output[base_output + (long long)out_h * W_out + out_w] = 0.0f;
++    }
++}
++
++// Launcher function (extern "C" to be callable from binding)
++extern "C" void zero_pad_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    int pad_top, int pad_bottom, int pad_left, int pad_right,
++    long long input_n_stride, long long input_c_stride,
++    long long input_h_stride, long long input_w_stride,
++    cudaStream_t stream)
++{
++    // Kernel launch configuration: use 16x16 threads per block
++    dim3 block(16, 16);
++    dim3 grid(
++        (W_out + block.x - 1) / block.x,
++        (H_out + block.y - 1) / block.y,
++        N * C  // grid z maximum 65535; N*C = 48 safe
++    );
++
++    zero_pad_kernel<<<grid, block, 0, stream>>>(
++        output, input, N, C, H_in, W_in, H_out, W_out,
++        pad_top, pad_left,
++        input_n_stride, input_c_stride, input_h_stride, input_w_stride
++    );
++}
+--- before/kernels/zero_pad_binding.cpp
++++ after/kernels/zero_pad_binding.cpp
+@@ -0,0 +1,97 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launcher from custom_ops.cu
++extern "C" void zero_pad_forward_launcher(
++    float* output,
++    const float* input,
++    int N, int C, int H_in, int W_in,
++    int H_out, int W_out,
++    int pad_top, int pad_bottom, int pad_left, int pad_right,
++    long long input_n_stride, long long input_c_stride,
++    long long input_h_stride, long long input_w_stride,
++    cudaStream_t stream);
++
++torch::Tensor zero_pad_forward(
++    torch::Tensor x,
++    int64_t pad_top,
++    int64_t pad_bottom,
++    int64_t pad_left,
++    int64_t pad_right) {
++    // Input checks
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(x.dim() == 4, "Input must be 4D (N,C,H,W)");
++
++    // Padding values are non-negative
++    TORCH_CHECK(pad_top >= 0 && pad_bottom >= 0 && pad_left >= 0 && pad_right >= 0,
++                "Padding must be non-negative");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H_in = x.size(2);
++    int64_t W_in = x.size(3);
++
++    int64_t H_out = H_in + pad_top + pad_bottom;
++    int64_t W_out = W_in + pad_left + pad_right;
++
++    // Output shape and strides (contiguous)
++    std::vector<int64_t> out_shape = {N, C, H_out, W_out};
++    std::vector<int64_t> out_strides = {
++        C * H_out * W_out,
++        H_out * W_out,
++        W_out,
++        1
++    };
++
++    auto output = torch::empty_strided(out_shape, out_strides, x.options());
++
++    // Input strides may be non-contiguous; pass as long long
++    auto input_strides = x.strides();
++    long long input_n_stride = static_cast<long long>(input_strides[0]);
++    long long input_c_stride = static_cast<long long>(input_strides[1]);
++    long long input_h_stride = static_cast<long long>(input_strides[2]);
++    long long input_w_stride = static_cast<long long>(input_strides[3]);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    zero_pad_forward_launcher(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        static_cast<int>(N),
++        static_cast<int>(C),
++        static_cast<int>(H_in),
++        static_cast<int>(W_in),
++        static_cast<int>(H_out),
++        static_cast<int>(W_out),
++        static_cast<int>(pad_top),
++        static_cast<int>(pad_bottom),
++        static_cast<int>(pad_left),
++        static_cast<int>(pad_right),
++        input_n_stride, input_c_stride, input_h_stride, input_w_stride,
++        stream);
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_zero_pad(pybind11::module& m) {
++    m.def("zero_pad_forward", &zero_pad_forward,
++          "Zero padding forward (CUDA)",
++          py::arg("x"),
++          py::arg("pad_top"),
++          py::arg("pad_bottom"),
++          py::arg("pad_left"),
++          py::arg("pad_right"));
++}
++
++REGISTER_BINDING(zero_pad, register_zero_pad);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,18 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, padding_size):
++        super().__init__()
++        self.padding_size = padding_size
++
++    def forward(self, x):
++        pad_left, pad_right, pad_top, pad_bottom = self.padding_size
++        return cuda_extension.zero_pad_forward(x, pad_top, pad_bottom, pad_left, pad_right)
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        pad_left, pad_right, pad_top, pad_bottom = self.padding_size
++        out = cuda_extension.zero_pad_forward(x, pad_top, pad_bottom, pad_left, pad_right)
++        yield ('step_001', out)

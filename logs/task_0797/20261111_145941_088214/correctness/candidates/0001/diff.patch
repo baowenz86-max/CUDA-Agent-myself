@@ -1,0 +1,243 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,85 @@
++#include <cuda_runtime.h>
++
++// isin_custom kernel: output[i] = true if x[i] matches any element in elements
++__global__ void isin_kernel(const float* __restrict__ x, const float* __restrict__ elements,
++                            bool* __restrict__ output, int64_t numel, int64_t elements_size) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        float val = x[i];
++        bool found = false;
++        for (int64_t j = 0; j < elements_size; ++j) {
++            if (val == elements[j]) {
++                found = true;
++                break;
++            }
++        }
++        output[i] = found;
++    }
++}
++
++// split_with_sizes kernel: copy input block to output, assumes dim=1 contiguous chunks
++// For general case we use 3D indexing: (batch, channel, spatial)
++// Here we hardcode for dim=1 split, but we can keep generic enough for the contract
++// Since dim is always 1 in the contract, we assume x shape [N, C, H, W]
++// and split along C. Each output is [N, split_size, H, W] and is contiguous.
++// We copy N * split_size * H * W elements from input offset.
++__global__ void split_copy_kernel(const float* __restrict__ input, float* __restrict__ output,
++                                   int64_t total_copy, int64_t input_offset) {
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++    for (int64_t i = idx; i < total_copy; i += stride) {
++        output[i] = input[input_offset + i];
++    }
++}
++
++// Launcher for isin_custom
++// x: input tensor pointer, contiguous or not (we assume contiguous as per contract?)
++// elements: elements tensor pointer (contiguous)
++// output: output bool tensor pointer (same shape as x)
++// numel: total number of elements in x
++// elements_size: number of elements in elements
++// stream: CUDA stream
++extern "C" void isin_custom_launcher(const float* x, const float* elements, bool* output,
++                                    int64_t numel, int64_t elements_size, cudaStream_t stream) {
++    if (numel <= 0) return;
++    const int threads = 256;
++    int blocks = (int)((numel + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid limit (not strictly needed, but safe)
++    isin_kernel<<<blocks, threads, 0, stream>>>(x, elements, output, numel, elements_size);
++}
++
++// Launcher for split_with_sizes_custom
++// We receive x pointer, and we need to copy into multiple output tensors.
++// Since binding layer will allocate outputs, we receive pointers to each output
++// and their sizes. We provide a vector of pointers and offsets.
++// For simplicity with raw pointers, we design a launcher that takes:
++//   const float* x
++//   int64_t num_outputs
++//   const float** outputs  (array of output pointers)
++//   const int64_t* output_numels
++//   const int64_t* input_offsets
++//   int64_t total_elements_per_split? Actually we need split sizes, but we can pass offsets
++// We'll define a C++ struct? But .cu cannot include vector? We can use raw arrays.
++// Instead, we can have a simpler launcher that takes a single output pointer and copy size?
++// However, binding must call multiple times or we can define a launcher that handles all outputs.
++// Since contract says split_sizes is int64_t (list), we need to pass list via C-style array.
++// Use raw pointers to arrays.
++extern "C" void split_with_sizes_custom_launcher(
++    const float* x,
++    int64_t num_outputs,
++    float** outputs,
++    int64_t* output_numels,
++    int64_t* input_offsets,
++    cudaStream_t stream) {
++    if (num_outputs <= 0) return;
++    const int threads = 256;
++    for (int64_t out_idx = 0; out_idx < num_outputs; ++out_idx) {
++        int64_t total = output_numels[out_idx];
++        if (total <= 0) continue;
++        int blocks = (int)((total + threads - 1) / threads);
++        if (blocks > 65535) blocks = 65535;
++        split_copy_kernel<<<blocks, threads, 0, stream>>>(
++            x, outputs[out_idx], total, input_offsets[out_idx]);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,127 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++#include <vector>
++#include <cstdint>
++
++// Launcher declarations from custom_ops.cu
++extern "C" void isin_custom_launcher(const float* x, const float* elements, bool* output,
++                                    int64_t numel, int64_t elements_size, cudaStream_t stream);
++
++extern "C" void split_with_sizes_custom_launcher(
++    const float* x,
++    int64_t num_outputs,
++    float** outputs,
++    int64_t* output_numels,
++    int64_t* input_offsets,
++    cudaStream_t stream);
++
++// isin_custom: output[i] = (x[i] in elements)
++torch::Tensor isin_custom(torch::Tensor x, torch::Tensor elements) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(elements.is_cuda(), "elements must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(elements.dtype() == torch::kFloat32, "elements must be float32");
++    TORCH_CHECK(elements.dim() == 1, "elements must be 1-dimensional");
++    TORCH_CHECK(elements.is_contiguous(), "elements must be contiguous");
++
++    auto output = torch::empty(x.sizes(), x.options().dtype(torch::kBool));
++    if (x.numel() == 0) {
++        return output;
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    isin_custom_launcher(
++        x.data_ptr<float>(),
++        elements.data_ptr<float>(),
++        output.data_ptr<bool>(),
++        x.numel(),
++        elements.numel(),
++        stream
++    );
++    // Error checking after launch is optional; launcher already returns void.
++    return output;
++}
++
++// split_with_sizes_custom: split x along dim=1 according to split_sizes
++torch::Tensor split_with_sizes_custom(torch::Tensor x, int64_t split_sizes) {
++    // Note: split_sizes is typed as int64_t, but the Python call passes a list.
++    // We need to handle the list by accepting py::list, but contract says int64_t.
++    // The following is an intentional mismatch; operator contract expects pybind to accept list.
++    TORCH_CHECK(false, "split_with_sizes_custom should be called with a list; see registration");
++    return torch::Tensor();
++}
++
++// Actual wrapper for split_with_sizes_custom that accepts a Python list of ints.
++// Since operator_contract listed parameter as int (singular), but actual Python call uses a list,
++// we must use a std::vector<int64_t> or py::list at binding. We'll define the real function here.
++// To avoid duplicate registration, we won't use the above stub; we'll define a different name
++torch::Tensor split_with_sizes_custom_impl(torch::Tensor x, std::vector<int64_t> split_sizes) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dimension");
++    int64_t dim = 1; // fixed by reference
++    TORCH_CHECK(dim < x.dim(), "dim out of range");
++
++    int64_t sum_sizes = 0;
++    for (auto s : split_sizes) {
++        sum_sizes += s;
++    }
++    TORCH_CHECK(sum_sizes == x.size(dim), "split_sizes must sum to x.size(dim)");
++
++    int64_t num_outputs = split_sizes.size();
++    std::vector<torch::Tensor> outputs;
++    outputs.reserve(num_outputs);
++
++    // Allocate outputs as contiguous tensors with same options as x
++    auto options = x.options();
++    for (int64_t i = 0; i < num_outputs; ++i) {
++        std::vector<int64_t> sizes = x.sizes().vec();
++        sizes[dim] = split_sizes[i];
++        outputs.push_back(torch::empty(sizes, options));
++    }
++
++    // Prepare launcher arrays
++    std::vector<float*> output_ptrs(num_outputs);
++    std::vector<int64_t> output_numels(num_outputs);
++    std::vector<int64_t> input_offsets(num_outputs);
++
++    int64_t offset = 0;
++    for (int64_t i = 0; i < num_outputs; ++i) {
++        output_ptrs[i] = outputs[i].data_ptr<float>();
++        output_numels[i] = outputs[i].numel();
++        input_offsets[i] = offset;
++        offset += outputs[i].numel();
++    }
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    split_with_sizes_custom_launcher(
++        x.data_ptr<float>(),
++        num_outputs,
++        output_ptrs.data(),
++        output_numels.data(),
++        input_offsets.data(),
++        stream
++    );
++
++    // Convert vector to tuple for return
++    py::tuple tuple_outputs(num_outputs);
++    for (int64_t i = 0; i < num_outputs; ++i) {
++        tuple_outputs[i] = outputs[i];
++    }
++    return torch::Tensor(tuple_outputs);
++}
++
++// Registration function for pybind
++void register_custom_ops(pybind11::module& m) {
++    m.def("isin_custom", &isin_custom, "Check if elements of x are in elements",
++          py::arg("x"), py::arg("elements"));
++    m.def("split_with_sizes_custom", &split_with_sizes_custom_impl,
++          "Split x along dim=1 according to split_sizes",
++          py::arg("x"), py::arg("split_sizes"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_tensor_shape, elements_shape, split_sizes):
++        super().__init__()
++        self.elements = nn.Parameter(torch.randn(elements_shape))
++        self.split_sizes = split_sizes
++
++    def forward(self, x):
++        mask = cuda_extension.isin_custom(x, self.elements)
++        parts = cuda_extension.split_with_sizes_custom(x, self.split_sizes)
++        return mask, parts
++
++    def debug_forward(self, x):
++        mask = cuda_extension.isin_custom(x, self.elements)
++        yield 'step_001', mask
++        parts = cuda_extension.split_with_sizes_custom(x, self.split_sizes)
++        yield 'step_002', parts
++        yield 'step_003', (mask, parts)

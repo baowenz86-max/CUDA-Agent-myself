@@ -1,0 +1,228 @@
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -51,6 +51,24 @@
+                                  int has_bias,
+                                  cudaStream_t stream);
+ 
++extern "C" void lstm_launcher(const float* input,
++                               float* output,
++                               float* h_n,
++                               float* c_n,
++                               const float* weight_ih_l0,
++                               const float* weight_hh_l0,
++                               const float* bias_ih_l0,
++                               const float* bias_hh_l0,
++                               const float* weight_ih_l1,
++                               const float* weight_hh_l1,
++                               const float* bias_ih_l1,
++                               const float* bias_hh_l1,
++                               int batch_size,
++                               int seq_len,
++                               int input_size,
++                               int hidden_size,
++                               cudaStream_t stream);
++
+ // ------------------------- Helper: get current stream -------------------------
+ static cudaStream_t getCurrentStream() {
+     return c10::cuda::getCurrentCUDAStream().stream();
+@@ -201,26 +219,7 @@
+ }
+ 
+ // ------------------------- LSTM -------------------------
+-// Implement LSTM forward using cuBLAS GEMM and custom elementwise kernels.
+-// Since we cannot write kernels in .cpp, we use cuBLAS for matrix multiplications
+-// and simple sequential loops on host for activation (low overhead for this task).
+-// However, host loops over all elements would be too slow for large tensor,
+-// but this task has manageable size (seq_len=64, batch=32, hidden=256).
+-// We'll use cublasSgemm for GEMMs and use elementwise operations via torch? Not allowed.
+-// Instead, we'll use a custom CUDA kernel from .cu? But we cannot add new kernels in this iteration? We already have .cu file, can add more.
+-// For now, we'll implement LSTM using cuBLAS and simple elementwise operations on host via std::transform? That would require moving data to CPU, too slow.
+-// Alternative: We'll use cuBLAS and use device-side lambda? Not allowed.
+-// We'll defer LSTM implementation to later fix, but need to provide a placeholder that at least compiles and doesn't call torch ops.
+-// For now, we'll implement LSTM by using the module's parameters and a naive CPU loop? No.
+-// We'll keep the existing cuBLAS + host activation approach but replace torch::sigmoid/torch::tanh with custom functions using std::exp/ std::tanh on CPU? That would require device pointers, can't.
+-// We'll instead use cuDNN RNN API, which is allowed for LSTM? According to task, cuDNN is mandatory for Conv/ConvTranspose, but not forbidden for LSTM. We'll use cuDNN RNN.
+-// But we need to include cudnn.h and link. We'll implement that.
+-// This binding will likely be long.
+-
+-#include <cudnn.h>
+-
+-// Helper to create cudnn RNN and return tensors
+-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> lstm_cudnn_forward(torch::Tensor x,
++std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> lstm_forward_impl(torch::Tensor x,
+                                                                            torch::Tensor weight_ih_l0,
+                                                                            torch::Tensor weight_hh_l0,
+                                                                            torch::Tensor bias_ih_l0,
+@@ -228,99 +227,39 @@
+                                                                            torch::Tensor weight_ih_l1,
+                                                                            torch::Tensor weight_hh_l1,
+                                                                            torch::Tensor bias_ih_l1,
+-                                                                           torch::Tensor bias_hh_l1,
+-                                                                           int64_t input_size,
+-                                                                           int64_t hidden_size,
+-                                                                           int64_t num_layers) {
+-    cudnnHandle_t cudnn;
+-    cudnnCreate(&cudnn);
+-    cudnnSetStream(cudnn, getCurrentStream());
+-
+-    cudnnRNNDescriptor_t rnn_desc;
+-    cudnnCreateRNNDescriptor(&rnn_desc);
+-    cudnnSetRNNDescriptor_v8(rnn_desc, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_NO_BIAS, CUDNN_UNIDIRECTIONAL,
+-                             CUDNN_LINEAR_INPUT, CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT, CUDNN_DEFAULT_MATH, input_size, hidden_size, 0, num_layers, nullptr, CUDNN_RNN_PADDED_IO_DISABLED);
+-
+-    cudnnDropoutDescriptor_t dropout_desc;
+-    cudnnCreateDropoutDescriptor(&dropout_desc);
+-    cudnnSetDropoutDescriptor(dropout_desc, cudnn, 0.0f, nullptr, 0, 0);
+-
++                                                                           torch::Tensor bias_hh_l1) {
+     int batch_size = x.size(0);
+     int seq_len = x.size(1);
+-
+-    std::vector<cudnnTensorDescriptor_t> x_desc(seq_len), y_desc(seq_len);
+-    for (int i = 0; i < seq_len; i++) {
+-        cudnnCreateTensorDescriptor(&x_desc[i]);
+-        cudnnSetTensor4dDescriptor(x_desc[i], CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, batch_size, input_size, 1, 1);
+-        cudnnCreateTensorDescriptor(&y_desc[i]);
+-        cudnnSetTensor4dDescriptor(y_desc[i], CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, batch_size, hidden_size, 1, 1);
+-    }
+-
+-    cudnnTensorDescriptor_t hx_desc, cx_desc, hy_desc, cy_desc;
+-    cudnnCreateTensorDescriptor(&hx_desc);
+-    cudnnSetTensor4dDescriptor(hx_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, num_layers, batch_size, hidden_size, 1);
+-    cudnnCreateTensorDescriptor(&cx_desc);
+-    cudnnSetTensor4dDescriptor(cx_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, num_layers, batch_size, hidden_size, 1);
+-    cudnnCreateTensorDescriptor(&hy_desc);
+-    cudnnSetTensor4dDescriptor(hy_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, num_layers, batch_size, hidden_size, 1);
+-    cudnnCreateTensorDescriptor(&cy_desc);
+-    cudnnSetTensor4dDescriptor(cy_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, num_layers, batch_size, hidden_size, 1);
+-
+-    size_t weight_size = 0;
+-    cudnnGetRNNWeightSpaceSize(cudnn, rnn_desc, &weight_size);
+-    auto weight_space = torch::empty({static_cast<int64_t>(weight_size / sizeof(float))}, x.options());
+-
+-    float* weight_ptr = weight_space.data_ptr<float>();
+-    // copy weights in order: layer0 weight_ih, weight_hh, bias_ih, bias_hh; then layer1 same
+-    cudaMemcpyAsync(weight_ptr, weight_ih_l0.data_ptr<float>(), weight_ih_l0.numel() * sizeof(float), cudaMemcpyDeviceToDevice, getCurrentStream());
+-    weight_ptr += weight_ih_l0.numel();
+-    cudaMemcpyAsync(weight_ptr, weight_hh_l0.data_ptr<float>(), weight_hh_l0.numel() * sizeof(float), cudaMemcpyDeviceToDevice, getCurrentStream());
+-    weight_ptr += weight_hh_l0.numel();
+-    cudaMemcpyAsync(weight_ptr, bias_ih_l0.data_ptr<float>(), bias_ih_l0.numel() * sizeof(float), cudaMemcpyDeviceToDevice, getCurrentStream());
+-    weight_ptr += bias_ih_l0.numel();
+-    cudaMemcpyAsync(weight_ptr, bias_hh_l0.data_ptr<float>(), bias_hh_l0.numel() * sizeof(float), cudaMemcpyDeviceToDevice, getCurrentStream());
+-    weight_ptr += bias_hh_l0.numel();
+-    cudaMemcpyAsync(weight_ptr, weight_ih_l1.data_ptr<float>(), weight_ih_l1.numel() * sizeof(float), cudaMemcpyDeviceToDevice, getCurrentStream());
+-    weight_ptr += weight_ih_l1.numel();
+-    cudaMemcpyAsync(weight_ptr, weight_hh_l1.data_ptr<float>(), weight_hh_l1.numel() * sizeof(float), cudaMemcpyDeviceToDevice, getCurrentStream());
+-    weight_ptr += weight_hh_l1.numel();
+-    cudaMemcpyAsync(weight_ptr, bias_ih_l1.data_ptr<float>(), bias_ih_l1.numel() * sizeof(float), cudaMemcpyDeviceToDevice, getCurrentStream());
+-    weight_ptr += bias_ih_l1.numel();
+-    cudaMemcpyAsync(weight_ptr, bias_hh_l1.data_ptr<float>(), bias_hh_l1.numel() * sizeof(float), cudaMemcpyDeviceToDevice, getCurrentStream());
+-
+-    size_t work_size = 0;
+-    cudnnGetRNNTempSpaceSizes(cudnn, rnn_desc, CUDNN_FWD_MODE_TRAINING, x_desc.data(), &work_size, nullptr);
+-    auto work_space = torch::empty({static_cast<int64_t>(work_size / sizeof(float))}, x.options());
+-
+-    auto y = torch::empty({batch_size, seq_len, hidden_size}, x.options());
++    int input_size = x.size(2);
++    int hidden_size = weight_hh_l0.size(1);
++    int num_layers = 2; // hardcoded for this task
++
++    auto output = torch::empty({batch_size, seq_len, hidden_size}, x.options());
+     auto h_n = torch::empty({num_layers, batch_size, hidden_size}, x.options());
+     auto c_n = torch::empty({num_layers, batch_size, hidden_size}, x.options());
+-    auto hx = torch::zeros({num_layers, batch_size, hidden_size}, x.options());
+-    auto cx = torch::zeros({num_layers, batch_size, hidden_size}, x.options());
+-
+-    cudnnRNNForward(cudnn, rnn_desc, CUDNN_FWD_MODE_TRAINING,
+-                    nullptr, x_desc.data(), x.data_ptr<float>(),
+-                    hx_desc, hx.data_ptr<float>(),
+-                    cx_desc, cx.data_ptr<float>(),
+-                    weight_space.data_ptr<float>(), weight_size,
+-                    y_desc.data(), y.data_ptr<float>(),
+-                    hy_desc, h_n.data_ptr<float>(),
+-                    cy_desc, c_n.data_ptr<float>(),
+-                    work_space.data_ptr<float>(), work_size,
+-                    nullptr, 0);
+-
+-    // destroy descriptors
+-    for (auto& desc : x_desc) cudnnDestroyTensorDescriptor(desc);
+-    for (auto& desc : y_desc) cudnnDestroyTensorDescriptor(desc);
+-    cudnnDestroyTensorDescriptor(hx_desc);
+-    cudnnDestroyTensorDescriptor(cx_desc);
+-    cudnnDestroyTensorDescriptor(hy_desc);
+-    cudnnDestroyTensorDescriptor(cy_desc);
+-    cudnnDestroyDropoutDescriptor(dropout_desc);
+-    cudnnDestroyRNNDescriptor(rnn_desc);
+-    cudnnDestroy(cudnn);
+-
+-    return std::make_tuple(y, h_n, c_n);
++
++    cudaStream_t stream = getCurrentStream();
++    lstm_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        h_n.data_ptr<float>(),
++        c_n.data_ptr<float>(),
++        weight_ih_l0.data_ptr<float>(),
++        weight_hh_l0.data_ptr<float>(),
++        bias_ih_l0.data_ptr<float>(),
++        bias_hh_l0.data_ptr<float>(),
++        weight_ih_l1.data_ptr<float>(),
++        weight_hh_l1.data_ptr<float>(),
++        bias_ih_l1.data_ptr<float>(),
++        bias_hh_l1.data_ptr<float>(),
++        batch_size,
++        seq_len,
++        input_size,
++        hidden_size,
++        stream
++    );
++
++    return std::make_tuple(output, h_n, c_n);
+ }
+ 
+ // Binding for lstm_forward: accept module as py::object and extract parameters
+@@ -328,13 +267,7 @@
+     TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kFloat32, "x must be CUDA float32");
+     TORCH_CHECK(x.dim() == 3, "x must be 3D [batch, seq_len, input_size]");
+ 
+-    int batch_size = x.size(0);
+-    int seq_len = x.size(1);
+-    int input_size = x.size(2);
+-    int hidden_size = 256;
+-    int num_layers = 2;
+-
+-    // Extract parameters
++    // Hidden size and num_layers are known from module; but we can extract them from weight shapes
+     auto weight_ih_l0 = module.attr("weight_ih_l0").cast<torch::Tensor>().cuda();
+     auto weight_hh_l0 = module.attr("weight_hh_l0").cast<torch::Tensor>().cuda();
+     auto bias_ih_l0 = module.attr("bias_ih_l0").cast<torch::Tensor>().cuda();
+@@ -344,14 +277,23 @@
+     auto bias_ih_l1 = module.attr("bias_ih_l1").cast<torch::Tensor>().cuda();
+     auto bias_hh_l1 = module.attr("bias_hh_l1").cast<torch::Tensor>().cuda();
+ 
+-    auto result = lstm_cudnn_forward(x, weight_ih_l0, weight_hh_l0, bias_ih_l0, bias_hh_l0,
+-                                     weight_ih_l1, weight_hh_l1, bias_ih_l1, bias_hh_l1,
+-                                     input_size, hidden_size, num_layers);
+-    auto y = std::get<0>(result);
++    // Ensure all parameters are contiguous and on same device as x
++    TORCH_CHECK(weight_ih_l0.is_cuda() && weight_ih_l0.is_contiguous(), "weights must be CUDA contiguous");
++    TORCH_CHECK(weight_hh_l0.is_cuda() && weight_hh_l0.is_contiguous(), "weights must be CUDA contiguous");
++    TORCH_CHECK(bias_ih_l0.is_cuda() && bias_ih_l0.is_contiguous(), "biases must be CUDA contiguous");
++    TORCH_CHECK(bias_hh_l0.is_cuda() && bias_hh_l0.is_contiguous(), "biases must be CUDA contiguous");
++    TORCH_CHECK(weight_ih_l1.is_cuda() && weight_ih_l1.is_contiguous(), "weights must be CUDA contiguous");
++    TORCH_CHECK(weight_hh_l1.is_cuda() && weight_hh_l1.is_contiguous(), "weights must be CUDA contiguous");
++    TORCH_CHECK(bias_ih_l1.is_cuda() && bias_ih_l1.is_contiguous(), "biases must be CUDA contiguous");
++    TORCH_CHECK(bias_hh_l1.is_cuda() && bias_hh_l1.is_contiguous(), "biases must be CUDA contiguous");
++
++    auto result = lstm_forward_impl(x, weight_ih_l0, weight_hh_l0, bias_ih_l0, bias_hh_l0,
++                                    weight_ih_l1, weight_hh_l1, bias_ih_l1, bias_hh_l1);
++    auto output = std::get<0>(result);
+     auto h_n = std::get<1>(result);
+     auto c_n = std::get<2>(result);
+ 
+-    return py::make_tuple(y, py::make_tuple(h_n, c_n));
++    return py::make_tuple(output, py::make_tuple(h_n, c_n));
+ }
+ 
+ // ------------------------- Registration -------------------------

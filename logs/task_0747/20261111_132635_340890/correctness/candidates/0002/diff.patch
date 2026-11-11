@@ -1,0 +1,314 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -39,8 +39,8 @@
+ // -----------------------------------------------------------------------------
+ // mean_only: reduction along one dimension
+ // -----------------------------------------------------------------------------
+-// The launcher takes the input pointer, output pointer, input sizes, input
+-// strides, reduction dim, and total number of output elements. The input is
++// The launcher takes the input pointer, output pointer, input sizes,
++// reduction dim, and total number of output elements. The input is
+ // expected to be contiguous in the PyTorch sense, but we also pass strides in
+ // case the binding wants to handle non-contiguous input. For this initial
+ // implementation we assume the input is contiguous (C-order) and verify that
+@@ -88,70 +88,6 @@
+         output[out_idx] = (float)(sum / reduce_size);
+     }
+ }
+-
+-// Launcher for mean_only: input pointer, output pointer, input sizes,
+-// reduction dim, ndim, stream.
+-// The binding must allocate output as contiguous tensor with shape = input
+-// shape without the specified dimension, using torch::empty.
+-extern "C" void mean_only_launcher(
+-    const float* input,
+-    float* output,
+-    const int* input_sizes,
+-    int ndim,
+-    int dim,
+-    cudaStream_t stream) {
+-
+-    int normalized_dim = (dim < 0) ? dim + ndim : dim;
+-    if (normalized_dim < 0 || normalized_dim >= ndim) {
+-        // Invalid dim; binding should have checked. Return without launch.
+-        return;
+-    }
+-
+-    // Calculate output sizes and out_numel
+-    int out_numel = 1;
+-    for (int d = 0; d < ndim; ++d) {
+-        if (d != normalized_dim) out_numel *= input_sizes[d];
+-    }
+-
+-    // The kernel expects contiguous input; we pass sizes and assume contiguous
+-    // strides. However, we need to pass input_strides for potential future
+-    // non-contiguous support. Here we construct strides on device? No, we pass
+-    // null for strides and handle inside kernel assuming contiguous. But kernel
+-    // currently uses direct formula without strides. We'll modify kernel to
+-    // accept contiguous assumption and compute accordingly.
+-    // Actually our kernel uses outer_factor, inner_factor and contiguous layout,
+-    // so we don't need strides. We pass only input_sizes, reduce_dim.
+-
+-    // We'll replace with a kernel that assumes input is contiguous.
+-    int outer_factor = 1;
+-    for (int d = 0; d < normalized_dim; ++d) outer_factor *= input_sizes[d];
+-    int inner_factor = 1;
+-    for (int d = normalized_dim + 1; d < ndim; ++d) inner_factor *= input_sizes[d];
+-    int reduce_size = input_sizes[normalized_dim];
+-
+-    // Use grid-stride loop over output elements
+-    int block_size = 256;
+-    long long total = (long long)outer_factor * inner_factor;
+-    int grid_size = (int)((total + block_size - 1) / block_size);
+-    if (grid_size > 65535) {
+-        grid_size = 65535;
+-    }
+-
+-    // We'll implement a simpler kernel that takes outer_factor, inner_factor,
+-    // reduce_size, and assumes input contiguous.
+-    // For now, call a kernel that does that.
+-    // We need to define another kernel below.
+-    // To avoid changing too much, we define mean_contiguous_kernel.
+-    // This launcher will call it.
+-    // Actually we already defined mean_dim_kernel but with input_sizes and
+-    // ndim. We can reuse it by computing strides internally? It expects
+-    // strides but we don't pass them. Let's keep a simplified kernel.
+-
+-    // We'll add a new kernel below.
+-    // We'll define mean_only_kernel_impl then call.
+-}
+-
+-// We need to write the actual kernel and launcher properly. Let's restructure.
+ 
+ // -----------------------------------------------------------------------------
+ // mean_only kernel (contiguous input)
+@@ -253,6 +189,81 @@
+         }
+         output[out_linear] = input[in_linear];
+     }
++}
++
++// Specialized transpose kernels for 3D and 4D contiguous tensors.
++__global__ void transpose3d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int in0, int in1, int in2,
++    int out0, int out1, int out2,
++    int dim0, int dim1) {
++
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = in0 * in1 * in2;
++    if (idx >= total) return;
++
++    // Convert idx to input multi-index (contiguous)
++    int i2 = idx % in2;
++    int temp = idx / in2;
++    int i1 = temp % in1;
++    int i0 = temp / in1;
++
++    int idx_arr[3] = {i0, i1, i2};
++    int o0, o1, o2;
++    if (dim0 == 0 && dim1 == 1) {
++        o0 = idx_arr[1]; o1 = idx_arr[0]; o2 = idx_arr[2];
++    } else if (dim0 == 0 && dim1 == 2) {
++        o0 = idx_arr[2]; o1 = idx_arr[1]; o2 = idx_arr[0];
++    } else if (dim0 == 1 && dim1 == 2) {
++        o0 = idx_arr[0]; o1 = idx_arr[2]; o2 = idx_arr[1];
++    } else {
++        // other cases, swap dim0,dim1
++        o0 = idx_arr[0]; o1 = idx_arr[1]; o2 = idx_arr[2];
++        int tmp = o0;
++        o0 = o1;
++        o1 = tmp;
++    }
++
++    int out_idx = o0 * out1 * out2 + o1 * out2 + o2;
++    output[out_idx] = input[idx];
++}
++
++__global__ void transpose4d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int in0, int in1, int in2, int in3,
++    int out0, int out1, int out2, int out3,
++    int dim0, int dim1) {
++
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    long long total = (long long)in0 * in1 * in2 * in3;
++    if (idx >= total) return;
++
++    int i3 = idx % in3;
++    long long temp = idx / in3;
++    int i2 = temp % in2;
++    temp /= in2;
++    int i1 = temp % in1;
++    int i0 = temp / in1;
++
++    int idx_arr[4] = {i0, i1, i2, i3};
++    int o0, o1, o2, o3;
++    // general swap dim0,dim1
++    o0 = idx_arr[0]; o1 = idx_arr[1]; o2 = idx_arr[2]; o3 = idx_arr[3];
++    int tmp;
++    if (dim0 == 0 && dim1 == 1) { tmp=o0; o0=o1; o1=tmp; }
++    else if (dim0 == 0 && dim1 == 2) { tmp=o0; o0=o2; o2=tmp; }
++    else if (dim0 == 0 && dim1 == 3) { tmp=o0; o0=o3; o3=tmp; }
++    else if (dim0 == 1 && dim1 == 2) { tmp=o1; o1=o2; o2=tmp; }
++    else if (dim0 == 1 && dim1 == 3) { tmp=o1; o1=o3; o3=tmp; }
++    else if (dim0 == 2 && dim1 == 3) { tmp=o2; o2=o3; o3=tmp; }
++
++    long long out_idx = ((long long)o0 * out1 * out2 * out3 +
++                         (long long)o1 * out2 * out3 +
++                         (long long)o2 * out3 +
++                         o3);
++    output[out_idx] = input[idx];
+ }
+ 
+ // Launcher for transpose_only.
+@@ -284,7 +295,7 @@
+         return;
+     }
+ 
+-    // Compute contiguous strides for input and output
++    // Compute contiguous strides for input and output (not used in specialized kernels)
+     long long input_strides[8], output_strides[8];
+     input_strides[ndim-1] = 1;
+     output_strides[ndim-1] = 1;
+@@ -297,59 +308,8 @@
+     for (int d = 0; d < ndim; ++d) output_numel *= output_sizes[d];
+     if (output_numel == 0) return;
+ 
+-    // Copy sizes/strides to device memory? We can just pass by value to kernel,
+-    // but arrays can't be passed directly. We can allocate constant memory or
+-    // use kernel parameters with fixed array size. We'll use a simpler approach:
+-    // since input and output are contiguous, we can compute the mapping using
+-    // formulas without strides arrays.
+-    // For ndim <= 4, we can specialize.
+-    // Here we assume ndim <= 4 (as in typical use). For general ndim, we need
+-    // dynamic shared memory or pass arrays via constant memory. For simplicity,
+-    // we support ndim <= 8 by declaring arrays and copying them into kernel
+-    // parameters (struct). We'll create a struct containing arrays.
+-    // But that would require constructing on host. Instead, we can compute
+-    // strides within the kernel based on ndim and sizes passed via arrays,
+-    // but we need to pass input_sizes and output_sizes as pointers. We can
+-    // copy them to device memory (cudaMemcpyAsync) but that's extra overhead.
+-    // Another approach: since input and output are contiguous, we can compute
+-    // the linear mapping without full strides: use the fact that output index
+-    // reversed to input index. For a 3D case [N,H,W] -> [N,W,H], the mapping is
+-    // out(n,w,h) = in(n,h,w). Linear: out_index = n*W*H + w*H + h.
+-    // input_index = n*H*W + h*W + w.
+-    // For general dim0, dim1, we can write kernel specialized for ndim up to 4.
+-    // For simplicity and given the contract, we implement for arbitrary ndim
+-    // but using device-side arrays via kernel parameters? Actually, we can
+-    // pass the sizes as separate scalar arguments if ndim is known at compile
+-    // time? The launcher doesn't know ndim at compile time, but we can use
+-    // a template with runtime ndim? Not easy.
+-    // We'll instead require ndim <= 4 and implement specialized kernels for
+-    // ndim=1,2,3,4, selecting at runtime. That covers the common cases.
+-    // The contract says arbitrary dimensions, but for this task the max ndim
+-    // after mean is 3, so ndim=3 is enough. We'll also handle ndim<=4 for safety,
+-    // but we can implement generic using dynamic shared memory to pass arrays.
+-    // Let's use a simpler approach: assume dimensions are passed as int arrays
+-    // and we use a helper to compute mapping inside kernel using loops without
+-    // needing explicit strides: if input and output are contiguous, we can
+-    // compute the output multi-index using quotients/remainders with sizes,
+-    // then swap, then compute input linear using product of sizes.
+-    // We'll implement a generic kernel that receives input_sizes and output_sizes
+-    // as device pointers (allocated by binding? binding could pack them into
+-    // a struct and pass by value via kernel parameter, but that's complicated).
+-    // The most straightforward for our case: ndim is fixed (3 for transpose_only
+-    // after mean, but transpose_only could be called on any tensor, and binding
+-    // may handle generic ndim). Since we control the binding in the next phase,
+-    // we can decide to make binding always pass 3D or 4D? But contract says
+-    // arbitrary. However, the binding can pass a struct with sizes/strides if
+-    // needed. Since this phase only creates .cu, we can design launcher to take
+-    // a struct pointer, but that requires binding to know.
+-    // To keep it simple and avoid dynamic allocation in .cu, we will implement
+-    // transposition only for ndim == 3 and ndim == 4, which are the common cases.
+-    // The binding can raise error for unsupported ndim. Given the reference uses
+-    // 3D after mean, this suffices.
+-
+     if (ndim == 3) {
+         // input sizes: [D0, D1, D2], output sizes: swapped dim0,dim1
+-        // We'll launch a specialized kernel.
+         int block_size = 256;
+         long long total = (long long)input_sizes[0] * input_sizes[1] * input_sizes[2];
+         int grid_size = (int)((total + block_size - 1) / block_size);
+@@ -380,78 +340,3 @@
+         return;
+     }
+ }
+-
+-// Specialized transpose kernels for 3D and 4D contiguous tensors.
+-__global__ void transpose3d_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    int in0, int in1, int in2,
+-    int out0, int out1, int out2,
+-    int dim0, int dim1) {
+-
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = in0 * in1 * in2;
+-    if (idx >= total) return;
+-
+-    // Convert idx to input multi-index (contiguous)
+-    int i2 = idx % in2;
+-    int temp = idx / in2;
+-    int i1 = temp % in1;
+-    int i0 = temp / in1;
+-
+-    int idx_arr[3] = {i0, i1, i2};
+-    int o0, o1, o2;
+-    if (dim0 == 0 && dim1 == 1) {
+-        o0 = idx_arr[1]; o1 = idx_arr[0]; o2 = idx_arr[2];
+-    } else if (dim0 == 0 && dim1 == 2) {
+-        o0 = idx_arr[2]; o1 = idx_arr[1]; o2 = idx_arr[0];
+-    } else if (dim0 == 1 && dim1 == 2) {
+-        o0 = idx_arr[0]; o1 = idx_arr[2]; o2 = idx_arr[1];
+-    } else {
+-        // other cases, swap dim0,dim1
+-        o0 = idx_arr[0]; o1 = idx_arr[1]; o2 = idx_arr[2];
+-        int tmp = o0;
+-        o0 = o1;
+-        o1 = tmp;
+-    }
+-
+-    int out_idx = o0 * out1 * out2 + o1 * out2 + o2;
+-    output[out_idx] = input[idx];
+-}
+-
+-__global__ void transpose4d_kernel(
+-    const float* __restrict__ input,
+-    float* __restrict__ output,
+-    int in0, int in1, int in2, int in3,
+-    int out0, int out1, int out2, int out3,
+-    int dim0, int dim1) {
+-
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    long long total = (long long)in0 * in1 * in2 * in3;
+-    if (idx >= total) return;
+-
+-    int i3 = idx % in3;
+-    long long temp = idx / in3;
+-    int i2 = temp % in2;
+-    temp /= in2;
+-    int i1 = temp % in1;
+-    int i0 = temp / in1;
+-
+-    int idx_arr[4] = {i0, i1, i2, i3};
+-    int o0, o1, o2, o3;
+-    // general swap dim0,dim1
+-    o0 = idx_arr[0]; o1 = idx_arr[1]; o2 = idx_arr[2]; o3 = idx_arr[3];
+-    int tmp;
+-    if (dim0 == 0 && dim1 == 1) { tmp=o0; o0=o1; o1=tmp; }
+-    else if (dim0 == 0 && dim1 == 2) { tmp=o0; o0=o2; o2=tmp; }
+-    else if (dim0 == 0 && dim1 == 3) { tmp=o0; o0=o3; o3=tmp; }
+-    else if (dim0 == 1 && dim1 == 2) { tmp=o1; o1=o2; o2=tmp; }
+-    else if (dim0 == 1 && dim1 == 3) { tmp=o1; o1=o3; o3=tmp; }
+-    else if (dim0 == 2 && dim1 == 3) { tmp=o2; o2=o3; o3=tmp; }
+-
+-    long long out_idx = ((long long)o0 * out1 * out2 * out3 +
+-                         (long long)o1 * out2 * out3 +
+-                         (long long)o2 * out3 +
+-                         o3);
+-    output[out_idx] = input[idx];
+-}

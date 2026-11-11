@@ -1,0 +1,209 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,89 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Kernel: mean over channels (dim=1) with keepdim=True, then fmod by divisor.
++// Input: x shape [B, C, H, W], contiguous in memory, float32.
++// Output: out shape [B, 1, H, W], contiguous, float32.
++// Each thread block handles one (b,h,w) position and loops over channels.
++__global__ void mean_channel_fmod_kernel(const float* __restrict__ input,
++                                         float* __restrict__ output,
++                                         int batch,
++                                         int channels,
++                                         int height,
++                                         int width,
++                                         float divisor) {
++    // Flattened index over output elements: index = b*height*width + h*width + w
++    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total_out = batch * height * width;
++    if (out_idx >= total_out) return;
++
++    int w = out_idx % width;
++    int tmp = out_idx / width;
++    int h = tmp % height;
++    int b = tmp / height;
++
++    const float* in_base = input + ((long long)b * channels + 0LL) * height * width; // base for channel 0
++    float sum = 0.0f;
++    for (int c = 0; c < channels; ++c) {
++        // Access contiguous along width; for each channel, the offset is c * H * W + h * W + w
++        const float* in_ptr = input + ((long long)b * channels + c) * (long long)height * width + (long long)h * width + w;
++        sum += *in_ptr;
++    }
++    float mean = sum / (float)channels;
++    // fmod with divisor
++    output[out_idx] = fmodf(mean, divisor);
++}
++
++// Launcher for mean_channel_fmod. Assumes input and output are contiguous CUDA memory.
++extern "C" void mean_channel_fmod_launcher(const float* input,
++                                           float* output,
++                                           int batch,
++                                           int channels,
++                                           int height,
++                                           int width,
++                                           float divisor,
++                                           cudaStream_t stream) {
++    if (!input || !output || batch <= 0 || channels <= 0 || height <= 0 || width <= 0) {
++        // In production binding would handle error, but here we can return silently after checking.
++        // No error throwing allowed; launcher only returns. Binding should ensure validity.
++        return;
++    }
++    int total_out = batch * height * width;
++    // Choose block size 256 and compute grid size with grid-stride? Since each thread handles one output, we can use enough blocks.
++    // For large B*H*W (here 512*512*512 = 134,217,728 elements), 256 threads per block => 524,288 blocks, well within limits.
++    int threads = 256;
++    int blocks = (total_out + threads - 1) / threads;
++    mean_channel_fmod_kernel<<<blocks, threads, 0, stream>>>(input, output, batch, channels, height, width, divisor);
++}
++
++// Kernel: elementwise fmod scalar.
++__global__ void fmod_scalar_kernel(const float* __restrict__ input,
++                                   float* __restrict__ output,
++                                   size_t N,
++                                   float modulus) {
++    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    size_t stride = blockDim.x * gridDim.x;
++    for (size_t i = idx; i < N; i += stride) {
++        output[i] = fmodf(input[i], modulus);
++    }
++}
++
++// Launcher for fmod_scalar. Assumes contiguous CUDA memory.
++extern "C" void fmod_scalar_launcher(const float* input,
++                                     float* output,
++                                     size_t N,
++                                     float modulus,
++                                     cudaStream_t stream) {
++    if (!input || !output || N == 0) {
++        return;
++    }
++    int threads = 256;
++    // Calculate grid size to cover N, but use grid-stride loop for safety.
++    // We can set grid to min((N + threads - 1)/threads, some cap like 65535*32) but grid-stride loop handles any.
++    size_t blocks_required = (N + threads - 1) / threads;
++    // Cap grid at 2^31-1 blocks; if more, we rely on grid-stride loop with grid dims limited.
++    // But actual grid limit is 2^31-1 for x dimension; we can set grid size to min(blocks_required, 65535) and use stride.
++    // For very large N (134M), blocks_required ~ 524k, which is fine. So we can just use blocks_required, no need for capping.
++    int blocks = (int)blocks_required;
++    fmod_scalar_kernel<<<blocks, threads, 0, stream>>>(input, output, N, modulus);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,90 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void mean_channel_fmod_launcher(const float* input,
++                                           float* output,
++                                           int batch,
++                                           int channels,
++                                           int height,
++                                           int width,
++                                           float divisor,
++                                           cudaStream_t stream);
++
++extern "C" void fmod_scalar_launcher(const float* input,
++                                     float* output,
++                                     size_t N,
++                                     float modulus,
++                                     cudaStream_t stream);
++
++// Helper to validate float32 CUDA tensor
++static void check_float_cuda(const torch::Tensor& t, const char* name) {
++    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(t.scalar_type() == torch::kFloat32, name, " must be float32");
++    TORCH_CHECK(t.numel() > 0, name, " must have non-zero number of elements");
++}
++
++torch::Tensor mean_channel_fmod(torch::Tensor x, double divisor) {
++    check_float_cuda(x, "x");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (batch, channels, height, width)");
++
++    // Ensure contiguous for launcher
++    auto x_contig = x.contiguous();
++
++    int batch = x_contig.size(0);
++    int channels = x_contig.size(1);
++    int height = x_contig.size(2);
++    int width = x_contig.size(3);
++
++    // Allocate output [batch, 1, height, width]
++    auto output = torch::empty({batch, 1, height, width}, x_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    mean_channel_fmod_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        batch,
++        channels,
++        height,
++        width,
++        static_cast<float>(divisor),
++        stream
++    );
++
++    return output;
++}
++
++torch::Tensor fmod_scalar(torch::Tensor x, double modulus) {
++    check_float_cuda(x, "x");
++    // Work on contiguous input
++    auto x_contig = x.contiguous();
++
++    auto output = torch::empty_like(x_contig);
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    fmod_scalar_launcher(
++        x_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<size_t>(x_contig.numel()),
++        static_cast<float>(modulus),
++        stream
++    );
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("mean_channel_fmod", &mean_channel_fmod,
++          "Mean over channel dimension (keepdim=True) followed by fmod with divisor",
++          py::arg("x"), py::arg("divisor"));
++    m.def("fmod_scalar", &fmod_scalar,
++          "Element-wise fmod with scalar modulus",
++          py::arg("x"), py::arg("modulus"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import cuda_extension
++
++
++class ModelNew(torch.nn.Module):
++    def __init__(self, divisor, modulus):
++        super().__init__()
++        self.divisor = divisor
++        self.modulus = modulus
++
++    def forward(self, x):
++        x = cuda_extension.mean_channel_fmod(x, float(self.divisor))
++        x = cuda_extension.fmod_scalar(x, float(self.modulus))
++        return x
++
++    def debug_forward(self, x):
++        x1 = cuda_extension.mean_channel_fmod(x, float(self.divisor))
++        yield ("step_001", x1)
++        yield ("step_002", x1)
++        x2 = cuda_extension.fmod_scalar(x1, float(self.modulus))
++        yield ("step_003", x2)
++        yield ("step_004", x2)

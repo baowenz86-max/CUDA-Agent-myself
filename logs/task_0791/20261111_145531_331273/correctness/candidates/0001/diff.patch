@@ -1,0 +1,124 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,32 @@
++#include <cuda_runtime.h>
++
++// Fused kernel: out[i] = (float)(x1[i] || x2[i]);
++// Since inputs are bool and output is float32, logical_or yields 0/1.
++__global__ void logical_or_round_kernel(
++    const bool* __restrict__ x1,
++    const bool* __restrict__ x2,
++    float* __restrict__ out,
++    int64_t numel)
++{
++    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++    for (int64_t i = idx; i < numel; i += stride) {
++        out[i] = (x1[i] || x2[i]) ? 1.0f : 0.0f;
++    }
++}
++
++extern "C" void logical_or_round_launcher(
++    const bool* x1,
++    const bool* x2,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream)
++{
++    const int threads = 256;
++    // Cap grid at 65535*threads coverage via grid-stride loop; for large numel, grid is limited.
++    int64_t max_blocks = 65535;
++    int64_t needed_blocks = (numel + threads - 1) / threads;
++    int blocks = static_cast<int>(needed_blocks < max_blocks ? needed_blocks : max_blocks);
++    if (blocks < 1) blocks = 1;
++    logical_or_round_kernel<<<blocks, threads, 0, stream>>>(x1, x2, out, numel);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,59 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare the launcher from custom_ops.cu
++extern "C" void logical_or_round_launcher(
++    const bool* x1,
++    const bool* x2,
++    float* out,
++    int64_t numel,
++    cudaStream_t stream);
++
++// PyTorch tensor wrapper
++static torch::Tensor logical_or_round_forward(torch::Tensor x1, torch::Tensor x2) {
++    // Input validation
++    TORCH_CHECK(x1.is_cuda(), "x1 must be a CUDA tensor");
++    TORCH_CHECK(x2.is_cuda(), "x2 must be a CUDA tensor");
++    TORCH_CHECK(x1.dtype() == torch::kBool, "x1 must be bool");
++    TORCH_CHECK(x2.dtype() == torch::kBool, "x2 must be bool");
++    TORCH_CHECK(x1.sizes() == x2.sizes(), "x1 and x2 must have the same shape");
++
++    // Ensure contiguous (the kernel assumes linear contiguous layout)
++    auto x1_contig = x1.is_contiguous() ? x1 : x1.contiguous();
++    auto x2_contig = x2.is_contiguous() ? x2 : x2.contiguous();
++
++    // Allocate output float32 tensor with same shape
++    auto out = torch::empty_like(x1_contig, torch::TensorOptions().dtype(torch::kFloat32));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    int64_t numel = x1_contig.numel();
++    logical_or_round_launcher(
++        x1_contig.data_ptr<bool>(),
++        x2_contig.data_ptr<bool>(),
++        out.data_ptr<float>(),
++        numel,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return out;
++}
++
++// Registration function
++static void register_logical_or_round(pybind11::module& m) {
++    m.def("logical_or_round", &logical_or_round_forward,
++          "Compute logical_or of two bool tensors and return float32 rounded result",
++          py::arg("x1"), py::arg("x2"));
++}
++
++// Auto-register
++REGISTER_BINDING(logical_or_round, register_logical_or_round);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,24 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_shape):
++        super().__init__()
++        self.input_shape = input_shape
++
++    def forward(self, x1, x2):
++        return cuda_extension.logical_or_round(x1, x2)
++
++    def debug_forward(self, *inputs):
++        x1, x2 = inputs
++        # 调用自定义算子得到最终 float32 结果
++        out = cuda_extension.logical_or_round(x1, x2)
++        # 为了提供 step_001 的 bool 中间值，计算逻辑或（仅用于调试，不改变 forward 路径）
++        # 这里复用 cuda_extension.logical_or_round 的结果，但需要 bool 类型，因此通过比较得到 bool。
++        # 由于 out 是 float32 且值为 0.0 或 1.0，大于 0.5 即为 True
++        bool_out = out > 0.5
++        yield 'step_001', bool_out
++        yield 'step_002', out
++        yield 'step_003', out

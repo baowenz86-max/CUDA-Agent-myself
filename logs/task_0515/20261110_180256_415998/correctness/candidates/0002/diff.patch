@@ -1,0 +1,120 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -9,13 +9,6 @@
+ // -----------------------------------------------------------------------------
+ // adaptive_avg_pool2d
+ // -----------------------------------------------------------------------------
+-// Computes adaptive average pooling for 4D input (N, C, H, W)
+-// with output size (outH, outW).
+-// Each output element at (n, c, oh, ow) averages over the window
+-// [start_h, end_h) x [start_w, end_w) where
+-// start_h = floor(oh * H / outH), end_h = ceil((oh+1) * H / outH)
+-// similarly for width.
+-
+ template <typename scalar_t>
+ __global__ void adaptive_avg_pool2d_kernel(
+     const scalar_t* __restrict__ input,
+@@ -27,7 +20,6 @@
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx >= total_elements) return;
+ 
+-    // Index decomposition: output is contiguous [N, C, outH, outW]
+     int ow = idx % outW;
+     int oh = (idx / outW) % outH;
+     int c = (idx / (outW * outH)) % C;
+@@ -58,7 +50,6 @@
+     output[idx] = sum / (scalar_t)count;
+ }
+ 
+-// Launcher for float32 (only dtype used in contract)
+ extern "C" void adaptive_avg_pool2d_launcher(
+     const float* input,
+     float* output,
+@@ -75,26 +66,16 @@
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// view_flatten
++// view_flatten placeholder
+ // -----------------------------------------------------------------------------
+-// Since view returns a view, it must be done in binding.cpp with Tensor::view.
+-// This .cu cannot implement it without Tensor operations.
+-// We provide a dummy launcher declaration that binding can ignore or not use.
+-// However, for completeness, we could implement a copy-based flatten if desired,
+-// but contract says "No copy is performed; returns a view".
+-// So we do not implement any CUDA kernel for view_flatten. The binding layer
+-// will directly return x.view({batch_size, -1}) without calling CUDA.
+-// To satisfy the requirement that each operator has a launcher, we define a
+-// no-op launcher that does nothing, but it should not be called by binding.
+ extern "C" void view_flatten_launcher(
+     const float* input, float* output, int batch_size, int num_features,
+     cudaStream_t stream) {
+-    // This is intentionally a no-op placeholder; actual view is done in C++.
+-    // It will not be used in the binding since binding directly returns a view.
++    // intentionally no-op
+ }
+ 
+ // -----------------------------------------------------------------------------
+-// bias_add kernel (for linear_forward after GEMM)
++// bias_add kernel for linear_forward
+ // -----------------------------------------------------------------------------
+ template <typename scalar_t>
+ __global__ void bias_add_kernel(
+@@ -114,13 +95,6 @@
+ // -----------------------------------------------------------------------------
+ // linear_forward
+ // -----------------------------------------------------------------------------
+-// Computes output = input @ weight^T + bias using cuBLAS GEMM.
+-// input: [batch, in_features]
+-// weight: [out_features, in_features]
+-// bias: [out_features] (may be null)
+-// output: [batch, out_features]
+-// Uses CUBLAS_OP_T for weight to perform X * W^T.
+-
+ extern "C" void linear_launcher(
+     const float* input,
+     const float* weight,
+@@ -138,10 +112,31 @@
+     const float alpha = 1.0f;
+     const float beta = 0.0f;
+ 
+-    // Perform GEMM: C = alpha * A * B + beta * C
+-    // A is input [batch, in_features], B is weight^T [in_features, out_features]
+-    // So we set: op(A)=CUBLAS_OP_N, op(B)=CUBLAS_OP_T
+-    // lda = in_features, ldb = in_features, ldc = out_features
++    // cuBLAS column-major: compute C = alpha * op(A) * op(B) + beta * C
++    // A is input (batch x in_features) stored row-major, but cuBLAS sees it as
++    // column-major matrix of dimensions in_features x batch.
++    // We want output = input @ weight^T + bias, which in cuBLAS terms is
++    // C^T = W^T * A^T? Let's use the standard trick:
++    // For row-major A(m,k) and B(k,n), compute C(m,n) = A * B^T.
++    // In cuBLAS, treat A as column-major A_col(k,m) with lda=in_features, and
++    // B as column-major B_col(n,k) with ldb=in_features (since weight is out_features x in_features).
++    // Then C_col = A_col * B_col^T, which is column-major C(n,m).
++    // But we need row-major C(m,n). The memory layout of C_col corresponds to
++    // row-major C(m,n) if we set ldc=out_features and interpret correctly.
++    // Actually, the common approach for row-major C = A * B^T is:
++    // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
++    //             m=batch, n=out_features, k=in_features,
++    //             &alpha, input, lda=in_features,
++    //             weight, ldb=in_features,
++    //             &beta, output, ldc=out_features);
++    // However, cuBLAS expects column-major, but this call with these parameters
++    // exactly computes the row-major result because of the transpose flags.
++    // Let's verify: A is m x k (row-major input), op(A)=A (N) so cuBLAS sees A as k x m column-major.
++    // B is k x n (weight^T), op(B)=B^T (T) so cuBLAS sees B as n x k column-major (which matches weight).
++    // Then C = A * B^T is m x n row-major, but cuBLAS stores it as n x m column-major,
++    // which is exactly the memory layout if ldc=out_features (since row stride = n).
++    // So the call is correct. But we'll re-verify and keep as is.
++
+     cublasSgemm(
+         handle,
+         CUBLAS_OP_N, CUBLAS_OP_T,
+@@ -152,7 +147,6 @@
+         &beta,
+         output, out_features);
+ 
+-    // Add bias if present
+     if (bias != nullptr) {
+         int total_elements = batch * out_features;
+         int block_size = 256;

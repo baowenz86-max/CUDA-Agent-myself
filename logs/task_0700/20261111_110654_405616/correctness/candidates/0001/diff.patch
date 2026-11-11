@@ -1,0 +1,301 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,131 @@
++#include <cuda_runtime.h>
++
++// ==============================================
++// CUDA kernels for custom ops (no torch/ATen)
++// ==============================================
++
++// ------------------- Unfold kernel -------------------
++// Implements nn.Unfold for a 4D input (N, C, H, W) with
++// kernel_size (kh, kw), dilation (dh, dw), padding (ph, pw), stride (sh, sw).
++// Output shape: (N, C*kh*kw, L) where L = out_h * out_w.
++//
++// The kernel is written as a 1D grid over total output elements.
++// Each thread computes one output element, using 64-bit indexing to avoid overflow.
++
++__global__ void unfold_kernel_float(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t kh, int64_t kw,
++    int64_t dh, int64_t dw,
++    int64_t ph, int64_t pw,
++    int64_t sh, int64_t sw,
++    int64_t out_h, int64_t out_w,
++    int64_t L,
++    int64_t total_output)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    for (int64_t linear_idx = idx; linear_idx < total_output; linear_idx += stride) {
++        // Decompose linear index: (n, c, l) where l = out_h * out_w
++        int64_t l = linear_idx % L;
++        int64_t tmp = linear_idx / L;
++        int64_t c = tmp % C;
++        int64_t n = tmp / C;
++
++        // Within output channel c, we have (kh*kw) values corresponding to each kernel position.
++        // Let k = c % (kh*kw), and the original input channel = c / (kh*kw).
++        int64_t kk = c % (kh * kw);
++        int64_t in_c = c / (kh * kw);
++        int64_t k_h = kk / kw;
++        int64_t k_w = kk % kw;
++
++        // Output spatial position (out_i, out_j)
++        int64_t out_i = l / out_w;
++        int64_t out_j = l % out_w;
++
++        // Input spatial position
++        int64_t in_i = out_i * sh - ph + k_h * dh;
++        int64_t in_j = out_j * sw - pw + k_w * dw;
++
++        float val = 0.0f;
++        if (in_i >= 0 && in_i < H && in_j >= 0 && in_j < W) {
++            val = input[((n * C + in_c) * H + in_i) * W + in_j];
++        }
++        output[linear_idx] = val;
++    }
++}
++
++// ------------------- Cat kernel -------------------
++// Concatenates two tensors along dim=1.
++// This specialized version assumes both tensors have identical shapes,
++// are contiguous, and concatenation duplicates along the channel dimension.
++// It writes tensor_a to the first half and tensor_b to the second half.
++__global__ void cat_duplicate_kernel_float(
++    const float* __restrict__ tensor_a,
++    const float* __restrict__ tensor_b,
++    float* __restrict__ output,
++    int64_t total_elements_per_tensor,
++    int64_t total_output,
++    int64_t chunk_size) // chunk_size = total_elements_per_tensor (since concatenating two identical tensors)
++{
++    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int64_t stride = blockDim.x * gridDim.x;
++
++    // Copy first half from tensor_a
++    for (int64_t i = idx; i < chunk_size; i += stride) {
++        output[i] = tensor_a[i];
++    }
++    // Copy second half from tensor_b
++    for (int64_t i = idx; i < chunk_size; i += stride) {
++        output[chunk_size + i] = tensor_b[i];
++    }
++}
++
++// ------------------- Launchers -------------------
++// Extern "C" functions to be called by binding.cpp (not included in this file)
++
++extern "C" void unfold_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t kh, int64_t kw,
++    int64_t dh, int64_t dw,
++    int64_t ph, int64_t pw,
++    int64_t sh, int64_t sw,
++    cudaStream_t stream)
++{
++    int64_t out_h = (H + 2 * ph - dh * (kh - 1) - 1) / sh + 1;
++    int64_t out_w = (W + 2 * pw - dw * (kw - 1) - 1) / sw + 1;
++    int64_t L = out_h * out_w;
++    int64_t C_out = C * kh * kw;
++    int64_t total_output = N * C_out * L;
++
++    const int threads = 256;
++    int64_t blocks = (total_output + threads - 1) / threads;
++    if (blocks > 2147483647LL) blocks = 2147483647LL; // grid dimension limit
++    if (total_output > 0) {
++        unfold_kernel_float<<<(unsigned int)blocks, threads, 0, stream>>>(
++            input, output, N, C, H, W,
++            kh, kw, dh, dw, ph, pw, sh, sw,
++            out_h, out_w, L, total_output);
++    }
++}
++
++extern "C" void cat_forward_launcher(
++    const float* tensor_a,
++    const float* tensor_b,
++    float* output,
++    int64_t total_elements_per_tensor,
++    cudaStream_t stream)
++{
++    int64_t total_output = 2 * total_elements_per_tensor;
++    const int threads = 256;
++    int64_t blocks = (total_output + threads - 1) / threads;
++    if (blocks > 2147483647LL) blocks = 2147483647LL;
++    if (total_output > 0) {
++        cat_duplicate_kernel_float<<<(unsigned int)blocks, threads, 0, stream>>>(
++            tensor_a, tensor_b, output, total_elements_per_tensor, total_output, total_elements_per_tensor);
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,139 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include <pybind11/pybind11.h>
++#include <pybind11/stl.h>
++#include "../binding_registry.h"
++
++namespace py = pybind11;
++
++// Declare launchers from custom_ops.cu
++extern "C" void unfold_forward_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t kh, int64_t kw,
++    int64_t dh, int64_t dw,
++    int64_t ph, int64_t pw,
++    int64_t sh, int64_t sw,
++    cudaStream_t stream);
++
++extern "C" void cat_forward_launcher(
++    const float* tensor_a,
++    const float* tensor_b,
++    float* output,
++    int64_t total_elements_per_tensor,
++    cudaStream_t stream);
++
++// Helper to extract pair of int64_t from Python object (int or tuple/list of two ints)
++static inline std::pair<int64_t, int64_t> extract_pair(py::handle obj, const std::string& name) {
++    if (py::isinstance<py::tuple>(obj) || py::isinstance<py::list>(obj)) {
++        auto seq = py::reinterpret_borrow<py::sequence>(obj);
++        if (py::len(seq) != 2) {
++            throw py::type_error(name + " must be an int or a pair of ints");
++        }
++        return {py::cast<int64_t>(seq[0]), py::cast<int64_t>(seq[1])};
++    } else {
++        int64_t v = py::cast<int64_t>(obj);
++        return {v, v};
++    }
++}
++
++torch::Tensor unfold_forward(
++    torch::Tensor input,
++    py::object kernel_size,
++    py::object dilation,
++    py::object padding,
++    py::object stride) {
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.dim() == 4, "input must be 4D (N,C,H,W)");
++
++    // Ensure contiguous for launcher; if already contiguous, this is a no-op.
++    auto input_contig = input.contiguous();
++
++    int64_t N = input_contig.size(0);
++    int64_t C = input_contig.size(1);
++    int64_t H = input_contig.size(2);
++    int64_t W = input_contig.size(3);
++
++    auto kh_kw = extract_pair(kernel_size, "kernel_size");
++    auto dh_dw = extract_pair(dilation, "dilation");
++    auto ph_pw = extract_pair(padding, "padding");
++    auto sh_sw = extract_pair(stride, "stride");
++    int64_t kh = kh_kw.first, kw = kh_kw.second;
++    int64_t dh = dh_dw.first, dw = dh_dw.second;
++    int64_t ph = ph_pw.first, pw = ph_pw.second;
++    int64_t sh = sh_sw.first, sw = sh_sw.second;
++
++    int64_t out_h = (H + 2 * ph - dh * (kh - 1) - 1) / sh + 1;
++    int64_t out_w = (W + 2 * pw - dw * (kw - 1) - 1) / sw + 1;
++    int64_t L = out_h * out_w;
++    int64_t C_out = C * kh * kw;
++
++    auto output = torch::empty({N, C_out, L}, input_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    unfold_forward_launcher(
++        input_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        kh, kw,
++        dh, dw,
++        ph, pw,
++        sh, sw,
++        stream);
++
++    return output;
++}
++
++torch::Tensor cat_forward(
++    torch::Tensor tensor_a,
++    torch::Tensor tensor_b,
++    int64_t dim) {
++    TORCH_CHECK(tensor_a.is_cuda(), "tensor_a must be a CUDA tensor");
++    TORCH_CHECK(tensor_b.is_cuda(), "tensor_b must be a CUDA tensor");
++    TORCH_CHECK(tensor_a.dtype() == torch::kFloat32, "tensor_a must be float32");
++    TORCH_CHECK(tensor_b.dtype() == torch::kFloat32, "tensor_b must be float32");
++    TORCH_CHECK(dim == 1, "only dim=1 supported");
++
++    auto a_contig = tensor_a.contiguous();
++    auto b_contig = tensor_b.contiguous();
++
++    TORCH_CHECK(a_contig.sizes() == b_contig.sizes(), "tensors must have same shape");
++
++    int64_t total_elements_per_tensor = a_contig.numel();
++    int64_t C = a_contig.size(1);
++    int64_t N = a_contig.size(0);
++    int64_t L = total_elements_per_tensor / (N * C);
++
++    auto output = torch::empty({N, 2 * C, L}, a_contig.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    cat_forward_launcher(
++        a_contig.data_ptr<float>(),
++        b_contig.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total_elements_per_tensor,
++        stream);
++
++    return output;
++}
++
++void register_custom_ops(py::module& m) {
++    m.def("unfold_forward", &unfold_forward,
++          py::arg("input"),
++          py::arg("kernel_size"),
++          py::arg("dilation"),
++          py::arg("padding"),
++          py::arg("stride"));
++    m.def("cat_forward", &cat_forward,
++          py::arg("tensor_a"),
++          py::arg("tensor_b"),
++          py::arg("dim"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
++        super().__init__()
++        self.unfold = nn.Unfold(kernel_size=kernel_size, stride=stride, padding=padding)
++
++    def forward(self, x):
++        x = cuda_extension.unfold_forward(x, self.unfold.kernel_size, self.unfold.dilation, self.unfold.padding, self.unfold.stride)
++        x = cuda_extension.cat_forward(x, x, dim=1)
++        return x
++
++    def debug_forward(self, *inputs):
++        x = inputs[0]
++        x = cuda_extension.unfold_forward(x, self.unfold.kernel_size, self.unfold.dilation, self.unfold.padding, self.unfold.stride)
++        yield 'step_001', x
++        x = cuda_extension.cat_forward(x, x, dim=1)
++        yield 'step_002', x
++        yield 'step_003', x

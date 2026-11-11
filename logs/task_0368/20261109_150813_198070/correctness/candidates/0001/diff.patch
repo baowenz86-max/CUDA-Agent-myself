@@ -1,0 +1,303 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,155 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// embedding_forward kernel
++// input: int64 indices, shape [batch, seq]
++// weight: float32, shape [num_embeddings, embedding_dim]
++// output: float32, shape [batch, seq, embedding_dim]
++// Each thread handles one input index and copies embedding_dim floats.
++__global__ void embedding_kernel(
++    const int64_t* __restrict__ input,
++    const float* __restrict__ weight,
++    float* __restrict__ output,
++    int total_indices,
++    int embedding_dim)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    for (int i = idx; i < total_indices; i += stride)
++    {
++        int64_t index = input[i];
++        // assume index is valid (< num_embeddings)
++        const float* weight_row = weight + index * embedding_dim;
++        float* out_row = output + (int64_t)i * embedding_dim;
++        for (int j = 0; j < embedding_dim; ++j)
++        {
++            out_row[j] = weight_row[j];
++        }
++    }
++}
++
++// log_softmax_forward kernel along dim=1 (seq dimension)
++// input: float32, shape [batch, seq, embedding_dim]
++// output: float32, same shape
++// dim: must be 1
++// We process one (batch, embedding) column per block. Each block reduces along seq.
++// Block size is chosen as 256, and seq length is 1024.
++__global__ void log_softmax_dim1_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int batch,
++    int seq,
++    int embedding_dim)
++{
++    // blockIdx.x = batch * embedding_dim + embedding_idx
++    int block_col = blockIdx.x;
++    int b = block_col / embedding_dim;
++    int e = block_col % embedding_dim;
++
++    // shared memory for max and sum
++    __shared__ float smax;
++    __shared__ float ssum;
++
++    int tid = threadIdx.x;
++    int nthreads = blockDim.x;
++
++    // step 1: find max along seq for this (b,e)
++    float local_max = -1e30f;
++    for (int s = tid; s < seq; s += nthreads)
++    {
++        float val = input[(b * seq + s) * embedding_dim + e];
++        if (val > local_max) local_max = val;
++    }
++    // block reduction to find max
++    __shared__ float smem_max[256];
++    smem_max[tid] = local_max;
++    __syncthreads();
++    for (int offset = nthreads / 2; offset > 0; offset >>= 1)
++    {
++        if (tid < offset)
++        {
++            float other = smem_max[tid + offset];
++            if (other > smem_max[tid]) smem_max[tid] = other;
++        }
++        __syncthreads();
++    }
++    if (tid == 0) smax = smem_max[0];
++    __syncthreads();
++
++    float max_val = smax;
++
++    // step 2: compute sum of exp(x - max)
++    float local_sum = 0.0f;
++    for (int s = tid; s < seq; s += nthreads)
++    {
++        float val = input[(b * seq + s) * embedding_dim + e];
++        local_sum += __expf(val - max_val);
++    }
++    __shared__ float smem_sum[256];
++    smem_sum[tid] = local_sum;
++    __syncthreads();
++    for (int offset = nthreads / 2; offset > 0; offset >>= 1)
++    {
++        if (tid < offset)
++        {
++            smem_sum[tid] += smem_sum[tid + offset];
++        }
++        __syncthreads();
++    }
++    if (tid == 0) ssum = smem_sum[0];
++    __syncthreads();
++
++    float log_sum = logf(ssum);
++
++    // step 3: compute output = x - max - log_sum
++    for (int s = tid; s < seq; s += nthreads)
++    {
++        float val = input[(b * seq + s) * embedding_dim + e];
++        output[(b * seq + s) * embedding_dim + e] = val - max_val - log_sum;
++    }
++}
++
++// Launcher for embedding_forward
++// input: int64_t* on device
++// weight: float* on device
++// output: float* on device (allocated by binding)
++// batch, seq, embedding_dim, num_embeddings (not needed if weight is valid)
++// stream: current CUDA stream
++extern "C" void embedding_launcher(
++    const int64_t* input,
++    const float* weight,
++    float* output,
++    int batch,
++    int seq,
++    int embedding_dim,
++    int num_embeddings,
++    cudaStream_t stream)
++{
++    int total_indices = batch * seq;
++    // choose grid size: enough blocks to cover total_indices with 256 threads, but cap at 1024 blocks?
++    // grid-stride loop handles any size.
++    int block_size = 256;
++    int grid_size = (total_indices + block_size - 1) / block_size;
++    if (grid_size > 65535) grid_size = 65535; // max grid x dimension
++    embedding_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, weight, output, total_indices, embedding_dim);
++}
++
++// Launcher for log_softmax_forward
++extern "C" void log_softmax_launcher(
++    const float* input,
++    float* output,
++    int batch,
++    int seq,
++    int embedding_dim,
++    int dim,
++    cudaStream_t stream)
++{
++    // only dim=1 is supported in this kernel; dim may be passed for validation but not used otherwise
++    // grid: one block per (batch, embedding) column, each block reduces over seq.
++    // block_size fixed to 256, must be power of 2 and >= seq? seq=1024, so 256 threads need multiple iterations.
++    int block_size = 256;
++    int grid_size = batch * embedding_dim;
++    log_softmax_dim1_kernel<<<grid_size, block_size, 0, stream>>>(
++        input, output, batch, seq, embedding_dim);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,118 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declarations from custom_ops.cu
++extern "C" void embedding_launcher(
++    const int64_t* input,
++    const float* weight,
++    float* output,
++    int batch,
++    int seq,
++    int embedding_dim,
++    int num_embeddings,
++    cudaStream_t stream);
++
++extern "C" void log_softmax_launcher(
++    const float* input,
++    float* output,
++    int batch,
++    int seq,
++    int embedding_dim,
++    int dim,
++    cudaStream_t stream);
++
++// Embedding forward wrapper
++torch::Tensor embedding_forward(torch::Tensor input, torch::Tensor weight) {
++    // Validate input
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kInt64, "input must be int64");
++    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++
++    // Parse dimensions
++    int64_t batch_size = input.size(0);
++    int64_t seq_length = input.size(1);
++    int64_t num_embeddings = weight.size(0);
++    int64_t embedding_dim = weight.size(1);
++
++    TORCH_CHECK(embedding_dim > 0, "embedding_dim must be positive");
++    TORCH_CHECK(batch_size > 0 && seq_length > 0, "input dimensions must be positive");
++
++    // Allocate output
++    auto output = torch::empty({batch_size, seq_length, embedding_dim}, input.options().dtype(torch::kFloat32));
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    embedding_launcher(
++        input.data_ptr<int64_t>(),
++        weight.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(batch_size),
++        static_cast<int>(seq_length),
++        static_cast<int>(embedding_dim),
++        static_cast<int>(num_embeddings),
++        stream);
++
++    // Check for CUDA errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "embedding_launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Log softmax forward wrapper
++torch::Tensor log_softmax_forward(torch::Tensor input, int64_t dim) {
++    // Validate input
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++    TORCH_CHECK(dim == 1, "only dim=1 is supported");
++
++    // Parse dimensions (assume input shape [batch, seq, embedding_dim])
++    TORCH_CHECK(input.dim() == 3, "input must be 3D");
++    int64_t batch = input.size(0);
++    int64_t seq = input.size(1);
++    int64_t embedding_dim = input.size(2);
++
++    TORCH_CHECK(batch > 0 && seq > 0 && embedding_dim > 0, "dimensions must be positive");
++
++    // Allocate output same shape as input
++    auto output = torch::empty_like(input);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    log_softmax_launcher(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        static_cast<int>(batch),
++        static_cast<int>(seq),
++        static_cast<int>(embedding_dim),
++        static_cast<int>(dim),
++        stream);
++
++    // Check for CUDA errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "log_softmax_launcher failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("embedding_forward", &embedding_forward, "Embedding forward",
++          py::arg("input"), py::arg("weight"));
++    m.def("log_softmax_forward", &log_softmax_forward, "Log softmax forward",
++          py::arg("input"), py::arg("dim"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_embeddings, embedding_dim):
++        super().__init__()
++        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
++
++    def forward(self, x):
++        x = cuda_extension.embedding_forward(x, self.embedding.weight)
++        x = cuda_extension.log_softmax_forward(x, 1)
++        return x
++
++    def debug_forward(self, x):
++        x1 = cuda_extension.embedding_forward(x, self.embedding.weight)
++        yield 'step_001', x1
++        x2 = cuda_extension.log_softmax_forward(x1, 1)
++        yield 'step_002', x2
++        yield 'step_003', x2

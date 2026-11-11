@@ -1,0 +1,334 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,170 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Helper: ceil division
++static inline int ceil_div(int a, int b) {
++    return (a + b - 1) / b;
++}
++
++// GroupNorm kernel
++// Each block handles one (batch, group) pair and uses block reduction via shared memory.
++// Input layout: [B, C, H, W] with C channels, each group has group_size channels.
++// channel_stride = H*W, spatial_size = H*W, group_spatial = group_size*spatial_size
++// Output has same layout.
++__global__ void group_norm_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    int B,
++    int C,
++    int H,
++    int W,
++    int num_groups,
++    float eps
++) {
++    int group_size = C / num_groups; // channels per group
++    int spatial_size = H * W;
++    int group_spatial = group_size * spatial_size; // elements per group per batch
++    
++    int group_per_batch = num_groups;
++    int total_groups = B * num_groups;
++    
++    for (int group_idx = blockIdx.x; group_idx < total_groups; group_idx += gridDim.x) {
++        int b = group_idx / num_groups;
++        int g = group_idx % num_groups;
++        const float* x_group = x + b * C * spatial_size + g * group_spatial;
++        float* y_group = y + b * C * spatial_size + g * group_spatial;
++        
++        // Compute mean and variance using block reduction
++        extern __shared__ float smem[]; // two arrays: mean and variance
++        float* s_mean = smem;
++        float* s_var = &smem[blockDim.x];
++        
++        float sum = 0.0f;
++        float sum_sq = 0.0f;
++        int idx = threadIdx.x;
++        int stride = blockDim.x;
++        for (int i = idx; i < group_spatial; i += stride) {
++            float val = x_group[i];
++            sum += val;
++            sum_sq += val * val;
++        }
++        
++        // Block reduction for sum and sum_sq
++        // Use warp shuffle then shared memory for cross-warp reduction
++        // Simple approach: shared memory reduction with __syncthreads
++        s_mean[idx] = sum;
++        s_var[idx] = sum_sq;
++        __syncthreads();
++        
++        // Reduce within block using shared memory
++        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++            if (idx < s) {
++                s_mean[idx] += s_mean[idx + s];
++                s_var[idx] += s_var[idx + s];
++            }
++            __syncthreads();
++        }
++        
++        float total_sum = s_mean[0];
++        float total_sum_sq = s_var[0];
++        float mean = total_sum / group_spatial;
++        float var = total_sum_sq / group_spatial - mean * mean;
++        float inv_std = rsqrtf(var + eps);
++        
++        // Apply normalization and affine
++        for (int i = idx; i < group_spatial; i += stride) {
++            int local_channel = i / spatial_size;
++            int pos = i % spatial_size;
++            int global_channel = g * group_size + local_channel;
++            float normalized = (x_group[i] - mean) * inv_std;
++            if (weight != nullptr) normalized *= weight[global_channel];
++            if (bias != nullptr) normalized += bias[global_channel];
++            y_group[i] = normalized;
++        }
++    }
++}
++
++// PermuteSum kernel: sum over C dimension, output shape [B,H,W,1]
++// Output stride: [H*W, W, 1, H*W] as per reference (but actual memory layout is contiguous with shape [B,H,W,1])
++// We allocate contiguous output and write accordingly: output linear index = ((b*H + h)*W + w)*1
++// Input linear index = b*C*H*W + c*H*W + h*W + w
++__global__ void permute_sum_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ out,
++    int B,
++    int C,
++    int H,
++    int W
++) {
++    int total = B * H * W;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total) return;
++    
++    int w = idx % W;
++    int tmp = idx / W;
++    int h = tmp % H;
++    int b = tmp / H;
++    
++    float sum = 0.0f;
++    const float* base = x + b * C * H * W + h * W + w;
++    for (int c = 0; c < C; ++c) {
++        sum += base[c * H * W];
++    }
++    out[idx] = sum;
++}
++
++// Launcher for custom_group_norm
++extern "C" void custom_group_norm_launcher(
++    const float* x,
++    float* y,
++    const float* weight,
++    const float* bias,
++    int B,
++    int C,
++    int H,
++    int W,
++    int num_groups,
++    float eps,
++    cudaStream_t stream
++) {
++    int group_size = C / num_groups;
++    int spatial_size = H * W;
++    int group_spatial = group_size * spatial_size;
++    
++    // Choose block size: use 256 threads; if group_spatial smaller, use smaller block.
++    int threads = std::min(256, group_spatial);
++    if (threads == 0) threads = 1;
++    // Ensure threads is power of two for reduction
++    int power = 1;
++    while (power * 2 <= threads) power *= 2;
++    threads = power;
++    
++    int groups_total = B * num_groups;
++    // Use enough blocks to cover all groups, but also grid-stride loop in kernel handles multiple groups per block if needed.
++    int blocks = std::min(groups_total, 65535); // gridDim.x max 65535 in X dimension
++    if (blocks == 0) blocks = 1;
++    
++    size_t smem_bytes = 2 * threads * sizeof(float);
++    
++    group_norm_kernel<<<blocks, threads, smem_bytes, stream>>>(
++        x, y, weight, bias, B, C, H, W, num_groups, eps
++    );
++}
++
++// Launcher for custom_permute_sum
++extern "C" void custom_permute_sum_launcher(
++    const float* x,
++    float* out,
++    int B,
++    int C,
++    int H,
++    int W,
++    cudaStream_t stream
++) {
++    int total = B * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    permute_sum_kernel<<<blocks, threads, 0, stream>>>(x, out, B, C, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,123 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Extern declarations for launchers in custom_ops.cu
++extern "C" void custom_group_norm_launcher(
++    const float* x,
++    float* y,
++    const float* weight,
++    const float* bias,
++    int B,
++    int C,
++    int H,
++    int W,
++    int num_groups,
++    float eps,
++    cudaStream_t stream
++);
++
++extern "C" void custom_permute_sum_launcher(
++    const float* x,
++    float* out,
++    int B,
++    int C,
++    int H,
++    int W,
++    cudaStream_t stream
++);
++
++// Custom GroupNorm wrapper
++torch::Tensor custom_group_norm(
++    torch::Tensor x,
++    c10::optional<torch::Tensor> weight,
++    c10::optional<torch::Tensor> bias,
++    int64_t num_groups,
++    int64_t num_channels,
++    double eps
++) {
++    // Input validation
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (B, C, H, W)");
++    TORCH_CHECK(num_groups > 0, "num_groups must be positive");
++    TORCH_CHECK(num_channels % num_groups == 0, "num_channels must be divisible by num_groups");
++
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++    TORCH_CHECK(C == num_channels, "x.size(1) must match num_channels");
++
++    const float* weight_ptr = nullptr;
++    const float* bias_ptr = nullptr;
++    if (weight.has_value() && weight->defined()) {
++        TORCH_CHECK(weight->is_cuda(), "weight must be a CUDA tensor");
++        TORCH_CHECK(weight->scalar_type() == torch::kFloat32, "weight must be float32");
++        TORCH_CHECK(weight->numel() == C, "weight must have numel equal to num_channels");
++        weight_ptr = weight->data_ptr<float>();
++    }
++    if (bias.has_value() && bias->defined()) {
++        TORCH_CHECK(bias->is_cuda(), "bias must be a CUDA tensor");
++        TORCH_CHECK(bias->scalar_type() == torch::kFloat32, "bias must be float32");
++        TORCH_CHECK(bias->numel() == C, "bias must have numel equal to num_channels");
++        bias_ptr = bias->data_ptr<float>();
++    }
++
++    // Allocate output of same shape as input
++    auto y = torch::empty_like(x);
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    custom_group_norm_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        weight_ptr,
++        bias_ptr,
++        B, C, H, W,
++        static_cast<int>(num_groups),
++        static_cast<float>(eps),
++        stream
++    );
++
++    return y;
++}
++
++// Custom PermuteSum wrapper: x [B,C,H,W] -> [B,H,W,1]
++torch::Tensor custom_permute_sum(torch::Tensor x) {
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (B, C, H, W)");
++
++    int B = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Output shape [B,H,W,1]
++    auto out = torch::empty({B, H, W, 1}, x.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++    custom_permute_sum_launcher(
++        x.data_ptr<float>(),
++        out.data_ptr<float>(),
++        B, C, H, W,
++        stream
++    );
++
++    return out;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_group_norm", &custom_group_norm,
++          "Custom GroupNorm forward",
++          py::arg("x"), py::arg("weight"), py::arg("bias"),
++          py::arg("num_groups"), py::arg("num_channels"), py::arg("eps"));
++    m.def("custom_permute_sum", &custom_permute_sum,
++          "Custom permute and sum over channel dimension");
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,32 @@
++import torch
++import torch.nn as nn
++
++
++class ModelNew(nn.Module):
++    def __init__(self, num_features, eps, affine, num_groups):
++        super(ModelNew, self).__init__()
++        self.num_features = num_features
++        self.eps = eps
++        self.affine = affine
++        self.num_groups = num_groups
++        if affine:
++            self.weight = nn.Parameter(torch.ones(num_features))
++            self.bias = nn.Parameter(torch.zeros(num_features))
++        else:
++            self.register_parameter('weight', None)
++            self.register_parameter('bias', None)
++
++    def forward(self, x):
++        import cuda_extension
++        gn_out = cuda_extension.custom_group_norm(
++            x, self.weight, self.bias, self.num_groups, self.num_features, self.eps
++        )
++        return cuda_extension.custom_permute_sum(gn_out)
++
++    def debug_forward(self, x):
++        import cuda_extension
++        gn_out = cuda_extension.custom_group_norm(
++            x, self.weight, self.bias, self.num_groups, self.num_features, self.eps
++        )
++        out = cuda_extension.custom_permute_sum(gn_out)
++        yield 'step_001', out

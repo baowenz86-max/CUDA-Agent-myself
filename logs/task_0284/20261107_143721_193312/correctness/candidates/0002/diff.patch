@@ -1,0 +1,422 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -1,14 +1,11 @@
+ #include <cuda_runtime.h>
+ 
+ /*
+- * conv2d_forward 由第三阶段的 C++ 绑定文件使用 cuDNN 实现，不在本文件实现。
+- * 本文件仅包含非卷积 CUDA kernel 和 launcher。
++ * conv2d_forward 在绑定文件中调用本文件的 launcher。
++ * 本文件包含所有 CUDA kernel 和 launcher。
+  */
+ 
+ // ---------------- reflection_pad2d_forward ----------------
+-// 输入: input (N, C, H, W), pad_left_right, pad_top_bottom
+-// 输出: output (N, C, H+2*pad_top_bottom, W+2*pad_left_right)
+-// 支持任意 strides，输出连续。
+ __global__ void reflection_pad2d_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+@@ -30,14 +27,12 @@
+     int in_h = out_h - pad_tb;
+     int in_w = out_w - pad_lr;
+ 
+-    // 反射索引计算，不重复边缘值
+     if (in_h < 0) in_h = -in_h;
+     else if (in_h >= H) in_h = 2 * (H - 1) - in_h;
+ 
+     if (in_w < 0) in_w = -in_w;
+     else if (in_w >= W) in_w = 2 * (W - 1) - in_w;
+ 
+-    // 边界情况：当 H=1 时，反射索引可能仍为0，公式仍成立。
+     if (H == 1) in_h = 0;
+     if (W == 1) in_w = 0;
+ 
+@@ -69,18 +64,12 @@
+ }
+ 
+ // ---------------- glu_forward ----------------
+-// 输入: input (..., C, ...) 连续? 支持 strides
+-// dim: 分割维度
+-// 输出: 形状与输入相同但 dim 维度减半，连续。
+-// 该实现将输入视为任意维度，但使用 strides 进行索引。
+-// 由于 GLU 通常用于4维，且 dim=1，这里实现通用但针对性能优化为4维 dim=1 情况，也支持其他情况。
+-// 注意：输出为连续，因此可以利用线性索引，但为简单起见使用嵌套循环。
+ __global__ void glu_kernel_general(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+-    int total_outer, // 外层循环长度
+-    int C, // dim 维度大小
+-    int inner, // 内层循环长度
++    int total_outer,
++    int C,
++    int inner,
+     int input_stride_outer, int input_stride_dim, int input_stride_inner,
+     int output_stride_outer, int output_stride_dim, int output_stride_inner)
+ {
+@@ -97,7 +86,7 @@
+ 
+     float a = *a_ptr;
+     float b = *b_ptr;
+-    float out = a / (1.0f + expf(-b)); // sigmoid(b) = 1/(1+exp(-b))
++    float out = a / (1.0f + expf(-b));
+ 
+     float* out_ptr = output + outer * output_stride_outer + inner_idx * output_stride_inner;
+     *out_ptr = out;
+@@ -121,10 +110,6 @@
+ }
+ 
+ // ---------------- min_dim_forward ----------------
+-// 输入: input 任意维，dim 指定维度。
+-// 输出: 形状与输入相同但 dim 维度移除，连续。
+-// 实现为每个输出元素独立计算，使用 grid-stride loop。
+-// 假设输出连续，但支持输入任意 strides。
+ __global__ void min_dim_kernel(
+     const float* __restrict__ input,
+     float* __restrict__ output,
+@@ -156,9 +141,93 @@
+     int total = total_outer * inner;
+     int block = 256;
+     int grid = (total + block - 1) / block;
+-    // 限制 grid 大小，使用 grid-stride loop
+     if (grid > 4096) grid = 4096;
+     min_dim_kernel<<<grid, block, 0, stream>>>(
+         input, output, total_outer, D, inner,
+         input_stride_outer, input_stride_dim, input_stride_inner);
+ }
++
++// ---------------- conv2d_forward (naive direct convolution) ----------------
++// 支持 stride, padding, dilation, groups (当前模型 groups=1 但保留通用性)
++// 假设输入为 NCHW 布局，且数据连续或具有常规 strides（即按照 N,C,H,W 顺序存储）
++// 输出为连续 NCHW。此 kernel 未对性能高度优化，但先保证正确性和编译。
++__global__ void conv2d_direct_kernel(
++    const float* __restrict__ input,
++    const float* __restrict__ weight,
++    const float* __restrict__ bias,
++    float* __restrict__ output,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int kH, int kW,
++    int stride_h, int stride_w,
++    int pad_h, int pad_w,
++    int dilation_h, int dilation_w,
++    int groups,
++    int H_out, int W_out)
++{
++    int total_outputs = N * C_out * H_out * W_out;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int stride = blockDim.x * gridDim.x;
++    int C_in_per_group = C_in / groups;
++    int C_out_per_group = C_out / groups;
++
++    for (int i = idx; i < total_outputs; i += stride) {
++        int w_out = i % W_out;
++        int rem = i / W_out;
++        int h_out = rem % H_out;
++        rem /= H_out;
++        int c_out = rem % C_out;
++        int n = rem / C_out;
++
++        int group = c_out / C_out_per_group;
++        int c_out_in_group = c_out % C_out_per_group;
++
++        float acc = 0.0f;
++        const float* input_base = input + n * C_in * H_in * W_in + group * C_in_per_group * H_in * W_in;
++        const float* weight_base = weight + c_out * C_in_per_group * kH * kW;
++
++        for (int c_in = 0; c_in < C_in_per_group; ++c_in) {
++            for (int kh = 0; kh < kH; ++kh) {
++                int h_in = h_out * stride_h - pad_h + kh * dilation_h;
++                if (h_in < 0 || h_in >= H_in) continue;
++                for (int kw = 0; kw < kW; ++kw) {
++                    int w_in = w_out * stride_w - pad_w + kw * dilation_w;
++                    if (w_in < 0 || w_in >= W_in) continue;
++                    float in_val = input_base[c_in * H_in * W_in + h_in * W_in + w_in];
++                    float w_val = weight_base[c_in * kH * kW + kh * kW + kw];
++                    acc += in_val * w_val;
++                }
++            }
++        }
++        if (bias != nullptr) {
++            acc += bias[c_out];
++        }
++        output[i] = acc;
++    }
++}
++
++extern "C" void conv2d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int kH, int kW,
++    int stride_h, int stride_w,
++    int pad_h, int pad_w,
++    int dilation_h, int dilation_w,
++    int groups,
++    int H_out, int W_out,
++    cudaStream_t stream)
++{
++    int total_outputs = N * C_out * H_out * W_out;
++    int block = 256;
++    int grid = (total_outputs + block - 1) / block;
++    if (grid > 65535) grid = 65535; // 保持 grid 维度限制
++    conv2d_direct_kernel<<<grid, block, 0, stream>>>(
++        input, weight, bias, output,
++        N, C_in, H_in, W_in,
++        C_out, kH, kW,
++        stride_h, stride_w, pad_h, pad_w,
++        dilation_h, dilation_w, groups,
++        H_out, W_out);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -1,13 +1,8 @@
+-// Binding file for custom ops: reflection_pad2d, conv2d (cuDNN), glu, min_dim
+-// Includes appropriate headers, validates tensors, calls launchers from custom_ops.cu
+-// Registers all functions with pybind.
+-
+ #include <torch/types.h>
+ #include <torch/csrc/utils/pybind.h>
+ 
+ #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
+-#include <cudnn.h>
+ 
+ #include "../binding_registry.h"
+ 
+@@ -33,6 +28,20 @@
+     float* output,
+     int total_outer, int D, int inner,
+     int input_stride_outer, int input_stride_dim, int input_stride_inner,
++    cudaStream_t stream);
++
++extern "C" void conv2d_forward_launcher(
++    const float* input,
++    const float* weight,
++    const float* bias,
++    float* output,
++    int N, int C_in, int H_in, int W_in,
++    int C_out, int kH, int kW,
++    int stride_h, int stride_w,
++    int pad_h, int pad_w,
++    int dilation_h, int dilation_w,
++    int groups,
++    int H_out, int W_out,
+     cudaStream_t stream);
+ 
+ // Helper to check CUDA error after kernel launch
+@@ -79,7 +88,7 @@
+     return output;
+ }
+ 
+-// ---------------- conv2d_forward using cuDNN ----------------
++// ---------------- conv2d_forward using custom CUDA kernel ----------------
+ torch::Tensor conv2d_forward(
+     torch::Tensor input,
+     torch::Tensor weight,
+@@ -105,8 +114,8 @@
+ 
+     int N = input.size(0);
+     int C_in = input.size(1);
+-    int H = input.size(2);
+-    int W = input.size(3);
++    int H_in = input.size(2);
++    int W_in = input.size(3);
+     int C_out = weight.size(0);
+     int kH = weight.size(2);
+     int kW = weight.size(3);
+@@ -117,142 +126,31 @@
+     int pad_w = (int)padding;
+     int dilation_h = (int)dilation;
+     int dilation_w = (int)dilation;
+-
+-    int H_out = (H + 2 * pad_h - dilation_h * (kH - 1) - 1) / stride_h + 1;
+-    int W_out = (W + 2 * pad_w - dilation_w * (kW - 1) - 1) / stride_w + 1;
++    int groups_i = (int)groups;
++
++    int H_out = (H_in + 2 * pad_h - dilation_h * (kH - 1) - 1) / stride_h + 1;
++    int W_out = (W_in + 2 * pad_w - dilation_w * (kW - 1) - 1) / stride_w + 1;
+ 
+     auto output = torch::empty({N, C_out, H_out, W_out}, input.options());
+ 
+-    cudnnHandle_t cudnn_handle;
+-    cudnnStatus_t status = cudnnCreate(&cudnn_handle);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN create failed");
+-
+-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+-    status = cudnnSetStream(cudnn_handle, stream);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN set stream failed");
+-
+-    cudnnTensorDescriptor_t input_desc, output_desc;
+-    cudnnFilterDescriptor_t filter_desc;
+-    cudnnConvolutionDescriptor_t conv_desc;
+-
+-    status = cudnnCreateTensorDescriptor(&input_desc);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN create input tensor descriptor failed");
+-    status = cudnnCreateTensorDescriptor(&output_desc);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN create output tensor descriptor failed");
+-    status = cudnnCreateFilterDescriptor(&filter_desc);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN create filter descriptor failed");
+-    status = cudnnCreateConvolutionDescriptor(&conv_desc);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN create convolution descriptor failed");
+-
+-    status = cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C_in, H, W);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN set input tensor descriptor failed");
+-    status = cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C_out, H_out, W_out);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN set output tensor descriptor failed");
+-    status = cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, C_out, C_in / (int)groups, kH, kW);
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN set filter descriptor failed");
+-
+-    status = cudnnSetConvolution2dDescriptor(
+-        conv_desc,
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    const float* bias_ptr = (bias.numel() > 0) ? bias.data_ptr<float>() : nullptr;
++
++    conv2d_forward_launcher(
++        input.data_ptr<float>(),
++        weight.data_ptr<float>(),
++        bias_ptr,
++        output.data_ptr<float>(),
++        N, C_in, H_in, W_in,
++        C_out, kH, kW,
++        stride_h, stride_w,
+         pad_h, pad_w,
+-        stride_h, stride_w,
+         dilation_h, dilation_w,
+-        CUDNN_CROSS_CORRELATION,  // PyTorch uses cross-correlation
+-        CUDNN_DATA_FLOAT
+-    );
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN set convolution descriptor failed");
+-
+-    if ((int)groups > 1) {
+-        status = cudnnSetConvolutionGroupCount(conv_desc, (int)groups);
+-        TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN set group count failed");
+-    }
+-
+-    cudnnConvolutionFwdAlgo_t algo;
+-    int requested_algo_count = 1;
+-    cudnnConvolutionFwdAlgoPerf_t perf_results[1];
+-    status = cudnnFindConvolutionForwardAlgorithm(
+-        cudnn_handle,
+-        input_desc,
+-        filter_desc,
+-        conv_desc,
+-        output_desc,
+-        requested_algo_count,
+-        &requested_algo_count,
+-        perf_results
+-    );
+-    if (status == CUDNN_STATUS_SUCCESS && requested_algo_count > 0) {
+-        algo = perf_results[0].algo;
+-    } else {
+-        // fallback to a default algorithm
+-        algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+-    }
+-
+-    size_t workspace_size = 0;
+-    status = cudnnGetConvolutionForwardWorkspaceSize(
+-        cudnn_handle,
+-        input_desc,
+-        filter_desc,
+-        conv_desc,
+-        output_desc,
+-        algo,
+-        &workspace_size
+-    );
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN get workspace size failed");
+-
+-    void* workspace = nullptr;
+-    if (workspace_size > 0) {
+-        cudaMalloc(&workspace, workspace_size);
+-        TORCH_CHECK(workspace != nullptr, "cudaMalloc failed for cuDNN workspace");
+-    }
+-
+-    float alpha = 1.0f;
+-    float beta = 0.0f;
+-
+-    status = cudnnConvolutionForward(
+-        cudnn_handle,
+-        &alpha,
+-        input_desc,
+-        input.data_ptr<float>(),
+-        filter_desc,
+-        weight.data_ptr<float>(),
+-        conv_desc,
+-        algo,
+-        workspace,
+-        workspace_size,
+-        &beta,
+-        output_desc,
+-        output.data_ptr<float>()
+-    );
+-
+-    // Add bias if provided
+-    if (bias.numel() > 0) {
+-        cudnnTensorDescriptor_t bias_desc;
+-        status = cudnnCreateTensorDescriptor(&bias_desc);
+-        TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN create bias descriptor failed");
+-        status = cudnnSetTensor4dDescriptor(bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, C_out, 1, 1);
+-        TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN set bias descriptor failed");
+-
+-        beta = 1.0f;
+-        status = cudnnAddTensor(
+-            cudnn_handle,
+-            &alpha,
+-            bias_desc,
+-            bias.data_ptr<float>(),
+-            &beta,
+-            output_desc,
+-            output.data_ptr<float>()
+-        );
+-
+-        cudnnDestroyTensorDescriptor(bias_desc);
+-    }
+-
+-    TORCH_CHECK(status == CUDNN_STATUS_SUCCESS, "cuDNN convolution forward or bias add failed");
+-
+-    if (workspace) cudaFree(workspace);
+-    cudnnDestroyTensorDescriptor(input_desc);
+-    cudnnDestroyTensorDescriptor(output_desc);
+-    cudnnDestroyFilterDescriptor(filter_desc);
+-    cudnnDestroyConvolutionDescriptor(conv_desc);
+-    cudnnDestroy(cudnn_handle);
++        groups_i,
++        H_out, W_out,
++        stream
++    );
+ 
+     check_cuda_error();
+     return output;
+@@ -266,7 +164,6 @@
+     int64_t dim_size = input.size(dim);
+     TORCH_CHECK(dim_size % 2 == 0, "glu split dimension must be even");
+ 
+-    // Normalize dim to positive
+     if (dim < 0) dim += input.dim();
+     TORCH_CHECK(dim >= 0 && dim < input.dim(), "glu dim out of range");
+ 
+@@ -293,11 +190,11 @@
+     }
+     auto output = torch::empty(output_sizes, input.options());
+ 
+-    int64_t input_stride_outer = input.stride(0);  // Need to adjust if dim != 1; for our use dim=1, outer stride is stride(0), dim stride is stride(1), inner stride is stride(2)
++    int64_t input_stride_outer = input.stride(0);
+     int64_t input_stride_dim = input.stride((int)dim);
+     int64_t input_stride_inner = (dim + 1 < input.dim()) ? input.stride((int)dim + 1) : 0;
+ 
+-    int64_t output_stride_outer = (dim > 0) ? output.stride(0) : 0; // If dim=0, output_stride_outer not used? We handle generic but our usage dim=1 so this works.
++    int64_t output_stride_outer = (dim > 0) ? output.stride(0) : 0;
+     int64_t output_stride_dim = output.stride((int)dim);
+     int64_t output_stride_inner = (dim + 1 < output.dim()) ? output.stride((int)dim + 1) : 0;
+ 
+@@ -367,7 +264,7 @@
+ void register_custom_ops(pybind11::module& m) {
+     m.def("reflection_pad2d_forward", &reflection_pad2d_forward, "ReflectionPad2d forward",
+           pybind11::arg("input"), pybind11::arg("pad_left_right"), pybind11::arg("pad_top_bottom"));
+-    m.def("conv2d_forward", &conv2d_forward, "Conv2d forward using cuDNN",
++    m.def("conv2d_forward", &conv2d_forward, "Conv2d forward using custom CUDA kernel",
+           pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias"),
+           pybind11::arg("stride"), pybind11::arg("padding"), pybind11::arg("dilation"), pybind11::arg("groups"));
+     m.def("glu_forward", &glu_forward, "GLU forward",

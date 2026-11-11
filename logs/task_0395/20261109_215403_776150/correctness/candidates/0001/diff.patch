@@ -1,0 +1,309 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,111 @@
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// Average Pooling 2D forward kernel
++// input: (N, C, H, W) with strides in elements (not bytes), layout supports strides
++// output: (N, C, outH, outW) contiguous
++// kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w
++// count_include_pad = true (divisor is kernel_h*kernel_w)
++__global__ void avg_pool2d_forward_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t outH, int64_t outW,
++    int64_t inputNStride, int64_t inputCStride, int64_t inputHStride, int64_t inputWStride,
++    int64_t kernel_h, int64_t kernel_w,
++    int64_t stride_h, int64_t stride_w,
++    int64_t padding_h, int64_t padding_w)
++{
++    int64_t total = N * C * outH * outW;
++    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++         idx < total;
++         idx += gridDim.x * blockDim.x) {
++        int64_t w_out = idx % outW;
++        int64_t h_out = (idx / outW) % outH;
++        int64_t c = (idx / (outW * outH)) % C;
++        int64_t n = idx / (outW * outH * C);
++
++        float sum = 0.0f;
++        int64_t h_start = h_out * stride_h - padding_h;
++        int64_t w_start = w_out * stride_w - padding_w;
++        int64_t h_end = h_start + kernel_h;
++        int64_t w_end = w_start + kernel_w;
++
++        const float* base = input + n * inputNStride + c * inputCStride;
++        for (int64_t kh = h_start; kh < h_end; ++kh) {
++            for (int64_t kw = w_start; kw < w_end; ++kw) {
++                if (kh >= 0 && kh < H && kw >= 0 && kw < W) {
++                    sum += base[kh * inputHStride + kw * inputWStride];
++                }
++                // else treat as zero padding; divisor includes it
++            }
++        }
++        output[idx] = sum / (float)(kernel_h * kernel_w);
++    }
++}
++
++// LeakyReLU forward kernel (elementwise)
++__global__ void leaky_relu_forward_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    int64_t total,
++    float negative_slope)
++{
++    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
++         idx < total;
++         idx += gridDim.x * blockDim.x) {
++        float val = input[idx];
++        output[idx] = (val >= 0.0f) ? val : negative_slope * val;
++    }
++}
++
++extern "C" void avg_pool2d_forward(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t H, int64_t W,
++    int64_t inputNStride, int64_t inputCStride, int64_t inputHStride, int64_t inputWStride,
++    int64_t kernel_h, int64_t kernel_w,
++    int64_t stride_h, int64_t stride_w,
++    int64_t padding_h, int64_t padding_w,
++    bool ceil_mode,
++    cudaStream_t stream)
++{
++    // Compute output dimensions
++    int64_t outH, outW;
++    if (ceil_mode) {
++        outH = (H + 2 * padding_h - kernel_h + stride_h - 1) / stride_h + 1;
++        outW = (W + 2 * padding_w - kernel_w + stride_w - 1) / stride_w + 1;
++    } else {
++        outH = (H + 2 * padding_h - kernel_h) / stride_h + 1;
++        outW = (W + 2 * padding_w - kernel_w) / stride_w + 1;
++    }
++
++    int64_t total = N * C * outH * outW;
++    if (total <= 0) return;
++
++    const int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 65535) grid = 65535; // grid-stride loop handles rest
++
++    avg_pool2d_forward_kernel<<<grid, block, 0, stream>>>(
++        input, output,
++        N, C, H, W, outH, outW,
++        inputNStride, inputCStride, inputHStride, inputWStride,
++        kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w);
++}
++
++extern "C" void leaky_relu_forward(
++    const float* input,
++    float* output,
++    int64_t total,
++    double negative_slope,
++    cudaStream_t stream)
++{
++    if (total <= 0) return;
++    float slope = (float)negative_slope;
++    const int block = 256;
++    int grid = (int)((total + block - 1) / block);
++    if (grid > 65535) grid = 65535;
++    leaky_relu_forward_kernel<<<grid, block, 0, stream>>>(
++        input, output, total, slope);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,156 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++#include <cstdint>
++
++// Declare launchers from custom_ops.cu
++extern "C" void avg_pool2d_forward(
++    const float* input,
++    float* output,
++    int64_t N,
++    int64_t C,
++    int64_t H,
++    int64_t W,
++    int64_t inputNStride,
++    int64_t inputCStride,
++    int64_t inputHStride,
++    int64_t inputWStride,
++    int64_t kernel_h,
++    int64_t kernel_w,
++    int64_t stride_h,
++    int64_t stride_w,
++    int64_t padding_h,
++    int64_t padding_w,
++    bool ceil_mode,
++    cudaStream_t stream
++);
++
++extern "C" void leaky_relu_forward(
++    const float* input,
++    float* output,
++    int64_t total,
++    double negative_slope,
++    cudaStream_t stream
++);
++
++// Helper to compute output dimensions for average pooling
++static inline std::pair<int64_t, int64_t> compute_output_size(
++    int64_t H,
++    int64_t W,
++    int64_t kernel_h,
++    int64_t kernel_w,
++    int64_t stride_h,
++    int64_t stride_w,
++    int64_t padding_h,
++    int64_t padding_w,
++    bool ceil_mode)
++{
++    int64_t outH, outW;
++    if (ceil_mode) {
++        outH = (H + 2 * padding_h - kernel_h + stride_h - 1) / stride_h + 1;
++        outW = (W + 2 * padding_w - kernel_w + stride_w - 1) / stride_w + 1;
++    } else {
++        outH = (H + 2 * padding_h - kernel_h) / stride_h + 1;
++        outW = (W + 2 * padding_w - kernel_w) / stride_w + 1;
++    }
++    // Ensure at least 1 output if input non-empty
++    if (outH < 1) outH = 1;
++    if (outW < 1) outW = 1;
++    return {outH, outW};
++}
++
++torch::Tensor avg_pool2d(
++    torch::Tensor input,
++    int64_t kernel_h,
++    int64_t kernel_w,
++    int64_t stride_h,
++    int64_t stride_w,
++    int64_t padding_h,
++    int64_t padding_w,
++    bool ceil_mode)
++{
++    // Input validation
++    TORCH_CHECK(input.is_cuda(), "avg_pool2d: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "avg_pool2d: input must be float32");
++    TORCH_CHECK(input.dim() == 4, "avg_pool2d: input must be 4D (N, C, H, W)");
++    TORCH_CHECK(kernel_h > 0 && kernel_w > 0, "avg_pool2d: kernel size must be positive");
++    TORCH_CHECK(stride_h > 0 && stride_w > 0, "avg_pool2d: stride must be positive");
++    TORCH_CHECK(padding_h >= 0 && padding_w >= 0, "avg_pool2d: padding must be non-negative");
++
++    // Dimensions
++    int64_t N = input.size(0);
++    int64_t C = input.size(1);
++    int64_t H = input.size(2);
++    int64_t W = input.size(3);
++
++    // Get strides (in elements)
++    int64_t inputNStride = input.stride(0);
++    int64_t inputCStride = input.stride(1);
++    int64_t inputHStride = input.stride(2);
++    int64_t inputWStride = input.stride(3);
++
++    auto [outH, outW] = compute_output_size(H, W, kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, ceil_mode);
++
++    auto output = torch::empty({N, C, outH, outW}, input.options());
++
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    avg_pool2d_forward(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, H, W,
++        inputNStride, inputCStride, inputHStride, inputWStride,
++        kernel_h, kernel_w,
++        stride_h, stride_w,
++        padding_h, padding_w,
++        ceil_mode,
++        stream
++    );
++
++    // Check for launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "avg_pool2d: CUDA error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++torch::Tensor leaky_relu(
++    torch::Tensor input,
++    double negative_slope)
++{
++    TORCH_CHECK(input.is_cuda(), "leaky_relu: input must be a CUDA tensor");
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "leaky_relu: input must be float32");
++
++    auto output = torch::empty_like(input);
++
++    int64_t total = input.numel();
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    leaky_relu_forward(
++        input.data_ptr<float>(),
++        output.data_ptr<float>(),
++        total,
++        negative_slope,
++        stream
++    );
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "leaky_relu: CUDA error: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("avg_pool2d", &avg_pool2d,
++          "Average Pooling 2D forward",
++          py::arg("input"), py::arg("kernel_h"), py::arg("kernel_w"),
++          py::arg("stride_h"), py::arg("stride_w"),
++          py::arg("padding_h"), py::arg("padding_w"), py::arg("ceil_mode"));
++    m.def("leaky_relu", &leaky_relu,
++          "Leaky ReLU forward",
++          py::arg("input"), py::arg("negative_slope"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,33 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, ceil_mode=False):
++        super().__init__()
++        # Store configuration as plain attributes; no parameters or buffers.
++        self.kernel_size = kernel_size
++        self.stride = stride
++        self.padding = padding
++        self.ceil_mode = ceil_mode
++
++    def forward(self, x):
++        kh, kw = self.kernel_size
++        sh, sw = self.stride if isinstance(self.stride, tuple) else (self.stride, self.stride)
++        ph, pw = self.padding if isinstance(self.padding, tuple) else (self.padding, self.padding)
++        x = cuda_extension.avg_pool2d(x, kh, kw, sh, sw, ph, pw, self.ceil_mode)
++        x = cuda_extension.leaky_relu(x, 0.01)
++        return x
++
++    def debug_forward(self, *inputs):
++        # Inputs tuple contains x only.
++        x = inputs[0]
++        kh, kw = self.kernel_size
++        sh, sw = self.stride if isinstance(self.stride, tuple) else (self.stride, self.stride)
++        ph, pw = self.padding if isinstance(self.padding, tuple) else (self.padding, self.padding)
++        after_pool = cuda_extension.avg_pool2d(x, kh, kw, sh, sw, ph, pw, self.ceil_mode)
++        yield 'step_001', after_pool
++        after_relu = cuda_extension.leaky_relu(after_pool, 0.01)
++        yield 'step_002', after_relu
++        yield 'step_003', after_relu

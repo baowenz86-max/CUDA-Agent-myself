@@ -1,0 +1,162 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,77 @@
++// AdaptiveAvgPool1d CUDA kernel
++// Supports arbitrary strides for non-contiguous input
++#include <cuda_runtime.h>
++
++// Kernel: each thread computes one output element
++// Grid-stride loop over all output elements (N*C*output_size)
++// We use int64 for large total elements, but here N*C*output_size <= 1M fits int32, but keep int64 for safety
++__global__ void adaptive_avg_pool1d_kernel(
++    const float* __restrict__ input,
++    float* __restrict__ output,
++    long long N, long long C, long long L, long long output_size,
++    long long in_stride_n, long long in_stride_c, long long in_stride_l,
++    long long out_stride_n, long long out_stride_c, long long out_stride_l,
++    long long total_outputs)
++{
++    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++    long long stride = (long long)gridDim.x * blockDim.x;
++    for (long long linear = idx; linear < total_outputs; linear += stride) {
++        // decompose linear index into n, c, o
++        long long o = linear % output_size;
++        long long tmp = linear / output_size;
++        long long c = tmp % C;
++        long long n = tmp / C;
++        
++        // Adaptive average pooling window computation (PyTorch formula)
++        long long start = (long long)((double)o * L / (double)output_size);
++        long long end = (long long)ceil((double)(o + 1) * L / (double)output_size);
++        if (end > L) end = L;
++        long long window_size = end - start;
++        if (window_size <= 0) {
++            // Should not happen for valid output_size <= L
++            output[n * out_stride_n + c * out_stride_c + o * out_stride_l] = 0.0f;
++            continue;
++        }
++        
++        const float* in_base = input + n * in_stride_n + c * in_stride_c;
++        float sum = 0.0f;
++        for (long long l = start; l < end; ++l) {
++            sum += in_base[l * in_stride_l];
++        }
++        output[n * out_stride_n + c * out_stride_c + o * out_stride_l] = sum / (float)window_size;
++    }
++}
++
++// Launcher: called from binding.cpp
++// Input is assumed to be float32 CUDA tensor of shape [N,C,L]
++// output_size is int64
++// We require input pointer non-null, but binding layer checks
++// Returns via preallocated output pointer
++extern "C" void custom_adaptive_avg_pool1d_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t L, int64_t output_size,
++    int64_t in_stride_n, int64_t in_stride_c, int64_t in_stride_l,
++    int64_t out_stride_n, int64_t out_stride_c, int64_t out_stride_l,
++    cudaStream_t stream)
++{
++    long long total_outputs = (long long)N * C * output_size;
++    if (total_outputs <= 0) return;
++    
++    int threads = 256;
++    int blocks = (int)((total_outputs + threads - 1) / threads);
++    // cap blocks to avoid grid dimension limit, grid-stride loop handles rest
++    if (blocks > 65535) blocks = 65535;
++    if (blocks == 0) blocks = 1;
++    
++    adaptive_avg_pool1d_kernel<<<blocks, threads, 0, stream>>>(
++        input, output,
++        (long long)N, (long long)C, (long long)L, (long long)output_size,
++        (long long)in_stride_n, (long long)in_stride_c, (long long)in_stride_l,
++        (long long)out_stride_n, (long long)out_stride_c, (long long)out_stride_l,
++        total_outputs);
++    
++    // Error check after launch (optional for performance, but good for debugging)
++    // cudaError_t err = cudaGetLastError();
++    // if (err != cudaSuccess) { ... }  // binding can handle
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,58 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Launcher declaration from custom_ops.cu
++extern "C" void custom_adaptive_avg_pool1d_launcher(
++    const float* input,
++    float* output,
++    int64_t N, int64_t C, int64_t L, int64_t output_size,
++    int64_t in_stride_n, int64_t in_stride_c, int64_t in_stride_l,
++    int64_t out_stride_n, int64_t out_stride_c, int64_t out_stride_l,
++    cudaStream_t stream);
++
++torch::Tensor custom_adaptive_avg_pool1d(torch::Tensor x, int64_t output_size) {
++    // Check input tensor
++    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
++    TORCH_CHECK(x.dim() == 3, "Input must be a 3D tensor (batch, channels, length)");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
++    TORCH_CHECK(output_size > 0, "output_size must be positive");
++    TORCH_CHECK(output_size <= x.size(2), "output_size must not exceed input length");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t L = x.size(2);
++
++    // Allocate output tensor (contiguous by default)
++    auto output = torch::empty({N, C, output_size}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_adaptive_avg_pool1d_launcher(
++        x.data_ptr<float>(),
++        output.data_ptr<float>(),
++        N, C, L, output_size,
++        x.stride(0), x.stride(1), x.stride(2),
++        output.stride(0), output.stride(1), output.stride(2),
++        stream
++    );
++
++    // Check for kernel launch errors (optional but recommended for debugging)
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_adaptive_avg_pool1d(pybind11::module& m) {
++    m.def("custom_adaptive_avg_pool1d", &custom_adaptive_avg_pool1d,
++          "Adaptive average pooling 1d",
++          py::arg("x"),
++          py::arg("output_size"));
++}
++
++REGISTER_BINDING(custom_adaptive_avg_pool1d, register_custom_adaptive_avg_pool1d);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,18 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_features, out_features):
++        super().__init__()
++        self.out_features = out_features
++
++    def forward(self, x):
++        x = cuda_extension.custom_adaptive_avg_pool1d(x, self.out_features)
++        return x
++
++    def debug_forward(self, x):
++        pooled = cuda_extension.custom_adaptive_avg_pool1d(x, self.out_features)
++        yield 'step_001', pooled
++        yield 'step_002', pooled

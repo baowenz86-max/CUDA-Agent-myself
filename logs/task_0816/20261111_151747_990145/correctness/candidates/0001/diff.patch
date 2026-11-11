@@ -1,0 +1,249 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,119 @@
++#include <cuda_runtime.h>
++
++// CUDA kernel for bilinear upsampling, align_corners=false
++// Input: x (float*) shape [N, C, H, W]
++// Output: y (float*) shape [N, C, H_out, W_out]
++// scale_factor: multiplier for H and W
++__global__ void upsample_bilinear2d_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    int N, int C, int H, int W,
++    int H_out, int W_out,
++    float scale_factor)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * C * H_out * W_out;
++    if (idx >= total) return;
++
++    int w_out = idx % W_out;
++    int h_out = (idx / W_out) % H_out;
++    int c = (idx / (W_out * H_out)) % C;
++    int n = idx / (W_out * H_out * C);
++
++    // Compute source coordinates (align_corners=false)
++    float src_h = (h_out + 0.5f) / scale_factor - 0.5f;
++    float src_w = (w_out + 0.5f) / scale_factor - 0.5f;
++
++    // Clamp to valid range
++    if (src_h < 0) src_h = 0;
++    if (src_w < 0) src_w = 0;
++    if (src_h > H - 1) src_h = H - 1;
++    if (src_w > W - 1) src_w = W - 1;
++
++    int h0 = (int)src_h;
++    int w0 = (int)src_w;
++    int h1 = (h0 < H - 1) ? h0 + 1 : h0;
++    int w1 = (w0 < W - 1) ? w0 + 1 : w0;
++
++    float h_lambda = src_h - h0;
++    float w_lambda = src_w - w0;
++
++    const float* base = x + ((long long)n * C + c) * H * W;
++    float v00 = base[h0 * W + w0];
++    float v01 = base[h0 * W + w1];
++    float v10 = base[h1 * W + w0];
++    float v11 = base[h1 * W + w1];
++
++    float top = v00 * (1.0f - w_lambda) + v01 * w_lambda;
++    float bottom = v10 * (1.0f - w_lambda) + v11 * w_lambda;
++    float value = top * (1.0f - h_lambda) + bottom * h_lambda;
++
++    y[idx] = value;
++}
++
++// CUDA kernel for mean along dim=1 keepdim
++// Input: x (float*) shape [N, C, H, W]
++// Output: y (float*) shape [N, 1, H, W]
++__global__ void mean_dim1_keepdim_kernel(
++    const float* __restrict__ x,
++    float* __restrict__ y,
++    int N, int C, int H, int W)
++{
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * H * W;
++    if (idx >= total) return;
++
++    int w = idx % W;
++    int h = (idx / W) % H;
++    int n = idx / (W * H);
++
++    float sum = 0.0f;
++    const float* base = x + ((long long)n * C) * H * W;
++    for (int c = 0; c < C; ++c) {
++        sum += base[(c * H + h) * W + w];
++    }
++    y[idx] = sum / C;
++}
++
++// Launcher for custom_upsample_bilinear2d
++// x: input pointer (CUDA float*)
++// y: output pointer (CUDA float*)
++// N,C,H,W: input dims
++// scale_factor: float
++// align_corners: bool (only false supported)
++// stream: CUDA stream
++extern "C" void custom_upsample_bilinear2d_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    float scale_factor,
++    bool align_corners,
++    cudaStream_t stream)
++{
++    // align_corners currently unused; only false case is needed
++    int H_out = (int)(H * scale_factor);
++    int W_out = (int)(W * scale_factor);
++    int total = N * C * H_out * W_out;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    upsample_bilinear2d_kernel<<<blocks, threads, 0, stream>>>(
++        x, y, N, C, H, W, H_out, W_out, scale_factor);
++}
++
++// Launcher for custom_mean_dim1_keepdim
++// x: input pointer (CUDA float*)
++// y: output pointer (CUDA float*)
++// N,C,H,W: input dims
++// stream: CUDA stream
++extern "C" void custom_mean_dim1_keepdim_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    cudaStream_t stream)
++{
++    int total = N * H * W;
++    int threads = 256;
++    int blocks = (total + threads - 1) / threads;
++    mean_dim1_keepdim_kernel<<<blocks, threads, 0, stream>>>(
++        x, y, N, C, H, W);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,100 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Declare launchers from custom_ops.cu
++extern "C" void custom_upsample_bilinear2d_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    float scale_factor,
++    bool align_corners,
++    cudaStream_t stream);
++
++extern "C" void custom_mean_dim1_keepdim_launcher(
++    const float* x,
++    float* y,
++    int N, int C, int H, int W,
++    cudaStream_t stream);
++
++// Wrapper for custom_upsample_bilinear2d
++torch::Tensor custom_upsample_bilinear2d(
++    torch::Tensor x,
++    double scale_factor,
++    bool align_corners) {
++    // Check tensor properties
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (N, C, H, W)");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Compute output dimensions: floor(H * scale_factor)
++    int H_out = static_cast<int>(H * scale_factor);
++    int W_out = static_cast<int>(W * scale_factor);
++
++    // Allocate output tensor
++    auto y = torch::empty({N, C, H_out, W_out}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_upsample_bilinear2d_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        N, C, H, W,
++        static_cast<float>(scale_factor),
++        align_corners,
++        stream);
++
++    return y;
++}
++
++// Wrapper for custom_mean_dim1_keepdim
++torch::Tensor custom_mean_dim1_keepdim(torch::Tensor x) {
++    // Check tensor properties
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "x must be 4D (N, C, H, W)");
++
++    int N = x.size(0);
++    int C = x.size(1);
++    int H = x.size(2);
++    int W = x.size(3);
++
++    // Allocate output tensor [N, 1, H, W]
++    auto y = torch::empty({N, 1, H, W}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    custom_mean_dim1_keepdim_launcher(
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        N, C, H, W,
++        stream);
++
++    return y;
++}
++
++// Registration function
++void register_custom_ops(pybind11::module& m) {
++    m.def("custom_upsample_bilinear2d", &custom_upsample_bilinear2d,
++          "CUDA bilinear upsampling (align_corners=false)",
++          py::arg("x"), py::arg("scale_factor"), py::arg("align_corners"));
++    m.def("custom_mean_dim1_keepdim", &custom_mean_dim1_keepdim,
++          "CUDA mean along dim=1 with keepdim=True",
++          py::arg("x"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,21 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, scale_factor, mode):
++        super().__init__()
++        self.upsample = nn.Upsample(scale_factor=scale_factor, mode=mode)
++
++    def forward(self, x):
++        x = cuda_extension.custom_upsample_bilinear2d(x, float(self.upsample.scale_factor), self.upsample.align_corners)
++        x = cuda_extension.custom_mean_dim1_keepdim(x)
++        return x
++
++    def debug_forward(self, x):
++        x = cuda_extension.custom_upsample_bilinear2d(x, float(self.upsample.scale_factor), self.upsample.align_corners)
++        yield ("step_001", x)
++        x = cuda_extension.custom_mean_dim1_keepdim(x)
++        yield ("step_002", x)
++        yield ("step_003", x)

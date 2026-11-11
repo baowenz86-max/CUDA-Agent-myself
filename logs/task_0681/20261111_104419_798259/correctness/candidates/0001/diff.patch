@@ -1,0 +1,247 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,85 @@
++#include <cuda_runtime.h>
++
++// cat_forward: concatenate two float32 tensors along dim=1.
++// Inputs are contiguous with shapes:
++//   x: [batch, Cx, H, W]
++//   y: [batch, Cy, H, W]
++// Output: [batch, Cx+Cy, H, W]
++// dim=1 is assumed (as per contract); other dims are not implemented.
++__global__ void cat_forward_kernel(
++    float* __restrict__ out,
++    const float* __restrict__ x,
++    const float* __restrict__ y,
++    int64_t total_elements,
++    int64_t Cx,
++    int64_t Cy,
++    int64_t HW)
++{
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        // Determine batch, channel, spatial offset
++        int64_t hw = i % HW;
++        int64_t rem = i / HW;
++        int64_t c = rem % (Cx + Cy);
++        int64_t b = rem / (Cx + Cy);
++
++        float val;
++        if (c < Cx) {
++            // from x
++            int64_t x_idx = (b * Cx + c) * HW + hw;
++            val = x[x_idx];
++        } else {
++            // from y
++            int64_t c_offset = c - Cx;
++            int64_t y_idx = (b * Cy + c_offset) * HW + hw;
++            val = y[y_idx];
++        }
++        out[i] = val;
++    }
++}
++
++// multiply_scalar_forward: elementwise multiply by scalar
++__global__ void multiply_scalar_kernel(
++    float* __restrict__ out,
++    const float* __restrict__ in,
++    int64_t total_elements,
++    float scalar)
++{
++    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    int64_t stride = (int64_t)gridDim.x * blockDim.x;
++    for (int64_t i = idx; i < total_elements; i += stride) {
++        out[i] = in[i] * scalar;
++    }
++}
++
++extern "C" void cat_forward(
++    float* output,
++    const float* x,
++    const float* y,
++    int64_t total_elements,
++    int64_t Cx,
++    int64_t Cy,
++    int64_t HW,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    int blocks = (int)((total_elements + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535; // grid cap for older GPUs; grid-stride loop handles rest
++    cat_forward_kernel<<<blocks, threads, 0, stream>>>(
++        output, x, y, total_elements, Cx, Cy, HW);
++}
++
++extern "C" void multiply_scalar_forward(
++    float* output,
++    const float* input,
++    int64_t total_elements,
++    double scalar,
++    cudaStream_t stream)
++{
++    int threads = 256;
++    int blocks = (int)((total_elements + threads - 1) / threads);
++    if (blocks > 65535) blocks = 65535;
++    multiply_scalar_kernel<<<blocks, threads, 0, stream>>>(
++        output, input, total_elements, (float)scalar);
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,132 @@
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Forward declarations from custom_ops.cu
++extern "C" void cat_forward(
++    float* output,
++    const float* x,
++    const float* y,
++    int64_t total_elements,
++    int64_t Cx,
++    int64_t Cy,
++    int64_t HW,
++    cudaStream_t stream);
++
++extern "C" void multiply_scalar_forward(
++    float* output,
++    const float* input,
++    int64_t total_elements,
++    double scalar,
++    cudaStream_t stream);
++
++// Helper to get current CUDA stream
++static cudaStream_t getCurrentStream() {
++    return c10::cuda::getCurrentCUDAStream().stream();
++}
++
++// Binding wrapper for cat_forward
++torch::Tensor cat_forward_binding(torch::Tensor x, torch::Tensor y, int64_t dim) {
++    // Check device
++    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
++    TORCH_CHECK(y.is_cuda(), "y must be a CUDA tensor");
++
++    // Check dtype
++    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
++    TORCH_CHECK(y.dtype() == torch::kFloat32, "y must be float32");
++
++    // Check contiguous
++    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
++    TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
++
++    // Only support dim=1 as per contract
++    TORCH_CHECK(dim == 1, "Only dim=1 is supported for cat_forward");
++
++    // Check rank and dimensions compatibility
++    TORCH_CHECK(x.dim() == 4 && y.dim() == 4, "Expected 4D tensors");
++    TORCH_CHECK(x.size(0) == y.size(0), "Batch size mismatch");
++    TORCH_CHECK(x.size(2) == y.size(2) && x.size(3) == y.size(3), "Spatial dimensions mismatch");
++
++    int64_t batch = x.size(0);
++    int64_t Cx = x.size(1);
++    int64_t Cy = y.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++    int64_t HW = H * W;
++    int64_t total_elements = batch * (Cx + Cy) * HW;
++
++    // Allocate output tensor with correct shape [batch, Cx+Cy, H, W]
++    auto output = torch::empty({batch, Cx + Cy, H, W}, x.options());
++
++    // Ensure output is contiguous (empty should be contiguous by default)
++    TORCH_CHECK(output.is_contiguous(), "Output should be contiguous");
++
++    // Get current CUDA stream
++    cudaStream_t stream = getCurrentStream();
++
++    // Call launcher
++    cat_forward(
++        output.data_ptr<float>(),
++        x.data_ptr<float>(),
++        y.data_ptr<float>(),
++        total_elements,
++        Cx,
++        Cy,
++        HW,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "cat_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Binding wrapper for multiply_scalar_forward
++torch::Tensor multiply_scalar_forward_binding(torch::Tensor input, double scalar) {
++    // Check device
++    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
++
++    // Check dtype
++    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
++
++    // Check contiguous
++    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++
++    // Allocate output same shape as input
++    auto output = torch::empty_like(input);
++
++    // Get current CUDA stream
++    cudaStream_t stream = getCurrentStream();
++
++    // Call launcher
++    multiply_scalar_forward(
++        output.data_ptr<float>(),
++        input.data_ptr<float>(),
++        input.numel(),
++        scalar,
++        stream
++    );
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "multiply_scalar_forward kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++// Function to register bindings
++void register_custom_ops(pybind11::module& m) {
++    m.def("cat_forward", &cat_forward_binding,
++          "Concatenate two CUDA float32 tensors along dim=1",
++          py::arg("x"), py::arg("y"), py::arg("dim"));
++    m.def("multiply_scalar_forward", &multiply_scalar_forward_binding,
++          "Multiply tensor by scalar",
++          py::arg("input"), py::arg("scalar"));
++}
++
++// Auto-register
++REGISTER_BINDING(custom_ops, register_custom_ops);--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,22 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, input_size, num_channels):
++        super(ModelNew, self).__init__()
++        self.input_size = input_size
++        self.num_channels = num_channels
++
++    def forward(self, x, y):
++        x = cuda_extension.cat_forward(x, y, 1)
++        x = cuda_extension.multiply_scalar_forward(x, self.input_size)
++        return x
++
++    def debug_forward(self, x, y):
++        x = cuda_extension.cat_forward(x, y, 1)
++        yield "step_001", x
++        x = cuda_extension.multiply_scalar_forward(x, self.input_size)
++        yield "step_002", x
++        yield "step_003", x

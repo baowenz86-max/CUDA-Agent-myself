@@ -1,0 +1,252 @@
+--- before/kernels/custom_ops.cu
++++ after/kernels/custom_ops.cu
+@@ -0,0 +1,97 @@
++// custom_ops.cu - CUDA kernels for channel sum and average pooling
++// Only includes CUDA runtime; no PyTorch dependencies.
++#include <cuda_runtime.h>
++
++// Channel sum kernel: sum over dimension 1 (channels) with keepdim=True.
++// Input: [N, C, H, W] contiguous float32
++// Output: [N, 1, H, W] contiguous float32
++// Each thread computes one output element (n, h, w), summing over C.
++__global__ void channel_sum_kernel(const float* __restrict__ input,
++                                   float* __restrict__ output,
++                                   int N, int C, int H, int W) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * H * W;
++    if (idx >= total) return;
++    // Decode idx into n, h, w
++    int w = idx % W;
++    int h = (idx / W) % H;
++    int n = idx / (H * W);
++    // Sum over channels
++    float sum = 0.0f;
++    const float* in_base = input + n * C * H * W + h * W + w;
++    for (int c = 0; c < C; ++c) {
++        sum += in_base[c * H * W];
++    }
++    output[n * H * W + h * W + w] = sum;
++}
++
++// Average pooling kernel (2D) with count_include_pad=True.
++// Input: [N, 1, H, W] contiguous float32
++// Output: [N, 1, OH, OW] with OH = floor((H + 2*padding - kernel_size)/stride)+1, OW similarly.
++// Each thread computes one output element.
++__global__ void avg_pool2d_kernel(const float* __restrict__ input,
++                                  float* __restrict__ output,
++                                  int N, int H, int W,
++                                  int kernel_size, int stride, int padding,
++                                  int OH, int OW) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    int total = N * OH * OW;
++    if (idx >= total) return;
++    int ow = idx % OW;
++    int oh = (idx / OW) % OH;
++    int n = idx / (OH * OW);
++
++    // Compute input start coordinates (with padding offset)
++    int h_start = oh * stride - padding;
++    int w_start = ow * stride - padding;
++    // Accumulate
++    float sum = 0.0f;
++    for (int kh = 0; kh < kernel_size; ++kh) {
++        int ih = h_start + kh;
++        if (ih < 0 || ih >= H) continue; // zero padding (not included)
++        for (int kw = 0; kw < kernel_size; ++kw) {
++            int iw = w_start + kw;
++            if (iw < 0 || iw >= W) continue;
++            // Input is [N, 1, H, W], so offset = n*H*W + ih*W + iw
++            sum += input[n * H * W + ih * W + iw];
++        }
++    }
++    // count_include_pad=True means divide by kernel_size*kernel_size always.
++    int divisor = kernel_size * kernel_size;
++    output[idx] = sum / (float)divisor;
++}
++
++// Host launcher for channel_sum
++extern "C" void channel_sum_launcher(float* output, const float* input,
++                                     int N, int C, int H, int W,
++                                     cudaStream_t stream) {
++    int total = N * H * W;
++    int block_size = 256;
++    int grid_size = (total + block_size - 1) / block_size;
++    channel_sum_kernel<<<grid_size, block_size, 0, stream>>>(input, output, N, C, H, W);
++    // Check for launch errors (synchronous check)
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // In a real binding, you would throw; here we just ignore or could print.
++        // No dependency on printf if not desired; but we keep minimal.
++    }
++}
++
++// Host launcher for avg_pool2d
++extern "C" void avg_pool2d_launcher(float* output, const float* input,
++                                    int N, int H, int W,
++                                    int kernel_size, int stride, int padding,
++                                    cudaStream_t stream) {
++    int OH = (H + 2 * padding - kernel_size) / stride + 1;
++    int OW = (W + 2 * padding - kernel_size) / stride + 1;
++    int total = N * OH * OW;
++    int block_size = 256;
++    int grid_size = (total + block_size - 1) / block_size;
++    avg_pool2d_kernel<<<grid_size, block_size, 0, stream>>>(input, output, N, H, W,
++                                                            kernel_size, stride, padding,
++                                                            OH, OW);
++    cudaError_t err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        // ignore for now
++    }
++}
+--- before/kernels/custom_ops_binding.cpp
++++ after/kernels/custom_ops_binding.cpp
+@@ -0,0 +1,116 @@
++// custom_ops_binding.cpp - PyTorch bindings for channel_sum and avg_pool2d
++#include <torch/types.h>
++#include <torch/csrc/utils/pybind.h>
++#include <cuda_runtime.h>
++#include <c10/cuda/CUDAStream.h>
++#include "../binding_registry.h"
++
++// Forward declarations of launchers from custom_ops.cu
++extern "C" void channel_sum_launcher(float* output, const float* input,
++                                     int N, int C, int H, int W,
++                                     cudaStream_t stream);
++
++extern "C" void avg_pool2d_launcher(float* output, const float* input,
++                                    int N, int H, int W,
++                                    int kernel_size, int stride, int padding,
++                                    cudaStream_t stream);
++
++namespace {
++
++// Check that kernel_size, stride, padding are valid for AvgPool2d semantics:
++// kernel_size and stride must be positive, padding must be non-negative.
++// Also ensure input dimensions support the computed output.
++inline bool valid_pool_params(int64_t kernel_size, int64_t stride, int64_t padding,
++                              int64_t H, int64_t W) {
++    if (kernel_size <= 0 || stride <= 0 || padding < 0) return false;
++    if (H + 2 * padding < kernel_size || W + 2 * padding < kernel_size) return false;
++    return true;
++}
++
++} // anonymous namespace
++
++torch::Tensor channel_sum_forward(torch::Tensor x) {
++    // Validate input tensor
++    TORCH_CHECK(x.is_cuda(), "channel_sum: input tensor must be CUDA");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "channel_sum: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "channel_sum: input must be contiguous");
++    TORCH_CHECK(x.dim() == 4, "channel_sum: input must be 4D (N, C, H, W)");
++
++    int64_t N = x.size(0);
++    int64_t C = x.size(1);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    TORCH_CHECK(N > 0 && C > 0 && H > 0 && W > 0, "channel_sum: dimensions must be positive");
++
++    // Allocate output tensor [N, 1, H, W]
++    auto output = torch::empty({N, 1, H, W}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    channel_sum_launcher(output.data_ptr<float>(),
++                         x.data_ptr<float>(),
++                         static_cast<int>(N),
++                         static_cast<int>(C),
++                         static_cast<int>(H),
++                         static_cast<int>(W),
++                         stream);
++
++    // Check for kernel launch errors
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "channel_sum: kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++torch::Tensor avg_pool2d_forward(torch::Tensor x, int64_t kernel_size, int64_t stride, int64_t padding) {
++    // Validate input tensor
++    TORCH_CHECK(x.is_cuda(), "avg_pool2d: input tensor must be CUDA");
++    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "avg_pool2d: input must be float32");
++    TORCH_CHECK(x.is_contiguous(), "avg_pool2d: input must be contiguous");
++    TORCH_CHECK(x.dim() == 4 && x.size(1) == 1, "avg_pool2d: input must be 4D (N, 1, H, W)");
++
++    int64_t N = x.size(0);
++    int64_t H = x.size(2);
++    int64_t W = x.size(3);
++
++    TORCH_CHECK(N > 0 && H > 0 && W > 0, "avg_pool2d: dimensions must be positive");
++    TORCH_CHECK(valid_pool_params(kernel_size, stride, padding, H, W),
++                "avg_pool2d: invalid pooling parameters");
++
++    int64_t OH = (H + 2 * padding - kernel_size) / stride + 1;
++    int64_t OW = (W + 2 * padding - kernel_size) / stride + 1;
++
++    // Allocate output tensor [N, 1, OH, OW]
++    auto output = torch::empty({N, 1, OH, OW}, x.options());
++
++    // Get current CUDA stream
++    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
++
++    // Call launcher
++    avg_pool2d_launcher(output.data_ptr<float>(),
++                        x.data_ptr<float>(),
++                        static_cast<int>(N),
++                        static_cast<int>(H),
++                        static_cast<int>(W),
++                        static_cast<int>(kernel_size),
++                        static_cast<int>(stride),
++                        static_cast<int>(padding),
++                        stream);
++
++    cudaError_t err = cudaGetLastError();
++    TORCH_CHECK(err == cudaSuccess, "avg_pool2d: kernel launch failed: ", cudaGetErrorString(err));
++
++    return output;
++}
++
++void register_custom_ops(pybind11::module& m) {
++    m.def("channel_sum", &channel_sum_forward, "Sum over channel dimension with keepdim=True",
++          py::arg("x"));
++    m.def("avg_pool2d", &avg_pool2d_forward, "2D average pooling",
++          py::arg("x"), py::arg("kernel_size"), py::arg("stride"), py::arg("padding"));
++}
++
++REGISTER_BINDING(custom_ops, register_custom_ops);
+--- before/model_new.py
++++ after/model_new.py
+@@ -0,0 +1,30 @@
++import torch
++import torch.nn as nn
++import cuda_extension
++
++
++class ModelNew(nn.Module):
++    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
++        super().__init__()
++        # Original Model stores only AvgPool2d; we keep no parameters, but store config for custom op
++        self.kernel_size = kernel_size
++        self.stride = stride
++        self.padding = padding
++
++    def forward(self, x):
++        # Step 1: sum over channel dimension, keepdim=True
++        x = cuda_extension.channel_sum(x)
++        # Step 2: average pooling with kernel_size, stride, padding
++        x = cuda_extension.avg_pool2d(x, self.kernel_size, self.stride, self.padding)
++        return x
++
++    def debug_forward(self, x):
++        # Must yield checkpoint ID and value for each reference step, including final return
++        # Checkpoint step_001: after channel sum
++        x_sum = cuda_extension.channel_sum(x)
++        yield 'step_001', x_sum
++        # Checkpoint step_002: after pooling
++        x_pool = cuda_extension.avg_pool2d(x_sum, self.kernel_size, self.stride, self.padding)
++        yield 'step_002', x_pool
++        # Checkpoint step_003: final return
++        yield 'step_003', x_pool
