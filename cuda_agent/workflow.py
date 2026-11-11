@@ -20,6 +20,7 @@ from typing import Mapping, Sequence
 
 from cuda_agent.api import run_agent
 from cuda_agent.candidates import CandidateStore, clean_sources, read_json
+from cuda_agent.compile_artifacts import prepare_compile_cache, save_compile_artifacts
 from cuda_agent.validation import check_sources
 from cuda_agent.repair import failure_category, concise_log, TERMINAL_FAILURES
 from cuda_agent.log_setup import CURRENT_TASK_ID, configure_logging
@@ -550,7 +551,8 @@ def execute_workflow(
     if success:
         report.correctness_passed = True
         started = time.monotonic()
-        profiled, profile_log = run_command(PROFILE_COMMAND, config.workdir, env, gpu_pool)
+        compile_cache, profile_env = prepare_compile_cache(run_dir, env)
+        profiled, profile_log = run_command(PROFILE_COMMAND, config.workdir, profile_env, gpu_pool)
         report.add_stage("profiling", profiled, time.monotonic() - started)
         if not profiled:
             report.profiling_failed = True
@@ -559,7 +561,11 @@ def execute_workflow(
         started = time.monotonic()
         generate_kernel_artifacts(env, config.workdir, gpu_pool)
         report.add_stage("artifacts", True, time.monotonic() - started, "best effort")
-        save_result(task_id, config.workdir, {"verification.log": log, "profile.log": profile_log})
+        save_dir = save_result(task_id, config.workdir, {"verification.log": log, "profile.log": profile_log})
+        try:
+            save_compile_artifacts(compile_cache, save_dir / "torch_compile", profile_env)
+        except OSError:
+            LOGGER.exception("torch.compile 产物归档失败；任务结果已保存，缓存保留在 %s", compile_cache)
         return True
     store.restore_best()
     report.failure_type = failure_category(store.best) if store.best else report.failure_type

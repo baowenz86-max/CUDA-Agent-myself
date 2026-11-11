@@ -148,6 +148,16 @@ are written to `results/task_NNNN/`. Toolchain defaults can be overridden with
 `CUDA_HOME`, `CC`, `CXX`, and `CUDA_ARCH`; the defaults target CUDA 12.6, GCC 13,
 and `sm_89`.
 
+Successful runs also archive the profiling baseline's `torch.compile` artifacts
+under `results/task_NNNN/torch_compile/`. Profiling uses fresh, task-local Inductor
+and Triton caches (overriding their cache directory environment variables), and
+preserves generated PTX, cubin, shared libraries, source files, and intermediate
+IR with their cache directory structure. SASS is exported from each cubin using
+`cuobjdump --dump-sass`. `manifest.json` lists saved files and any export errors;
+the available file types depend on the compilation backend and operators used.
+Export failures do not invalidate successful verification/profiling, and the
+original cache remains in the run's `correctness/torch_compile_*` directory.
+
 Each run writes a detailed log and a Markdown summary under
 `logs/task_NNNN/<timestamp>/`. Use `--verbose` to also show DEBUG messages in the
 terminal, or `--log-dir` to choose another log root. The API key is never logged.
