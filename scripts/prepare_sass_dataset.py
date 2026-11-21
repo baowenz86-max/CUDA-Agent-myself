@@ -7,6 +7,7 @@ Grouping is a conservative structural heuristic, not semantic deduplication.
 import argparse
 import ast
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 import hashlib
 import json
 from pathlib import Path
@@ -18,6 +19,26 @@ import re
 
 def sha(text):
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def chat_token_count(tokenizer, messages, *, generation_prompt=False):
+    """Count token IDs, never the number of fields in a BatchEncoding."""
+    encoded = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=generation_prompt,
+        return_dict=True,
+    )
+    ids = encoded["input_ids"] if isinstance(encoded, Mapping) else encoded
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if not isinstance(ids, (list, tuple)):
+        raise TypeError(f"Unexpected token IDs: {type(ids).__name__}")
+    if ids and isinstance(ids[0], (list, tuple)):
+        if len(ids) != 1:
+            raise ValueError("Expected a single chat, received multiple sequences")
+        ids = ids[0]
+    if not all(isinstance(token, int) for token in ids):
+        raise TypeError("Token IDs must be integers")
+    return len(ids)
 
 
 def write_json(path, value):
@@ -64,7 +85,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=args.resume)
     config_path = args.output / "audit_config.json"
     config = {"results": str(args.results.resolve()), "tokenizer": args.tokenizer,
-              "max_tokens": args.max_tokens, "version": 2}
+              "max_tokens": args.max_tokens, "version": 3}
     if args.tokenizer:
         config["tokenizer_hashes"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(Path(args.tokenizer).glob("*")) if p.is_file()}
@@ -156,10 +177,9 @@ def main():
                 row["input_chars"] = len(messages[0]["content"])
                 row["output_chars"] = len(messages[1]["content"])
                 if tokenizer is not None:
-                    row["total_tokens"] = len(tokenizer.apply_chat_template(
-                        messages, tokenize=True, add_generation_prompt=False))
-                    row["prompt_tokens"] = len(tokenizer.apply_chat_template(
-                        messages[:1], tokenize=True, add_generation_prompt=True))
+                    row["total_tokens"] = chat_token_count(tokenizer, messages)
+                    row["prompt_tokens"] = chat_token_count(
+                        tokenizer, messages[:1], generation_prompt=True)
                     if args.max_tokens and row["total_tokens"] > args.max_tokens:
                         row["issues"].append("over_token_limit")
                 if not row["issues"]:
