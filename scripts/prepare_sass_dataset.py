@@ -21,6 +21,24 @@ def sha(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def format_sass(text, mode):
+    """Compact cuobjdump text without removing instruction locations or operands.
+
+    Only hexadecimal machine-code comments are dropped; address comments such as
+    /*0000*/ are retained, since branch/call operands can reference those offsets.
+    This representation targets functional recovery, not scheduling recovery.
+    """
+    if mode == "raw":
+        return text
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"/\*\s*0x[0-9a-fA-F]+\s*\*/", "", line)
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
 def chat_token_count(tokenizer, messages, *, generation_prompt=False):
     """Count token IDs, never the number of fields in a BatchEncoding."""
     encoded = tokenizer.apply_chat_template(
@@ -67,6 +85,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, help="Exclude longer complete chat samples")
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--sass-format", choices=("raw", "compact"), default="raw")
     args = parser.parse_args()
     if args.max_tokens is not None and (not args.tokenizer or args.max_tokens <= 0):
         parser.error("--max-tokens requires --tokenizer and a positive value")
@@ -85,7 +104,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=args.resume)
     config_path = args.output / "audit_config.json"
     config = {"results": str(args.results.resolve()), "tokenizer": args.tokenizer,
-              "max_tokens": args.max_tokens, "version": 3}
+              "max_tokens": args.max_tokens, "sass_format": args.sass_format, "version": 4}
     if args.tokenizer:
         config["tokenizer_hashes"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(Path(args.tokenizer).glob("*")) if p.is_file()}
@@ -163,6 +182,9 @@ def main():
             if not row["architectures"]:
                 row["issues"].append("unknown_architecture")
             if not row["issues"]:
+                row["sass_raw_chars"] = len(contents["sass"])
+                contents["sass"] = format_sass(contents["sass"], args.sass_format)
+                row["sass_formatted_chars"] = len(contents["sass"])
                 # Full binding is an explicitly allowed input, identical at training/evaluation.
                 messages = [
                     {"role": "user", "content": (
@@ -200,6 +222,7 @@ def main():
     if args.audit_only:
         lengths = sorted(r["total_tokens"] for r in audit if "total_tokens" in r)
         report = {"archives": len(audit), "eligible": sum(r["eligible"] for r in audit),
+                  "sass_format": args.sass_format,
                   "token_lengths": ({"min": lengths[0], "median": lengths[len(lengths)//2],
                     "p95": lengths[min(len(lengths)-1, int(.95*len(lengths)))], "max": lengths[-1]}
                     if lengths else None),
@@ -258,7 +281,7 @@ def main():
             for item in rows:
                 task = Path(item["archive"])
                 binding = (task / "kernels/custom_ops_binding.cpp").read_text()
-                sass = (task / "kernels/custom_ops.sass").read_text()
+                sass = format_sass((task / "kernels/custom_ops.sass").read_text(), args.sass_format)
                 cuda = (task / "kernels/custom_ops.cu").read_text()
                 row = next(r for r in audit if r["task_id"] == item["id"])
                 prompt = ("根据以下 SASS 和固定 C++ binding 恢复完整 kernels/custom_ops.cu。\n"
@@ -279,6 +302,7 @@ def main():
         "largest_group": max((len(g) for g in groups.values()), default=0),
         "splits": {name: len(rows) for name, rows in split_rows.items()},
         "tokenizer": args.tokenizer, "max_tokens": args.max_tokens,
+        "sass_format": args.sass_format,
         "token_lengths": ({"min": lengths[0], "median": lengths[len(lengths)//2],
                            "p95": lengths[min(len(lengths)-1, int(.95*len(lengths)))],
                            "max": lengths[-1]} if lengths else None),
