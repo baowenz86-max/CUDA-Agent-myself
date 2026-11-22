@@ -1,5 +1,6 @@
 """Rebuild original and recovered CUDA in isolated directories; no model calls."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tempfile
 
 
 def run(command, directory, env, timeout, name):
@@ -30,24 +32,65 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="New directory for each run")
     parser.add_argument("--python", type=Path, default=Path(".venv/bin/python"))
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     python = str(args.python.absolute())
     if not Path(python).is_file():
         parser.error("Verification Python does not exist")
     config = json.loads((args.predictions / "generation_config.json").read_text())
-    args.output.mkdir(parents=True, exist_ok=False)
+    # Freeze inputs so completed results are never reused with different source.
+    digest = hashlib.sha256()
+    paths = [args.predictions / "generation_config.json", Path(__file__)]
+    paths += sorted((repo / "agent_workdir/utils").glob("*.py"))
+    paths += [repo / "agent_workdir" / n for n in ("binding.cpp", "binding_registry.h")]
+    for task_id in config["ids"]:
+        if not task_id.startswith("task_") or not task_id[5:].isdigit():
+            raise ValueError(f"Invalid task ID {task_id}")
+        paths += [args.results / task_id / n for n in
+                  ("model.py", "model_new.py", "kernels/custom_ops.cu", "kernels/custom_ops_binding.cpp")]
+        paths.append(args.predictions / task_id / "result.json")
+        candidate = args.predictions / task_id / "custom_ops.cu"
+        if candidate.exists():
+            paths.append(candidate)
+    for path in paths:
+        digest.update(str(path.absolute()).encode())
+        digest.update(path.read_bytes())
+    settings = {"input_hash": digest.hexdigest(), "python": python, "timeout": args.timeout,
+                "env": {k: os.environ.get(k) for k in
+                        ("CUDA_HOME", "CC", "CXX", "CUDAHOSTCXX", "TORCH_CUDA_ARCH_LIST", "MAX_JOBS")}}
+    args.output.mkdir(parents=True, exist_ok=args.resume)
+    settings_path = args.output / "evaluation_config.json"
+    if args.resume and any(args.output.iterdir()) and not settings_path.exists():
+        raise ValueError("Cannot resume old output without evaluation_config.json; use a new directory")
+    if settings_path.exists() and json.loads(settings_path.read_text()) != settings:
+        raise ValueError("Evaluation inputs/settings changed; use a new output directory")
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
     rows = []
     for position, task_id in enumerate(config["ids"], 1):
         if not task_id.startswith("task_") or not task_id[5:].isdigit():
             raise ValueError(f"Invalid task ID {task_id}")
+        saved = args.output / task_id / "result.json"
+        if args.resume and saved.exists():
+            try:
+                cached = json.loads(saved.read_text())
+                if cached.get("id") == task_id and "status" in cached:
+                    rows.append(cached)
+                    print(f"[{position}/{len(config['ids'])}] {task_id} cached: {cached['status']}", flush=True)
+                    continue
+            except ValueError:
+                pass
+        task_root = args.output / task_id
+        task_root.mkdir(parents=True, exist_ok=True)
+        # Preserve interrupted attempts; never reuse their possibly stale binary.
+        attempt = Path(tempfile.mkdtemp(prefix="attempt_", dir=task_root)).absolute()
         print(f"[{position}/{len(config['ids'])}] {task_id} original replay", flush=True)
         archive = args.results / task_id
         seed = 2026 + int(task_id[5:]) * 100
-        row = {"id": task_id, "seed": seed}
+        row = {"id": task_id, "seed": seed, "attempt": str(attempt)}
 
         def prepare(kind, cuda):
-            directory = (args.output / task_id / kind).absolute()
+            directory = attempt / kind
             directory.mkdir(parents=True)
             shutil.copytree(repo / "agent_workdir/utils", directory / "utils",
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -103,7 +146,9 @@ def main():
             row.update(status="infrastructure_error", error=f"{type(exc).__name__}: {exc}")
         rows.append(row)
         (args.output / task_id).mkdir(parents=True, exist_ok=True)
-        (args.output / task_id / "result.json").write_text(json.dumps(row, indent=2) + "\n")
+        temporary = saved.with_suffix(".tmp")
+        temporary.write_text(json.dumps(row, indent=2) + "\n")
+        temporary.replace(saved)
         print(f"  {task_id}: {row['status']}", flush=True)
     evaluable = [r for r in rows if r.get("original", {}).get("status") == "passed"
                  and r["status"] != "infrastructure_error"]
