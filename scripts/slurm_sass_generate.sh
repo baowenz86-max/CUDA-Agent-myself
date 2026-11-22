@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=sass-generate
 #SBATCH --partition=Students
-#SBATCH --qos=qos_stu_default
+#SBATCH --qos=qos_stu_medium_2gpu
 #SBATCH --gres=gpu:A100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
