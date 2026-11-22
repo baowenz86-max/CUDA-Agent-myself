@@ -142,7 +142,7 @@ def main():
         warmup_steps=warmup_steps, weight_decay=0.01, max_grad_norm=1.0,
         logging_steps=1 if smoke else 5, report_to="none", seed=2026,
         eval_strategy="no" if smoke else "steps",
-        save_strategy="steps", save_steps=args.max_steps if smoke else interval,
+        save_strategy="steps", save_steps=min(10, args.max_steps) if smoke else interval,
         eval_steps=interval, save_total_limit=2,
         load_best_model_at_end=not smoke, metric_for_best_model="eval_loss",
         greater_is_better=False, prediction_loss_only=True,
