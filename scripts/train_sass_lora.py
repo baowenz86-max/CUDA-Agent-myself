@@ -43,6 +43,8 @@ def main():
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
+    if args.grad_accum <= 0 or args.epochs <= 0 or args.max_length <= 0:
+        parser.error("grad-accum, epochs and max-length must be positive")
 
     import torch
     from datasets import Dataset
@@ -95,6 +97,35 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     torch.cuda.reset_peak_memory_stats()
+    def collate(features):
+        width = max(len(f["input_ids"]) for f in features)
+        batch = {}
+        for key, pad in (("input_ids", tokenizer.pad_token_id), ("attention_mask", 0), ("labels", -100)):
+            batch[key] = torch.tensor([f[key] + [pad] * (width-len(f[key])) for f in features])
+        return batch
+
+    smoke = args.max_steps > 0
+    steps_per_epoch = math.ceil(math.ceil(len(train_items) / world) / args.grad_accum)
+    total_steps = args.max_steps if smoke else math.ceil(steps_per_epoch * args.epochs)
+    warmup_steps = math.ceil(0.05 * total_steps)
+    interval = max(1, math.ceil(steps_per_epoch / 2))
+    report.update(total_steps=total_steps, warmup_steps=warmup_steps)
+    config = TrainingArguments(
+        output_dir=str(args.output), per_device_train_batch_size=1,
+        per_device_eval_batch_size=1, gradient_accumulation_steps=args.grad_accum,
+        learning_rate=1e-4, num_train_epochs=args.epochs, max_steps=args.max_steps,
+        bf16=True, gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        ddp_find_unused_parameters=False, optim="adamw_torch",
+        warmup_steps=warmup_steps, weight_decay=0.01, max_grad_norm=1.0,
+        logging_steps=1 if smoke else 5, report_to="none", seed=2026,
+        eval_strategy="no" if smoke else "steps",
+        save_strategy="steps", save_steps=args.max_steps if smoke else interval,
+        eval_steps=interval, save_total_limit=2,
+        load_best_model_at_end=not smoke, metric_for_best_model="eval_loss",
+        greater_is_better=False, prediction_loss_only=True,
+        dataloader_num_workers=0, ddp_timeout=3600,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.model.resolve(), local_files_only=True, torch_dtype=torch.bfloat16,
         attn_implementation="sdpa")
@@ -106,31 +137,6 @@ def main():
     if rank == 0:
         model.print_trainable_parameters()
 
-    def collate(features):
-        width = max(len(f["input_ids"]) for f in features)
-        batch = {}
-        for key, pad in (("input_ids", tokenizer.pad_token_id), ("attention_mask", 0), ("labels", -100)):
-            batch[key] = torch.tensor([f[key] + [pad] * (width-len(f[key])) for f in features])
-        return batch
-
-    smoke = args.max_steps > 0
-    interval = max(1, math.ceil(len(train_items) / (world * args.grad_accum) / 2))
-    config = TrainingArguments(
-        output_dir=str(args.output), per_device_train_batch_size=1,
-        per_device_eval_batch_size=1, gradient_accumulation_steps=args.grad_accum,
-        learning_rate=1e-4, num_train_epochs=args.epochs, max_steps=args.max_steps,
-        bf16=True, gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        ddp_find_unused_parameters=False, optim="adamw_torch",
-        warmup_ratio=0.05, weight_decay=0.01, max_grad_norm=1.0,
-        logging_steps=1 if smoke else 5, report_to="none", seed=2026,
-        eval_strategy="no" if smoke else "steps",
-        save_strategy="steps", save_steps=args.max_steps if smoke else interval,
-        eval_steps=interval, save_total_limit=2,
-        load_best_model_at_end=not smoke, metric_for_best_model="eval_loss",
-        greater_is_better=False, prediction_loss_only=True,
-        dataloader_num_workers=0, ddp_timeout=3600,
-    )
     kwargs = dict(model=model, args=config, data_collator=collate,
                   train_dataset=Dataset.from_list([x[1] for x in train_items]),
                   eval_dataset=Dataset.from_list([x[1] for x in valid_items]))
