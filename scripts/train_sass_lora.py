@@ -11,6 +11,28 @@ import os
 from pathlib import Path
 
 
+def completion_loss(model, inputs, return_outputs=False):
+    """Compute only the LM-head positions needed for supervised next tokens."""
+    import torch
+    import torch.nn.functional as F
+
+    inputs = dict(inputs)
+    labels = inputs.pop("labels")
+    # Position t predicts label t+1, including the first answer token.
+    targets = labels[:, 1:]
+    positions = torch.where((targets != -100).any(dim=0))[0]
+    if positions.numel() == 0:
+        raise ValueError("Batch has no supervised next-token targets")
+    outputs = model(**inputs, logits_to_keep=positions, use_cache=False)
+    selected_targets = targets.index_select(1, positions)
+    logits = outputs.logits
+    if logits.shape[:2] != selected_targets.shape:
+        raise ValueError("Model did not honor logits_to_keep; refusing full-sequence logits")
+    loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]),
+                           selected_targets.reshape(-1), ignore_index=-100)
+    return (loss, outputs) if return_outputs else loss
+
+
 def encode_sample(tokenizer, messages, max_length):
     if [m["role"] for m in messages] != ["user", "assistant"]:
         raise ValueError("Expected exactly a user prompt and an assistant answer")
@@ -143,7 +165,14 @@ def main():
     # Transformers renamed tokenizer to processing_class; support both interfaces.
     name = "processing_class" if "processing_class" in inspect.signature(Trainer.__init__).parameters else "tokenizer"
     kwargs[name] = tokenizer
-    trainer = Trainer(**kwargs)
+    class CompletionTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            return completion_loss(model, inputs, return_outputs)
+
+    trainer = CompletionTrainer(**kwargs)
+    # Loss is a local supervised-token mean; Trainer handles accumulation scaling.
+    trainer.model_accepts_loss_kwargs = False
+    report["loss_implementation"] = "completion_positions_only"
     result = trainer.train(resume_from_checkpoint=str(args.resume) if args.resume else None)
     trainer.save_model(str(args.output / "adapter"))
     if trainer.is_world_process_zero():
