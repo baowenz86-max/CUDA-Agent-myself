@@ -17,6 +17,16 @@
 #SBATCH --output=cuda-agent-%A_%a.log
 
 set -euo pipefail
+# Load API credentials on the compute node without printing their values.
+secrets_file="$HOME/.config/cuda-agent/secrets.env"
+if [[ ! -r "$secrets_file" ]]; then
+  echo "Cannot read API credentials: $secrets_file" >&2
+  exit 2
+fi
+set -a
+source "$secrets_file"
+set +a
+
 cd "${SLURM_SUBMIT_DIR:?Submit from the CUDA-Agent project root}"
 [[ -f main.py && -f pyproject.toml ]] || {
   echo 'Please run sbatch from the CUDA-Agent project root.' >&2
