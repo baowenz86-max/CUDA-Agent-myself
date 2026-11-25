@@ -69,6 +69,31 @@ def write_jsonl(path, rows):
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def load_holdouts(directory):
+    locked = {}
+    hashes = {}
+    for split in ("valid", "test"):
+        path = directory / f"{split}.jsonl"
+        hashes[split] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with path.open() as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                if item["id"] in locked:
+                    raise ValueError(f"Duplicate holdout task: {item['id']}")
+                locked[item["id"]] = (split, sha(json.dumps(item["messages"], ensure_ascii=False)))
+    return locked, hashes
+
+
+def frozen_group_split(group, locked):
+    destinations = {locked[s["row"]["task_id"]][0] for s in group
+                    if s["row"]["task_id"] in locked}
+    if len(destinations) > 1:
+        raise ValueError("A similarity group bridges frozen validation and test sets; review before export")
+    return next(iter(destinations), "train")
+
+
 class StructuralReference(ast.NodeTransformer):
     """Group identical reference structure even when constants differ."""
 
@@ -86,6 +111,8 @@ def main():
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--sass-format", choices=("raw", "compact"), default="raw")
+    parser.add_argument("--previous-split", type=Path,
+                        help="Freeze old valid/test tasks; reserve their matching groups from training")
     args = parser.parse_args()
     if args.max_tokens is not None and (not args.tokenizer or args.max_tokens <= 0):
         parser.error("--max-tokens requires --tokenizer and a positive value")
@@ -101,10 +128,13 @@ def main():
                                                    trust_remote_code=False)
         if not tokenizer.chat_template:
             parser.error("Tokenizer needs a chat template for exact chat length counting")
+    locked, holdout_hashes = load_holdouts(args.previous_split) if args.previous_split else ({}, {})
     args.output.mkdir(parents=True, exist_ok=args.resume)
     config_path = args.output / "audit_config.json"
     config = {"results": str(args.results.resolve()), "tokenizer": args.tokenizer,
               "max_tokens": args.max_tokens, "sass_format": args.sass_format, "version": 4}
+    if args.previous_split:
+        config["frozen_holdout_hashes"] = holdout_hashes
     if args.tokenizer:
         config["tokenizer_hashes"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(Path(args.tokenizer).glob("*")) if p.is_file()}
@@ -232,6 +262,13 @@ def main():
         return
 
     # Union by reference structure or identical CUDA/SASS, including transitive matches.
+    if args.previous_split:
+        by_id = {s["row"]["task_id"]: s["row"] for s in samples}
+        for task_id, (_, fingerprint) in locked.items():
+            if task_id not in by_id:
+                raise ValueError(f"Frozen holdout missing or ineligible: {task_id}")
+            if by_id[task_id]["message_hash"] != fingerprint:
+                raise ValueError(f"Frozen holdout content changed: {task_id}; do not silently replace it")
     parent = list(range(len(samples)))
 
     def find(index):
@@ -261,16 +298,23 @@ def main():
     unique_count = len({s["row"]["message_hash"] for s in samples})
     targets = {"train": .8 * unique_count, "valid": .1 * unique_count, "test": .1 * unique_count}
     duplicate_count = 0
+    quarantined = []
     for group in group_list:
-        split = max(targets, key=lambda name: targets[name] - len(split_rows[name]))
+        split = (frozen_group_split(group, locked) if args.previous_split else
+                 max(targets, key=lambda name: targets[name] - len(split_rows[name])))
         group_id = sha("\n".join(sorted(s["row"]["task_id"] for s in group)))[:16]
         unique = set()
         for sample in group:
             row = sample["row"]
+            if args.previous_split and split != "train" and row["task_id"] not in locked:
+                row.update(group_id=group_id, split="quarantine",
+                           quarantine_reason="matches_frozen_holdout_group")
+                quarantined.append(row["task_id"])
+                continue
             row.update(group_id=group_id, split=split)
             fingerprint = row["message_hash"]
             row["duplicate_removed"] = fingerprint in unique
-            if fingerprint in unique:
+            if fingerprint in unique and not (args.previous_split and row["task_id"] in locked):
                 duplicate_count += 1
                 continue
             unique.add(fingerprint)
@@ -301,6 +345,8 @@ def main():
         "exact_duplicates_removed": duplicate_count, "groups": len(groups),
         "largest_group": max((len(g) for g in groups.values()), default=0),
         "splits": {name: len(rows) for name, rows in split_rows.items()},
+        "frozen_holdouts": bool(args.previous_split),
+        "quarantined_holdout_matches": quarantined,
         "tokenizer": args.tokenizer, "max_tokens": args.max_tokens,
         "sass_format": args.sass_format,
         "token_lengths": ({"min": lengths[0], "median": lengths[len(lengths)//2],
