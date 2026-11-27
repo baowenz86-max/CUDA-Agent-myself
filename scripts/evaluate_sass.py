@@ -38,6 +38,14 @@ def main():
     python = str(args.python.absolute())
     if not Path(python).is_file():
         parser.error("Verification Python does not exist")
+    # Explicit interpreter selection does not activate its bin directory.
+    # PyTorch invokes ninja via PATH, not via Python imports.
+    verification_env = os.environ.copy()
+    verification_env["PATH"] = str(Path(python).parent) + os.pathsep + verification_env.get("PATH", "")
+    verification_env.pop("PYTHONPATH", None)
+    subprocess.run([python, "-c", "from torch.utils.cpp_extension import verify_ninja_availability; "
+                    "verify_ninja_availability(); print('Ninja preflight passed', flush=True)"],
+                   env=verification_env, check=True, timeout=120)
     config = json.loads((args.predictions / "generation_config.json").read_text())
     # Freeze inputs so completed results are never reused with different source.
     digest = hashlib.sha256()
@@ -105,8 +113,7 @@ def main():
             return directory
 
         def evaluate(directory):
-            env = os.environ.copy()
-            env.pop("PYTHONPATH", None)
+            env = verification_env.copy()
             env["CUDA_AGENT_RUN_DIR"] = str(directory / ".correctness")
             env["MAX_JOBS"] = env.get("MAX_JOBS", "4")
             result = {"compile": run([python, "-m", "utils.compile"], directory,

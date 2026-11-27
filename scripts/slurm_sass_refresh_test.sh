@@ -31,7 +31,7 @@ case "$stage" in
     export TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=4
     .venv/bin/python -u scripts/evaluate_sass.py \
       --predictions runs/lora_refresh_20261125_test113 --results results \
-      --output runs/lora_refresh_20261125_test113_eval_v1 \
+      --output "${2:-runs/lora_refresh_20261125_test113_eval_v2}" \
       --python .venv/bin/python --resume
     ;;
   *) echo 'Use generate or evaluate'; exit 2;;
